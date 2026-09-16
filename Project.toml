@@ -36,9 +36,8 @@ Functors = "0.5"
 JLD2 = "0.5, 0.6"
 JSON3 = "1"
 Lux = "1"
-# ReactantServerExport floor: 1.0.0, the General-registry release; no further 0.1.x.
-ReactantServerExport = "1.0.0"
-KaimonGate = "1.2.0"
+ReactantServerExport = "1"
+KaimonGate = "1"
 
 [extras]
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
