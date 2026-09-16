@@ -95,6 +95,10 @@ contract that ships no backend.
 ```julia
 using ReactantNitro, Lux, Random
 
+# Explicit CPU, so the quick start runs anywhere. It has to come BEFORE the first `Nitro`: that
+# is where the XLA client initializes, and the backend is fixed for the process from then on.
+setup_devices!(backend = "cpu")
+
 @experiment struct MnistMLP
     width::GraphConst{Int} = 128
     smoothing::Device{Float32} = 0.05f0
@@ -117,13 +121,19 @@ function ReactantNitro.forward(e::MnistMLP, model, ps, st; img)
 end
 
 function ReactantNitro.loss(e::MnistMLP, logits; label)
-    logp = logits .- log.(sum(exp, logits; dims = 1))
+    logp = logsoftmax(logits; dims = 1)   # NNlib's, re-exported by Lux: max-subtracted
     return -sum(label .* logp) / size(label, 2)
 end
 
 n = Nitro(MnistMLP())
 train!(n)
 ```
+
+Drop the `setup_devices!` line to take whatever backend Reactant finds, which is a GPU wherever one
+is visible, or name one with `backend = "cuda"` and pin how many devices the batch shards over with
+`n_devs`. One caveat that reads far worse than it is: with `CUDA_VISIBLE_DEVICES` set to the empty
+string on a machine that has GPUs, the CUDA plugin is still probed, fails, and logs a stack trace
+before falling back to CPU. Selecting the CPU backend up front skips the probe and the noise.
 
 `Nitro(e)` runs the setup sequence and nothing else, so validation, evaluation, and prediction never
 depend on a `train!` having happened in the process. Each hook declares the batch fields it wants as

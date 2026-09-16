@@ -190,7 +190,13 @@ function ReactantNitro.loss(e::MnistMLP, logits; label)
     # INPUTS and neither needs unwrapping; had `class_weights` been a `GraphConst` field it would have been
     # baked into the graph as a constant and walked by the tracer on every compile.
     smoothed = (1f0 - e.smoothing) .* label .+ e.smoothing / 10f0
-    logp = logits .- log.(sum(exp, logits; dims = 1))       # log-softmax, in one stable step
+    # NNlib's log-softmax, re-exported by Lux, which subtracts the row max. Reach for it rather
+    # than writing `logits .- log.(sum(exp, logits; dims = 1))`: that spelling is the same
+    # function on paper and overflows Float32 above 88.7 in practice, and `forward` divides by
+    # `e.smoothing`, so a logit of 5 arrives here as 100. Hand-rolled, this loss is `Inf` on
+    # roughly a quarter of freshly initialized batches and the run dies at step 1 on the
+    # non-finite check.
+    logp = logsoftmax(logits; dims = 1)
     return -sum(smoothed .* logp .* e.class_weights) / size(label, 2)
 end
 ```
