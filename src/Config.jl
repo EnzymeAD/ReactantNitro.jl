@@ -708,17 +708,18 @@ function _show_experiment(io::IO, e; long::Bool = false)
         return nothing
     end
     df, hf = device_fields(T), host_fields(T)
-    println(io, nameof(T), "  (@experiment; no device buffer is shown)")
-    isempty(fs) && return print(io, "  (no fields)")
-    w = maximum(length(string(f)) for f in fs)
-    for (i, f) in enumerate(fs)
-        # The marker is the column that makes the table actionable: it is what a reader changes
-        # when a field is in the wrong category, and it cannot be inferred from the value.
-        kind = f in df ? "Device" : f in hf ? "Host" : "GraphConst"
-        line = "  " * rpad(string(f), w) * "  " * rpad(kind, 10) * " " *
-            _shown(getfield(e, f))
-        i == length(fs) ? print(io, line) : println(io, line)
-    end
+    title = string(nameof(T)) * "  (@experiment; no device buffer is shown)"
+    isempty(fs) && return print(io, title, "\n  (no fields)")
+    # The marker is the column that makes the table actionable: it is what a reader changes when a
+    # field is in the wrong category, and it cannot be inferred from the value.
+    rows = Vector{String}[
+        [
+            string(f),
+            f in df ? "Device" : f in hf ? "Host" : "GraphConst",
+            _shown(getfield(e, f)),
+        ] for f in fs
+    ]
+    _render_table(io, title, ["field", "marker", "value"], rows)
     return nothing
 end
 

@@ -527,4 +527,55 @@
         @test length(sprint(show, bare)) < 2_000
     end
 
+    # ── what the run produced, without a logger backend ──────────────────────────────────
+    #
+    # The shipped `JSONLogger` writes metrics to a file and a hosted backend sends them away, so a
+    # REPL `train!(n)` used to return a handle that could say it had finished and not how it had
+    # done. The numbers exist on the handle for exactly that reason.
+    @testset "a finished handle reports what the run produced" begin
+        n = mk_life(; max_epochs = 2)
+        @test isempty(n.last_metrics)          # nothing has run yet, including after a restore
+        @test n.elapsed === nothing
+
+        untrained = sprint(show, MIME"text/plain"(), n)
+        @test !occursin("metrics ", untrained)
+        @test !occursin("elapsed", untrained)
+        @test occursin("fresh from build_model", untrained)
+
+        train!(n)
+
+        # The last epoch's validation metrics, on the handle, as HOST values.
+        @test !isempty(n.last_metrics)
+        @test haskey(n.last_metrics, :val_loss)
+        @test n.last_metrics.val_loss isa Real
+        @test n.elapsed isa Real && n.elapsed > 0
+
+        long = sprint(show, MIME"text/plain"(), n)
+        @test occursin("metrics", long) && occursin("val_loss", long)
+        @test occursin("elapsed", long)
+        # `checkpoint_source` is a CONSTRUCTION-time fact, so reporting it alone made a trained
+        # handle claim its weights were "fresh from build_model": true of where they started and
+        # wrong about what they are.
+        @test occursin("trained here", long)
+        @test !occursin("fresh from build_model", long)
+        @test length(long) < 2_000
+
+        # A metric may be an array (a confusion matrix is the standard case), and the summary
+        # routes metrics through the same renderer as everything else. Set directly rather than
+        # trained, so this pins the DISPLAY path and not a second experiment's numerics.
+        n.last_metrics = (; acc = 0.5, confusion = zeros(Int, 10, 10))
+        withmat = sprint(show, MIME"text/plain"(), n)
+        @test occursin("size 10x10", withmat)
+        @test !occursin("0, 0, 0", withmat)
+        @test length(withmat) < 2_000
+    end
+
+    @testset "elapsed reads at all three scales" begin
+        el = ReactantNitro._nitro_elapsed
+        @test el(nothing) === nothing
+        @test el(1.25) == "1.2s"
+        @test el(125.0) == "2m 05s"          # zero-padded, so a column of these lines up
+        @test el(7_500.0) == "2h 05m"
+    end
+
 end

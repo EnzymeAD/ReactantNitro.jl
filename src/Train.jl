@@ -449,6 +449,7 @@ function _train!(nitro::Nitro)
     # The per-run copy of the module-level registry, taken here rather than at construction, so
     # that a monitor registered between `Nitro(e)` and `train!` is in this run.
     adopt_monitors!(nitro)
+    t_started = time()
     last_metrics = (;)
     # The final checkpoint rewrite below applies to the checkpoint THIS CALL wrote, and there may be
     # none. `nitro.epoch > 0` is not that condition: a resume restores the epoch counter, so a
@@ -620,6 +621,9 @@ function _train!(nitro::Nitro)
 
             metrics_out = haskey(nitro.data, :val) ? run_eval(nitro, :val; report = false) : (;)
             last_metrics = metrics_out
+            # On the handle too, not only in this local: the local exists for the final checkpoint
+            # rewrite and dies with the call, and the handle is what a REPL is holding afterwards.
+            nitro.last_metrics = metrics_out
             isempty(metrics_out) || log_metrics!(
                 nitro.logger, finite_only(metrics_out);
                 step = nitro.step, epoch = nitro.epoch,
@@ -643,6 +647,15 @@ function _train!(nitro::Nitro)
         end
     catch
         nitro.stop_reason = :error
+        nitro.elapsed = time() - t_started
+        # A failed run still wrote epochs, and which one survived is the first thing asked of it.
+        # Through `try`, because a run that died on I/O is exactly the run whose manifest may not
+        # be readable, and a display helper must not replace the real exception with its own.
+        nitro.best_checkpoint = try
+            selected_checkpoint(nitro.checkpointer, nitro.run_dir)
+        catch
+            nothing
+        end
         set_phase!(nitro, Failed())
         finish!(nitro.logger, :error)
         rethrow()
@@ -667,6 +680,9 @@ function _train!(nitro::Nitro)
     # stop a finished run rather than a failure. `stop_reason` is where the difference lives, and
     # the checkpoint record keeps it, since "completed 40/40" and "stopped at 37 on patience" are
     # different outcomes that a resume with `:auto` would otherwise have to guess at.
+    nitro.elapsed = time() - t_started
+    # After the final rewrite above, so the winning entry is the one the manifest ends up holding.
+    nitro.best_checkpoint = selected_checkpoint(nitro.checkpointer, nitro.run_dir)
     set_phase!(nitro, Done())
     finish!(nitro.logger, nitro.stop_reason === :completed ? :completed : :early_stop)
     return nitro
@@ -735,6 +751,7 @@ function _train_manual!(nitro::Nitro)
     worlds = nitro.frozen.worlds_manual
     router = nitro.routing.train_step
     adopt_monitors!(nitro)
+    t_started = time()
     last_metrics = (;)
     wrote_epoch = false
     try
@@ -823,6 +840,9 @@ function _train_manual!(nitro::Nitro)
 
             metrics_out = haskey(nitro.data, :val) ? run_eval(nitro, :val; report = false) : (;)
             last_metrics = metrics_out
+            # On the handle too, not only in this local: the local exists for the final checkpoint
+            # rewrite and dies with the call, and the handle is what a REPL is holding afterwards.
+            nitro.last_metrics = metrics_out
             isempty(metrics_out) || log_metrics!(
                 nitro.logger, finite_only(metrics_out);
                 step = nitro.step, epoch = nitro.epoch,
@@ -840,6 +860,15 @@ function _train_manual!(nitro::Nitro)
         end
     catch
         nitro.stop_reason = :error
+        nitro.elapsed = time() - t_started
+        # A failed run still wrote epochs, and which one survived is the first thing asked of it.
+        # Through `try`, because a run that died on I/O is exactly the run whose manifest may not
+        # be readable, and a display helper must not replace the real exception with its own.
+        nitro.best_checkpoint = try
+            selected_checkpoint(nitro.checkpointer, nitro.run_dir)
+        catch
+            nothing
+        end
         set_phase!(nitro, Failed())
         finish!(nitro.logger, :error)
         rethrow()
@@ -848,6 +877,9 @@ function _train_manual!(nitro::Nitro)
     # The final rewrite, identical to the automatic loop: the last epoch's record is rewritten
     # once the outcome is known, gated on this call having written an epoch at all.
     wrote_epoch && save_checkpoint!(nitro.checkpointer, nitro.epoch, last_metrics, snapshot(nitro))
+    nitro.elapsed = time() - t_started
+    # After the final rewrite above, so the winning entry is the one the manifest ends up holding.
+    nitro.best_checkpoint = selected_checkpoint(nitro.checkpointer, nitro.run_dir)
     set_phase!(nitro, Done())
     finish!(nitro.logger, nitro.stop_reason === :completed ? :completed : :early_stop)
     return nitro

@@ -486,7 +486,10 @@ function _build_nitro(
         frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state),
         (; masks, anchors),
         map(zero, flat), RegisteredMonitor[], Int(step0), Int(epoch0), Starting(),
-        false, nothing
+        false, nothing,
+        # No metrics and no elapsed time yet: a fresh handle has run nothing, including one
+        # restored from a checkpoint, whose recorded metrics belong to the process that wrote it.
+        (;), nothing, nothing
     )
     nitro.report = build_binding_report(nitro)
     @info nitro.report

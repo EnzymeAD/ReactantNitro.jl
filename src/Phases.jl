@@ -237,6 +237,21 @@ mutable struct Nitro
     phase::Phase
     stop_requested::Bool
     stop_reason::Any          # also a record field: how the run ended, `nothing` while it runs
+    # WHAT THE RUN ACTUALLY PRODUCED, retained so that a handle can answer it without a logger
+    # backend. The shipped `JSONLogger` writes these to a file and a hosted backend sends them
+    # away, so before this the numbers a run computed were reachable only by opening something
+    # else, and a REPL `train!(n)` returned a handle that could say it had finished and not how it
+    # had done. Host values, asserted so by `run_eval`, and the LAST epoch's rather than a series:
+    # a handle is not a metrics store, and the series is what a logger is for.
+    last_metrics::Any         # the last validation metrics; `(;)` until a run produces some
+    # Wall seconds of the most recent `train!` ON THIS HANDLE, and `nothing` before one. Not the
+    # run's total across a resume: this call is the only thing this handle timed, and adding a
+    # restored duration to it would report a number no clock ever measured.
+    elapsed::Any
+    # The checkpoint the run would hand you: `(; path, epoch, metric, score)`, resolved ONCE at the
+    # end of `train!` rather than on demand. A `show` must not do I/O, and this is the one piece of
+    # the summary that lives on disk instead of in the handle.
+    best_checkpoint::Any
 end
 
 # ── The accessors, which are reads and which everything downstream is specified in terms of.
@@ -356,6 +371,91 @@ logger_info(nitro::Nitro) = logger_info(nitro.logger)
 # cost transfers. The parameter count comes from `layout.lengths`, host metadata computed once at
 # setup, and never from the arrays it describes.
 
+# ── One table shape, several renderers ──────────────────────────────────────────────
+#
+# Every long `show` in this package produces the same thing: a title, an optional column header,
+# and rows of strings. Rendering that is a separate decision from deciding WHAT to show, and it is
+# the decision that depends on where Julia is running: a plain terminal wants aligned columns, and
+# a session with PrettyTables loaded can have boxes. Keeping the two apart means a new destination
+# is a renderer rather than another copy of every `show` in the package.
+#
+# A `Ref` rather than dispatch, because the renderer is a process-wide setting with no argument to
+# dispatch on, and because an extension setting it in `__init__` is one assignment that cannot
+# invalidate anything already compiled.
+const _TABLE_RENDERER = Ref{Any}(nothing)
+
+"""
+    ReactantNitro.table_renderer!(f) -> previous
+
+Set the renderer every long `show` in this package goes through, and return the previous one.
+`f` is called as `f(io::IO, title::AbstractString, header::Vector{String},
+rows::`[`TableRows`](@ref)`, note::Union{AbstractString, Nothing})`, and `nothing` restores the
+built-in aligned-column renderer. **Write those argument types out in the renderer**: it is reached
+through a `Ref{Any}`, so nothing checks them for you, and five untyped arguments under a generic
+name is the signature that muddles a stack trace and looks applicable to calls that are not this
+one.
+
+Loading `PrettyTables` sets this for you through this package's extension, which is the supported
+way to get boxed tables. `table_renderer!(nothing)` puts the plain renderer back, which is what to
+do when something else in a session pulled PrettyTables in and you did not want the change.
+"""
+function table_renderer!(f)
+    prev = _TABLE_RENDERER[]
+    _TABLE_RENDERER[] = f
+    return prev
+end
+
+"""
+    ReactantNitro.TableRows
+
+The row type every renderer receives, `Vector{Vector{String}}`: one inner vector per row, already
+rendered to strings. Spelled as an alias so the core and an extension state the same type rather
+than two that happen to agree today.
+"""
+const TableRows = Vector{Vector{String}}
+
+# CONCRETELY TYPED, all five arguments, and not because this is hot: it is called once per display.
+# A renderer is reached through a `Ref{Any}`, so the call is already dynamic, and a generically
+# named `render(io, title, header, rows, note)` with five untyped arguments is the shape that
+# makes a stack trace ambiguous and invites a method from somewhere else to look applicable. The
+# types are the contract `table_renderer!` documents; an extension writes the same ones.
+function _render_table(
+        io::IO, title::AbstractString, header::Vector{String}, rows::TableRows;
+        note::Union{AbstractString, Nothing} = nothing
+    )
+    r = _TABLE_RENDERER[]
+    r === nothing || return r(io, title, header, rows, note)
+    return _render_table_plain(io, title, header, rows, note)
+end
+
+# The built-in: aligned columns, no rules, and NO TRAILING NEWLINE. That last point is the one a
+# `show` method has to get right, since Julia's REPL supplies the line break itself and a method
+# that prints its own leaves a blank line under every display.
+function _render_table_plain(
+        io::IO, title::AbstractString, header::Vector{String}, rows::TableRows,
+        note::Union{AbstractString, Nothing}
+    )
+    print(io, title)
+    isempty(rows) && return nothing
+    cols = maximum(length, rows)
+    show_header = any(!isempty, header)
+    widths = [
+        maximum(
+            length(get(r, c, "")) for r in (show_header ? vcat([header], rows) : rows)
+        ) for c in 1:cols
+    ]
+    # The last column is never padded: trailing blanks are invisible and would only widen a line
+    # that a terminal then wraps.
+    line(r) = "  " * rstrip(join((rpad(get(r, c, ""), widths[c]) for c in 1:cols), "  "))
+    show_header && (println(io); print(io, line(header)))
+    for r in rows
+        println(io)
+        print(io, line(r))
+    end
+    note === nothing || (println(io); print(io, "  ", note))
+    return nothing
+end
+
 # `nothing` rather than a guess for a handle whose layout is not a `FlatLayout`: a display reports
 # what it can read and invents nothing.
 function _nitro_params(nitro::Nitro)
@@ -375,6 +475,27 @@ function _nitro_devices(nitro::Nitro)
     catch
         nothing
     end
+end
+
+function _nitro_elapsed(sec)
+    sec === nothing && return nothing
+    sec < 60 && return string(round(sec; digits = 1)) * "s"
+    m, sc = divrem(round(Int, sec), 60)
+    m < 60 && return string(m) * "m " * lpad(string(sc), 2, '0') * "s"
+    h, mm = divrem(m, 60)
+    return string(h) * "h " * lpad(string(mm), 2, '0') * "m"
+end
+
+# Where these weights came from AND whether this handle put training into them, which are two
+# different questions that one field cannot answer. `checkpoint_source` is a construction-time
+# fact, so reporting it alone made a trained handle claim its weights were "fresh from
+# build_model": true of where they started and wrong about what they are.
+function _nitro_weights(nitro::Nitro)
+    src = nitro.checkpoint_source
+    nitro.elapsed === nothing && return src === nothing ?
+        "fresh from build_model" : "restored from " * string(src)
+    return src === nothing ? "trained here, from fresh init" :
+        "trained here, resumed from " * string(src)
 end
 
 # A split's size WITHOUT iterating it. A loader that promises no length is reported as streaming
@@ -416,42 +537,76 @@ end
 function Base.show(io::IO, ::MIME"text/plain", nitro::Nitro)
     pg = _nitro_params(nitro)
     devs = _nitro_devices(nitro)
-    println(io, "Nitro for ", nameof(typeof(nitro.e)), "  (the run handle; no weights are shown)")
-    println(
-        io, "  phase        ", nameof(typeof(nitro.phase)),
-        nitro.stop_reason === nothing ? "" : " (" * string(nitro.stop_reason) * ")"
+    rows = Vector{String}[
+        [
+            "phase",
+            string(nameof(typeof(nitro.phase))) *
+                (nitro.stop_reason === nothing ? "" : " (" * string(nitro.stop_reason) * ")"),
+        ],
+        ["epoch", string(nitro.epoch, " / ", nitro.max_epochs)],
+        [
+            "step",
+            string(nitro.step) * (nitro.total === nothing ? "" : " / " * string(nitro.total)),
+        ],
+        [
+            "params",
+            pg === nothing ? "not built" :
+                _commas(pg[1]) * " in " * string(pg[2]) * (pg[2] == 1 ? " group" : " groups"),
+        ],
+        ["batch_size", string(something(nitro.batch_size, "pending"))],
+        [
+            "devices",
+            (devs === nothing ? "sharded" : string(devs)) *
+                (nitro.mesh === nothing ? "  (no mesh)" : "  (mesh :data)"),
+        ],
+        ["data", _nitro_splits(nitro.data)],
+    ]
+    # The numbers the run produced, which is the question a finished `train!` leaves behind and
+    # which nothing else in this process could answer without a logger backend. Through `_shown`
+    # like everything else: a metric may be a confusion matrix, and a summary that printed one
+    # would have reintroduced the problem this whole `show` exists to solve.
+    isempty(nitro.last_metrics) ||
+        push!(rows, ["metrics", _shown(nitro.last_metrics)])
+    el = _nitro_elapsed(nitro.elapsed)
+    el === nothing || push!(rows, ["elapsed", el * "  (this `train!` call)"])
+    # The selected checkpoint: which epoch won, on which metric, and a path short enough to paste.
+    # `relpath` is string arithmetic and touches no filesystem, which is what keeps it legal here.
+    bc = nitro.best_checkpoint
+    bc === nothing || push!(
+        rows, [
+            "checkpoint",
+            string("epoch ", bc.epoch, ", ", bc.metric, " ", _shown(bc.score), "  ->  ") *
+                _nitro_relpath(bc.path),
+        ]
     )
-    println(io, "  epoch        ", nitro.epoch, " / ", nitro.max_epochs)
-    println(
-        io, "  step         ", nitro.step,
-        nitro.total === nothing ? "" : " / " * string(nitro.total)
-    )
-    println(
-        io, "  params       ", pg === nothing ? "not built" :
-            _commas(pg[1]) * " in " * string(pg[2]) * (pg[2] == 1 ? " group" : " groups")
-    )
-    println(io, "  batch_size   ", something(nitro.batch_size, "pending"))
-    println(
-        io, "  devices      ", devs === nothing ? "sharded" : string(devs),
-        nitro.mesh === nothing ? "  (no mesh)" : "  (mesh :data)"
-    )
-    println(io, "  data         ", _nitro_splits(nitro.data))
-    println(
-        io, "  weights      ",
-        nitro.checkpoint_source === nothing ? "fresh from build_model" :
-            string(nitro.checkpoint_source)
-    )
-    println(io, "  run_dir      ", nitro.run_dir)
-    println(io, "  seed         ", nitro.seed, "   accum ", nitro.accum)
-    nitro.preset === nothing || println(io, "  preset       ", nitro.preset)
-    # Named where the question is asked, exactly as the record's `show` names `checkpoint_info`:
-    # whoever printed this handle wanted one of these and the summary is not it.
-    print(
-        io, "  ask it for more with `experiment`, `parameters`, `states`, `binding_report`, ",
-        "`logger_info`"
+    push!(rows, ["weights", _nitro_weights(nitro)])
+    push!(rows, ["run_dir", nitro.run_dir])
+    push!(rows, ["seed", string(nitro.seed, "   accum ", nitro.accum)])
+    nitro.preset === nothing || push!(rows, ["preset", string(nitro.preset)])
+    _render_table(
+        io, "Nitro for " * string(nameof(typeof(nitro.e))) *
+            "  (the run handle; no weights are shown)",
+        ["", ""], rows;
+        # Named where the question is asked, exactly as the record's `show` names
+        # `checkpoint_info`: whoever printed this handle wanted one of these and the summary is
+        # not it.
+        note = "ask it for more with `experiment`, `parameters`, `states`, `binding_report`, " *
+            "`logger_info`",
     )
     return nothing
 end
+
+# Relative to the working directory when it helps and absolute when it does not: a path that
+# climbed out through a pile of `..` is worse than the one it replaced.
+function _nitro_relpath(path)
+    return try
+        rel = relpath(path, pwd())
+        startswith(rel, "..") ? path : rel
+    catch
+        path
+    end
+end
+
 
 # ── Monitor registry, not dispatch ──────────────────────────────────────────────────
 #

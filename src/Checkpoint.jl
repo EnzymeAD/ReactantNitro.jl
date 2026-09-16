@@ -991,3 +991,31 @@ function find_latest(ckpt::TopKCheckpointer, run_dir)
     path = joinpath(dir, newest.file)
     return isfile(path) ? path : nothing
 end
+
+"""
+    ReactantNitro.selected_checkpoint(ckpt, run_dir) -> NamedTuple or `nothing`
+
+**Which checkpoint the run would hand you**, as `(; path, epoch, metric, score)`: the BEST one by
+the checkpointer's own `metric` and `mode`, which is a different question from `find_latest`'s
+newest and is the one someone asks after a run finishes.
+
+Answered entirely from the manifest, so it costs one small read and opens no record. That is what
+lets a run call it at the end and a handle report it afterwards without going back to disk.
+
+`nothing` when there is no checkpointer, no directory, no scored entry (a train-only run scores
+nothing and is retained by being newest), or when the winning entry names a file that is no longer
+there. Ranking matches `retained`'s: ascending score, reversed for `mode = :max`.
+"""
+selected_checkpoint(::Nothing, run_dir) = nothing
+
+function selected_checkpoint(ckpt::TopKCheckpointer, run_dir)
+    dir = ckpt.dir === nothing ? run_dir : ckpt.dir
+    isdir(dir) || return nothing
+    scored = [e for e in read_manifest(dir) if e.score !== nothing]
+    isempty(scored) && return nothing
+    pick = ckpt.mode === :max ? argmax : argmin
+    best = scored[pick([e.score for e in scored])]
+    path = joinpath(dir, best.file)
+    isfile(path) || return nothing
+    return (; path, epoch = best.epoch, metric = ckpt.metric, score = best.score)
+end
