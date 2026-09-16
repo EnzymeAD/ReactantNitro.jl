@@ -3,10 +3,41 @@
 # here on an ordinary GitHub-hosted runner.
 name: CI
 
+# Only when something the suite can actually read changes. The lists below are
+# DENYLISTS on purpose: a path nobody thought about runs the tests, so a new
+# directory of Julia is covered on the day it lands rather than the day someone
+# remembers to add it here. `paths-ignore` skips a run only when EVERY changed
+# file matches, so a commit touching both `src/` and `README.md` still runs.
+#
+# The two lists are duplicated because GitHub's workflow parser does not resolve
+# YAML anchors, so `&x`/`*x` here would be a silent no-op rather than an error:
+# edit both, or the push build and the PR build disagree about what is prose.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'skills/**'
+      - 'scripts/**'
+      - '.claude-plugin/**'
+      - 'README.md'
+      - 'CLAUDE.md'
+      - 'LICENSE'
+      - '.github/workflows/docs.yml'
+      - '.github/workflows/format.yml'
+      - '.github/workflows/TagBot.yml'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'skills/**'
+      - 'scripts/**'
+      - '.claude-plugin/**'
+      - 'README.md'
+      - 'CLAUDE.md'
+      - 'LICENSE'
+      - '.github/workflows/docs.yml'
+      - '.github/workflows/format.yml'
+      - '.github/workflows/TagBot.yml'
 
 permissions:
   contents: read

@@ -6,11 +6,46 @@
 # plugins).
 name: Docs
 
+# The docs read more of the tree than they look like they do: `docs/src/api.md`
+# is `@autodocs` over `ReactantNitro`, so every docstring in `src/` is a docs
+# input and a `src/`-only change can break this build on a cross-reference while
+# CI stays green. Hence a denylist of the few paths the build genuinely cannot
+# see, rather than an allowlist that would have to name `src/` and `ext/`.
+#
+# ONE CAVEAT, and it is the release path: a path filter is evaluated against the
+# files a push changed, and a tag pushed onto a commit that is already on main
+# changes none, so a filtered tag push can be skipped and the versioned docs for
+# a release never get built. Drop the filter here if a release is ever tagged by
+# hand and its docs do not appear. (TagBot's own tags use GITHUB_TOKEN, which
+# does not trigger workflows at all, so they never reached this build anyway.)
+#
+# Repeated for push and pull_request: the workflow parser does not resolve YAML
+# anchors.
 on:
   push:
     branches: [main]
     tags: ['*']
+    paths-ignore:
+      - 'test/**'
+      - 'skills/**'
+      - 'scripts/**'
+      - '.claude-plugin/**'
+      - 'CLAUDE.md'
+      - 'LICENSE'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/format.yml'
+      - '.github/workflows/TagBot.yml'
   pull_request:
+    paths-ignore:
+      - 'test/**'
+      - 'skills/**'
+      - 'scripts/**'
+      - '.claude-plugin/**'
+      - 'CLAUDE.md'
+      - 'LICENSE'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/format.yml'
+      - '.github/workflows/TagBot.yml'
 
 jobs:
   docs:

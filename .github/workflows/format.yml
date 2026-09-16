@@ -3,10 +3,22 @@
 # this check fails with a diff until the whole tree is formatted.
 name: Format
 
+# An ALLOWLIST here, unlike CI's denylist, because the rule this job enforces is
+# itself about one file type: Runic formats `.jl` and nothing else, so a change
+# that adds no Julia cannot break the check. `**/*.jl` is every tracked Julia
+# file at any depth, which is a superset of the `src ext test docs` the local
+# hook formats. Repeated for push and pull_request: the workflow parser does not
+# resolve YAML anchors.
 on:
   push:
     branches: [main]
+    paths:
+      - '**/*.jl'
+      - '.github/workflows/format.yml'
   pull_request:
+    paths:
+      - '**/*.jl'
+      - '.github/workflows/format.yml'
 
 concurrency:
   group: format-${{ github.ref }}
