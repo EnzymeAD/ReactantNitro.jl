@@ -430,8 +430,8 @@
         ck = TopKCheckpointer(; metric = :d, mode = :min)   # ToyGAN's metrics emit `d`, not val_loss
         n1 = Nitro(ToyGAN(); checkpointer = ck, run_dir = dir)
         train!(n1)
-        # A fresh handle with `resume = :auto` (the default) restores ps, st, opt_state, step, epoch.
-        n2 = Nitro(ToyGAN(); checkpointer = ck, run_dir = dir, max_epochs = 3)
+        # `resume = :auto`, which is opt in, restores ps, st, opt_state, step, and epoch.
+        n2 = Nitro(ToyGAN(); checkpointer = ck, run_dir = dir, max_epochs = 3, resume = :auto)
         @test current_step(n2) == current_step(n1)
         @test current_epoch(n2) == current_epoch(n1)
         # The restored user opt_state is re-normalized to device residency, the discipline the

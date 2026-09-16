@@ -750,7 +750,7 @@
         r = resolve_schedules(e, given, 40; chains = (chain,), accessor)
 
         txt = binding_report_text(;
-            name = "SchedExp", seed = 42, accum = 2, total = 1240,
+            name = "SchedExp",
             splits = [
                 (;
                     name = "train", batches = 46, batch_size = 64, samples = 3001,
@@ -811,7 +811,7 @@
 
         @testset "a source that cannot report samples omits the parenthetical rather than guessing" begin
             bare = binding_report_text(;
-                name = "X", seed = 1, accum = 1, total = 10,
+                name = "X",
                 splits = [
                     (;
                         name = "train", batches = 4, batch_size = 8, samples = nothing,
@@ -820,8 +820,8 @@
                 ],
                 clip = 0, clip_source = :field
             )
-            @test occursin("4 batches x 8", bare)
             @test !occursin("samples", bare)
+            @test occursin("(nothing resolved)", bare)
             @test occursin("none (threshold 0)", bare)
             @test occursin("[field on e]", bare)
         end
@@ -838,7 +838,7 @@
             Symbol[], true
         )
         txt = binding_report_text(;
-            name = "X", seed = 1, accum = 1, total = 10, clip = 0,
+            name = "X", clip = 0,
             clip_source = :default, schedules = r,
             groups = [
                 (;

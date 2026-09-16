@@ -477,6 +477,21 @@ function _nitro_devices(nitro::Nitro)
     end
 end
 
+# `Starting` is published at the top of `Nitro` construction and nothing moves it until an entry
+# point runs, so a handle that was merely built reports `Starting` forever. That is accurate about
+# the phase and misleading as a display: it reads as "in progress" for something that has not begun
+# and may never. `Created` is what a constructed, unrun handle is.
+#
+# DISPLAY ONLY. `phase(nitro)` still returns `Starting()`, because the phase tree is the monitor
+# contract and a new type in it would be a change to that contract rather than to this line.
+function _nitro_phase_label(nitro::Nitro)
+    p = nitro.phase
+    p isa Starting && nitro.step == 0 && nitro.elapsed === nothing &&
+        return "Created  (nothing has run on this handle)"
+    return string(nameof(typeof(p))) *
+        (nitro.stop_reason === nothing ? "" : " (" * string(nitro.stop_reason) * ")")
+end
+
 function _nitro_elapsed(sec)
     sec === nothing && return nothing
     sec < 60 && return string(round(sec; digits = 1)) * "s"
@@ -538,11 +553,7 @@ function Base.show(io::IO, ::MIME"text/plain", nitro::Nitro)
     pg = _nitro_params(nitro)
     devs = _nitro_devices(nitro)
     rows = Vector{String}[
-        [
-            "phase",
-            string(nameof(typeof(nitro.phase))) *
-                (nitro.stop_reason === nothing ? "" : " (" * string(nitro.stop_reason) * ")"),
-        ],
+        ["phase", _nitro_phase_label(nitro)],
         ["epoch", string(nitro.epoch, " / ", nitro.max_epochs)],
         [
             "step",

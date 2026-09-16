@@ -372,7 +372,9 @@
             # The report is what tells the user, since nothing else will: no recompile, no behaviour
             # change, and the loop still groups micro-batches by the stored 2.
             txt = ReactantNitro.fixed_config_report(n; entry = :train)
-            @test occursin("accum 2", txt)
+            # DRIFT ONLY now: the handle's values are `show(nitro)`'s job, so what this report
+            # carries is the redefinition and what the handle is still using instead.
+            @test !isempty(txt)
             @test occursin("`accum(e)` was redefined", txt)
             @test occursin("still uses 2", txt)
             # And the check does NOT fire for a keyword override, which is what makes it usable: this
@@ -505,7 +507,12 @@
         n = Nitro(MLP, :narrow; checkpointer = nothing, run_dir = mktempdir())
         @test n.preset === :narrow
         @test experiment(n).width == 8
-        @test occursin("preset :narrow", binding_report(n))   # named ONCE, as a header line
+        # The preset is named by the HANDLE, not by the binding report: a preset's values are
+        # ordinary struct fields by the time anything reads `e`, so it was never a per-value source,
+        # and the handle is where the run's own facts live.
+        @test occursin("preset", sprint(show, MIME"text/plain"(), n))
+        @test occursin("narrow", sprint(show, MIME"text/plain"(), n))
+        @test !occursin("preset", binding_report(n))
 
         # A Nitro keyword goes to Nitro, EVEN when it is also a field, which is what preserves the
         # three-way collision resolution on names like max_epochs.

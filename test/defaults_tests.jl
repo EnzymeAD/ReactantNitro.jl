@@ -55,8 +55,8 @@
     # THE WORKING DIRECTORY, and the default checkpointer writes there. A bare-run test that passed
     # a `run_dir` would no longer be a test of the defaults, so this file asserts on that path and
     # cleans it up instead. Cleaning
-    # BEFORE as well as after is not tidiness: `resume = :auto` is the default, so a directory left by an
-    # earlier suite run would make the first `train!` below resume instead of train.
+    # BEFORE as well as after is not tidiness: the resume testset below asks for `resume = :auto`,
+    # so a directory left by an earlier suite run would change what it is measuring.
     const BARE_DIR = default_run_dir(BareMLP())
     clean_bare_dir() = (
         rm(BARE_DIR; recursive = true, force = true);
@@ -305,14 +305,16 @@
         end
     end
 
-    @testset "second run: `resume = :auto` is a default too, composing with `max_epochs`" begin
+    @testset "second run: `resume = :auto` composes with `max_epochs`" begin
         # Designed behavior, and exactly the interaction a defaults audit exists to surface: a second
-        # `train!` in the same directory RESUMES the first rather than starting fresh, and since
-        # `max_epochs` is 1 and the first run reached it, this one returns without running an epoch. It
-        # says so rather than exiting silently, which is what the checkpoint layer built the
-        # `stop_reason` for.
+        # `train!` in the same directory with `resume = :auto` continues the first rather than
+        # starting fresh, and since `max_epochs` is 1 and the first run reached it, this one returns
+        # without running an epoch. It says so rather than exiting silently, which is what the
+        # checkpoint layer built the `stop_reason` for. Resuming is opt in, so it is asked for here.
         before = load_checkpoint(TopKCheckpointer(), BARE_CKPT1())
-        n2 = @test_logs (:warn, r"will return without running an epoch") match_mode = :any train!(BareMLP())
+        n2 = @test_logs (:warn, r"will return without running an epoch") match_mode = :any train!(
+            BareMLP(); resume = :auto
+        )
 
         @test current_epoch(n2) == 1                     # restored, not advanced
         @test current_step(n2) == length(BARE_TRAIN)

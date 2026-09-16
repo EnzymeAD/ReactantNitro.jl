@@ -853,7 +853,7 @@ whether the keyword, a method, or a field won.
 Emitted through `@info` and handed to `log_other!(lgr, "binding_report", str)` so it lands in the
 run's record.
 """
-function build_binding_report(nitro)
+function build_binding_report(nitro; plain::Bool = true)
     lay = nitro.layout
     splits = [
         (;
@@ -892,12 +892,11 @@ function build_binding_report(nitro)
         ]
     end
     return binding_report_text(;
-        name = string(nameof(typeof(nitro.e))), seed = nitro.seed,
-        accum = nitro.accum, total = something(nitro.total, 0), splits,
+        name = string(nameof(typeof(nitro.e))), splits,
         clip = nitro.gradient_clip_norm,
         clip_source = clip_source(nitro.e, nitro.gradient_clip_norm),
-        schedules = nitro.schedules, groups, preset = nitro.preset,
-        manual = get(nitro.frozen, :manual, false)
+        schedules = nitro.schedules, groups,
+        manual = get(nitro.frozen, :manual, false), plain
     )
 end
 
@@ -953,17 +952,24 @@ _prefetch_note(pf) =
     "prefetch: $(pf.path)"
 
 """
-    ReactantNitro.binding_report_text(; name, seed, accum, total, splits, clip, clip_source,
+    ReactantNitro.binding_report_text(; name, splits, clip, clip_source,
                                         schedules, groups, level2 = ()) -> String
 
 The binding report's text, built from explicit pieces so it is testable without a run.
 `build_binding_report` assembles these from a [`Nitro`](@ref).
 
+**It reports where values BOUND, and deliberately nothing else.** The seed, the accum, the schedule
+horizon, the batch size, the batch counts and the preset are all state the handle carries, so
+`show(nitro)` is where they are read; a fact printed by two reports is a fact that can disagree
+between them. What is redefined since construction is the third report,
+[`fixed_config_report`](@ref).
+
   * `splits`: one `(; name, batches, batch_size, samples, dropped, short_final[, prefetch])` per
-    split. `samples`, `dropped`, and `short_final` may be `nothing`, and the parenthetical is then
-    **omitted rather than guessed**, per the rule above for sources that do not support
-    `MLUtils.numobs`. `prefetch` is optional and read with `get`, so a caller assembling the pieces by
-    hand may leave it out; `build_binding_report` always supplies it, from
+    split. Only what the data path RESOLVED is printed: `samples`, `dropped`, and `short_final` may
+    be `nothing` and are then **omitted rather than guessed**, per the rule above for sources that
+    do not support `MLUtils.numobs`. `batches` and `batch_size` are accepted and not printed, since
+    the handle carries both. `prefetch` is optional and read with `get`, so a caller assembling the
+    pieces by hand may leave it out; `build_binding_report` always supplies it, from
     [`prefetch_report_entry`](@ref).
   * `clip_source`: `:keyword`, `:method`, `:field`, or `:default`. **This is the one place a reader
     sees which of them won.** `:default` is the framework's own value and is what a bare
@@ -976,9 +982,9 @@ The binding report's text, built from explicit pieces so it is testable without 
     information costs nothing and rejects nothing.
 """
 function binding_report_text(;
-        name, seed, accum, total, splits = (), clip = 0,
+        name, splits = (), clip = 0,
         clip_source::Symbol = :default, schedules = nothing, groups = (),
-        level2 = (), preset = nothing, manual = false, plain::Bool = true
+        level2 = (), manual = false, plain::Bool = true
     )
     io = IOBuffer()
     # `plain = true` BY DEFAULT, and that default is load-bearing rather than conservative. This
@@ -990,14 +996,13 @@ function binding_report_text(;
         plain ? _render_table_plain(buf, title, header, rows, nothing) :
             _render_table(buf, title, header, rows)
     end
-    println(
-        io, "ReactantNitro: binding report for $name (seed $seed, accum $accum, ",
-        "total $total optimizer steps)"
-    )
-    # A preset is named ONCE, as a header line, and deliberately NOT as a fifth per-value source.
-    # By the time anything sees `e`, a preset's values ARE struct fields, indistinguishable from
-    # hand-set ones, so claiming per-value provenance would be a lie the type system cannot back.
-    preset === nothing || println(io, "  preset $(repr(preset))")
+    # WHERE VALUES BOUND, and nothing else. The seed, the accum, the horizon and the preset used to
+    # head this report and are all on the handle, so `show(nitro)` says them; a value repeated in
+    # two reports is a value that can disagree between them. A preset was never a per-value source
+    # anyway: by the time anything sees `e`, a preset's values ARE struct fields, indistinguishable
+    # from hand-set ones, so claiming provenance for them would be a lie the type system cannot
+    # back.
+    println(io, "ReactantNitro: binding report for $name")
 
     if !isempty(splits)
         rows = TableRows()
@@ -1016,16 +1021,11 @@ function binding_report_text(;
             # explicit pieces, and the suites that do so construct their splits tuples by hand.
             pf = get(sp, :prefetch, nothing)
             pf === nothing || push!(notes, _prefetch_note(pf))
-            # The batch count and the batch size stay ONE cell. They are read as a shape, "100
-            # batches x 32", and splitting them into two columns would make a reader assemble it.
-            push!(
-                rows, [
-                    sp.name, string(sp.batches, " batches x ", sp.batch_size),
-                    isempty(notes) ? "" : "(" * join(notes, "; ") * ")",
-                ]
-            )
+            # No batch count and no batch size: `show(nitro)` carries both, and what belongs here
+            # is what the DATA PATH resolved to, which is drop-last, padding, and prefetch.
+            push!(rows, [sp.name, isempty(notes) ? "(nothing resolved)" : join(notes, "; ")])
         end
-        print(io, "\n", section("  data", ["split", "shape", "notes"], rows), "\n")
+        print(io, "\n", section("  data", ["split", "resolved"], rows), "\n")
     end
 
     println(io, "\n  gradient clip")

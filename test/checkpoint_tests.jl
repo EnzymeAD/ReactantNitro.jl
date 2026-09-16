@@ -355,8 +355,8 @@
         first_half = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 2))
         @test current_epoch(first_half) == 2 && current_step(first_half) == 8
 
-        # `resume = :auto` is the DEFAULT, so this says nothing about resuming and resumes.
-        resumed = Nitro(CkptMLP(); run_dir = dir, max_epochs = 4)
+        # Resuming is OPT IN: a fresh handle over the same directory would start from zero.
+        resumed = Nitro(CkptMLP(); run_dir = dir, max_epochs = 4, resume = :auto)
         @test current_epoch(resumed) == 2                        # step and epoch restored, not derived
         @test current_step(resumed) == 8
         train!(resumed)
@@ -379,7 +379,8 @@
         n = @test_logs (:warn, r"restoring `seed = 11`") match_mode = :any Nitro(
             CkptMLP();
             run_dir = dir,
-            seed = 99
+            seed = 99,
+            resume = :auto
         )
         @test n.seed == 11
     end
@@ -391,7 +392,7 @@
         train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 1))
 
         err = try
-            Nitro(CkptMLP(; tag = 2); run_dir = dir)
+            Nitro(CkptMLP(; tag = 2); run_dir = dir, resume = :auto)
             nothing
         catch ex
             ex
@@ -402,7 +403,11 @@
 
         # A `Device` may change freely: it is a traced input and cannot change the graph, and the
         # change stays visible after the fact in the record's `devices`.
-        @test (@test_logs match_mode = :any Nitro(CkptMLP(; scale = 2.0f0); run_dir = dir)).epoch == 1
+        @test (
+            @test_logs match_mode = :any Nitro(
+                CkptMLP(; scale = 2.0f0); run_dir = dir, resume = :auto
+            )
+        ).epoch == 1
         # A `Host` field may change: raising `max_epochs` on resume is the normal case.
         @test Nitro(CkptMLP(); run_dir = dir, max_epochs = 9).max_epochs == 9   # raised: no warning
     end
@@ -467,11 +472,11 @@
 
         # The POSITIVE half passes whether or not the check is implemented, which is why the negative
         # half below is the one that matters.
-        @test Nitro(AnchoredExp(); run_dir = dir, max_epochs = 2).epoch == 1
+        @test Nitro(AnchoredExp(); run_dir = dir, max_epochs = 2, resume = :auto).epoch == 1
 
         ANCHOR_NOISE[] = 0.5f0
         err = try
-            Nitro(AnchoredExp(); run_dir = dir, max_epochs = 2)
+            Nitro(AnchoredExp(); run_dir = dir, max_epochs = 2, resume = :auto)
             nothing
         catch ex
             ex
@@ -576,7 +581,7 @@
             @test rec.logger_type == "StatefulLog"
 
             fresh = StatefulLog((; key = "exp-1"), nothing)
-            Nitro(CkptMLP(); run_dir = dir, logger = fresh)
+            Nitro(CkptMLP(); run_dir = dir, logger = fresh, resume = :auto)
             @test fresh.reattached == (; key = "exp-1")
         end
 
@@ -656,7 +661,7 @@
                 )
             )
             err = try
-                Nitro(CkptMLP(); run_dir = dir, logger = OtherLog())
+                Nitro(CkptMLP(); run_dir = dir, logger = OtherLog(), resume = :auto)
                 nothing
             catch ex
                 ex
@@ -759,7 +764,7 @@
         end
 
         @testset "resume reads it back rather than dying on a dead pointer" begin
-            n2 = Nitro(DropoutCkpt(); run_dir = dir, max_epochs = 2)
+            n2 = Nitro(DropoutCkpt(); run_dir = dir, max_epochs = 2, resume = :auto)
             @test current_epoch(n2) == 1                      # restored, not reset
             @test n2.st.layer_2.rng isa Reactant.ReactantRNG
             n3 = train!(n2)

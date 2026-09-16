@@ -492,8 +492,13 @@ function _build_nitro(
         # restored from a checkpoint, whose recorded metrics belong to the process that wrote it.
         (;), nothing, nothing
     )
+    # TWO BUILDS, and only when they would differ. The stored report is the machine-read one: it
+    # goes to `log_other!`, it is what `binding_report` returns, and its bytes must not depend on
+    # whether something else in the session loaded PrettyTables. The displayed one takes whatever
+    # renderer is installed, which is the whole point of installing one.
     nitro.report = build_binding_report(nitro)
-    @info nitro.report
+    @info _TABLE_RENDERER[] === nothing ? nitro.report :
+        build_binding_report(nitro; plain = false)
     log_other!(logger, "binding_report", nitro.report)
     run_ref === nothing || (run_ref[] = nitro)
     # The per-run monitor copy, taken HERE and not only at `train!`. `train!` calls it again,
@@ -1398,14 +1403,20 @@ probe_accessors(e) = NamedTuple{_PROBED}(
 """
     ReactantNitro.fixed_config_report(nitro; entry = :train) -> String
 
-The values this handle FIXED at construction, and any accessor that now disagrees with them.
+**What has been redefined since this handle froze it**, and therefore is not in effect. Empty when
+nothing has, which is the usual case and is why the entry points are silent about it.
+
+It does NOT list the handle's values. `show(nitro)` is the view of what a handle holds, and the
+binding report is the view of where each configured value came from; this is the third question,
+and the only one whose answer nothing else can supply. Overlapping the three was how the top of
+every `train!` came to repeat the seed and the run directory twice before the run started.
 
 Setup resolves the ten accessor-defaulted keywords once, into the `Nitro`'s own fields, and every
 read after that goes to the field. So revising `accum(::MyExp)` or `max_epochs(::MyExp)` and calling
 `train!` on an existing handle changes nothing, and it once also triggered a full recompile through
 [`hook_worlds`](@ref), which made the wasted compile read as confirmation that the edit had landed.
 Removing that entry fixed the cost and made the silence total, so this report is what tells the user
-instead: it names the fixed values, and flags a scalar accessor that has moved away from one.
+instead.
 
 **The handle always wins.** This never applies a divergence, because `accum` and `max_epochs` are
 entangled with the schedule horizon `total = max_epochs * div(n_batches, accum)` and with
@@ -1419,21 +1430,14 @@ Only pure scalar accessors are probed; see `_PROBED` for which and why.
 function fixed_config_report(nitro::Nitro; entry::Symbol = :train)
     e = nitro.e
     io = IOBuffer()
-    println(
-        io, "ReactantNitro: $(nameof(typeof(e))) values fixed at construction ",
-        "(rebuild the `Nitro` to change them)"
-    )
-    fields = entry === :train ?
-        (
-            ("seed", nitro.seed), ("accum", nitro.accum), ("max_epochs", nitro.max_epochs),
-            ("total", something(nitro.total, "n/a")), ("clip", nitro.gradient_clip_norm),
-            ("run_dir", nitro.run_dir),
-        ) :
-        (
-            ("seed", nitro.seed), ("batch_size", something(nitro.batch_size, "pending")),
-            ("run_dir", nitro.run_dir),
-        )
-    println(io, "  ", join(("$k $v" for (k, v) in fields), "   "))
+    # DRIFT ONLY. This used to open with a table of the handle's fixed values, which is now what
+    # `show(nitro)` is for: seed, accum, max_epochs, total, clip and run_dir were all in both, and
+    # printing them again at the top of every `train!`, `validate` and `predict` was noise a reader
+    # learned to scroll past. What is left is the half nothing else can tell you: which accessors
+    # and hooks were redefined AFTER this handle froze them, and are therefore not in effect.
+    #
+    # Empty when nothing drifted, which is the common case, and `report_fixed_config` prints
+    # nothing at all then. Silence is the correct output for "everything is as you left it".
     then = nitro.accessors_at_setup
     for f in _PROBED
         entry === :train || f in (:seed, :run_dir) || continue
@@ -1480,12 +1484,22 @@ function fixed_config_report(nitro::Nitro; entry::Symbol = :train)
         "rebuild the `Nitro` to recompile against current dispatch. New `Nitro`s already ",
         "recompile."
     )
-    return String(take!(io))
+    body = String(take!(io))
+    isempty(body) && return ""
+    # The title is built here rather than up front so that "nothing drifted" can be the empty
+    # string: a header with no findings under it reads as a finding nobody wrote down.
+    title = "ReactantNitro: $(nameof(typeof(e))) has values fixed at construction that have \
+             since been redefined. This handle keeps what it froze; rebuild the `Nitro` to pick \
+             up the new ones, and see `show(nitro)` for what it is currently holding."
+    return title * "\n" * body
 end
 
-# Printed rather than `@info`-ed: it is a report, like the binding report, not a diagnostic.
+# Printed rather than `@info`-ed: it is a report, like the binding report, not a diagnostic. And
+# printed only when there is something to say, which is why this is not simply `print`.
 function report_fixed_config(nitro::Nitro, entry::Symbol)
-    CONFIG_REPORT[] && print(stdout, fixed_config_report(nitro; entry))
+    CONFIG_REPORT[] || return nothing
+    txt = fixed_config_report(nitro; entry)
+    isempty(txt) || print(stdout, txt)
     return nothing
 end
 
