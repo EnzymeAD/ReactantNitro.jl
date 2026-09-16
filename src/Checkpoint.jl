@@ -307,6 +307,29 @@ const ManifestEntry = @NamedTuple{
 
 manifest_path(dir) = joinpath(dir, "manifest.jld2")
 
+"""
+    read_manifest(dir) -> Vector
+
+**Which checkpoints a run directory holds, without opening one of them.** Each entry
+carries `file` (a basename, not a path), `epoch`, `score` (the validation metric the retention rule
+ranked that checkpoint by, or `nothing` for a run with no `val` split) and `stop_reason` (`nothing`
+until a run records how it ended).
+
+```julia
+for e in sort(read_manifest("runs/MyExp"); by = e -> e.epoch)
+    println(e.epoch, "  ", e.score, "  ", e.file)
+end
+```
+
+**This is the cheap question, and it is the one worth asking first.** The manifest is a single small
+file the checkpointer rewrites next to every record, so ranking a run's checkpoints, or finding the
+newest one to resume from, costs one read instead of deserializing a parameter tree per file in the
+directory. [`checkpoint_info`](@ref) is the other half of the pair: go to a record only for the
+fields the manifest does not carry, and not in a loop over a directory.
+
+Returns an empty vector when `dir` has no manifest. That is a directory no run has written to yet,
+which is an answer rather than an error, and it is what makes `resume = :auto` safe in a fresh one.
+"""
 function read_manifest(dir)
     p = manifest_path(dir)
     isfile(p) || return ManifestEntry[]
