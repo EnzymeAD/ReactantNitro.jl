@@ -166,5 +166,6 @@ written, and the run exits through the normal `Done` path with `stop_reason = re
 They do not replace the framework. The tools are the agent's interface to `train!`, `validate`,
 `evaluate`, `predict`, and `export_model`; anything those entry points cannot do, the tools
 cannot do. They also do not manage checkpoints or resumes beyond passing the knobs through: a
-fresh `run_dir` trains fresh, a reused one resumes by default, and `resume = "false"` starts
+a `run_dir` is trained fresh unless `resume = "auto"` asks for the latest checkpoint in it, and
+`resume = "false"` is the default that starts
 over, exactly as with `Nitro`.

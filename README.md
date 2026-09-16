@@ -140,8 +140,10 @@ depend on a `train!` having happened in the process. Each hook declares the batc
 keywords, the framework routes those to the device, and a field no hook declares is never
 transferred. The batch dimension is always last.
 
-A follow-up run is a new handle and costs no compiles: the cache is module-level, `resume = :auto`
-is the default, and `data = n.data` reuses the loaded collection instead of re-running `build_data`.
+A follow-up run is a new handle and costs no compiles: the cache is module-level, `data = n.data`
+reuses the loaded collection instead of re-running `build_data`, and `resume = :auto` continues from
+the latest checkpoint in `run_dir` when you ask for it. **A fresh handle does not resume.** The
+default is `resume = false`, so constructing a `Nitro` never picks up weights nobody named.
 
 ```julia
 n2 = Nitro(MnistMLP(); data = n.data, max_epochs = 20)   # continues from the latest checkpoint
@@ -201,9 +203,9 @@ host-to-device transfer overlaps the current step.
 Metrics are `(sum, count)` pairs with a per-hook residency choice, `:host` or `:device`, detailed
 in the next section; `finalize_metrics` reduces host-side when a macro-averaged recall is not the
 mean of per-batch recalls. Checkpointing defaults to `TopKCheckpointer` and early stopping to
-`EarlyStopping` when you opt in (the default is off); both are run accessors, and `resume = :auto`
-continues a run from the latest checkpoint behind a config-compatibility check and an anchor
-checksum. The logging contract is a set of verbs
+`EarlyStopping` when you opt in (the default is off); both are run accessors, and `resume = :auto`,
+also opt in, continues a run from the latest checkpoint behind a config-compatibility check and an
+anchor checksum. The logging contract is a set of verbs
 (`log_metrics!`, `log_params!`, `log_other!`, `finish!`, ...) on your own type: the framework ships
 no backend, `nothing` is the public "no logging" value, and your tracker's run handle goes in
 directly.
@@ -415,7 +417,7 @@ framework from the session where the model code is loaded: `nitro_train`, `nitro
 `nitro_evaluate`, `nitro_predict`, and `nitro_export`, plus `nitro_runs`, `nitro_status`,
 `nitro_logger`, and `nitro_stop`. Runs execute on a background task, so no tool call ever blocks
 until the work finishes; the agent polls `nitro_status` until the run completes. A completed train
-run's `Nitro` is reused by the eval and export tools, and `resume = :auto` continues a run after a
+run's `Nitro` is reused by the eval and export tools, and `resume = "auto"` continues a run after a
 session restart, as it does without the tools.
 
 ```julia

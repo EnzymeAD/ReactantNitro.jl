@@ -476,6 +476,13 @@ function _train!(nitro::Nitro)
             # non-finite loss, and any error mid-epoch all leave the loop with a full channel behind
             # it, and closing it is what stops the producers.
             stream = batch_stream(nitro.data.train, nitro.routing, nitro.mesh)
+            # One bar per EPOCH, not per run: "steps left in this epoch" is the number a person
+            # watching a run actually wants, and the epoch position goes in the label as text.
+            # `div` is exact here because setup checked `length(train) % accum == 0` to resolve the
+            # schedule horizon, so this is the same arithmetic `total` was built from.
+            progress_begin!(
+                "train", _epoch_steps(nitro), nitro.epoch, nitro.max_epochs
+            )
             try
                 # An explicit `iterate` loop rather than `for`, for one reason: the pull is what has to
                 # be timed, and `for` gives nowhere to put the clock around it. Everything inside is
@@ -610,6 +617,10 @@ function _train!(nitro::Nitro)
                 nitro.stop_requested || check_prefetch_delivery(stream)
             finally
                 close_stream!(stream)
+                # In the `finally` with the stream: a non-finite loss, a `request_stop!`, and an
+                # error all leave the epoch early, and a bar left open would sit on the terminal
+                # underneath whatever the run printed next.
+                progress_end!()
             end
             nitro.st = st
             check_epoch_length(
@@ -648,6 +659,7 @@ function _train!(nitro::Nitro)
     catch
         nitro.stop_reason = :error
         nitro.elapsed = time() - t_started
+        progress_done!()
         # A failed run still wrote epochs, and which one survived is the first thing asked of it.
         # Through `try`, because a run that died on I/O is exactly the run whose manifest may not
         # be readable, and a display helper must not replace the real exception with its own.
@@ -681,6 +693,10 @@ function _train!(nitro::Nitro)
     # the checkpoint record keeps it, since "completed 40/40" and "stopped at 37 on patience" are
     # different outcomes that a resume with `:auto` would otherwise have to guess at.
     nitro.elapsed = time() - t_started
+    # The last stretch of this entry point is over, so a reporter reusing one terminal line can
+    # close it. Per entry point, not per epoch: an epoch is followed by a validation pass and then
+    # by the next epoch, and only here is it known that nothing follows.
+    progress_done!()
     # After the final rewrite above, so the winning entry is the one the manifest ends up holding.
     nitro.best_checkpoint = selected_checkpoint(nitro.checkpointer, nitro.run_dir)
     set_phase!(nitro, Done())
@@ -764,6 +780,13 @@ function _train_manual!(nitro::Nitro)
             t_wait = 0.0
             t_step = 0.0
             stream = batch_stream(nitro.data.train, nitro.routing, nitro.mesh)
+            # One bar per EPOCH, not per run: "steps left in this epoch" is the number a person
+            # watching a run actually wants, and the epoch position goes in the label as text.
+            # `div` is exact here because setup checked `length(train) % accum == 0` to resolve the
+            # schedule horizon, so this is the same arithmetic `total` was built from.
+            progress_begin!(
+                "train", _epoch_steps(nitro), nitro.epoch, nitro.max_epochs
+            )
             try
                 t0 = time()
                 it = iterate(stream)
@@ -829,6 +852,10 @@ function _train_manual!(nitro::Nitro)
                 nitro.stop_requested || check_prefetch_delivery(stream)
             finally
                 close_stream!(stream)
+                # In the `finally` with the stream: a non-finite loss, a `request_stop!`, and an
+                # error all leave the epoch early, and a bar left open would sit on the terminal
+                # underneath whatever the run printed next.
+                progress_end!()
             end
             nitro.st = st
             check_epoch_length(
@@ -861,6 +888,7 @@ function _train_manual!(nitro::Nitro)
     catch
         nitro.stop_reason = :error
         nitro.elapsed = time() - t_started
+        progress_done!()
         # A failed run still wrote epochs, and which one survived is the first thing asked of it.
         # Through `try`, because a run that died on I/O is exactly the run whose manifest may not
         # be readable, and a display helper must not replace the real exception with its own.
@@ -878,6 +906,10 @@ function _train_manual!(nitro::Nitro)
     # once the outcome is known, gated on this call having written an epoch at all.
     wrote_epoch && save_checkpoint!(nitro.checkpointer, nitro.epoch, last_metrics, snapshot(nitro))
     nitro.elapsed = time() - t_started
+    # The last stretch of this entry point is over, so a reporter reusing one terminal line can
+    # close it. Per entry point, not per epoch: an epoch is followed by a validation pass and then
+    # by the next epoch, and only here is it known that nothing follows.
+    progress_done!()
     # After the final rewrite above, so the winning entry is the one the manifest ends up holding.
     nitro.best_checkpoint = selected_checkpoint(nitro.checkpointer, nitro.run_dir)
     set_phase!(nitro, Done())
@@ -1687,6 +1719,12 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
     protected = protected_buffers(nitro, st)
     acc, prev_phase = nothing, nitro.phase
     set_phase!(nitro, EvalStepping())
+    # The eval bar counts BATCHES, which is what `note_progress!` bumps here, and carries the split
+    # name so a validation pass inside a training run is distinguishable from the epoch it sits in.
+    progress_begin!(
+        String(split), _split_length(getproperty(nitro.data, split)),
+        nitro.epoch, nitro.max_epochs
+    )
     try
         for (idx, batch) in enumerate(getproperty(nitro.data, split))
             # `honor_stop`: the standalone eval entry points stop the split at its next batch
@@ -1729,8 +1767,14 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
         end
     catch
         set_phase!(nitro, prev_phase)
+        progress_end!()
+        report && progress_done!()
         rethrow()
     end
+    progress_end!()
+    # `report` is already the standalone-versus-inside-a-training-epoch distinction: `train!`'s own
+    # per-epoch validation passes `false`, and the last stretch of THAT entry point is the run.
+    report && progress_done!()
     # The boundary assertion, placed on the OUTPUT rather than the input because the input is
     # `host_metrics`' product and already host. `finalize_metrics` is user code, and what it returns
     # reaches three consumers that all assume host values: the logger, the phase monitors, and the
@@ -1746,6 +1790,28 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
     # metrics and `info.logger` here, so the framework needs no dedicated hook for it.
     set_phase!(nitro, prev_phase; metrics = out)
     return out
+end
+
+# Optimizer steps in one epoch, which is what the training bar counts. Setup checked
+# `length(train) % accum == 0` to resolve the schedule horizon, so the division is exact and this
+# is the same arithmetic `total` came from. Zero when the length is not knowable, which the
+# reporter contract reads as an indeterminate bar rather than an empty one.
+function _epoch_steps(nitro::Nitro)
+    return try
+        div(_split_length(nitro.data.train), max(nitro.accum, 1))
+    catch
+        0
+    end
+end
+
+# A split's batch count WITHOUT iterating it, on the same rule the handle's display uses: a source
+# that promises no length gets zero rather than a number nobody measured.
+function _split_length(v)
+    return try
+        Base.IteratorSize(typeof(v)) isa Union{Base.HasLength, Base.HasShape} ? length(v) : 0
+    catch
+        0
+    end
 end
 
 # ── Metric accumulation, host-side ───────────────────────────────────────────────────

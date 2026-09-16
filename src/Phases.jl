@@ -924,9 +924,168 @@ during an eval loop, since the batch index is local to it, so a monitor keying o
 """
 progress_counter() = PROGRESS[]
 
-# Bumped on the hot path, so it is an atomic add and nothing else. Not exported: the
-# framework's own loops are the only callers.
-note_progress!() = (Threads.atomic_add!(PROGRESS, 1); nothing)
+# ── The progress REPORTER, which is the counter's display half ───────────────────────
+#
+# `progress_counter` is a watchdog primitive: one monotonic number, no total, no output. It answers
+# "is this process still moving" and it is not, and was never, something a person watches. A bar
+# needs two more things the counter cannot supply: how many units this stretch of work will take,
+# and when the stretch starts and stops. Those are `progress_begin!` and `progress_end!`, and the
+# per-unit advance is `note_progress!`, which the loops already call in exactly the right places.
+#
+# A `Ref` for the same reason `_TABLE_RENDERER` is one, but unlike the table renderer this one has
+# a DEFAULT, `progress_bar_reporter`, installed at load. ProgressMeter is an ordinary dependency
+# here: its only dependency is Printf, which this package already has, so making it optional would
+# have bought conditionality over nothing and left the common case with no progress output.
+const _PROGRESS_REPORTER = Ref{Any}(nothing)
+
+"""
+    ReactantNitro.progress_reporter!(f) -> previous
+
+Set the progress reporter and return the previous one. `nothing` disables progress output
+entirely; the default is [`ReactantNitro.progress_bar_reporter`](@ref), which draws a
+ProgressMeter bar when a person is watching and nothing otherwise.
+
+`f` is called as `f(verb::Symbol, label::String, total::Int, epoch::Int, max_epochs::Int)`, with
+`verb` one of:
+
+  * `:begin`, once per stretch of work, carrying that stretch's `label` (`"train"`, or the split
+    name for an evaluation), its `total` units, and the epoch position. `total = 0` means the
+    length is not known.
+  * `:step`, once per completed unit. The other arguments are placeholders.
+  * `:end`, once when the stretch finishes, however it finishes.
+  * `:done`, once when the LAST stretch of an entry point is over, so a reporter that has been
+    reusing one terminal line can close it. Every argument is a placeholder.
+
+
+**A reporter that throws is switched off rather than propagated.** It is display, the caller is a
+training run, and losing GPU hours to a broken progress bar is not a trade this framework makes.
+"""
+function progress_reporter!(f)
+    prev = _PROGRESS_REPORTER[]
+    _PROGRESS_REPORTER[] = f
+    return prev
+end
+
+function _progress_report(verb::Symbol, label::String, total::Int, epoch::Int, max_epochs::Int)
+    r = _PROGRESS_REPORTER[]
+    r === nothing && return nothing
+    try
+        r(verb, label, total, epoch, max_epochs)
+    catch err
+        # Off, and said once. Leaving it installed would repeat the failure every step, which turns
+        # a cosmetic bug into a flooded log on top of a missing bar.
+        _PROGRESS_REPORTER[] = nothing
+        @warn "ReactantNitro: the progress reporter threw and has been switched off for this \
+               process. The run is unaffected. Reinstall one with `progress_reporter!`." exception =
+            (err, catch_backtrace())
+    end
+    return nothing
+end
+
+"""
+    ReactantNitro.progress_begin!(label, total, epoch, max_epochs) -> nothing
+    ReactantNitro.progress_end!() -> nothing
+
+Open and close one stretch of reported work. Both are no-ops with no reporter installed, which is
+the default. `total = 0` means the length is not known ahead of time.
+"""
+progress_begin!(label::AbstractString, total::Integer, epoch::Integer, max_epochs::Integer) =
+    _progress_report(:begin, String(label), Int(total), Int(epoch), Int(max_epochs))
+
+progress_end!() = _progress_report(:end, "", 0, 0, 0)
+
+"""
+    ReactantNitro.progress_done!() -> nothing
+
+Tell the reporter that the last stretch of an entry point is over. Separate from
+[`progress_end!`](@ref) because a reporter that redraws one line cannot know, at the end of a
+stretch, whether another is coming: an epoch is followed by a validation pass and then by the next
+epoch, and only the entry point knows which one was the last.
+"""
+progress_done!() = _progress_report(:done, "", 0, 0, 0)
+
+# Bumped on the hot path, so the counter half is an atomic add and nothing else. The reporter half
+# is one `Ref` load and a branch, which is nothing against an optimizer step, and it is here rather
+# than at a second call site so that the bar and the watchdog can never disagree about what a unit
+# of work is. Not exported: the framework's own loops are the only callers.
+function note_progress!()
+    Threads.atomic_add!(PROGRESS, 1)
+    _PROGRESS_REPORTER[] === nothing || _progress_report(:step, "", 0, 0, 0)
+    return nothing
+end
+
+# The one live bar. There is exactly one stretch of work in flight per process: the loops do not
+# nest, and a validation pass inside a training epoch happens after that epoch's bar has closed.
+const _BAR = Ref{Any}(nothing)
+
+# Whether a bar has written to the terminal line and not yet closed it. ONE LINE IS REUSED across
+# every stretch of a run, which is the difference between a forty-epoch run leaving eighty lines
+# of finished bars and leaving one that updates. The mechanism is ProgressMeter's `keep = false`:
+# it skips the newline after the final frame, `printover` opens the next frame with a carriage
+# return and clears to end of line, and the next bar therefore lands on the same line. What that
+# costs is the newline nobody prints at the end, which is what `:done` is for.
+const _BAR_DIRTY = Ref(false)
+
+# Drawn only where a person is watching. A bar is a cursor animation: in a CI log, a `nohup` file,
+# or a captured gate transcript it renders as thousands of carriage returns and escape codes,
+# which is worse than nothing and is precisely what a long unattended training run produces. Read
+# at each `:begin` rather than cached at load, because a session can gain or lose a terminal.
+_drawing_progress() = isinteractive() && (stderr isa Base.TTY)
+
+function _close_bar!()
+    p = _BAR[]
+    _BAR[] = nothing
+    p === nothing || ProgressMeter.finish!(p; keep = false)
+    return nothing
+end
+
+"""
+    ReactantNitro.progress_bar_reporter(verb, label, total, epoch, max_epochs) -> nothing
+
+The built-in progress reporter, installed by default, and the reference implementation of the
+contract [`progress_reporter!`](@ref) documents.
+
+**One bar per stretch of work**, an epoch of training or one pass over an evaluation split,
+counting the steps left in THAT stretch. The epoch position rides in the bar's description as
+text rather than as a second bar, because "epoch 3/40" is a fact to read and not a thing to watch
+fill. No metrics on the bar: the contract carries a label and counts, and widening it is a change
+to the contract rather than to this function.
+
+Draws only when the session is interactive and `stderr` is a terminal. Everything else, including
+the per-epoch metrics a run logs, is unaffected either way.
+"""
+function progress_bar_reporter(
+        verb::Symbol, label::String, total::Int, epoch::Int, max_epochs::Int
+    )
+    if verb === :begin
+        # Defensive, not expected: a stretch that never closed would otherwise leave its bar on
+        # the terminal while the next one draws over it.
+        _close_bar!()
+        desc = max_epochs > 0 ? "$label epoch $epoch/$max_epochs " : "$label "
+        on = _drawing_progress()
+        on && (_BAR_DIRTY[] = true)
+        _BAR[] = total > 0 ?
+            ProgressMeter.Progress(total; desc, output = stderr, enabled = on) :
+            ProgressMeter.ProgressUnknown(; desc, output = stderr, enabled = on)
+    elseif verb === :step
+        p = _BAR[]
+        # `keep = false` on EVERY update, not only the last. `finish!` is a no-op once the counter
+        # has reached the total, so a bar that completed through `next!` never sees the close, and
+        # its final frame is the one that would otherwise have printed the newline.
+        p === nothing || ProgressMeter.next!(p; keep = false)
+    elseif verb === :end
+        _close_bar!()
+    elseif verb === :done
+        _close_bar!()
+        # The newline nobody else printed. Without it the run's last bar is still on the cursor's
+        # line and whatever prints next, a returned handle's summary or the prompt, lands on top
+        # of it.
+        _BAR_DIRTY[] || return nothing
+        _BAR_DIRTY[] = false
+        println(stderr)
+    end
+    return nothing
+end
 
 # Returns whether this entry was the OUTERMOST one, mirroring `repl_exit!`, so an entry point can
 # declare `Starting` exactly once however deeply the verbs nest.

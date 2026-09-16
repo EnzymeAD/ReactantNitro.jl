@@ -3,7 +3,7 @@ name: reactantnitro-checkpoint-resume
 description: >
   Checkpoint and resume a ReactantNitro run: `TopKCheckpointer` and the latest-plus-top-K
   retention rule, what a checkpoint record holds and why every value in it is a host
-  value, `resume = :auto` and the four refusals that make it safe as a default, and what
+  value, opt-in `resume = :auto` and the four refusals behind it, and what
   is recomputed rather than restored. Invoke when configuring checkpointing, resuming or
   continuing a run, debugging a refused or failed resume, or deciding which artifact to
   load for evaluation or export, or configuring an early stop.
@@ -11,14 +11,18 @@ description: >
 
 # Checkpointing and resume
 
-`resume = :auto` is the **default**. `train!(nitro)` looks for `latest` in the run directory and
-continues from it; `resume = false` forces a fresh run; an explicit path overrides.
+**`resume = false` is the default: a fresh `Nitro` does not resume.** Resuming is opt in.
+`resume = :auto` looks for `latest` in the run directory and continues from it, and an explicit
+path names one directly. The default used to be `:auto`, and it was changed because `run_dir`
+defaults to a name derived from the experiment type, so a second `Nitro(MyExp())` in the same
+working directory silently continued the previous run. Picking up weights nobody named is not
+something a constructor should do on its own.
 
 **When driving from a Kaimon session, the tools pass this through unchanged** (`reactantnitro-kaimon`):
 `nitro_train(..., run_dir = ..., resume = ...)` accepts `"auto"`, `"false"`, or a checkpoint path,
-and a reused `run_dir` resumes by default exactly as here. The tools' run registry is
-process-local, so a session restart loses in-flight runs and `resume = :auto` is the recovery
-path, not a convenience.
+and the same default applies: a reused `run_dir` does NOT resume unless asked. The tools' run
+registry is process-local, so a session restart loses in-flight runs and `resume = "auto"` is the
+recovery path, not a convenience. Ask for it explicitly after a restart.
 
 ## Configuring it
 
@@ -34,10 +38,10 @@ emits, not a magic name). A metric nothing emits is a setup error naming the one
 retained set and a `NaN` compares false against everything. The way this arrives is not exotic: a
 metric whose count was zero on a split reduces to `0 / 0`. See `reactantnitro-metrics` for the scrub.
 
-**If you are porting, `resume = :auto` is the default here and may not have been where you came
-from.** A second `train!` into a directory that already holds checkpoints continues rather than
-starting over, which is usually what you want and is occasionally a surprise: a seed sweep that
-varies the seed and not the run directory resumes into itself and runs one seed N times.
+**Under `resume = :auto`, a second `train!` into a directory that already holds checkpoints
+continues rather than starting over.** That is the point of it, and it has one trap worth knowing
+before you opt in: a seed sweep that varies the seed and not the run directory resumes into itself
+and runs one seed N times. Vary `run_dir` too.
 
 **Retention is top-K plus a `latest` rule: never rotate out the newest, whatever it scored.** On disk
 that is K+1 files when the newest is not among the best and exactly K when it is. Resuming from the
@@ -127,7 +131,7 @@ resumes into itself and runs the same seed N times.
 
 ## The four refusals
 
-`resume = :auto` is safe as a default only because the compatibility check lives in the framework
+`resume = :auto` is safe to reach for only because the compatibility check lives in the framework
 rather than in your harness. It refuses, with a diff, when:
 
 1. **Config changed.** The flattened config is in the record. Identical continues, changed errors,

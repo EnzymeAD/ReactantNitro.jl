@@ -532,13 +532,13 @@ so:
 n = Nitro(e); train!(n)                                # pays the compiles once, this session
 
 # "Now train it longer." A NEW handle, and it compiles nothing.
-n2 = Nitro(e; data = n.data, max_epochs = 60)          # resume = :auto restores the weights
+n2 = Nitro(e; data = n.data, max_epochs = 60, resume = :auto)   # restores the weights
 train!(n2)
 ReactantNitro.cache_stats()                                          # (; hits = ..., misses = 0)
 ```
 
 Two details make that cheap. `data = n.data` re-uses the collection instead of re-running
-[`build_data`](@ref), and `resume = :auto` is already the default, so the new handle finds the
+[`build_data`](@ref), and `resume = :auto` searches `run_dir`, so the new handle finds the
 latest checkpoint in [`run_dir`](@ref) and continues from the trained weights rather than fresh
 ones. For evaluation and inference, `checkpoint = path` restores weights *and* the derived values
 from the record, so it skips [`derive`](@ref) as well.

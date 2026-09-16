@@ -553,6 +553,10 @@
         long = sprint(show, MIME"text/plain"(), n)
         @test occursin("metrics", long) && occursin("val_loss", long)
         @test occursin("elapsed", long)
+        # `mk_life` passes `checkpointer = nothing`, so there is no selected checkpoint and the
+        # row is absent rather than present and empty.
+        @test n.best_checkpoint === nothing
+        @test !occursin("checkpoint  ", long)
         # `checkpoint_source` is a CONSTRUCTION-time fact, so reporting it alone made a trained
         # handle claim its weights were "fresh from build_model": true of where they started and
         # wrong about what they are.
@@ -568,6 +572,179 @@
         @test occursin("size 10x10", withmat)
         @test !occursin("0, 0, 0", withmat)
         @test length(withmat) < 2_000
+    end
+
+    # ── progress reporting: begin, one per unit, end ────────────────────────────────────
+    #
+    # `progress_counter` was already correct and already invisible: one monotonic number with no
+    # total and no output, which answers "is this process moving" for a watchdog and is not
+    # something a person watches. A bar needs the two things it cannot supply, how long this
+    # stretch is and when it starts and stops, and those are what this contract adds. The events
+    # are tested rather than the drawing: a stub reporter pins the contract, and whether
+    # ProgressMeter renders a bar correctly is ProgressMeter's business.
+    @testset "the progress reporter sees every unit of work, bracketed" begin
+        events = Tuple{Symbol, String, Int, Int, Int}[]
+        prev = ReactantNitro.progress_reporter!(
+            (v, l, t, e, m) -> (push!(events, (v, l, t, e, m)); nothing)
+        )
+        try
+            n = mk_life(; max_epochs = 2)
+            train!(n)
+        finally
+            ReactantNitro.progress_reporter!(prev)
+        end
+
+        begins = [e for e in events if e[1] === :begin]
+        # Two epochs, each a training stretch then a validation stretch over the `val` split.
+        @test [(e[2], e[3], e[4], e[5]) for e in begins] ==
+            [("train", 4, 1, 2), ("val", 2, 1, 2), ("train", 4, 2, 2), ("val", 2, 2, 2)]
+        # Every stretch closes. An unbalanced pair is a bar left on someone's terminal.
+        @test count(e -> e[1] === :end, events) == length(begins)
+        # One `:step` per unit, and the same units the counter counts: 4 train steps and 2 val
+        # batches, twice over.
+        @test count(e -> e[1] === :step, events) == 2 * (4 + 2)
+        # `:done` exactly once, at the very end of the entry point and not once per stretch.
+        # It is what lets a reporter reuse one terminal line across every bar of a run and still
+        # close that line when the run is over, and a second one would close it twice.
+        @test count(e -> e[1] === :done, events) == 1
+        @test events[end][1] === :done
+        # Ordering, not just counts: nothing may step outside a bracket.
+        depth = 0
+        for (v, _, _, _, _) in events
+            v === :begin && (depth += 1)
+            v === :step && (@test depth == 1)
+            v === :end && (depth -= 1)
+        end
+        @test depth == 0
+    end
+
+    # A reporter that throws is a display bug, and a training run is not the place to pay for one.
+    @testset "a reporter that throws is switched off, not propagated" begin
+        prev = ReactantNitro.progress_reporter!((args...) -> error("reporter is broken"))
+        try
+            n = mk_life(; max_epochs = 1)
+            @test_logs (:warn,) match_mode = :any train!(n)
+            @test phase(n) isa Done                       # the run finished regardless
+            @test ReactantNitro._PROGRESS_REPORTER[] === nothing   # and said so once
+        finally
+            ReactantNitro.progress_reporter!(prev)
+        end
+    end
+
+    @testset "the built-in reporter is installed and draws nothing off a terminal" begin
+        # `__init__` installs it, so a fresh process has a reporter without anyone asking.
+        @test ReactantNitro.progress_bar_reporter isa Function
+        # Driving it directly must not throw, and must not draw here: the suite is not
+        # interactive, so `_drawing_progress()` is false and the bar is created disabled.
+        @test ReactantNitro._drawing_progress() == false
+        @test ReactantNitro.progress_bar_reporter(:begin, "train", 3, 1, 2) === nothing
+        @test ReactantNitro.progress_bar_reporter(:step, "", 0, 0, 0) === nothing
+        @test ReactantNitro.progress_bar_reporter(:end, "", 0, 0, 0) === nothing
+        @test ReactantNitro._BAR[] === nothing            # closed, not left open
+        # An unknown length is an indeterminate bar rather than an error.
+        @test ReactantNitro.progress_bar_reporter(:begin, "test", 0, 0, 0) === nothing
+        ReactantNitro.progress_bar_reporter(:end, "", 0, 0, 0)
+    end
+
+    # ── the table renderer, which the PrettyTables extension swaps ───────────────────────
+    @testset "a swapped table renderer receives the documented arguments" begin
+        seen = Ref{Any}(nothing)
+        prev = ReactantNitro.table_renderer!(
+            (io, title, header, rows, note) -> begin
+                seen[] = (; title, header, rows, note)
+                print(io, "RENDERED BY THE STUB")
+            end
+        )
+        try
+            n = mk_life(; max_epochs = 1)
+            out = sprint(show, MIME"text/plain"(), n)
+            @test out == "RENDERED BY THE STUB"
+            got = seen[]
+            @test occursin("Nitro for LifeMLP", got.title)
+            @test got.header == ["", ""]
+            @test got.rows isa ReactantNitro.TableRows
+            @test all(r -> r isa Vector{String}, got.rows)
+            @test any(r -> r[1] == "phase", got.rows)
+            @test got.note isa AbstractString      # the handle summary carries one
+
+            # The experiment show goes through the same path with a real header and no note.
+            sprint(show, MIME"text/plain"(), experiment(n))
+            @test seen[].header == ["field", "marker", "value"]
+            @test seen[].note === nothing
+        finally
+            ReactantNitro.table_renderer!(prev)
+        end
+        # Restoring `nothing` puts the built-in aligned renderer back, which is what a user does
+        # when something else in a session pulled PrettyTables in.
+        @test ReactantNitro._TABLE_RENDERER[] === prev
+    end
+
+    # ── the selected checkpoint ─────────────────────────────────────────────────────────
+    #
+    # Which file the run would hand you is the BEST by the checkpointer's own metric and mode,
+    # which is a different question from the newest, and it is answered from the manifest alone so
+    # that no record is opened and `show` never touches the filesystem.
+    @testset "a run with a checkpointer reports the one it selected" begin
+        dir = mktempdir()
+        n = Nitro(LifeMLP(); run_dir = dir, max_epochs = 3, resume = false)
+        train!(n)
+
+        bc = n.best_checkpoint
+        @test bc !== nothing
+        @test bc.metric === :val_loss
+        @test bc.score isa Real
+        @test isfile(bc.path)
+        # The BEST, not the newest: `mode = :min` by default, so no retained entry scores lower.
+        entries = [e for e in read_manifest(dir) if e.score !== nothing]
+        @test bc.score == minimum(e.score for e in entries)
+
+        long = sprint(show, MIME"text/plain"(), n)
+        @test occursin("checkpoint", long)
+        @test occursin("epoch $(bc.epoch)", long)
+        @test occursin("val_loss", long)
+        @test occursin(basename(bc.path), long)          # the file, pasteable
+        @test length(long) < 2_000
+
+        # `selected_checkpoint` is the whole mechanism, and it refuses rather than guesses.
+        @test ReactantNitro.selected_checkpoint(nothing, dir) === nothing
+        # A directory with no manifest is an answer, not an error. Note the checkpointer passed
+        # here is a FRESH one: setup pins `ckpt.dir` to the run directory, so a bound checkpointer
+        # ignores the `run_dir` argument entirely, which is the behaviour and not a bug.
+        @test ReactantNitro.selected_checkpoint(
+            TopKCheckpointer(; dir = mktempdir()), mktempdir()
+        ) === nothing
+    end
+
+    # ── resuming is opt in ──────────────────────────────────────────────────────────────
+    #
+    # `run_dir` defaults to a name derived from the experiment type, so under the old
+    # `resume = :auto` default a second `Nitro(MyExp())` in the same working directory silently
+    # continued the previous run. A constructor picking up weights nobody named is the wrong
+    # default whatever warning surrounds it, so the default is `false` and resuming is asked for.
+    @testset "a fresh handle does not resume; `:auto` is what does" begin
+        dir = mktempdir()
+        n1 = Nitro(LifeMLP(); run_dir = dir, max_epochs = 1)
+        train!(n1)
+        @test current_epoch(n1) == 1
+
+        # THE DEFAULT. Same directory, same experiment, checkpoints sitting right there.
+        fresh = Nitro(LifeMLP(); run_dir = dir, max_epochs = 4)
+        @test current_epoch(fresh) == 0
+        @test current_step(fresh) == 0
+        @test fresh.checkpoint_source === nothing
+        @test occursin("fresh from build_model", sprint(show, MIME"text/plain"(), fresh))
+
+        # And what resuming looks like when it is asked for.
+        cont = Nitro(LifeMLP(); run_dir = dir, max_epochs = 4, resume = :auto)
+        @test current_epoch(cont) == 1
+        @test cont.checkpoint_source !== nothing
+        @test occursin("restored from", sprint(show, MIME"text/plain"(), cont))
+
+        # `:auto` in a directory with nothing in it is a fresh run, not an error: that is what
+        # makes it usable as a standing setting in a harness that may be starting or recovering.
+        empty_dir = Nitro(LifeMLP(); run_dir = mktempdir(), max_epochs = 4, resume = :auto)
+        @test current_epoch(empty_dir) == 0
+        @test empty_dir.checkpoint_source === nothing
     end
 
     @testset "elapsed reads at all three scales" begin

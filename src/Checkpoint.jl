@@ -339,7 +339,7 @@ directory. [`checkpoint_info`](@ref) is the other half of the pair: go to a reco
 fields the manifest does not carry, and not in a loop over a directory.
 
 Returns an empty vector when `dir` has no manifest. That is a directory no run has written to yet,
-which is an answer rather than an error, and it is what makes `resume = :auto` safe in a fresh one.
+which is an answer rather than an error, and it is what lets `resume = :auto` run in a fresh one.
 """
 function read_manifest(dir)
     p = manifest_path(dir)
@@ -637,7 +637,7 @@ end
 """
     ReactantNitro.check_resume_compatible(record, e, layout; kwargs...) -> nothing
 
-**`resume = :auto` is the default**, and that is safe only because the compatibility check lives in
+**`resume = :auto` is opt in**, and it is safe to reach for only because the compatibility check lives in
 the framework rather than in a harness.
 
   * **Config.** The flattened config is in the record, so on mismatch **refuse with a diff of the
@@ -978,7 +978,7 @@ exactly this: resuming from the *best* checkpoint is not resuming from where you
 that resumed from its best epoch would silently discard every epoch after it.
 
 Returns `nothing` when there is nothing to resume from, without raising, or a first run in a fresh
-directory could not start under the default `resume = :auto`.
+directory could not start under `resume = :auto`.
 """
 find_latest(::Nothing, run_dir) = nothing
 

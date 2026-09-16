@@ -795,9 +795,12 @@
         end
 
         @testset "the groups block names the anchor per group" begin
-            @test occursin("decay toward zero", txt)
-            @test occursin("decay toward w0", txt)
-            @test occursin("23,456,789 params", txt)
+            # The groups block is a TABLE now, so the anchor is a cell under a `decay toward`
+            # column rather than a phrase on the line. Both facts still have to be there: the
+            # column that says what the number means, and a row per anchor.
+            @test occursin("decay toward", txt)
+            @test occursin(r"\bzero\b", txt) && occursin(r"\bw0\b", txt)
+            @test occursin("params", txt) && occursin("23,456,789", txt)
             @test occursin("G = 2", txt)
         end
 

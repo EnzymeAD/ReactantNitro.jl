@@ -426,8 +426,8 @@ function _collect_run_kwargs(;
     return kwargs
 end
 
-# `resume` mirrors the constructor's own three-way split: the symbol `:auto` (the default, find
-# the latest checkpoint in run_dir), `false` (start over), or a checkpoint path.
+# `resume` mirrors the constructor's own three-way split: the symbol `:auto` (find the latest
+# checkpoint in run_dir), `false` (the default, start over), or a checkpoint path.
 _parse_resume(s::AbstractString) = s == "auto" ? :auto : s == "false" ? false : String(s)
 
 # `nitro_export`'s `data`, which is the one invocation keyword that lets an export SKIP a setup

@@ -62,8 +62,8 @@ boundary.
   * **Between 1 and 2:** locate the checkpoint (`:auto` finds `latest` in `run_dir`), read its
     record, run the config compatibility check, and **restore `seed` from the record, overriding
     any `seed = ...` and warning when they differ**. A silent override turns a seed sweep that forgot
-    to vary `run_dir` into N identical runs, and `resume = :auto` is the default. Restoring is what
-    makes `w0` reproducible, so the override is right and only its silence was wrong.
+    to vary `run_dir` into N identical runs. Restoring is what makes `w0` reproducible, so the
+    override is right and only its silence was wrong.
   * **After 7:** restore `ps`, `st`, `opt_state`, `step`, and `epoch`. **`w0` is the value freshly
     captured at step 7, verified against the record's `anchor_checksum`**, which is why step 6's
     rebuild happens before the restore in spite of being thrown away.
@@ -73,7 +73,7 @@ boundary.
     Step 9's normalization applies to state the framework *constructed*; a restore does not
     construct, so without this the resumed run reacquires the frozen-step-counter bug in full.
     **That is the single most dangerous omission this framework could have**, because the symptom is
-    a plausible loss curve and no error, on the default path.
+    a plausible loss curve and no error.
 
 ## The no-train variant
 
@@ -121,7 +121,7 @@ function _build_nitro(
         preset::Union{Symbol, Nothing} = nothing,
         # Four stay keyword-only, because each names a fact about THIS INVOCATION rather than
         # a property of the experiment. `data`'s accessor exists and is called `build_data`.
-        resume = :auto,
+        resume = false,
         data = nothing,
         checkpoint = nothing,
         run_ref = nothing
@@ -173,6 +173,7 @@ function _build_nitro(
         record, source = load_checkpoint(checkpointer, checkpoint), checkpoint
     elseif resume === :auto
         found = find_latest(checkpointer, run_dir)
+        # No announcement: `:auto` is opt in, so a restore here is what the caller asked for.
         found === nothing || ((record, source) = (load_checkpoint(checkpointer, found), found))
     elseif resume !== false
         record, source = load_checkpoint(checkpointer, resume), resume
@@ -205,7 +206,7 @@ function _build_nitro(
     # ── 2. seed, before anything that draws ────────────────────────────────────────
     # The seed is RESTORED from the record, overriding any `seed = ...`, and the override is
     # announced. A silent one turns a seed sweep that forgot to vary `run_dir` into N identical
-    # runs, and `resume = :auto` is the default. Restoring is what makes `w0` reproducible, which
+    # runs. Restoring is what makes `w0` reproducible, which
     # the anchor checksum then depends on, so the override is right and only silence was wrong.
     if record !== nothing && record.seed != seed
         @warn "ReactantNitro: restoring `seed = $(record.seed)` from the checkpoint, overriding the \
@@ -402,7 +403,7 @@ function _build_nitro(
             # Omitting this is the single most dangerous omission this framework could have. Step
             # 9's normalization applies to state the framework CONSTRUCTED; a restore constructs
             # nothing, so without this the resumed run reacquires the frozen-step-counter bug in
-            # full, on `resume = :auto`, which is the DEFAULT path. The symptom is a plausible loss
+            # full, on `resume = :auto`. The symptom is a plausible loss
             # curve and no error: RAdam's `t` stays host, never advances under trace, and the run
             # silently trains at the wrong point of its own bias correction.
             #

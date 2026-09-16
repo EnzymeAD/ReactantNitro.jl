@@ -978,9 +978,18 @@ The binding report's text, built from explicit pieces so it is testable without 
 function binding_report_text(;
         name, seed, accum, total, splits = (), clip = 0,
         clip_source::Symbol = :default, schedules = nothing, groups = (),
-        level2 = (), preset = nothing, manual = false
+        level2 = (), preset = nothing, manual = false, plain::Bool = true
     )
     io = IOBuffer()
+    # `plain = true` BY DEFAULT, and that default is load-bearing rather than conservative. This
+    # text is stored on the handle, returned by `binding_report`, and sent to `log_other!`: a
+    # machine-read artifact whose bytes must not depend on whether some other package in the
+    # session happened to load PrettyTables. Setup asks for the rendered version separately, for
+    # the human reading the `@info` at that moment, and keeps the plain one for everything else.
+    section(title, header, rows) = sprint() do buf
+        plain ? _render_table_plain(buf, title, header, rows, nothing) :
+            _render_table(buf, title, header, rows)
+    end
     println(
         io, "ReactantNitro: binding report for $name (seed $seed, accum $accum, ",
         "total $total optimizer steps)"
@@ -991,12 +1000,8 @@ function binding_report_text(;
     preset === nothing || println(io, "  preset $(repr(preset))")
 
     if !isempty(splits)
-        println(io, "\n  data")
+        rows = TableRows()
         for sp in splits
-            line = string(
-                "    ", rpad(sp.name, 8), lpad(sp.batches, 4), " batches x ",
-                sp.batch_size
-            )
             notes = String[]
             if sp.samples !== nothing
                 notes = [
@@ -1011,9 +1016,16 @@ function binding_report_text(;
             # explicit pieces, and the suites that do so construct their splits tuples by hand.
             pf = get(sp, :prefetch, nothing)
             pf === nothing || push!(notes, _prefetch_note(pf))
-            isempty(notes) || (line *= "  (" * join(notes, "; ") * ")")
-            println(io, line)
+            # The batch count and the batch size stay ONE cell. They are read as a shape, "100
+            # batches x 32", and splitting them into two columns would make a reader assemble it.
+            push!(
+                rows, [
+                    sp.name, string(sp.batches, " batches x ", sp.batch_size),
+                    isempty(notes) ? "" : "(" * join(notes, "; ") * ")",
+                ]
+            )
         end
+        print(io, "\n", section("  data", ["split", "shape", "notes"], rows), "\n")
     end
 
     println(io, "\n  gradient clip")
@@ -1024,7 +1036,7 @@ function binding_report_text(;
     )
 
     if schedules !== nothing && !isempty(schedules)
-        println(io, "\n  schedules", " "^58, "(source)")
+        rows = TableRows()
         for (ns, tbl) in ((:opt, schedules.opt), (:device, schedules.device))
             for k in keys(tbl)
                 disp = haskey(schedules.source, k) ? k : Symbol(ns, ".", k)
@@ -1032,26 +1044,38 @@ function binding_report_text(;
                     (manual ? _manual_opt_desc(k) : _auto_opt_desc(k)) :
                     "Device field   e.$k"
                 note = disp in schedules.constant ? "  (constant)" : ""
-                println(
-                    io, "    ", rpad(disp, 18), " -> ", rpad(what * note, 55),
-                    "[", _source_label(get(schedules.source, disp, :accessor)), "]"
+                # The source keeps its brackets. It is the column a reader scans for, and "[train!
+                # keyword]" is the token that appears in every other report and in the docs.
+                push!(
+                    rows, [
+                        string(disp), what * note,
+                        "[" * _source_label(get(schedules.source, disp, :accessor)) * "]",
+                    ]
                 )
             end
         end
+        print(io, "\n", section("  schedules", ["binding", "what", "source"], rows), "\n")
     end
 
     if !isempty(groups)
-        println(io, "\n  parameter groups (G = ", length(groups), ")")
-        for g in groups
-            println(
-                io, "    ", rpad(repr(g.name), 12),
-                "base eta ", rpad(_g(g.base_eta), 9),
-                "ratio ", rpad(string(round(Float64(g.ratio); digits = 2)), 6),
-                "decay toward ", rpad(string(g.anchor), 6),
-                " lambda ", rpad(_g(g.lambda), 9),
-                rpad(string(g.rule), 8), lpad(_commas(g.params), 12), " params"
-            )
-        end
+        rows = TableRows[]
+        rows = TableRows(
+            [
+                [
+                    repr(g.name), _g(g.base_eta),
+                    string(round(Float64(g.ratio); digits = 2)), string(g.anchor),
+                    _g(g.lambda), string(g.rule), _commas(g.params),
+                ] for g in groups
+            ]
+        )
+        print(
+            io, "\n",
+            section(
+                "  parameter groups (G = " * string(length(groups)) * ")",
+                ["group", "base eta", "ratio", "decay toward", "lambda", "rule", "params"],
+                rows
+            ), "\n"
+        )
     end
 
     if !isempty(level2)

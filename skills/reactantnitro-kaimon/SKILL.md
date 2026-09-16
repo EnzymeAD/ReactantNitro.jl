@@ -207,5 +207,6 @@ evaluation, prediction, and export: launch, wait, read the result.
 They do not replace the framework. The tools are the interface to `train!`, `validate`,
 `evaluate`, `predict`, and `export_model`; anything those entry points cannot do, the tools
 cannot do. They also do not manage checkpoints or resumes beyond passing the knobs through: a
-fresh `run_dir` trains fresh, a reused one resumes by default, and `resume = "false"` starts
+a `run_dir` trains fresh unless `resume = "auto"` asks for the latest checkpoint in it, and
+`resume = "false"` is the default that starts
 over, exactly as with `Nitro`.

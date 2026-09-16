@@ -132,7 +132,7 @@ the whole point of the fact this file opens with, and carries no `Bool`.
 The same normalization runs on the **resume** path, over the restored `opt_state`. The record
 stores **host** values, so the flow is uniform and has exactly one normalization point per path:
 write host, read host, normalize on the way in. Skipping it on resume reacquires the frozen-counter
-bug in full, and `resume = :auto` is the default.
+bug in full.
 """
 function to_device_leaf(l::Optimisers.Leaf; mesh = nothing)
     return Optimisers.Leaf(
