@@ -82,9 +82,20 @@ end
 #
 # Nothing here can throw on a partly-migrated record: every field is read through `_shown`, which
 # falls back to the type name for anything it does not recognize.
+#
+# `_shown` IS ALSO THE EXPERIMENT RENDERER (`_show_experiment` in Config.jl), for the same reason
+# the weight list below is named once: an experiment carries device buffers under `Device{T}` where
+# `T` is a tuple or a NamedTuple, which is the same array-in-a-container shape a record's `ps` has.
+# Two renderers would drift, and the one that drifted would be the one that dumped a model.
 _shown(x::Union{Nothing, Symbol, AbstractString, Real}) = repr(x)
+# A DEVICE scalar reads back as a host number. That is a four-byte transfer, and the value is the
+# entire reason such a field is in a table; the wrapper type is not.
+_shown(x::Reactant.RNumber) = repr(Reactant.to_number(x))
 _shown(x::NamedTuple) = isempty(x) ? "(;)" :
     "(" * join(("$k = " * _shown(v) for (k, v) in pairs(x)), ", ") * ")"
+# Tuples recurse for the buffer case: `Device{Tuple{Matrix, Matrix}}` renders as two shapes rather
+# than as `<Tuple>`, which would hide the one thing worth knowing about it.
+_shown(x::Tuple) = isempty(x) ? "()" : "(" * join(map(_shown, x), ", ") * ")"
 _shown(x::AbstractArray) = "<" * string(eltype(x)) * " array, size " * join(size(x), "x") * ">"
 _shown(x) = "<" * string(nameof(typeof(x))) * ">"
 

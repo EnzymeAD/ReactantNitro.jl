@@ -539,4 +539,55 @@
         end
     end
 
+    # ── showing an experiment, without showing a device buffer ──────────────────────────
+    #
+    # `Device{T}` takes any `T`, and the read-only buffer case puts WEIGHTS in one: a
+    # `Device{NamedTuple}` or `Device{Tuple}` of arrays that an `hlo_call` reads. Under Julia's
+    # default struct `show` that config prints element by element, so `display(e)` dumps a model.
+    # Measured before this existed: 51,635 characters for one 64x64 and two 16x16 buffers.
+    @testset "an experiment shows its values and never a device buffer" begin
+        @experiment struct BufExp
+            width::GraphConst{Int} = 8
+            smoothing::Device{Float32} = 0.05f0
+            buffers::Device{NamedTuple{(:w, :b), Tuple{Matrix{Float32}, Vector{Float32}}}} =
+                (w = zeros(Float32, 64, 64), b = zeros(Float32, 64))
+            pair::Device{Tuple{Matrix{Float32}, Matrix{Float32}}} =
+                (zeros(Float32, 16, 16), ones(Float32, 16, 16))
+            max_epochs::Int = 1
+        end
+
+        e = BufExp()
+        for s in (sprint(show, e), sprint(show, MIME"text/plain"(), e))
+            # The test that catches a regression to the struct default: the printed form of an
+            # array of floats. 4,096 zeros print as `0.0, 0.0, ...` and nothing else here does.
+            @test !occursin("Float32[", s)
+            @test !occursin("0.0, 0.0", s)
+            # Bounded by the FIELD COUNT, never by the model. Five fields cannot reach this.
+            @test length(s) < 2_000
+            # A buffer is named by its shapes, which is what makes the summary useful rather than
+            # merely short: both members of the NamedTuple and both of the Tuple.
+            @test occursin("size 64x64", s) && occursin("size 64", s)
+            @test count("size 16x16", s) == 2
+            # Values, not just names: a config table that withheld its scalars would be useless.
+            @test occursin("0.05", s) && occursin("8", s)
+        end
+
+        # The long form carries the marker per field, which is the column a reader acts on.
+        long = sprint(show, MIME"text/plain"(), e)
+        @test occursin("GraphConst", long) && occursin("Device", long) && occursin("Host", long)
+        for f in fieldnames(BufExp)
+            @test occursin(string(f), long)
+        end
+
+        # The short form stays one line, because that is where a nested display puts it.
+        @test count("\n", sprint(show, e)) == 0
+
+        # An experiment with no Device field at all is the common case and must not regress into
+        # something less readable than the struct default was.
+        @experiment struct PlainExp
+            n::GraphConst{Int} = 3
+        end
+        @test occursin("n", sprint(show, PlainExp())) && occursin("3", sprint(show, PlainExp()))
+    end
+
 end

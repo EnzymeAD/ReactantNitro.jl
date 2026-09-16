@@ -480,4 +480,51 @@
         @test any(p isa Failed for (p, _, _, _) in seen)
     end
 
+    # ── showing a handle, without showing the model ─────────────────────────────────────
+    #
+    # The same hazard `CheckpointRecord`'s `show` covers, one level up: six `Nitro` fields are
+    # parameter trees and `data` is the loaded collection, so the DEFAULT struct `show` prints the
+    # whole model for a bare `nitro` at the REPL. In an agent session the REPL's output is the
+    # transcript, so that is context window spent to read an epoch number. Bounded output has to be
+    # the default rendering or the trap stays one keystroke away.
+    @testset "a handle shows its state and never its weights" begin
+        n = mk_life(; max_epochs = 2)
+        train!(n)
+
+        for s in (sprint(show, n), sprint(show, MIME"text/plain"(), n))
+            # The test that actually catches a regression: the printed form of an array of floats.
+            # A `show` that fell back to the struct default prints these in the thousands.
+            @test !occursin("Float32[", s)
+            @test !occursin("Float64[", s)
+            # Bounded, and bounded SMALL. This cannot be allowed to grow with the model, so the
+            # limit is checked rather than the content.
+            @test length(s) < 2_000
+            @test occursin("LifeMLP", s)
+        end
+
+        # The weights ARE still in there: this is a summary, not a lighter handle.
+        @test parameters(n) !== nothing
+
+        short = sprint(show, n)
+        @test occursin("epoch $(current_epoch(n))", short)
+        @test occursin("step $(current_step(n))", short)
+
+        long = sprint(show, MIME"text/plain"(), n)
+        @test occursin("Done", long)                       # the phase, which is the usual question
+        @test occursin("train 4 batches", long)            # split sizes, not the splits themselves
+        @test occursin("val 2 batches", long)
+        @test occursin("no weights are shown", long)       # says what it withheld, as the record does
+        @test occursin("binding_report", long)             # and names the readers, where it is asked
+
+        # Counting parameters must not need the arrays: the count comes off the layout, which is
+        # host metadata, so a handle displays without moving a byte of device memory.
+        @test occursin(string(ReactantNitro._commas(sum(n.layout.lengths))), long)
+
+        # A handle with no data and no training still displays, because a `show` that can throw is
+        # a `show` nobody can use while debugging the thing that broke.
+        bare = Nitro(LifeMLP(); data = (;), checkpointer = nothing, run_dir = mktempdir())
+        @test occursin("none", sprint(show, MIME"text/plain"(), bare))
+        @test length(sprint(show, bare)) < 2_000
+    end
+
 end

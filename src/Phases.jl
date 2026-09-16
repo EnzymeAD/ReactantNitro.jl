@@ -335,6 +335,124 @@ extends the verb with. The ReactantNitroKaimonGateExt `nitro_logger` tool render
 """
 logger_info(nitro::Nitro) = logger_info(nitro.logger)
 
+# ── Showing a `Nitro` NEVER shows the weights ───────────────────────────────────────
+#
+# The failure `CheckpointRecord`'s `show` exists to prevent, one level up and bigger. A `Nitro` is
+# a mutable struct of thirty-odd `Any` fields, and six of them (`model`, `ps`, `st`, `w0`,
+# `opt_state`, `g_accum`) are parameter trees, while `data` is the whole loaded collection. The
+# default struct `show` walks all of it, so evaluating a bare `nitro`, the most ordinary thing
+# anyone does with a handle, prints every weight in the model. In a REPL that is a lost screen; in
+# an agent session the REPL's output IS the transcript, so it is context window, and it gets spent
+# to learn which epoch a run is on.
+#
+# So the summary is the show, and it is an ALLOWLIST rather than the record's denylist. That is
+# deliberate: nearly every field here is either bulk or an internal whose printed form tells a
+# reader nothing, so the short list of what is worth showing is the one that stays correct as
+# fields are added. A new field is invisible here until someone decides it belongs, which is the
+# right default for a display.
+#
+# EVERY READ BELOW IS A HOST READ, and that is a requirement rather than an accident. `show` runs
+# on every REPL expression, and a display that moved device memory would make looking at a handle
+# cost transfers. The parameter count comes from `layout.lengths`, host metadata computed once at
+# setup, and never from the arrays it describes.
+
+# `nothing` rather than a guess for a handle whose layout is not a `FlatLayout`: a display reports
+# what it can read and invents nothing.
+function _nitro_params(nitro::Nitro)
+    lay = nitro.layout
+    lay === nothing && return nothing
+    return try
+        (sum(lay.lengths), length(lay.groups))
+    catch
+        nothing
+    end
+end
+
+function _nitro_devices(nitro::Nitro)
+    nitro.mesh === nothing && return 1
+    return try
+        length(nitro.mesh.device_ids)
+    catch
+        nothing
+    end
+end
+
+# A split's size WITHOUT iterating it. A loader that promises no length is reported as streaming
+# rather than counted: `length` on one is wrong at best, and at worst consumes the split that the
+# next epoch was going to read.
+function _nitro_split(v)
+    return try
+        Base.IteratorSize(typeof(v)) isa Union{Base.HasLength, Base.HasShape} ?
+            string(length(v)) * " batches" : "streaming"
+    catch
+        "?"
+    end
+end
+
+function _nitro_splits(data)
+    data === nothing && return "none"
+    ks = try
+        keys(data)
+    catch
+        return "<" * string(nameof(typeof(data))) * ">"
+    end
+    isempty(ks) && return "none"
+    return join(("$k " * _nitro_split(data[k]) for k in ks), ", ")
+end
+
+function Base.show(io::IO, nitro::Nitro)
+    pg = _nitro_params(nitro)
+    print(
+        io, "Nitro(", nameof(typeof(nitro.e)),
+        ", ", nameof(typeof(nitro.phase)),
+        ", epoch ", nitro.epoch, "/", nitro.max_epochs,
+        ", step ", nitro.step,
+        pg === nothing ? "" : ", " * _commas(pg[1]) * " params",
+        ", ", repr(nitro.run_dir), ")",
+    )
+    return nothing
+end
+
+function Base.show(io::IO, ::MIME"text/plain", nitro::Nitro)
+    pg = _nitro_params(nitro)
+    devs = _nitro_devices(nitro)
+    println(io, "Nitro for ", nameof(typeof(nitro.e)), "  (the run handle; no weights are shown)")
+    println(
+        io, "  phase        ", nameof(typeof(nitro.phase)),
+        nitro.stop_reason === nothing ? "" : " (" * string(nitro.stop_reason) * ")"
+    )
+    println(io, "  epoch        ", nitro.epoch, " / ", nitro.max_epochs)
+    println(
+        io, "  step         ", nitro.step,
+        nitro.total === nothing ? "" : " / " * string(nitro.total)
+    )
+    println(
+        io, "  params       ", pg === nothing ? "not built" :
+            _commas(pg[1]) * " in " * string(pg[2]) * (pg[2] == 1 ? " group" : " groups")
+    )
+    println(io, "  batch_size   ", something(nitro.batch_size, "pending"))
+    println(
+        io, "  devices      ", devs === nothing ? "sharded" : string(devs),
+        nitro.mesh === nothing ? "  (no mesh)" : "  (mesh :data)"
+    )
+    println(io, "  data         ", _nitro_splits(nitro.data))
+    println(
+        io, "  weights      ",
+        nitro.checkpoint_source === nothing ? "fresh from build_model" :
+            string(nitro.checkpoint_source)
+    )
+    println(io, "  run_dir      ", nitro.run_dir)
+    println(io, "  seed         ", nitro.seed, "   accum ", nitro.accum)
+    nitro.preset === nothing || println(io, "  preset       ", nitro.preset)
+    # Named where the question is asked, exactly as the record's `show` names `checkpoint_info`:
+    # whoever printed this handle wanted one of these and the summary is not it.
+    print(
+        io, "  ask it for more with `experiment`, `parameters`, `states`, `binding_report`, ",
+        "`logger_info`"
+    )
+    return nothing
+end
+
 # ── Monitor registry, not dispatch ──────────────────────────────────────────────────
 #
 # Dispatch does not scale here: only one monitor could be passed, so two independent observers

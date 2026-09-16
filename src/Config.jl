@@ -373,7 +373,7 @@ stripped view, which is exactly the split the `Host` marker exists to enforce.
 
 One declaration point, generating the struct, a `@kwdef`-style keyword constructor, the
 [`device_fields`](@ref) and [`host_fields`](@ref) traits, the [`config_metadata`](@ref) table, a
-[`compile_view`](@ref) method, and a `?MyExp` docstring.
+[`compile_view`](@ref) method, two `Base.show` methods, and a `?MyExp` docstring.
 
 ```julia
 @experiment struct MyExp
@@ -412,8 +412,21 @@ is that what the field holds changes.
 and are never visible to a macro, so `#` cannot carry a description. Per-field docs land in
 `config_metadata` and in the generated type docstring.
 
+**Display shows values and never a device buffer.** The generated `show` prints one line per
+field with its marker and its value, summarizing an array as its eltype and shape and recursing
+through tuples and NamedTuples to do it. That matters because `Device{T}` takes any `T`, and a
+read-only buffer for an `hlo_call` lives in a `Device{NamedTuple}` or `Device{Tuple}` of weights:
+under Julia's default struct `show`, printing such a config prints the arrays element by element.
+The generated output grows with the field count and never with the model.
+
 **The macro is optional.** A user may hand-write the struct and define `device_fields`,
 `host_fields`, and `config_metadata` themselves; those three are exported for exactly that reason.
+Such a struct keeps Julia's default `show`, and opts in with the one line the macro expands to:
+
+```julia
+Base.show(io::IO, e::MyExp) = ReactantNitro._show_experiment(io, e)
+Base.show(io::IO, ::MIME"text/plain", e::MyExp) = ReactantNitro._show_experiment(io, e; long = true)
+```
 """
 macro experiment(expr)
     return _experiment(expr, __source__, __module__)
@@ -647,8 +660,66 @@ function _experiment(expr, source, mod = @__MODULE__)
     # belongs above it. Neither is silently discarded.
     doc_def = :($(_qual(:_merge_field_table!))($mod, $(QuoteNode(name)), $docstr))
 
-    parts = Any[structdef, ctor, df_def, hf_def, cm_def, cv_def, doc_def, esc(name)]
+    # ── The two `show` methods ──────────────────────────────────────────────────────────
+    #
+    # Emitted per type rather than defined once, because a generated experiment has no common
+    # supertype to dispatch on: the macro builds a bare struct, and `super` is whatever the user
+    # wrote. A hand-written experiment (the macro is optional) keeps Julia's default `show` and can
+    # opt in with the same one-liner these expand to.
+    #
+    # `MIME{Symbol("text/plain")}` rather than the `MIME"text/plain"` string macro: the latter is a
+    # macrocall in macro output, and spelling the type directly is one less hygiene question.
+    show_def = :(Base.show(io::IO, e::$(esc(name))) = $(_qual(:_show_experiment))(io, e))
+    showl_def = :(
+        function Base.show(io::IO, ::MIME{Symbol("text/plain")}, e::$(esc(name)))
+            return $(_qual(:_show_experiment))(io, e; long = true)
+        end
+    )
+
+    parts = Any[
+        structdef, ctor, df_def, hf_def, cm_def, cv_def, show_def, showl_def, doc_def, esc(name),
+    ]
     return Expr(:block, filter(!isnothing, parts)...)
+end
+
+# ── Showing an experiment NEVER shows a device buffer ───────────────────────────────
+#
+# The same hazard as `CheckpointRecord`'s and `Nitro`'s, arriving by a different door. A `Device`
+# field is usually a scalar, and a table of scalars is exactly what an experiment should print. But
+# `Device{T}` takes any `T`, and the read-only buffer case puts WEIGHTS there: `Device{NamedTuple}`
+# or `Device{Tuple}` holding the arrays an `hlo_call` reads. Under Julia's default struct `show`
+# those print element by element, so displaying a config dumps a model. Measured on a toy
+# experiment carrying one 64x64 and two 16x16 buffers: 51,635 characters.
+#
+# The fix is the renderer `CheckpointRecord` already uses. `_shown` (Checkpoint.jl) summarizes an
+# array as its eltype and shape and RECURSES THROUGH tuples and NamedTuples, so a buffer field
+# renders as its shapes and a scalar field still renders as its value. The output's length grows
+# with the FIELD COUNT and never with the model, which is the property worth having.
+#
+# Values, not just names: an experiment is configuration, and a config table that withheld its
+# numbers would be useless in the case that is not a buffer, which is nearly all of them.
+function _show_experiment(io::IO, e; long::Bool = false)
+    T = typeof(e)
+    fs = fieldnames(T)
+    if !long
+        print(io, nameof(T), "(")
+        print(io, join(("$f = " * _shown(getfield(e, f)) for f in fs), ", "))
+        print(io, ")")
+        return nothing
+    end
+    df, hf = device_fields(T), host_fields(T)
+    println(io, nameof(T), "  (@experiment; no device buffer is shown)")
+    isempty(fs) && return print(io, "  (no fields)")
+    w = maximum(length(string(f)) for f in fs)
+    for (i, f) in enumerate(fs)
+        # The marker is the column that makes the table actionable: it is what a reader changes
+        # when a field is in the wrong category, and it cannot be inferred from the value.
+        kind = f in df ? "Device" : f in hf ? "Host" : "GraphConst"
+        line = "  " * rpad(string(f), w) * "  " * rpad(kind, 10) * " " *
+            _shown(getfield(e, f))
+        i == length(fs) ? print(io, line) : println(io, line)
+    end
+    return nothing
 end
 
 # Each note NAMES ITS MARKER, because the table's job is to be actionable: a reader deciding whether
