@@ -1,0 +1,14 @@
+Manifest.toml
+/runs/
+/docs/build/
+*.jls
+.idea/
+.claude/
+/CLAUDE.local.md
+/graphify-out/
+/.graphify/
+/docs/design/
+.pi-subagents/
+# Scratch space for agent work (throwaway by definition).
+/.scratch/
+/.nitrosquad/

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Runic pre-commit hook: format the source tree with Runic and re-stage the result.
+#
+# Runs `runic --inplace --diff` over `src ext test docs` (whichever of those
+# directories exist), which covers every tracked .jl file in the repo.
+#
+# Requires the `runic` CLI (Julia >= 1.12 Pkg app):
+#     julia -e 'using Pkg; Pkg.Apps.add("Runic")'
+#
+# .git/hooks/ is machine-local and not versioned, so install this script as
+# your pre-commit hook in a fresh clone with:
+#     cp scripts/pre-commit-runic .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+set -u
+
+if ! command -v runic >/dev/null 2>&1; then
+    echo "pre-commit: runic CLI not found; skipping formatting." >&2
+    echo "  Install it once with:  julia -e 'using Pkg; Pkg.Apps.add(\"Runic\")'" >&2
+    exit 0
+fi
+
+# Only pass directories that exist: `runic` errors out on a missing path, which
+# would block every commit if a source directory were ever renamed or removed.
+dirs=(src ext test docs)
+targets=()
+for d in "${dirs[@]}"; do
+    [ -d "$d" ] && targets+=("$d")
+done
+
+if [ ${#targets[@]} -eq 0 ]; then
+    echo "pre-commit: no source directories found; skipping formatting." >&2
+    exit 0
+fi
+
+echo "pre-commit: formatting ${targets[*]} with Runic..." >&2
+runic --inplace --diff "${targets[@]}"
+status=$?
+
+# Re-stage the .jl files the formatter touched so the commit includes the formatted code.
+# (git ls-files never errors on empty matches, unlike `git add -u` with an unmatched
+# pathspec, so a dir with no .jl files can't silently skip the re-stage.)
+git ls-files -m -z -- "${targets[@]}" | grep -z '\.jl$' | xargs -0 -r git add --
+
+exit $status

@@ -1,0 +1,35 @@
+# The test suite. Runs on CPU: test/runtests.jl sets CUDA_VISIBLE_DEVICES=""
+# itself (see its header comment), so no GPU is needed and the full suite runs
+# here on an ordinary GitHub-hosted runner.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.12']
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        env:
+          # ReTestItems workers. The ncores/2 default already yields 2 on this runner; pin it
+          # for determinism. retries is a load-flake safety net, not a fix for real failures.
+          RETESTITEMS_NWORKERS: 2
+          RETESTITEMS_RETRIES: 2

@@ -1,0 +1,27 @@
+{
+  "name": "reactantnitro-jl",
+  "owner": {
+    "name": "Carroll Vance",
+    "url": "https://github.com/EnzymeAD/ReactantNitro.jl"
+  },
+  "metadata": {
+    "description": "Agent skills for ReactantNitro.jl, the Reactant-first training framework for Julia.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "reactantnitro-jl",
+      "source": "./",
+      "description": "Skills for writing, porting, and operating ReactantNitro experiments: the hook contract, the three field markers, metrics, optimizers, recompilation, checkpoints, manual training, device boundaries, visualization, export, and Kaimon-driven runs.",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "julia",
+        "machine-learning",
+        "reactant",
+        "lux",
+        "training"
+      ]
+    }
+  ]
+}

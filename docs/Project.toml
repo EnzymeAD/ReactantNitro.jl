@@ -1,0 +1,29 @@
+# The documentation environment, on the default Documenter HTML theme with the
+# DocumenterLandingPage plugin (the VitePress-style landing page, rendered from
+# the YAML frontmatter in index.md) and the DocumenterCodeBlocks plugin (line
+# numbers, reference links, hover tooltips, JuliaSyntax highlighting).
+# `ReactantNitro` is sourced from the repository root rather than from the
+# registry, so `docs/make.jl` documents the tree it sits in, and
+# `Pkg.instantiate()` from CI resolves the package's own dependencies
+# (Reactant, Enzyme, Lux, ...) into this environment's Manifest.
+#
+# DocumenterLandingPage is sourced from its git URL below (no registry
+# entry yet); CI's Pkg.instantiate() resolves it like any other package.
+# No Node is involved anywhere in the build anymore.
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+DocumenterCodeBlocks = "b6400b83-267f-4b55-9fd8-bffc853bdfd8"
+DocumenterLandingPage = "1c52b33b-3e2f-4e99-b3b5-a6ad63f0d6d2"
+ReactantNitro = "641982cc-88f5-4d80-bec4-e68c6a8af0a5"
+
+[compat]
+Documenter = "1.17"
+DocumenterCodeBlocks = "1.3"
+ReactantNitro = "0.1"
+
+[sources]
+ReactantNitro = {path = ".."}
+# The landing-page plugin, from its git URL so the docs CI can resolve it;
+# a local build can override this with a path entry
+# ({path = "../../DocumenterLandingPage.jl"}) and instantiate again.
+DocumenterLandingPage = {url = "https://github.com/csvance/DocumenterLandingPage.jl"}

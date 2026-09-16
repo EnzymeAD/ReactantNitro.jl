@@ -1,0 +1,21 @@
+name: TagBot
+on:
+  issue_comment:
+    types:
+      - created
+  workflow_dispatch:
+jobs:
+  TagBot:
+    if: github.event_name == 'workflow_dispatch' || github.actor == 'JuliaTagBot'
+    runs-on: ubuntu-latest
+    # The repo default workflow token is read-only, so without this block TagBot
+    # cannot push the tag or create the GitHub release. contents: write does both;
+    # issues: write lets TagBot open a "manual intervention" issue if release
+    # creation ever fails.
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: JuliaRegistries/TagBot@cded32665b34ca0496d3ac10a67d08ddfc726963 # v1.25.11
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

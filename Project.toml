@@ -1,0 +1,50 @@
+name = "ReactantNitro"
+uuid = "641982cc-88f5-4d80-bec4-e68c6a8af0a5"
+authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
+version = "0.1.0"
+
+[deps]
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[weakdeps]
+KaimonGate = "5ee84a8c-75bd-412f-a7b8-4e6463aa635f"
+ReactantServerExport = "90fa0446-f028-4638-8833-e223884d9b4d"
+
+[extensions]
+ReactantNitroKaimonGateExt = "KaimonGate"
+ReactantNitroReactantServerExportExt = "ReactantServerExport"
+
+[compat]
+julia = "1.12"
+# Reactant floor: 0.2.264 is the release with the memory-leak fix.
+Reactant = "0.2.264"
+# Optimisers floor: 0.4.8 is the first release whose Reactant extension traces RAdam.
+Optimisers = "0.4.8"
+Enzyme = "0.13"
+Functors = "0.5"
+JLD2 = "0.5, 0.6"
+JSON3 = "1"
+Lux = "1"
+# ReactantServerExport floor: 1.0.0, the General-registry release; no further 0.1.x.
+ReactantServerExport = "1.0.0"
+KaimonGate = "1.2.0"
+
+[extras]
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+KaimonGate = "5ee84a8c-75bd-412f-a7b8-4e6463aa635f"
+ReTestItems = "817f1d60-ba6b-4fd5-9520-3cf149f6a823"
+
+[targets]
+test = ["KaimonGate", "Logging", "ReTestItems", "Test"]
