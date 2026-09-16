@@ -816,24 +816,35 @@ already compute and it never fails. It exists because the rules that resolve a l
 schedule key, and a per-group accessor are individually simple and jointly hard to hold in your
 head.
 
+**One of three reports, and they do not overlap.** This one says where each configured value BOUND
+and from which source. What the handle currently holds, including the seed, the batch size, the
+split sizes and the preset, is `show(nitro)`. What has been redefined since the handle froze it is
+[`fixed_config_report`](@ref).
+
+Rendered through whatever table renderer is installed, so loading `PrettyTables` boxes it; the
+copy stored on the handle and sent to the logger stays plain.
+
 ```
-ReactantNitro: binding report for MyExp (seed 42, accum 2, total 1240 optimizer steps)
+ReactantNitro: binding report for MyExp
 
   data
-    train   46 batches x 64  (2944 of 3001 samples; 57 dropped by drop-last; prefetch: 16 workers, depth 1)
-    val     8 batches x 64   (500 samples; final batch of 52 padded then sliced; prefetch: none; the eval path does not stream)
+  split  resolved
+  train  2944 of 3001 samples; 57 dropped by drop-last; prefetch: 16 workers, depth 1
+  val    500 samples; final batch of 52 padded then sliced; prefetch: none; the eval path does not stream
 
   gradient clip
     global norm 1.0   (optimizer program only; changing it recompiles it)       [train! keyword]
 
-  schedules                                                                      (source)
-    eta                -> optimizer field, all groups, per-group ratio applied   [train! keyword]
-    opt.lambda         -> optimizer field, all groups, per-group ratio applied   [schedules(e)]
-    device.lambda      -> Device field   e.lambda                                [schedules(e)]
+  schedules
+  binding        what                                                        source
+  eta            optimizer field, all groups, per-group ratio applied         [train! keyword]
+  opt.lambda     optimizer field, all groups, per-group ratio applied         [schedules(e)]
+  device.lambda  Device field   e.lambda                                      [schedules(e)]
 
   parameter groups (G = 2)
-    :default    base eta 1.0e-3  ratio 1.00  decay toward zero  lambda 1.0e-4  RAdam   1,234,567 params
-    :backbone   base eta 1.0e-4  ratio 0.10  decay toward w0    lambda 1.0e-3  RAdam  23,456,789 params
+  group      base eta  ratio  decay toward  lambda  rule   params
+  :default   1.0e-3    1.0    zero          1.0e-4  RAdam  1,234,567
+  :backbone  1.0e-4    0.1    w0            1.0e-3  RAdam  23,456,789
 
   level 2 chains
     :backbone   scheduled values present in the returned chain: eta, beta

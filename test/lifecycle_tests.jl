@@ -574,6 +574,49 @@
         @test length(withmat) < 2_000
     end
 
+    # ── metrics are their own section, tiled ────────────────────────────────────────────
+    #
+    # Metrics are the one part of this display that grows with the model: a dozen is ordinary, and
+    # a row each turns the handle into something you scroll past. Tiling packs `name value` pairs
+    # `_METRIC_TILES_PER_ROW` to a row, so twelve metrics cost four rows rather than twelve.
+    @testset "the metrics section tiles rather than listing" begin
+        tiles = ReactantNitro._metric_tiles
+        per = ReactantNitro._METRIC_TILES_PER_ROW
+
+        # No metrics, no section: an empty table is worse than an absent one.
+        @test tiles((;)) === nothing
+
+        # Every row is a full row of `name, value` pairs, including the last, which is padded.
+        # A short final row is a table PrettyTables cannot build.
+        eight = (; a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 8)
+        t8 = tiles(eight)
+        @test length(t8) == cld(8, per)
+        @test all(r -> length(r) == 2 * per, t8)
+        @test t8[1][1] == "a" && t8[1][2] == "1"
+        # Every name and every value is present exactly once across the grid.
+        flat = reduce(vcat, t8)
+        for k in keys(eight)
+            @test count(==(string(k)), flat) == 1
+        end
+        @test count(isempty, flat) == 2 * per * cld(8, per) - 16
+
+        # Fewer metrics than a full row does not pad out to one.
+        @test length(only(tiles((; x = 1, y = 2)))) == 4
+
+        # End to end: the section is titled, names the epoch, and carries the trailing note, which
+        # moves to the LAST section so it stays at the bottom.
+        n = mk_life(; max_epochs = 1)
+        train!(n)
+        n.last_metrics = eight
+        long = sprint(show, MIME"text/plain"(), n)
+        @test occursin("metrics", long)
+        @test occursin("epoch $(current_epoch(n))", long)
+        @test endswith(long, "`logger_info`")
+        # Tiled, not listed: the grid is shorter than one row per metric would be.
+        @test count("\n", long) < 25
+        @test length(long) < 2_000
+    end
+
     # ── progress reporting: begin, one per unit, end ────────────────────────────────────
     #
     # `progress_counter` was already correct and already invisible: one monotonic number with no
@@ -607,7 +650,11 @@
         # It is what lets a reporter reuse one terminal line across every bar of a run and still
         # close that line when the run is over, and a second one would close it twice.
         @test count(e -> e[1] === :done, events) == 1
-        @test events[end][1] === :done
+        # Nothing countable follows it. Not "it is the last event": `set_phase!(Done())` fires a
+        # `:phase` after the run has closed its last bar, which is correct and says nothing about
+        # work remaining.
+        after = events[(findfirst(e -> e[1] === :done, events) + 1):end]
+        @test all(e -> e[1] === :phase, after)
         # Ordering, not just counts: nothing may step outside a bracket.
         depth = 0
         for (v, _, _, _, _) in events
@@ -616,6 +663,44 @@
             v === :end && (depth -= 1)
         end
         @test depth == 0
+    end
+
+    # ── the bar's one blind spot: a compile produces no units ────────────────────────────
+    #
+    # An XLA compile emits nothing to count, so the bar sits at zero for what is most of a first
+    # epoch's wall clock and reads as a hang. The phase tree already knows, and `p isa Compiling`
+    # is the documented query for it, so the reporter is told instead of left to guess.
+    @testset "compiling is reported, and named" begin
+        ev = Tuple{Symbol, String}[]
+        # The compile cache is MODULE-LEVEL, so the testsets above have already compiled every
+        # program `LifeMLP` needs and this run would otherwise compile nothing and report nothing.
+        # Resetting is what makes the compile actually happen here.
+        cache_reset!()
+        prev = ReactantNitro.progress_reporter!((v, l, t, e, m) -> (push!(ev, (v, l)); nothing))
+        try
+            train!(mk_life(; max_epochs = 1))
+        finally
+            ReactantNitro.progress_reporter!(prev)
+        end
+
+        labels = unique(l for (v, l) in ev if v === :phase && !isempty(l))
+        # Which program, not merely "busy": the gradient compile is the long one and the eval
+        # compile is the one that surprises people mid-run.
+        @test "compiling gradient" in labels
+        @test "compiling optimizer" in labels
+        @test "compiling eval" in labels
+
+        # Every compile is closed with an empty label, or the bar would wear it for the rest of
+        # the stretch.
+        opened = count(x -> x[1] === :phase && !isempty(x[2]), ev)
+        closed = count(x -> x[1] === :phase && isempty(x[2]), ev)
+        @test closed >= opened
+
+        # The gradient compile happens INSIDE the training stretch, which is what puts the label
+        # on a bar that is already on screen rather than nowhere.
+        i = findfirst(x -> x == (:phase, "compiling gradient"), ev)
+        j = findlast(x -> x[1] === :begin, ev[1:i])
+        @test j !== nothing
     end
 
     # A reporter that throws is a display bug, and a training run is not the place to pay for one.
@@ -638,9 +723,14 @@
         # interactive, so `_drawing_progress()` is false and the bar is created disabled.
         @test ReactantNitro._drawing_progress() == false
         @test ReactantNitro.progress_bar_reporter(:begin, "train", 3, 1, 2) === nothing
+        @test ReactantNitro.progress_bar_reporter(:phase, "compiling gradient", 0, 0, 0) === nothing
+        @test ReactantNitro.progress_bar_reporter(:phase, "", 0, 0, 0) === nothing
         @test ReactantNitro.progress_bar_reporter(:step, "", 0, 0, 0) === nothing
         @test ReactantNitro.progress_bar_reporter(:end, "", 0, 0, 0) === nothing
         @test ReactantNitro._BAR[] === nothing            # closed, not left open
+        # Setup compiles before any stretch has begun, so a `:phase` with no live bar is ordinary
+        # and must be a no-op rather than a crash inside a training run.
+        @test ReactantNitro.progress_bar_reporter(:phase, "compiling gradient", 0, 0, 0) === nothing
         # An unknown length is an indeterminate bar rather than an error.
         @test ReactantNitro.progress_bar_reporter(:begin, "test", 0, 0, 0) === nothing
         ReactantNitro.progress_bar_reporter(:end, "", 0, 0, 0)

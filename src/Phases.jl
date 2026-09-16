@@ -572,12 +572,6 @@ function Base.show(io::IO, ::MIME"text/plain", nitro::Nitro)
         ],
         ["data", _nitro_splits(nitro.data)],
     ]
-    # The numbers the run produced, which is the question a finished `train!` leaves behind and
-    # which nothing else in this process could answer without a logger backend. Through `_shown`
-    # like everything else: a metric may be a confusion matrix, and a summary that printed one
-    # would have reintroduced the problem this whole `show` exists to solve.
-    isempty(nitro.last_metrics) ||
-        push!(rows, ["metrics", _shown(nitro.last_metrics)])
     el = _nitro_elapsed(nitro.elapsed)
     el === nothing || push!(rows, ["elapsed", el * "  (this `train!` call)"])
     # The selected checkpoint: which epoch won, on which metric, and a path short enough to paste.
@@ -594,17 +588,60 @@ function Base.show(io::IO, ::MIME"text/plain", nitro::Nitro)
     push!(rows, ["run_dir", nitro.run_dir])
     push!(rows, ["seed", string(nitro.seed, "   accum ", nitro.accum)])
     nitro.preset === nothing || push!(rows, ["preset", string(nitro.preset)])
+    # Named where the question is asked, exactly as the record's `show` names `checkpoint_info`:
+    # whoever printed this handle wanted one of these and the summary is not it. It rides on the
+    # LAST section, whichever that is, so it stays at the bottom.
+    note = "ask it for more with `experiment`, `parameters`, `states`, `binding_report`, " *
+        "`logger_info`"
+    title = "Nitro for " * string(nameof(typeof(nitro.e))) *
+        "  (the run handle; no weights are shown)"
+    tiles = _metric_tiles(nitro.last_metrics)
+    if tiles === nothing
+        _render_table(io, title, ["", ""], rows; note)
+        return nothing
+    end
+    _render_table(io, title, ["", ""], rows)
+    println(io)
+    println(io)
     _render_table(
-        io, "Nitro for " * string(nameof(typeof(nitro.e))) *
-            "  (the run handle; no weights are shown)",
-        ["", ""], rows;
-        # Named where the question is asked, exactly as the record's `show` names
-        # `checkpoint_info`: whoever printed this handle wanted one of these and the summary is
-        # not it.
-        note = "ask it for more with `experiment`, `parameters`, `states`, `binding_report`, " *
-            "`logger_info`",
+        io, "  metrics  (validation, epoch " * string(nitro.epoch) * ")",
+        fill("", 2 * length(first(tiles)) ÷ 2), tiles; note
     )
     return nothing
+end
+
+# How many `name value` tiles go on one row of the metrics section. Three is a compromise with one
+# real constraint behind it: a model reporting a dozen metrics is ordinary, and one row each turns
+# the handle's display into something you scroll, while one long row wraps in a terminal and stops
+# lining up. Three keeps a twelve-metric run to four rows and leaves the values in columns that
+# align down the section.
+const _METRIC_TILES_PER_ROW = 3
+
+# The metrics as a GRID rather than a list: each tile is a `name` column and a `value` column, and
+# `_METRIC_TILES_PER_ROW` tiles sit side by side. `nothing` when there are no metrics, which is how
+# the caller knows to skip the section rather than render an empty one.
+#
+# Values go through `_shown` like everything else here, because a metric may be a confusion matrix
+# and a summary that printed one would have reintroduced the problem this whole `show` exists to
+# solve.
+function _metric_tiles(m)
+    isempty(m) && return nothing
+    items = [(string(k), _shown(v)) for (k, v) in pairs(m)]
+    per = min(_METRIC_TILES_PER_ROW, length(items))
+    tiles = TableRows()
+    for i in 1:per:length(items)
+        chunk = items[i:min(i + per - 1, length(items))]
+        row = String[]
+        for (k, v) in chunk
+            push!(row, k)
+            push!(row, v)
+        end
+        # Padded to a full row: a short final row with fewer columns than the others is a table
+        # PrettyTables cannot build, and the plain renderer trims the blanks back off anyway.
+        append!(row, fill("", 2 * per - length(row)))
+        push!(tiles, row)
+    end
+    return tiles
 end
 
 # Relative to the working directory when it helps and absolute when it does not: a path that
@@ -788,8 +825,22 @@ carries `metrics`.
 function set_phase!(nitro::Nitro, phase::Phase; info...)
     nitro.phase === phase && return nothing
     nitro.phase = phase
+    # The bar's one blind spot, closed here. A compile produces no units of work, so the bar sits
+    # at zero for however long XLA takes, which on a first epoch is most of the wall clock and
+    # reads as a hang. The phase tree already knows, and `p isa Compiling` is the documented query
+    # for exactly this, so the reporter is told rather than left to guess from a stalled counter.
+    progress_phase!(phase isa Compiling ? _compiling_label(phase) : "")
     return fire_monitors(nitro, phase; info...)
 end
+
+# Which program is compiling, in words. Worth the mapping rather than printing the type name: the
+# gradient compile is the long one and the eval compile is the one that surprises people mid-run,
+# so naming them is the difference between "it is busy" and "it is busy with the expected thing".
+_compiling_label(::GradCompiling) = "compiling gradient"
+_compiling_label(::OptCompiling) = "compiling optimizer"
+_compiling_label(::EvalCompiling) = "compiling eval"
+_compiling_label(::ExportCompiling) = "compiling export"
+_compiling_label(p::Compiling) = "compiling " * string(nameof(typeof(p)))
 
 """
     ReactantNitro.publish_phase(nitro, phase; info...) -> nothing
@@ -966,6 +1017,8 @@ ProgressMeter bar when a person is watching and nothing otherwise.
   * `:end`, once when the stretch finishes, however it finishes.
   * `:done`, once when the LAST stretch of an entry point is over, so a reporter that has been
     reusing one terminal line can close it. Every argument is a placeholder.
+  * `:phase`, whenever the current stretch starts or stops doing something that produces no units
+    of work. `label` names it (`"compiling gradient"`) or is `""` when ordinary work resumes.
 
 
 **A reporter that throws is switched off rather than propagated.** It is display, the caller is a
@@ -1015,6 +1068,15 @@ epoch, and only the entry point knows which one was the last.
 """
 progress_done!() = _progress_report(:done, "", 0, 0, 0)
 
+"""
+    ReactantNitro.progress_phase!(label) -> nothing
+
+Tell the reporter what the current stretch is doing while its counter is not moving, or `""` when
+it is back to ordinary work. A compile emits no units, so without this a bar stalls at zero for the
+length of an XLA compile with nothing to say why.
+"""
+progress_phase!(label::AbstractString) = _progress_report(:phase, String(label), 0, 0, 0)
+
 # Bumped on the hot path, so the counter half is an atomic add and nothing else. The reporter half
 # is one `Ref` load and a branch, which is nothing against an optimizer step, and it is here rather
 # than at a second call site so that the bar and the watchdog can never disagree about what a unit
@@ -1036,6 +1098,9 @@ const _BAR = Ref{Any}(nothing)
 # return and clears to end of line, and the next bar therefore lands on the same line. What that
 # costs is the newline nobody prints at the end, which is what `:done` is for.
 const _BAR_DIRTY = Ref(false)
+
+# The live bar's description without any phase suffix, so a `:phase` can be taken back off again.
+const _BAR_DESC = Ref("")
 
 # Drawn only where a person is watching. A bar is a cursor animation: in a CI log, a `nohup` file,
 # or a captured gate transcript it renders as thousands of carriage returns and escape codes,
@@ -1073,11 +1138,21 @@ function progress_bar_reporter(
         # the terminal while the next one draws over it.
         _close_bar!()
         desc = max_epochs > 0 ? "$label epoch $epoch/$max_epochs " : "$label "
+        _BAR_DESC[] = desc
         on = _drawing_progress()
         on && (_BAR_DIRTY[] = true)
         _BAR[] = total > 0 ?
             ProgressMeter.Progress(total; desc, output = stderr, enabled = on) :
             ProgressMeter.ProgressUnknown(; desc, output = stderr, enabled = on)
+    elseif verb === :phase
+        p = _BAR[]
+        p === nothing && return nothing
+        want = isempty(label) ? _BAR_DESC[] : _BAR_DESC[] * "[" * label * "] "
+        p.core.desc == want && return nothing
+        p.core.desc = want
+        # FORCED REDRAW. Nothing else will do it: a compile emits no `next!`, so without this the
+        # new description would first appear on the step AFTER the compile everyone was waiting on.
+        ProgressMeter.update!(p, p.counter; keep = false)
     elseif verb === :step
         p = _BAR[]
         # `keep = false` on EVERY update, not only the last. `finish!` is a no-op once the counter
