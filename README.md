@@ -7,7 +7,7 @@
 
 <h1 align="center">ReactantNitro.jl</h1>
 
-<p align="center"><em>Reactant-first training for Lux models: the experiment is a struct whose fields decide what XLA compiles once and what it never recompiles.</em></p>
+<p align="center"><em>Reactant-first training for Lux models: declare the experiment, compile once, train without boilerplate.</em></p>
 
 <p align="center">
   <a href="https://github.com/EnzymeAD/ReactantNitro.jl/actions/workflows/ci.yml"><img src="https://github.com/EnzymeAD/ReactantNitro.jl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
