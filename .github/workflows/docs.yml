@@ -28,6 +28,7 @@ on:
     paths-ignore:
       - 'test/**'
       - 'skills/**'
+      - 'examples/**'
       - 'scripts/**'
       - '.claude-plugin/**'
       - 'CLAUDE.md'
@@ -39,6 +40,7 @@ on:
     paths-ignore:
       - 'test/**'
       - 'skills/**'
+      - 'examples/**'
       - 'scripts/**'
       - '.claude-plugin/**'
       - 'CLAUDE.md'
