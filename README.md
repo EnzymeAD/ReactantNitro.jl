@@ -29,38 +29,10 @@ The design follows PyTorch Lightning, pointed at Reactant. Lux has a training lo
 Reactant-first stack also needs gradient accumulation, a phase system, schedules, and control over
 when XLA compiles.
 
-## What it takes care of
-
-Reactant and Enzyme are fast, but a Reactant-first stack has snags that are easy to hit and hard to
-diagnose: a compile that balloons for no visible reason, an edit that silently reuses a stale
-program, a run that dies out of memory hours in. These are the ones the framework handles for you.
-
-**Your dataset is never traced.** Fields are `Host` unless marked otherwise, and the trace sees a
-stripped view of the experiment. A dataset reachable from traced code is walked element by element
-on every compile.
-
-**Beyond code changes, only a `GraphConst` change recompiles.** `Host` values never reach the
-compiled program, and a `Device` value changes without a recompile unless its shape or element type
-changes. Sweeping a hyperparameter, scheduling a value, changing the learning rate and reseeding are
-all free.
-
-**Revising a method invalidates the programs built on it.** The compile key carries the resolved
-world age of every hook, and each cached program also records the transitive closure of the methods
-it was traced against, so editing a helper `forward` calls several levels down is caught too. A new
-`Nitro` recompiles against the current code; an existing handle keeps the programs it was built with
-and says so.
-
-**Device transfers happen at known times.** A scheduled `Device` value uploads once per step; a
-constant one uploads once, at the start of training.
-
-**Parameters are flattened into one buffer per parameter group.** The gradient accumulator and the
-optimizer state cross the program boundary as `NTuple{G}`, so the optimizer program emits G updates
-rather than one per parameter array. An unflattened tree makes that program grow with the model's
-array count, and the compile with it.
-
-**Device buffers are freed per batch.** Host GC pressure does not track device memory, so the host
-can stay comfortable while the device fills and the run dies out of memory. Each batch's buffers are
-released explicitly once the step that used them has read back.
+A Reactant-first stack also has snags that are easy to hit and hard to diagnose, and none of them
+raise: a compile that balloons for no visible reason, an edit that silently reuses a stale program,
+a run that dies out of memory hours in. The ones the framework handles for you are collected under
+[Pitfalls](https://enzymead.github.io/ReactantNitro.jl/dev/pitfalls/).
 
 ## The three field markers
 
@@ -307,6 +279,7 @@ recompiles, checkpoint and resume, the device boundary, visualization, export, a
 The full documentation lives at <https://enzymead.github.io/ReactantNitro.jl/>:
 
 - [Tutorial](https://enzymead.github.io/ReactantNitro.jl/dev/tutorial/): MNIST from configuration to prediction, end to end.
+- [Pitfalls](https://enzymead.github.io/ReactantNitro.jl/dev/pitfalls/): the Reactant-first snags the framework takes care of.
 - [Experiments](https://enzymead.github.io/ReactantNitro.jl/dev/experiments/): the hook contract, the three markers, and the Revise workflow.
 - [Recompilation](https://enzymead.github.io/ReactantNitro.jl/dev/recompilation/): the compile cache, and when a change costs a compile.
 - [Optimization](https://enzymead.github.io/ReactantNitro.jl/dev/optimization/): parameter groups, decay, and clipping.
