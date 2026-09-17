@@ -185,4 +185,8 @@ function __init__()
     return nothing
 end
 
+# LAST, after every name it drives is defined. The workload writes checkpoints, which is measurably
+# the slowest first-call path in a run.
+include("Precompile.jl")
+
 end # module
