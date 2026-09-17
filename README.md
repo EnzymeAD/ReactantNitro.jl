@@ -82,12 +82,14 @@ Four hooks are required. Everything else has a default: the optimizer (RAdam at 
 parameter group, no decay, no schedule, prefetching, validation, checkpointing, and a logging
 contract whose shipped default writes JSON Lines.
 
-Real MNIST, so the numbers at the end mean something. `MLDatasets` is not a dependency of this
-package; `] add MLDatasets` and it downloads the data on first use.
+Real MNIST, so the numbers at the end mean something. Neither `MLDatasets` nor `MLUtils` is a
+dependency of this package; `] add MLDatasets MLUtils` and the data downloads on first use.
+Batching and shuffling are `MLUtils`' job, deliberately: the framework ships neither.
 
 ```julia
 using ReactantNitro, Lux, Random
 using MLDatasets: MNIST
+using MLUtils: DataLoader
 
 # Explicit CPU, so the quick start runs anywhere. It has to come BEFORE the first `Nitro`: that
 # is where the XLA client initializes, and the backend is fixed for the process from then on.
@@ -105,16 +107,20 @@ ReactantNitro.build_model(e::MnistMLP, rng) = begin
 end
 
 function ReactantNitro.build_data(::MnistMLP, dist)
-    function batches(d, bs = 32)
+    function fields(d)
         x = reshape(d.features, 28 * 28, :)              # Float32, already in [0, 1]
         y = zeros(Float32, 10, length(d.targets))
         for (i, t) in pairs(d.targets)
             y[t + 1, i] = 1f0                            # targets are 0..9
         end
-        stop = bs * div(length(d.targets), bs)           # drop the short final batch
-        return [(; img = x[:, i:(i + bs - 1)], label = y[:, i:(i + bs - 1)]) for i in 1:bs:stop]
+        return (; img = x, label = y)                    # batch dimension LAST, always
     end
-    return (; train = batches(MNIST(split = :train)), val = batches(MNIST(split = :test)))
+    # `shuffle = true` reshuffles every epoch, and the framework drives this loader by index rather
+    # than iterating it, so one producer per thread fills the pipeline.
+    return (;
+        train = DataLoader(fields(MNIST(split = :train)); batchsize = 32, shuffle = true, partial = false),
+        val = DataLoader(fields(MNIST(split = :test)); batchsize = 32),
+    )
 end
 
 ReactantNitro.forward(::MnistMLP, model, ps, st; img) = Lux.apply(model, img, ps, st)

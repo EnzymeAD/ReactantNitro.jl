@@ -354,6 +354,15 @@ function _build_nitro(
     # Only `train` is wrapped, and the reason is that `run_eval` iterates its split directly and
     # never enters `batch_stream`, so a wrapped eval split would report a worker count nothing uses.
     collection = auto_prefetch(collection)
+    # AFTER the wrap, because the question is about the resolved pipeline and not about the source:
+    # a split the user declined with `NoPrefetch` runs its data path inline, consuming each batch
+    # before the next is built, so a loader option that a producer running ahead would break is
+    # perfectly safe there.
+    for nm in keys(collection)
+        split = getproperty(collection, nm)
+        prefetch_device_batches(split) == 0 && continue
+        check_source_options(prefetch_source(split), nm)
+    end
     training && warn_no_concurrency(collection.train)
 
     # The early-stopping setup checks, here because they need both the split collection and the

@@ -169,8 +169,19 @@ training and validation prefetch memory never coexist.
 Several producers need the index-addressable trait, `ReactantNitro.batch_at` and
 `ReactantNitro.begin_epoch!` on the source, because a sequential Julia iterator cannot be consumed by
 several tasks: the expensive work happens inside `iterate` and there is no way to ask for batch *k*
-without walking to it. A plain `MLUtils.DataLoader` implements neither, so setup says the data path
-runs in ONE producer task.
+without walking to it. **An `MLUtils.DataLoader` gets both for free**, from the extension that loads
+with MLUtils: it reads the loader's declaration (the data, the batch size, the RNG, whether to
+shuffle) and rebuilds each epoch's plan with MLUtils' own `shuffleobs` and `BatchView` rather than
+iterating it, so the loader above uses every thread with nothing asked of you. A source the framework
+does not know still runs in ONE producer task and says so at setup; implementing the two methods is
+the fix, and `ReactantNitro.check_batch_at` is what verifies an implementation before a run does.
+
+Two `DataLoader` options do not survive a prefetched pipeline and are checked at setup.
+`buffer = true` is refused: it reuses one batch through `getobs!`, and the framework holds several
+batches in flight, so the producer would overwrite one still queued for its device transfer.
+`parallel = true` warns: MLUtils' own worker threads are a second, uncoordinated fan-out, and its
+documentation notes that they break ordering guarantees, so a fixed seed stops reproducing a run
+bitwise.
 
 The binding report carries `prefetch_workers`, `prefetch_device_batches`, `prefetch_host_batches`
 and `prefetch_ordered`. The two batch counts are the pipeline's two buffers, one per side of the

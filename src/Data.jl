@@ -39,6 +39,24 @@ function check_data_source(source, name::Symbol)
 end
 
 """
+    ReactantNitro.check_source_options(source, name::Symbol) -> nothing
+
+A hook for options a source type can carry that a PREFETCHED pipeline cannot honour, checked at
+setup on every split the framework wrapped.
+
+The default does nothing, because the framework knows nothing about any particular loader's
+options. An extension for a loader it does know implements this; `ReactantNitroMLUtilsExt` refuses
+`MLUtils.DataLoader`'s `buffer = true`, whose one reused batch is silently overwritten while it is
+still queued for transfer, and warns on `parallel = true`, whose own thread pool breaks the ordered
+delivery this framework promises.
+
+**Separate from [`check_data_source`](@ref) and called later**, because it is a question about the
+resolved pipeline rather than about the source: an inline split consumes each batch before the next
+is built, so the aliasing that makes `buffer = true` dangerous does not arise there.
+"""
+check_source_options(source, name::Symbol) = nothing
+
+"""
     ReactantNitro.check_epoch_length(seen::Integer, expected::Integer, name::Symbol;
                                      horizon_dependent::Bool) -> nothing
 
@@ -358,9 +376,20 @@ end
 
 """
     ReactantNitro.batch_at(source, i::Integer) -> batch
+    ReactantNitro.batch_at(source, i::Integer, plan) -> batch
 
 **Optional, and half of the index-addressable opt-in.** Produce batch `i` of the current epoch,
 independently of every other `i`, from a task that may be one of many running concurrently.
+
+**Two shapes, and which one you write depends on where the epoch's plan lives.** A source that
+stores its own plan writes the two-argument form; a source that is an immutable *declaration* of a
+dataset, with nowhere to store one, has [`begin_epoch!`](@ref) return the plan and writes the
+three-argument form. `MLUtils.DataLoader` is the second kind, and the extension that supports it is
+two methods and no state.
+
+**Leave the third argument untyped.** The capability check asks whether a three-argument method
+accepts any plan at all, so annotating it with the plan's concrete type hides it and the source
+falls back to one producer.
 
 **`i` is a BATCH index in `1:length(source)`, not a sample offset.** That distinction is the single
 easiest way to corrupt a run with this trait: a loader whose own producer takes a sample offset needs
@@ -382,7 +411,9 @@ Requirements on the implementation:
   * **Thread-safe with respect to the source's shared state.** Per-task scratch (a shared-memory
     segment, an RNG, a mutable buffer) belongs in a `TaskLocalValue` or is allocated per call.
   * **A pure function of `i` and the epoch's plan.** Anything that re-plans the epoch belongs in
-    [`begin_epoch!`](@ref), which the framework calls exactly once before any `batch_at`.
+    [`begin_epoch!`](@ref), which the framework calls exactly once before any `batch_at`. The
+    three-argument form makes that literal: the plan arrives as an argument, so N workers read one
+    immutable object rather than racing on the source's fields.
   * **Never `nothing`** for `i` in `1:length(source)`. A loader whose sequential producer returns
     `nothing` at exhaustion must not forward that; the framework raises on it.
 
@@ -392,10 +423,16 @@ Define this **and** [`begin_epoch!`](@ref) to opt in. Defining only one is a del
 function batch_at end
 
 """
-    ReactantNitro.begin_epoch!(source) -> nothing
+    ReactantNitro.begin_epoch!(source) -> plan
 
 **Optional, and the other half of the index-addressable opt-in.** Re-plan the epoch. Called exactly
 once per epoch, on the training task, **before any job is dispatched** to any worker.
+
+**Return `nothing` if the source stores its own plan**, which is what every stateful loader does and
+what this returned before there was anything to return; the framework then calls the two-argument
+[`batch_at`](@ref). **Return the plan itself** if the source cannot store one, and the framework
+hands it back to every three-argument `batch_at` call for that epoch. The returned value is opaque:
+the framework holds it, passes it along, and drops it when the epoch ends.
 
 This is what `Base.iterate`'s initialization used to do, and the reason it cannot stay there: the
 fan-out never calls `iterate` on the source at all, so a source that re-plans in its iteration init
@@ -412,6 +449,14 @@ A source that genuinely needs no re-plan opts in with a one-liner:
 
 ```julia
 ReactantNitro.begin_epoch!(::MySource) = nothing
+```
+
+A source that is a declaration rather than a cursor returns its plan instead, and needs no mutable
+field at all:
+
+```julia
+ReactantNitro.begin_epoch!(d::MyLoader) = shuffled_index(d.rng, d.n)
+ReactantNitro.batch_at(d::MyLoader, i::Integer, plan) = _build_batch(d, plan, i)
 ```
 
 **Implement it once and call it from `Base.iterate` too**, so the two entry points cannot drift:
@@ -452,8 +497,17 @@ epoch_token(source) = nothing
 
 Whether `source` implements **both** halves of the index-addressable trait. Both, deliberately: see
 [`begin_epoch!`](@ref).
+
+Either [`batch_at`](@ref) shape satisfies the second half. **There is deliberately no generic
+three-argument forwarding method**, because one would make `hasmethod` answer `true` for every
+source alive and this check would stop meaning anything; the framework picks the shape at its one
+call site instead, on whether the plan came back `nothing`.
 """
-fanout_capable(source) = applicable(batch_at, source, 1) && applicable(begin_epoch!, source)
+fanout_capable(source) =
+    applicable(begin_epoch!, source) && (
+    applicable(batch_at, source, 1) ||
+        hasmethod(batch_at, Tuple{typeof(source), Integer, Any})
+)
 
 """
     ReactantNitro.default_prefetch_workers() -> Int
@@ -757,12 +811,20 @@ function check_batch_at(source; values::Bool = false)
         halves of the index-addressable trait, so there is nothing to check. It needs `batch_at` AND
         `begin_epoch!`."""
     )
+    # BEFORE the sequential pass, which matters for the two kinds of source in opposite ways. A
+    # source that stores its own plan returns `nothing` here and is then re-planned by `collect`'s
+    # own `iterate`, so the indexed pass below reads exactly the plan the sequential pass used,
+    # which is what this check compared before plans existed. A source that RETURNS its plan gets
+    # one drawn here while `collect` draws another, so `values = true` needs a deterministic
+    # source; the error below says so.
+    plan = begin_epoch!(source)
     seq = collect(source)
     n = length(source)
     length(seq) == n || error("ReactantNitro: `check_batch_at`: the sequential pass yielded \
         $(length(seq)) batches and `length` promised $n. Fix that before checking `batch_at`.")
     for i in 1:n
-        got = batch_at(source, i)
+        # The same call the fan-out makes, through the same dispatch, so what is checked is what runs.
+        got = planned_batch_at(source, i, plan)
         want = seq[i]
         got === nothing && error("ReactantNitro: `check_batch_at`: `batch_at(source, $i)` returned \
             `nothing`, and every index in `1:length(source)` must produce a batch.")
@@ -786,8 +848,10 @@ function check_batch_at(source; values::Bool = false)
                 The overwhelmingly likely cause is that `batch_at`'s index is being used as a SAMPLE
                 offset rather than a BATCH index: it must be
                 `_build_batch(dl, 1 + (i - 1) * batch_size)`, not `_build_batch(dl, i)`.
-                If this source's augmentation is stochastic, this check cannot be run with
-                `values = true`; run it on a deterministic split instead."""
+                If this source SHUFFLES or its augmentation is stochastic, this check cannot be run
+                with `values = true`: the sequential pass and the indexed pass each draw their own
+                plan, so the two disagree for a reason that is not a bug. Run it on a deterministic
+                split, or with `shuffle = false`."""
             )
         end
     end
@@ -938,7 +1002,12 @@ function fanout_stream(
     token_before = epoch_token(src)
     # BEFORE `length`, and before any job exists. A source whose plan changes its batch count is
     # correct only if the count is read after the re-plan.
-    begin_epoch!(src)
+    #
+    # `plan` is `nothing` for a source that stores its own, and the epoch's plan object for one that
+    # cannot. It is held here, for exactly this epoch, and handed to every worker: the framework
+    # owning it is what lets an immutable declaration like `MLUtils.DataLoader` fan out at all, and
+    # what keeps N workers reading one immutable object instead of racing on a source's fields.
+    plan = begin_epoch!(src)
     check_epoch_advanced(src, token_before)
     n = length(src)
     n > 0 || error("ReactantNitro: the training split reports `length == $n` after `begin_epoch!`; \
@@ -973,17 +1042,17 @@ function fanout_stream(
         close_quiet!(jobs)
     end
 
-    wtasks = [Threads.@spawn(prefetch_worker(src, jobs, hostch, marks)) for _ in 1:workers]
+    wtasks = [Threads.@spawn(prefetch_worker(src, plan, jobs, hostch, marks)) for _ in 1:workers]
     joiner = Threads.@spawn prefetch_joiner(coord, wtasks, hostch)
     xfer = Threads.@spawn prefetch_transfer(hostch, devch, prepare, ordered, credits)
 
     return PrefetchStream(devch, hostch, jobs, credits, [coord; wtasks; joiner; xfer], marks)
 end
 
-function prefetch_worker(src, jobs::Channel{Int}, hostch::Channel, marks::Vector{UInt8})
+function prefetch_worker(src, plan, jobs::Channel{Int}, hostch::Channel, marks::Vector{UInt8})
     try
         for i in jobs
-            b = batch_at(src, i)
+            b = planned_batch_at(src, i, plan)
             b === nothing && error(
                 """
                 ReactantNitro: `batch_at(source, $i)` returned `nothing`, and it must produce a batch
@@ -1005,6 +1074,20 @@ function prefetch_worker(src, jobs::Channel{Int}, hostch::Channel, marks::Vector
     end
     return nothing
 end
+
+"""
+    ReactantNitro.planned_batch_at(source, i, plan) -> batch
+
+The framework's single call site for [`batch_at`](@ref), and the only place the two shapes of it are
+told apart.
+
+`nothing` means the source stores its own plan, so the two-argument method is the one it wrote.
+Anything else is the plan [`begin_epoch!`](@ref) returned, which goes to the three-argument method.
+Keeping the choice here rather than in a forwarding method is what leaves
+[`fanout_capable`](@ref) able to detect a three-argument implementation at all.
+"""
+planned_batch_at(source, i::Integer, ::Nothing) = batch_at(source, i)
+planned_batch_at(source, i::Integer, plan) = batch_at(source, i, plan)
 
 # `bind` is deliberately not used anywhere in this pipeline: its `close_chnl_on_taskdone` returns
 # early while the channel `isready`, so error propagation would stall behind any buffered item. Every
