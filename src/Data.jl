@@ -39,22 +39,22 @@ function check_data_source(source, name::Symbol)
 end
 
 """
-    ReactantNitro.check_source_options(source, name::Symbol) -> nothing
+    ReactantNitro.check_source_options(source, name::Symbol, cfg) -> nothing
 
-A hook for options a source type can carry that a PREFETCHED pipeline cannot honour, checked at
-setup on every split the framework wrapped.
+A hook for options a source type can carry that the resolved pipeline cannot honour, checked at
+setup on every split that streams.
 
 The default does nothing, because the framework knows nothing about any particular loader's
-options. An extension for a loader it does know implements this; `ReactantNitroMLUtilsExt` refuses
-`MLUtils.DataLoader`'s `buffer = true`, whose one reused batch is silently overwritten while it is
-still queued for transfer, and warns on `parallel = true`, whose own thread pool breaks the ordered
-delivery this framework promises.
+options. An extension for a loader it does know implements this; `ReactantNitroMLUtilsExt` handles
+`MLUtils.DataLoader`.
 
-**Separate from [`check_data_source`](@ref) and called later**, because it is a question about the
-resolved pipeline rather than about the source: an inline split consumes each batch before the next
-is built, so the aliasing that makes `buffer = true` dangerous does not arise there.
+**`cfg` is the resolved [`prefetch_config`](@ref), and the check needs it**, because whether an
+option is dangerous, inert, or fine depends entirely on which path the split took. An option that
+lives inside a source's `Base.iterate` is live on the single-producer path, which iterates, and dead
+on the fan-out path, which asks for batch `i` and never iterates at all. Refusing such an option
+unconditionally would reject a configuration in which nothing can go wrong.
 """
-check_source_options(source, name::Symbol) = nothing
+check_source_options(source, name::Symbol, cfg) = nothing
 
 """
     ReactantNitro.check_epoch_length(seen::Integer, expected::Integer, name::Symbol;

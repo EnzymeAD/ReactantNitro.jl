@@ -360,8 +360,9 @@ function _build_nitro(
     # perfectly safe there.
     for nm in keys(collection)
         split = getproperty(collection, nm)
-        prefetch_device_batches(split) == 0 && continue
-        check_source_options(prefetch_source(split), nm)
+        cfg = prefetch_config(split)
+        cfg.path === :inline && continue
+        check_source_options(prefetch_source(split), nm, cfg)
     end
     training && warn_no_concurrency(collection.train)
 

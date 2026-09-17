@@ -39,9 +39,18 @@ program, a run that dies out of memory hours in. These are the ones the framewor
 stripped view of the experiment. A dataset reachable from traced code is walked element by element
 on every compile.
 
-**Only a `GraphConst` change recompiles.** `Host` values never reach the compiled program, and a
-`Device` value changes without a recompile unless its shape or element type changes. Sweeping a
-hyperparameter, scheduling a value, changing the learning rate and reseeding are all free.
+**Beyond code changes, only a `GraphConst` change recompiles.** `Host` values never reach the
+compiled program, and a `Device` value changes without a recompile unless its shape or element type
+changes. Sweeping a hyperparameter, scheduling a value, changing the learning rate and reseeding are
+all free.
+
+**Revising a method invalidates the programs built on it.** The compile key carries the resolved
+world age of every hook, and each cached program also records the transitive closure of the methods
+it was traced against, so editing a helper `forward` calls several levels down is caught too. A new
+`Nitro` recompiles against the current code; an existing handle keeps the programs it was built with
+and says so, because a handle that changed underneath a running loop would be worse. What neither
+guard sees is a value rather than a method: a redefined `const`, a global, or an edited literal,
+for which `ReactantNitro.cache_reset!()` is the escape hatch.
 
 **Device transfers happen at known times.** A scheduled `Device` value uploads once per step; a
 constant one uploads once, at the start of training.
@@ -167,12 +176,11 @@ correct out of 9984, not an average of 312 per-batch fractions.
 
 ## Built for the REPL and Revise
 
-Everything that decides which compiled program a `Nitro` runs is resolved at construction, so an
-edit never changes a running handle and a handle never recompiles underneath you. Edit a hook,
-build a new `Nitro`, and the module-level cache recompiles only what the edit changed; every entry
-point prints what it fixed and names any hook redefined since, so a stale handle is never silent.
-The one thing that changes on a live handle is a `Device` value, through `set_device!`, which
-provably recompiles nothing and is what makes an inference sweep one compile for the whole sweep.
+A `Nitro` is a fixed point: everything deciding which compiled program it runs is resolved at
+construction. Edit a hook, build a new handle, and the module-level cache recompiles only what the
+edit changed. Every entry point prints what it fixed and names any hook redefined since, so a stale
+handle is never silent. The one thing that does change on a live handle is a `Device` value, through
+`set_device!`, which provably recompiles nothing and makes an inference sweep one compile.
 
 Long runs leave the interactive thread. With a worker pool (`-t N,1`) the entry points run the loop
 on a worker and park your call, so the REPL and your logger tasks keep running; Ctrl+C then requests

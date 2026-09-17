@@ -73,38 +73,54 @@ would silently fall back to one producer.
 ReactantNitro.batch_at(dl::DataLoader, i::Integer, plan) = getobs(plan, i)
 
 """
-    ReactantNitro.check_source_options(dl::MLUtils.DataLoader, name::Symbol) -> nothing
+    ReactantNitro.check_source_options(dl::MLUtils.DataLoader, name::Symbol, cfg) -> nothing
 
-The two `DataLoader` options that do not survive a prefetched pipeline, checked at setup rather than
-discovered in a run's numbers.
+`buffer` and `parallel`, judged against the path the split actually resolved to.
 
-**`buffer = true` is refused.** It allocates one batch and reuses it through `getobs!`, so every
-batch the loader yields is the same memory. The framework holds several batches in flight at once,
-so the producer overwrites a batch that is still queued for its device transfer. That is silent
-corruption rather than an error, and it is invisible in a loss curve.
+**Both options live inside `DataLoader`'s `Base.iterate`**, and that is the whole of it. `parallel`
+selects which `iterate` method runs; `buffer` matters because the buffered `iterate` fills one
+shared batch through `getobs!`. The trait in this file drives the loader by index instead, through
+`getobs`, so on the FAN-OUT path neither option runs and neither can hurt anything. On the
+single-producer path the framework iterates the source, so both are live. `workers = 1` is not
+exotic: plain `julia` with no `-t` has one default thread and lands there.
 
-**`parallel = true` is a warning, not an error.** MLUtils runs its own worker threads, which is a
-second, uncoordinated fan-out, and its own documentation says it breaks ordering guarantees. That
-contradicts the framework's ordered delivery without either side being able to detect it. It stays
-legal because it is a real way to get host concurrency from a loader that has not opted into the
-trait, and because nothing about it is unsafe, only unreproducible.
+**`buffer = true` is refused on the single-producer path**, because the framework reads ahead: the
+loader would fill its one batch again while the previous one is still queued for its device
+transfer, leaving the queued batch holding the wrong samples. Nothing raises and the loss curve
+still looks plausible. On the fan-out path it is merely ignored, and said so, since someone who set
+it to bound allocation should not be left believing it did something.
+
+**`parallel = true` warns on the single-producer path** and is silent on the fan-out path. There it
+is ignored and the user gets what they asked for anyway, from this framework's producers, in the
+source's order. On the single-producer path it does run, and MLUtils documents that it breaks
+ordering guarantees, so a fixed seed stops reproducing a run bitwise.
 """
-function ReactantNitro.check_source_options(dl::DataLoader, name::Symbol)
+function ReactantNitro.check_source_options(dl::DataLoader, name::Symbol, cfg)
+    fanned = cfg.path === :fanout || cfg.path === :fanout_unordered
+    if fanned
+        dl.buffer === false || @warn """
+        ReactantNitro: the `$name` split is an `MLUtils.DataLoader` with `buffer = true`, which has \
+        NO EFFECT here. Buffering lives in the loader's `iterate`, and this split is driven by \
+        index instead, so every batch is freshly allocated. Drop `buffer`; to bound host memory, \
+        set `host_batches` on the split's `PrefetchIterator`.""" maxlog = 1
+        return nothing
+    end
     dl.buffer === false || error(
         """
-        ReactantNitro: the `$name` split is an `MLUtils.DataLoader` with `buffer = true`, which
-        cannot be prefetched. A buffered loader reuses ONE batch through `getobs!`, and this
-        framework keeps several batches in flight, so the producer overwrites a batch that has not
-        been transferred to the device yet. Nothing raises and the loss curve still looks plausible.
+        ReactantNitro: the `$name` split is an `MLUtils.DataLoader` with `buffer = true`, and it
+        resolved to ONE producer, which iterates the loader. A buffered loader reuses one batch
+        through `getobs!`, and this framework reads ahead, so the producer overwrites a batch that
+        has not been transferred to the device yet. Nothing raises and the loss curve still looks
+        plausible.
         Drop `buffer` (the default is `false`), or wrap the split in `NoPrefetch` to run its data
         path inline on the training task, where one batch is consumed before the next is built."""
     )
     dl.parallel && @warn """
-    ReactantNitro: the `$name` split is an `MLUtils.DataLoader` with `parallel = true`, which runs \
-    MLUtils' own worker threads underneath this framework's pipeline. MLUtils documents that it \
-    breaks ordering guarantees, so batches arrive in an order neither side controls and a fixed \
-    seed no longer reproduces a run bitwise, whatever `ordered` says.
-    Drop `parallel` to let the framework's fan-out supply the concurrency, which preserves the \
+    ReactantNitro: the `$name` split is an `MLUtils.DataLoader` with `parallel = true`, and it \
+    resolved to ONE producer, so MLUtils' own worker threads are what build its batches. MLUtils \
+    documents that they break ordering guarantees, so a fixed seed no longer reproduces a run \
+    bitwise, whatever `ordered` says.
+    Give the split more workers to use this framework's fan-out instead, which preserves the \
     source's order, or keep it and treat the run as unordered.""" maxlog = 1
     return nothing
 end

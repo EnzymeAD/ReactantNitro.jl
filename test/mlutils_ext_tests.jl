@@ -81,23 +81,47 @@
 
     # ── the two options a prefetched pipeline cannot honour ─────────────────────────
 
-    @testset "`buffer = true` is refused, because it aliases batches in flight" begin
-        err = try
-            check_source_options(ml_loader(; buffer = true), :train)
-        catch ex
-            ex
-        end
-        @test err isa ErrorException
-        @test occursin("buffer = true", err.msg)
-        @test occursin("NoPrefetch", err.msg)
-        # The safe case is silent.
-        @test check_source_options(ml_loader(), :train) === nothing
-    end
+    # Both options live inside `DataLoader`'s `iterate`, so whether they matter depends entirely on
+    # whether the resolved path iterates. The fan-out asks for batch `i` and never does.
+    @testset "the option checks are judged against the resolved path" begin
+        fanned = prefetch_config(PrefetchIterator(ml_loader(); workers = 4))
+        single = prefetch_config(PrefetchIterator(ml_loader(); workers = 1))
+        @test fanned.path === :fanout
+        @test single.path === :single
 
-    @testset "`parallel = true` warns about ordering rather than refusing" begin
-        @test_logs (:warn, r"breaks ordering guarantees") check_source_options(
-            ml_loader(; parallel = true), :train
-        )
+        @testset "`buffer = true` is refused when one producer iterates the loader" begin
+            err = try
+                check_source_options(ml_loader(; buffer = true), :train, single)
+            catch ex
+                ex
+            end
+            @test err isa ErrorException
+            @test occursin("buffer = true", err.msg)
+            @test occursin("NoPrefetch", err.msg)
+        end
+
+        # Refusing it here would reject a configuration in which nothing can go wrong: the buffered
+        # `iterate` never runs, so every batch is freshly allocated. It is still said out loud,
+        # because the user asked for something they are not getting.
+        @testset "`buffer = true` is ignored, and said so, when the split fans out" begin
+            @test_logs (:warn, r"NO EFFECT") check_source_options(
+                ml_loader(; buffer = true), :train, fanned
+            )
+        end
+
+        @testset "`parallel = true` warns only when it actually runs" begin
+            @test_logs (:warn, r"break ordering guarantees") check_source_options(
+                ml_loader(; parallel = true), :train, single
+            )
+            # Silent on the fan-out path: it is ignored, and the user gets this framework's
+            # producers instead, in the source's order, which is what they were asking for.
+            @test_logs check_source_options(ml_loader(; parallel = true), :train, fanned)
+        end
+
+        @testset "the default loader is silent on both paths" begin
+            @test_logs check_source_options(ml_loader(), :train, single)
+            @test_logs check_source_options(ml_loader(), :train, fanned)
+        end
     end
 
     # ── end to end ──────────────────────────────────────────────────────────────────
