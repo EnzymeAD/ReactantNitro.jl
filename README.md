@@ -131,23 +131,3 @@ train!(n)
 ```
 
 `examples/mnist_tutorial.jl` is the same task with everything turned on, as one runnable file; see the [Tutorial](https://enzymead.github.io/ReactantNitro.jl/dev/tutorial/)
-
-## Built for the REPL and Revise
-
-A `Nitro` is a fixed point: everything deciding which compiled program it runs is resolved at
-construction. Edit a hook, build a new handle, and the module-level cache recompiles only what the
-edit changed. Every entry point prints what it fixed and names any hook redefined since, so a stale
-handle is never silent. The one thing that does change on a live handle is a `Device` value, through
-`set_device!`, which provably recompiles nothing and makes an inference sweep one compile.
-
-Long runs leave the interactive thread. With a worker pool (`-t N,1`) the entry points run the loop
-on a worker and park your call, so the REPL and your logger tasks keep running; Ctrl+C then requests
-a graceful stop rather than tearing the run down.
-
-## The automatic loop and the lifecycle
-
-`train!` sequences the forwards, the backwards, the optimizer steps, and the metrics, and wraps the
-run in a lifecycle with monitorable phases (`Starting`, `Compiling`, `Stepping`, `Checkpointing`,
-`Terminal`, `Done`, `Failed`), `request_stop!` for graceful interruption, and a progress counter.
-Every split is wrapped in a `PrefetchIterator` automatically, so the next batch's host-to-device
-transfer overlaps the current step, and each stream lives only for the phase that uses it.
