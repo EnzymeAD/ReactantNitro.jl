@@ -85,5 +85,9 @@ The package is meant to be driven from a REPL with Revise loaded. The rules are 
 - [Recompilation](recompilation.md): the compile cache and when a change costs a compile.
 - [Optimization](optimization.md): parameter groups, decay, and clipping.
 - [Schedules](schedules.md): what varies with the step.
+- [Metrics](metrics.md): `(sum, count)` pairs, host or device residency, and `finalize_metrics`.
+- [Manual training](manual.md): owning the optimizer step, GANs and beyond.
+- [Logging](logging.md): the ten verbs, the JSON default, and the TensorBoard extension.
+- [Export](export.md): the wire contract and the ReactantServer bundle.
 - [Kaimon](kaimon.md): driving runs from a Kaimon-hosted session, the `nitro_*` tools.
 - The [API](api.md): the docstrings, collected automatically.
