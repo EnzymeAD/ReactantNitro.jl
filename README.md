@@ -31,8 +31,9 @@ when XLA compiles.
 
 ## What it takes care of
 
-Reactant and Enzyme are fast. These are the common ways that speed is lost, and what the framework
-does about each.
+Reactant and Enzyme are fast, but a Reactant-first stack has snags that are easy to hit and hard to
+diagnose: a compile that balloons for no visible reason, an edit that silently reuses a stale
+program, a run that dies out of memory hours in. These are the ones the framework handles for you.
 
 **Your dataset is never traced.** Fields are `Host` unless marked otherwise, and the trace sees a
 stripped view of the experiment. A dataset reachable from traced code is walked element by element
