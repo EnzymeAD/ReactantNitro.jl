@@ -475,7 +475,17 @@ function _train!(nitro::Nitro)
             # transfer task, and the same channel. The `finally` is not optional: `request_stop!`, a
             # non-finite loss, and any error mid-epoch all leave the loop with a full channel behind
             # it, and closing it is what stops the producers.
-            stream = batch_stream(nitro.data.train, nitro.routing, nitro.mesh)
+            # PLANNING IS ITS OWN STRETCH, because it is not free and nothing else covers it.
+            # `"planning"` and not `"planning epoch"`: the reporter builds a bar's description as
+            # `"$label epoch $epoch/$max_epochs"`, so the longer label reads "planning epoch epoch
+            # 1/5".
+            # `batch_stream` starts with `begin_epoch!`, which re-plans the epoch, and for a source
+            # backed by a sampler or a server that is a round trip rather than a shuffle. It ran
+            # here with no bar open at all, so a slow re-plan was a stall between two bars with
+            # nothing on screen to name it.
+            stream = with_progress_stretch("planning", 0, nitro.epoch, nitro.max_epochs) do
+                batch_stream(nitro.data.train, nitro.routing, nitro.mesh)
+            end
             # One bar per EPOCH, not per run: "steps left in this epoch" is the number a person
             # watching a run actually wants, and the epoch position goes in the label as text.
             # `div` is exact here because setup checked `length(train) % accum == 0` to resolve the
@@ -620,6 +630,14 @@ function _train!(nitro::Nitro)
                 # been counted and the bar sits full while the producers stop.
                 progress_phase!("closing data stream")
                 close_stream!(stream)
+                # AND TAKEN BACK OFF, which matters more here than anywhere else the phase is used.
+                # `progress_end!` cannot erase it: closing a bar that already reached its total is
+                # a no-op by design, so the last frame drawn stays on the terminal until something
+                # else draws. A label left set is therefore still on screen through everything
+                # between here and the next stretch, and on this path that is the validation pass's
+                # setup and `report_data_wait!`, whose `log_metrics!` is a network round trip on a
+                # hosted logger. The phase would get the blame for it.
+                progress_phase!("")
                 # In the `finally` with the stream: a non-finite loss, a `request_stop!`, and an
                 # error all leave the epoch early, and a bar left open would sit on the terminal
                 # underneath whatever the run printed next.
@@ -644,7 +662,7 @@ function _train!(nitro::Nitro)
                 context = "validate"
             )
             set_phase!(nitro, Checkpointing())
-            save_checkpoint_reported!(nitro, "checkpoint", nitro.epoch, metrics_out)
+            save_checkpoint_reported!(nitro, nitro.epoch, metrics_out)
             wrote_epoch = true
 
             # Both stopping routes set the same flag and are checked once per epoch, AFTER
@@ -690,10 +708,11 @@ function _train!(nitro::Nitro)
     # dropping that epoch out of the top-K ranking. Silent, on the default path, and it needs only a
     # second `train!` in the same directory. There is nothing of this call's to rewrite when this
     # call wrote nothing; the record already carries the outcome of the process that did.
-    # LABELLED APART from the per-epoch writes, because it immediately follows the last one and
-    # two identical `checkpoint` stretches back to back read as a stutter rather than as the two
-    # different writes they are: the epoch's own, and this rewrite carrying the final metrics.
-    wrote_epoch && save_checkpoint_reported!(nitro, "final checkpoint", nitro.epoch, last_metrics)
+    # REPORTED AS A `checkpoint` LIKE ANY OTHER, though it follows the last epoch's own write
+    # immediately. Two of them back to back do read as a stutter, but naming this one apart was
+    # granularity for its own sake: a watcher has nothing to do differently about which of the two
+    # writes is in flight.
+    wrote_epoch && save_checkpoint_reported!(nitro, nitro.epoch, last_metrics)
     # `Done` for both stopping routes: exiting through the normal Done path is what makes an early
     # stop a finished run rather than a failure. `stop_reason` is where the difference lives, and
     # the checkpoint record keeps it, since "completed 40/40" and "stopped at 37 on patience" are
@@ -785,7 +804,14 @@ function _train_manual!(nitro::Nitro)
             # Per-epoch host-wait accounting, identical to the automatic loop.
             t_wait = 0.0
             t_step = 0.0
-            stream = batch_stream(nitro.data.train, nitro.routing, nitro.mesh)
+            # PLANNING IS ITS OWN STRETCH, because it is not free and nothing else covers it.
+            # `batch_stream` starts with `begin_epoch!`, which re-plans the epoch, and for a source
+            # backed by a sampler or a server that is a round trip rather than a shuffle. It ran
+            # here with no bar open at all, so a slow re-plan was a stall between two bars with
+            # nothing on screen to name it.
+            stream = with_progress_stretch("planning", 0, nitro.epoch, nitro.max_epochs) do
+                batch_stream(nitro.data.train, nitro.routing, nitro.mesh)
+            end
             # One bar per EPOCH, not per run: "steps left in this epoch" is the number a person
             # watching a run actually wants, and the epoch position goes in the label as text.
             # `div` is exact here because setup checked `length(train) % accum == 0` to resolve the
@@ -861,6 +887,14 @@ function _train_manual!(nitro::Nitro)
                 # been counted and the bar sits full while the producers stop.
                 progress_phase!("closing data stream")
                 close_stream!(stream)
+                # AND TAKEN BACK OFF, which matters more here than anywhere else the phase is used.
+                # `progress_end!` cannot erase it: closing a bar that already reached its total is
+                # a no-op by design, so the last frame drawn stays on the terminal until something
+                # else draws. A label left set is therefore still on screen through everything
+                # between here and the next stretch, and on this path that is the validation pass's
+                # setup and `report_data_wait!`, whose `log_metrics!` is a network round trip on a
+                # hosted logger. The phase would get the blame for it.
+                progress_phase!("")
                 # In the `finally` with the stream: a non-finite loss, a `request_stop!`, and an
                 # error all leave the epoch early, and a bar left open would sit on the terminal
                 # underneath whatever the run printed next.
@@ -885,7 +919,7 @@ function _train_manual!(nitro::Nitro)
                 context = "validate"
             )
             set_phase!(nitro, Checkpointing())
-            save_checkpoint_reported!(nitro, "checkpoint", nitro.epoch, metrics_out)
+            save_checkpoint_reported!(nitro, nitro.epoch, metrics_out)
             wrote_epoch = true
 
             stopped = should_stop(nitro.early_stop, nitro.epoch, metrics_out)
@@ -913,10 +947,11 @@ function _train_manual!(nitro::Nitro)
     nitro.stop_reason === nothing && (nitro.stop_reason = :completed)
     # The final rewrite, identical to the automatic loop: the last epoch's record is rewritten
     # once the outcome is known, gated on this call having written an epoch at all.
-    # LABELLED APART from the per-epoch writes, because it immediately follows the last one and
-    # two identical `checkpoint` stretches back to back read as a stutter rather than as the two
-    # different writes they are: the epoch's own, and this rewrite carrying the final metrics.
-    wrote_epoch && save_checkpoint_reported!(nitro, "final checkpoint", nitro.epoch, last_metrics)
+    # REPORTED AS A `checkpoint` LIKE ANY OTHER, though it follows the last epoch's own write
+    # immediately. Two of them back to back do read as a stutter, but naming this one apart was
+    # granularity for its own sake: a watcher has nothing to do differently about which of the two
+    # writes is in flight.
+    wrote_epoch && save_checkpoint_reported!(nitro, nitro.epoch, last_metrics)
     nitro.elapsed = time() - t_started
     # The last stretch of this entry point is over, so a reporter reusing one terminal line can
     # close it. Per entry point, not per epoch: an epoch is followed by a validation pass and then
@@ -1144,7 +1179,7 @@ function finite_only(metrics::NamedTuple)
 end
 
 """
-    ReactantNitro.save_checkpoint_reported!(nitro, label, epoch, metrics) -> nothing
+    ReactantNitro.save_checkpoint_reported!(nitro, epoch, metrics) -> nothing
 
 [`save_checkpoint!`](@ref) as one REPORTED stretch of work, so a progress reporter can say that a
 checkpoint is being written.
@@ -1158,11 +1193,17 @@ otherwise looks exactly like an epoch that finished and then hung.
 no-op, and a stretch announcing a write that never happens is worse than no stretch: it puts a bar
 on the terminal, and an open/close pair into the event stream, for a run with checkpointing
 switched off.
+
+**ONE LABEL FOR EVERY WRITE, which is why this takes no `label` argument.** The rewrite after the
+loop was briefly distinguished from the per-epoch writes, on the grounds that two identical
+stretches back to back read as a stutter. They do, but a watcher has nothing to do differently
+about which write is in flight, and a second name for the same operation is granularity nobody
+asked the display for.
 """
-function save_checkpoint_reported!(nitro::Nitro, label::AbstractString, epoch, metrics)
+function save_checkpoint_reported!(nitro::Nitro, epoch, metrics)
     write() = save_checkpoint!(nitro.checkpointer, epoch, metrics, snapshot(nitro))
     nitro.checkpointer === nothing && return write()
-    return with_progress_stretch(write, label, 0, epoch, nitro.max_epochs)
+    return with_progress_stretch(write, "checkpoint", 0, epoch, nitro.max_epochs)
 end
 
 """
@@ -1755,16 +1796,28 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
     set_phase!(nitro, EvalStepping())
     # The eval bar counts BATCHES, which is what `note_progress!` bumps here, and carries the split
     # name so a validation pass inside a training run is distinguishable from the epoch it sits in.
+    # PLANNED FIRST, THEN COUNTED, THEN THE BAR. The order used to be the other way round and both
+    # halves of that were wrong.
+    #
+    # `eval_stream` starts with `begin_epoch!`, which re-plans the split, and on a source backed by
+    # a sampler or a server that is a round trip. Under the old order it ran with the pass's bar
+    # already open and sitting at zero with no phase on it, so a slow re-plan looked exactly like a
+    # validation pass that had hung before its first batch.
+    #
+    # And the COUNT was read before the re-plan, which `fanout_stream` explicitly refuses to do:
+    # a source whose plan changes its batch count is only counted correctly afterwards. Training
+    # already planned before it counted; this is validation doing the same.
+    # Built here and closed in the `finally` below. The producers, their channels and every
+    # buffered batch therefore exist only for the duration of this pass, which is the same lifetime
+    # the training loop gives its own stream: `train!` closes the epoch's stream before it calls
+    # this, so training prefetch memory and evaluation prefetch memory never coexist.
+    stream = with_progress_stretch("planning", 0, nitro.epoch, nitro.max_epochs) do
+        eval_stream(getproperty(nitro.data, split), xfer, nitro.batch_size, nitro.mesh)
+    end
     progress_begin!(
         String(split), _split_length(getproperty(nitro.data, split)),
         nitro.epoch, nitro.max_epochs
     )
-    # BUILT HERE, WHEN THE PHASE STARTS, and closed in the `finally` below. The producers, their
-    # channels and every buffered batch therefore exist only for the duration of this pass, which is
-    # the same lifetime the training loop gives its own stream: `train!` closes the epoch's stream
-    # before it calls this, so training prefetch memory and evaluation prefetch memory never
-    # coexist.
-    stream = eval_stream(getproperty(nitro.data, split), xfer, nitro.batch_size, nitro.mesh)
     try
         for (idx, (batch, b)) in enumerate(stream)
             # `honor_stop`: the standalone eval entry points stop the split at its next batch
@@ -1828,6 +1881,9 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
         # teardown, since the reporter ignores a phase label it is already showing.
         progress_phase!("closing data stream")
         close_stream!(stream)
+        # Taken back off: `progress_end!` below cannot erase it, since closing a bar that reached
+        # its total is a no-op and the last frame drawn stays up until something else draws.
+        progress_phase!("")
     end
     progress_end!()
     # A STRETCH, not a `:phase`, and it has to be: the pass's bar closed on the line above, and a

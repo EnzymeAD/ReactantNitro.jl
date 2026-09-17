@@ -1302,21 +1302,31 @@ function progress_bar_reporter(
             ProgressMeter.Progress(total; desc, output = stderr, enabled = on) :
             ProgressMeter.ProgressUnknown(; desc, output = stderr, enabled = on)
         _BAR[] = p
-        # AN OPENING FRAME, forced, because neither ProgressMeter constructor draws one: a bar
-        # first appears on its first `next!`. For a stretch that emits no units at all, which is
-        # what a checkpoint write is, that means it never appears, and the terminal holds the
-        # PREVIOUS stretch's finished bar for the length of the write. Forcing it here is also
-        # what puts an epoch's bar up before its first batch rather than after.
-        ProgressMeter.update!(p, p.counter; keep = false)
+        # AN OPENING FRAME, and `force = true` IS WHAT MAKES IT ONE. Neither ProgressMeter
+        # constructor draws, so a bar first appears on its first `next!`; a stretch that emits no
+        # units at all therefore never appears by itself. That much was known. What was missed is
+        # that `update!` alone does not draw either: `_updateProgress!` returns early unless
+        # `force || t > p.tlast + p.dt`, and on a bar constructed microseconds ago `t` is not past
+        # `tlast + dt`, so the opening frame was silently throttled away.
+        #
+        # The consequence was the whole point of these stretches going missing. A checkpoint opens
+        # its bar, nothing draws, JLD2 blocks for seconds with no further update, and `finish!`
+        # then bails on its own `if p.printed` because nothing ever printed. `planning epoch`,
+        # `finalize metrics` and `checkpoint` were all invisible in a real terminal, which is
+        # exactly the work these were added to make visible.
+        ProgressMeter.update!(p, p.counter; keep = false, force = true)
     elseif verb === :phase
         p = _BAR[]
         p === nothing && return nothing
         want = isempty(label) ? _BAR_DESC[] : _BAR_DESC[] * "[" * label * "] "
         p.core.desc == want && return nothing
         p.core.desc = want
-        # FORCED REDRAW. Nothing else will do it: a compile emits no `next!`, so without this the
-        # new description would first appear on the step AFTER the compile everyone was waiting on.
-        ProgressMeter.update!(p, p.counter; keep = false)
+        # FORCED REDRAW, and `force = true` is load-bearing for the same reason it is on `:begin`.
+        # Nothing else will draw this: a compile emits no `next!`, so without a frame here the new
+        # description would first appear on the step AFTER the compile everyone was waiting on, and
+        # without `force` the frame is thrown away whenever the phase changes within `dt` of the
+        # last one, which is precisely the case of a phase entered immediately after a step.
+        ProgressMeter.update!(p, p.counter; keep = false, force = true)
     elseif verb === :step
         p = _BAR[]
         # `keep = false` on EVERY update, not only the last. `finish!` is a no-op once the counter

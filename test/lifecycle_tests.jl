@@ -645,14 +645,19 @@
         end
 
         begins = [e for e in events if e[1] === :begin]
-        # Two epochs, each a training stretch, then a validation stretch over the `val` split, then
-        # the metric reduction. That last one is UNCOUNTED (`total = 0`) and everything it covers
-        # runs after the validation bar has closed: `reduce_metrics` folds the accumulator and
-        # `finalize_metrics` is user code, so without a stretch of its own it is a silent stall
-        # between the last batch and the checkpoint.
+        # Two epochs, and each split is PLANNED before it is counted: `begin_epoch!` runs inside
+        # stream construction, and on a source that re-plans against a sampler or a server that is
+        # not free. It gets an uncounted stretch of its own on both sides, which is also what puts
+        # the bar's total on the right side of the re-plan.
+        #
+        # The metric reduction is likewise uncounted and likewise covers work that used to be
+        # silent: `reduce_metrics` folds the accumulator and `finalize_metrics` is user code, both
+        # after the validation bar has closed.
         @test [(e[2], e[3], e[4], e[5]) for e in begins] == [
-            ("train", 4, 1, 2), ("val", 2, 1, 2), ("finalize metrics", 0, 1, 2),
-            ("train", 4, 2, 2), ("val", 2, 2, 2), ("finalize metrics", 0, 2, 2),
+            ("planning", 0, 1, 2), ("train", 4, 1, 2),
+            ("planning", 0, 1, 2), ("val", 2, 1, 2), ("finalize metrics", 0, 1, 2),
+            ("planning", 0, 2, 2), ("train", 4, 2, 2),
+            ("planning", 0, 2, 2), ("val", 2, 2, 2), ("finalize metrics", 0, 2, 2),
         ]
         # Every stretch closes. An unbalanced pair is a bar left on someone's terminal.
         @test count(e -> e[1] === :end, events) == length(begins)
@@ -704,11 +709,11 @@
         end
 
         begins = [e for e in events if e[1] === :begin]
-        # One per epoch, carrying the epoch it belongs to, plus the final rewrite. The rewrite is
-        # LABELLED APART: it lands immediately after the last epoch's own write, and two identical
-        # stretches back to back read as a stutter rather than as two different writes.
+        # One per epoch, carrying the epoch it belongs to, plus the rewrite after the loop. ONE
+        # LABEL for all three: the rewrite lands immediately after the last epoch's own write, and
+        # naming it apart was granularity a watcher has nothing to do with.
         @test [(e[2], e[4], e[5]) for e in begins if occursin("checkpoint", e[2])] ==
-            [("checkpoint", 1, 2), ("checkpoint", 2, 2), ("final checkpoint", 2, 2)]
+            [("checkpoint", 1, 2), ("checkpoint", 2, 2), ("checkpoint", 2, 2)]
         # UNKNOWN LENGTH, never a count. A write emits no units, and claiming a total the stretch
         # will never reach leaves a bar stuck short of its own end.
         @test all(e -> e[3] == 0, [e for e in begins if occursin("checkpoint", e[2])])
