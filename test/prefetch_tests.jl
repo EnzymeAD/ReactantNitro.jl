@@ -14,8 +14,8 @@
     using ReactantNitro
     using ReactantNitro: PrefetchStream, auto_prefetch, batch_stream, check_batch_at,
         check_prefetch_delivery, close_stream!, default_prefetch_workers, epoch_token, fanout_capable,
-        free_batch!, prefetch_config, prefetch_depth, prefetch_source, prefetch_workers, routed_fields,
-        to_device_batch
+        free_batch!, materialized_source, prefetch_config, prefetch_depth, prefetch_ordered,
+        prefetch_source, prefetch_workers, routed_fields, to_device_batch
     using Functors, Lux, Optimisers, Random, Reactant, Statistics
 
     const PF = Float32
@@ -79,6 +79,13 @@
         @test default_prefetch_workers() == max(1, Threads.nthreads(:default))
         @test PrefetchIterator(src, 2; workers = 5).workers == 5
         @test prefetch_workers(src) == 0
+        # Ordered delivery is the DEFAULT, and the opt-out is explicit. That default is what makes
+        # adopting the index-addressable trait free: it changes a run's throughput and nothing else.
+        @test PrefetchIterator(src).ordered
+        @test prefetch_ordered(PrefetchIterator(src; ordered = false)) == false
+        # Everything that is not a `PrefetchIterator` delivers in the source's order anyway.
+        @test prefetch_ordered(src)
+        @test prefetch_ordered(NoPrefetch(src))
 
         @testset "a depth of 0 RAISES and names the marker, rather than meaning `off`" begin
             # The whole point of the rule: running the host data path inline on the training task is
@@ -304,6 +311,24 @@
     ReactantNitro.epoch_token(::StuckTokenSource) = 0
     ReactantNitro.batch_at(s::StuckTokenSource, i::Integer) = s.batches[i]
 
+    # A trait source whose `batch_at` is deliberately slowest on the FIRST index. That skew is what
+    # makes the two delivery modes distinguishable: with several workers, batch 1 is still being built
+    # while 2..N are finished, so an unordered stream emits those first and an ordered one may not.
+    mutable struct SkewedSource
+        batches::Vector{Any}
+        epochs::Int
+    end
+    SkewedSource(b) = SkewedSource(collect(b), 0)
+    Base.length(s::SkewedSource) = length(s.batches)
+    Base.iterate(s::SkewedSource, i::Int = 1) =
+        i > length(s.batches) ? nothing : (s.batches[i], i + 1)
+    ReactantNitro.begin_epoch!(s::SkewedSource) = (s.epochs += 1; nothing)
+    ReactantNitro.epoch_token(s::SkewedSource) = s.epochs
+    function ReactantNitro.batch_at(s::SkewedSource, i::Integer)
+        i == 1 && sleep(0.25)
+        return s.batches[i]
+    end
+
     const PF_MANY = pf_batches(16; seed = 21)
 
     # Every test that could hang is run under a watchdog, per this file's header: a hang must FAIL the
@@ -337,12 +362,88 @@
 
         @testset "`prefetch_config` reports the RESOLVED path, not the requested one" begin
             @test prefetch_config(PrefetchIterator(IndexedSource(PF_MANY), 2; workers = 4)) ==
-                (; depth = 2, workers = 4, path = :fanout)
+                (; depth = 2, workers = 4, ordered = true, path = :fanout)
+            # The opt-out is a different resolved path, so the report and the warning can tell the
+            # two apart without carrying the flag around separately.
+            @test prefetch_config(
+                PrefetchIterator(IndexedSource(PF_MANY), 2; workers = 4, ordered = false)
+            ) == (; depth = 2, workers = 4, ordered = false, path = :fanout_unordered)
             # Asked for 4, got 1, and the label says which case it is so the setup warning can differ.
             @test prefetch_config(PrefetchIterator(HalfTraitSource(collect(PF_MANY)); workers = 4)) ==
-                (; depth = 1, workers = 1, path = :single_no_trait)
+                (; depth = 1, workers = 1, ordered = true, path = :single_no_trait)
             @test prefetch_config(PrefetchIterator(IndexedSource(PF_MANY); workers = 1)).path === :single
             @test prefetch_config(PF_MANY).path === :inline   # unwrapped: no stream at all
+        end
+
+        # The false positive this path exists to remove. A `Vector` of batches `build_data` already
+        # built has no host work for N producers to spread, so resolving to one producer is the right
+        # answer and saying so as a warning would teach people to ignore the real one.
+        @testset "a materialized `Vector` source resolves to its own path, not to a complaint" begin
+            @test prefetch_config(PrefetchIterator(PF_MANY; workers = 8)) ==
+                (; depth = 1, workers = 1, ordered = true, path = :materialized)
+            @test ReactantNitro.materialized_source(PF_MANY)
+            # Narrow on purpose: a custom `AbstractVector` can compute in `getindex`, so it is not
+            # covered and still hears the warning.
+            @test !ReactantNitro.materialized_source(HalfTraitSource(collect(PF_MANY)))
+            @test !ReactantNitro.materialized_source(IndexedSource(PF_MANY))
+            # It decides the WARNING only. A `Vector` that implements the trait still fans out.
+            @test prefetch_config(PrefetchIterator(IndexedSource(PF_MANY); workers = 4)).path === :fanout
+        end
+    end
+
+    # ── delivery order, which is what makes the trait free to adopt ─────────────────────
+    #
+    # The reorder buffer is the whole point: before it, opting into `batch_at` changed a run's
+    # trajectory, because reordering repartitions the epoch into different accumulation groups and a
+    # fixed seed no longer reproduced bitwise. That made the one real throughput knob something a
+    # user had to trade reproducibility for. Ordered delivery is now the default and the trade is
+    # explicit.
+    @testset "ordered fan-out delivers the SOURCE's order, whatever the workers do" begin
+        n = Nitro(PrefetchMLP(); run_dir = mktempdir(), data = (; train = PF_TRAIN, val = PF_VAL))
+
+        # The skew guarantees the workers FINISH out of order: index 1 sleeps while 2, 3 and 4 are
+        # already done. An ordered stream must still emit 1 first. This is a one-directional
+        # assertion and therefore not a timing test: ordered order is the source's order regardless
+        # of who finished when.
+        @testset "with a source whose first batch is the slowest" begin
+            src = SkewedSource(PF_MANY)
+            split = PrefetchIterator(src, 2; workers = 4)
+            @test prefetch_config(split).path === :fanout
+            ok, res, t = pf_await() do
+                collect(batch_stream(split, n.routing))
+            end
+            @test ok                                        # false here means it hung
+            @test res isa Vector
+            @test [h for (h, _) in res] == collect(PF_MANY)
+            wait(t)
+        end
+
+        # The credit window is `2 x workers`, so this exercises the branch where the whole epoch is
+        # smaller than the window and the coordinator takes fewer credits than the channel holds.
+        @testset "an epoch shorter than the credit window still completes" begin
+            src = SkewedSource(PF_TRAIN)
+            ok, res, t = pf_await() do
+                collect(batch_stream(PrefetchIterator(src, 2; workers = 8), n.routing))
+            end
+            @test ok
+            @test [h for (h, _) in res] == collect(PF_TRAIN)
+            wait(t)
+        end
+
+        # The opt-out. Deliberately NOT asserting that the order differs: that would be a timing
+        # assertion and the kind of flake this file is written to avoid. What must hold either way is
+        # the invariant the ledger checks, that every batch is delivered exactly once.
+        @testset "the unordered opt-out still delivers every batch exactly once" begin
+            src = SkewedSource(PF_MANY)
+            split = PrefetchIterator(src, 2; workers = 4, ordered = false)
+            @test prefetch_config(split).path === :fanout_unordered
+            ok, res, t = pf_await() do
+                collect(batch_stream(split, n.routing))
+            end
+            @test ok
+            @test length(res) == length(PF_MANY)
+            @test sort([findfirst(==(h), collect(PF_MANY)) for (h, _) in res]) == collect(1:length(PF_MANY))
+            wait(t)
         end
     end
 
@@ -550,6 +651,22 @@
             @test Array(a) == Array(b)
         end
         @test validate(pref).val_loss == validate(plain).val_loss
+
+        # THE PAYOFF OF ORDERED DELIVERY, and the assertion the reorder buffer exists for. A source
+        # that DOES implement the trait, fanned out over four workers, must reach the same weights
+        # as the single-producer run. Before ordered delivery this was false by design: the fan-out
+        # delivered as workers finished, which repartitions the epoch into different accumulation
+        # groups, so opting into `batch_at` cost bitwise reproducibility. Adopting the trait now
+        # changes throughput and nothing else.
+        fanned = train!(
+            PrefetchMLP(); run_dir = mktempdir(),
+            data = (; train = PrefetchIterator(SkewedSource(PF_TRAIN), 2; workers = 4), val = PF_VAL)
+        )
+        @test current_step(fanned) == current_step(plain)
+        for (a, b) in zip(Functors.fleaves(parameters(plain)), Functors.fleaves(parameters(fanned)))
+            @test Array(a) == Array(b)
+        end
+        @test validate(fanned).val_loss == validate(plain).val_loss
 
         @testset "and the data-source contract still names the source, through the wrapper" begin
             # `check_data_source` is given `prefetch_source`, so a bad loader is reported as itself

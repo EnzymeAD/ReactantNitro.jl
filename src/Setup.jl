@@ -448,10 +448,10 @@ function _build_nitro(
     # derives from `Threads.nthreads(:default)`, so two runs of byte-identical code at different `-t`
     # get a different partition of each epoch into accumulation groups. A reader comparing two runs
     # needs the number, and the process's thread count is already logged separately by the backend.
-    pf = training ? prefetch_config(collection.train) : (; depth = 0, workers = 0)
+    pf = training ? prefetch_config(collection.train) : (; depth = 0, workers = 0, ordered = true)
     cfg = config_params(
         e; seed, accum, max_epochs, gradient_clip_norm,
-        prefetch_workers = pf.workers, prefetch_depth = pf.depth
+        prefetch_workers = pf.workers, prefetch_depth = pf.depth, prefetch_ordered = pf.ordered
     )
     log_params!(logger, preset === nothing ? cfg : merge(cfg, (; preset)))
 
@@ -535,6 +535,12 @@ A **warning rather than an error**, in all three cases. A single producer trains
 sources genuinely cannot be indexed, and `NoPrefetch` is a legitimate choice; erroring would refuse to
 run a correct configuration on a performance opinion. The binding report carries the same fact
 without the severity, for the runs where it is expected.
+
+**Three of the six resolved paths say nothing here, and their silence is deliberate.** `:fanout` and
+`:fanout_unordered` are the good cases. `:materialized` is a `Vector` whose batches `build_data`
+already built: producing one is a pointer load, so there is no host work for N producers to spread,
+and warning about a several-fold slowdown that cannot occur would be the false positive that teaches
+people to ignore the real one.
 """
 function warn_no_concurrency(train_split)
     cfg = prefetch_config(train_split)

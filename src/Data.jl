@@ -473,7 +473,7 @@ default_prefetch_workers() = max(1, Threads.nthreads(:default))
 const DEFAULT_PREFETCH_DEPTH = 1
 
 """
-    ReactantNitro.PrefetchIterator(source, depth = 1; workers = default_prefetch_workers())
+    ReactantNitro.PrefetchIterator(source, depth = 1; workers = default_prefetch_workers(), ordered = true)
 
 Prefetch: `workers` producer tasks building **host** batches, one transfer task performing the H2D
 copy, and a `Channel` of `depth` `(host, device)` pairs feeding the training loop. This is what
@@ -502,11 +502,22 @@ are wrong, and [`NoPrefetch`](@ref) is how a split declines entirely.
   * **Failure and cleanup.** A worker that throws must surface at the consumer rather than hanging it,
     and early exit must stop every task and free what the stream holds. This path only runs when
     something has already gone wrong, so it is tested by deliberately throwing mid-epoch.
-  * **Order is NOT the source's** with more than one worker, and that is not only a floating-point
-    matter: reordering repartitions the epoch into different accumulation groups, so a fixed seed no
-    longer reproduces a run bitwise. It is statistically equivalent to a different shuffle, every
-    sample is still seen exactly once, and `check_train_divisibility`'s invariant (a group never spans
-    an epoch boundary) is preserved. The prior framework's fan-out had the same property.
+  * **`ordered = true` is the default, and it is what makes fanning out free.** The workers finish
+    out of order, so the transfer stage holds finished batches in a reorder buffer and emits them in
+    the source's own order. A fixed seed therefore reproduces a run bitwise whatever `workers` is,
+    and adopting [`batch_at`](@ref) on a source changes its throughput and nothing else.
+  * **`ordered = false` trades that for throughput**, which is the prior framework's behaviour and
+    this one's before the reorder buffer existed. Emission then never waits on a straggler, at the
+    cost that reordering repartitions the epoch into different accumulation groups, so a fixed seed
+    no longer reproduces bitwise. It stays statistically equivalent to a different shuffle: every
+    sample is seen exactly once, and `check_train_divisibility`'s invariant (a group never spans an
+    epoch boundary) is preserved either way.
+  * **Ordered delivery bounds its own memory upstream.** A reorder buffer that simply drained the
+    workers would grow to a whole epoch behind one slow batch, so the coordinator hands out jobs
+    against a credit window of `2 x workers` instead: at most that many host batches exist at once,
+    across the workers' hands, the hand-off channel, and the reorder buffer together. The window is
+    never smaller than `workers`, so the batch everything is waiting for is always in flight and a
+    straggler stalls emission without deadlocking it.
 
 **Batching, shuffling, and splitting are not shipped**: `MLUtils.jl` covers those.
 
@@ -534,10 +545,11 @@ struct PrefetchIterator{S}
     source::S
     depth::Int
     workers::Int
+    ordered::Bool
 
     function PrefetchIterator(
             source::S, depth::Integer = DEFAULT_PREFETCH_DEPTH;
-            workers::Integer = default_prefetch_workers()
+            workers::Integer = default_prefetch_workers(), ordered::Bool = true
         ) where {S}
         depth >= 1 || error(
             """
@@ -552,7 +564,7 @@ struct PrefetchIterator{S}
         workers >= 1 || error("ReactantNitro: `PrefetchIterator` workers is $workers; it must be at \
             least 1. `workers = 1` is the single-producer path. To run the data path inline on the \
             training task instead, wrap the source in `NoPrefetch`.")
-        return new{S}(source, Int(depth), Int(workers))
+        return new{S}(source, Int(depth), Int(workers), ordered)
     end
 end
 
@@ -604,6 +616,10 @@ prefetch_depth(p::PrefetchIterator) = p.depth
 prefetch_depth(x) = 0
 prefetch_workers(p::PrefetchIterator) = p.workers
 prefetch_workers(x) = 0
+prefetch_ordered(p::PrefetchIterator) = p.ordered
+# `true` for everything else, because every other path delivers in the source's order anyway: the
+# inline path and the single-producer path both walk the source's own `iterate`.
+prefetch_ordered(x) = true
 
 """
     ReactantNitro.auto_prefetch(collection) -> collection
@@ -639,21 +655,47 @@ one producer.
 
 `path` is one of:
 
-  * `:fanout`: `workers` producers over [`batch_at`](@ref).
+  * `:fanout`: `workers` producers over [`batch_at`](@ref), delivered in the source's order.
+  * `:fanout_unordered`: the same, with `ordered = false`, delivered as the workers finish.
   * `:single`: one producer over the source's own `iterate`, because `workers == 1` was asked for.
+  * `:materialized`: one producer, because the source is a `Vector` whose batches `build_data`
+    already built. Fan-out cannot help it, so this is **not** a case the setup warning is about.
   * `:single_no_trait`: one producer, because the source implements neither or only one of
     [`batch_at`](@ref) and [`begin_epoch!`](@ref). **This is the case the setup warning is about.**
   * `:inline`: no stream at all, meaning a [`NoPrefetch`](@ref) split or one setup did not wrap.
 """
 function prefetch_config(split)
     d = prefetch_depth(split)
-    d == 0 && return (; depth = 0, workers = 0, path = :inline)
+    o = prefetch_ordered(split)
+    d == 0 && return (; depth = 0, workers = 0, ordered = o, path = :inline)
     w = prefetch_workers(split)
-    if !fanout_capable(prefetch_source(split))
-        return (; depth = d, workers = 1, path = w > 1 ? :single_no_trait : :single)
+    src = prefetch_source(split)
+    if fanout_capable(src)
+        w == 1 && return (; depth = d, workers = 1, ordered = o, path = :single)
+        return (; depth = d, workers = w, ordered = o, path = o ? :fanout : :fanout_unordered)
     end
-    return (; depth = d, workers = w, path = w > 1 ? :fanout : :single)
+    w == 1 && return (; depth = d, workers = 1, ordered = o, path = :single)
+    materialized_source(src) &&
+        return (; depth = d, workers = 1, ordered = o, path = :materialized)
+    return (; depth = d, workers = 1, ordered = o, path = :single_no_trait)
 end
+
+"""
+    ReactantNitro.materialized_source(x) -> Bool
+
+Whether a source's batches already exist, so that producing one costs nothing and `workers > 1`
+would buy nothing either.
+
+**`Vector` exactly, not `AbstractVector`**, and the narrowness is the point. The premise of the
+index-addressable trait is that the expensive work happens inside `iterate`; for a `Vector` that
+`build_data` filled, `getindex` is a pointer load and there is no host work for N producers to
+spread. A custom `AbstractVector` can compute in its `getindex` and genuinely wants the trait, so
+it is not covered here and still hears the warning.
+
+This decides only whether setup WARNS. It never changes what runs: the trait is what enables
+fan-out, and a `Vector` that implements it fans out like anything else.
+"""
+materialized_source(x) = x isa Vector
 
 """
     ReactantNitro.check_batch_at(source; values = false) -> nothing
@@ -752,7 +794,7 @@ function batch_stream(split, routing, mesh = nothing)
     src = prefetch_source(split)
     workers = prefetch_workers(split)
     (workers > 1 && fanout_capable(src)) &&
-        return fanout_stream(src, workers, depth, routing, mesh)
+        return fanout_stream(src, workers, depth, routing, mesh, prefetch_ordered(split))
     return Channel{Tuple{Any, Any}}(depth; spawn = true) do ch
         for b in src
             put!(ch, (b, to_device_batch(b, routing, mesh)))
@@ -772,7 +814,16 @@ coordinator  ->  Channel{Int}(workers)             the batch indices 1:n
    N workers ->  Channel{Tuple{Int,Any}}(workers)  HOST batches, with the index that produced them
       1 transfer task -> Channel{Tuple{Any,Any}}(depth)   (host, device) pairs
          the training loop
+
+   credits  <-  Channel{Nothing}(2 x workers)      one token per job in flight, returned on emit
 ```
+
+`credits` is the upstream bound on ordered delivery. The coordinator takes a token before handing
+out a job and the transfer stage returns one after emitting a batch, so at most `2 x workers`
+host batches exist at once across the workers, `hostch`, and the reorder buffer together. It is a
+`Channel` rather than a `Semaphore` for one reason: teardown closes it, and a coordinator blocked on
+`take!` of a closed channel unwinds into its own `finally`, whereas one blocked on a semaphore would
+be a leaked task with no way to reach it.
 
 `marks` is the exactly-once ledger: one byte per batch index, written by the worker that took that
 job. `check_prefetch_delivery` asserts every byte is set at the end of an epoch that ran to
@@ -783,6 +834,7 @@ struct PrefetchStream
     devch::Channel{Tuple{Any, Any}}
     hostch::Channel{Tuple{Int, Any}}
     jobs::Channel{Int}
+    credits::Channel{Nothing}
     tasks::Vector{Task}
     marks::Vector{UInt8}
 end
@@ -795,7 +847,7 @@ Base.iterate(s::PrefetchStream, state) = iterate(s.devch, state)
 # The error-propagation shape here is a prior framework's, reused rather than reinvented: its data
 # path carried two comments that each recorded a real deadlock in production, and a hang is the
 # failure mode this path is most able to produce.
-function fanout_stream(src, workers::Int, depth::Int, routing, mesh)
+function fanout_stream(src, workers::Int, depth::Int, routing, mesh, ordered::Bool = true)
     token_before = epoch_token(src)
     # BEFORE `length`, and before any job exists. A source whose plan changes its batch count is
     # correct only if the count is read after the re-plan.
@@ -810,11 +862,24 @@ function fanout_stream(src, workers::Int, depth::Int, routing, mesh)
     devch = Channel{Tuple{Any, Any}}(depth)
     marks = zeros(UInt8, n)
 
+    # The credit window, and the reason it is never smaller than `workers`: the batch ordered
+    # delivery is waiting for is always inside the window, so a straggler stalls emission without
+    # being able to deadlock it. UNORDERED DELIVERY NEEDS NO WINDOW, because it holds nothing back
+    # and `hostch` already bounds it, so it leaves the channel empty and never takes from it.
+    window = 2 * workers
+    credits = Channel{Nothing}(window)
+    if ordered
+        for _ in 1:min(window, n)
+            put!(credits, nothing)
+        end
+    end
+
     # One shared job channel rather than a per-worker stride, and that is the point: exactly-once
     # delivery is then a property of `Channel` (an item is taken by exactly one taker) instead of a
     # property of index arithmetic somebody has to get right.
     coord = Threads.@spawn try
         for i in 1:n
+            ordered && take!(credits)
             put!(jobs, i)
         end
     finally
@@ -823,9 +888,9 @@ function fanout_stream(src, workers::Int, depth::Int, routing, mesh)
 
     wtasks = [Threads.@spawn(prefetch_worker(src, jobs, hostch, marks)) for _ in 1:workers]
     joiner = Threads.@spawn prefetch_joiner(coord, wtasks, hostch)
-    xfer = Threads.@spawn prefetch_transfer(hostch, devch, routing, mesh)
+    xfer = Threads.@spawn prefetch_transfer(hostch, devch, routing, mesh, ordered, credits)
 
-    return PrefetchStream(devch, hostch, jobs, [coord; wtasks; joiner; xfer], marks)
+    return PrefetchStream(devch, hostch, jobs, credits, [coord; wtasks; joiner; xfer], marks)
 end
 
 function prefetch_worker(src, jobs::Channel{Int}, hostch::Channel, marks::Vector{UInt8})
@@ -875,19 +940,60 @@ function prefetch_joiner(coord::Task, wtasks::Vector{Task}, hostch::Channel)
     return nothing
 end
 
-function prefetch_transfer(hostch::Channel, devch::Channel, routing, mesh)
+function prefetch_transfer(
+        hostch::Channel, devch::Channel, routing, mesh, ordered::Bool, credits::Channel{Nothing}
+    )
     err = nothing
+    # The reorder buffer. Keyed on the batch index the worker carried through `hostch`, which the
+    # unordered path simply discards. It holds HOST batches, which are ordinary Julia arrays, so
+    # unlike the device channel it needs no explicit free on teardown.
+    pending = Dict{Int, Any}()
+    next = 1
     try
         # Iterating a channel the joiner closed WITH an exception rethrows it here, which is how a
         # worker's error reaches the consumer: this task then closes `devch` with it.
-        for (_, b) in hostch
-            put!(devch, (b, to_device_batch(b, routing, mesh)))
+        for (i, b) in hostch
+            if !ordered
+                put!(devch, (b, to_device_batch(b, routing, mesh)))
+                continue
+            end
+            pending[i] = b
+            # `haskey` rather than a `nothing` sentinel: `prefetch_worker` already refuses a
+            # `nothing` batch, but a buffer that encodes "absent" as a value a batch could take is
+            # the kind of thing that stops being true later.
+            while haskey(pending, next)
+                hb = pop!(pending, next)
+                put!(devch, (hb, to_device_batch(hb, routing, mesh)))
+                next += 1
+                # The credit goes back only once the batch has LEFT, which is what makes the window
+                # bound what exists rather than what has been started.
+                return_credit!(credits)
+            end
         end
     catch e
         err = e
     end
     close_quiet!(devch, err)
     err === nothing || rethrow(err)
+    return nothing
+end
+
+"""
+    ReactantNitro.return_credit!(credits) -> nothing
+
+Hand one job credit back to the coordinator, and **never raise doing it**.
+
+The one way this fails is teardown: [`close_stream!`](@ref) closes `credits` to unblock a
+coordinator parked on `take!`, and a `put!` racing that close throws `InvalidStateException`. Inside
+the transfer loop that exception would be caught as the epoch's error and close the device channel
+with it, replacing whatever real failure the teardown was already unwinding. Same reasoning as
+[`drain_and_free!`](@ref)'s `try`, and the same narrow scope: a credit nobody will ever take again.
+"""
+function return_credit!(credits::Channel{Nothing})
+    try
+        put!(credits, nothing)
+    catch
+    end
     return nothing
 end
 
@@ -1037,7 +1143,9 @@ function drain_and_free!(ch::Channel)
 end
 
 function close_stream!(s::PrefetchStream)
-    # Upstream first, so no stage is refilled behind the drain below.
+    # Upstream first, so no stage is refilled behind the drain below. `credits` leads, because the
+    # coordinator can be parked on `take!(credits)` and closing `jobs` would not wake it there.
+    close_quiet!(s.credits)
     close_quiet!(s.jobs)
     close_quiet!(s.hostch)
     close_quiet!(s.devch)

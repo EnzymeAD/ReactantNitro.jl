@@ -160,12 +160,20 @@ end
 ```
 
 The framework wraps the `train` split in a `PrefetchIterator` automatically (depth 1, one producer
-per thread), so the H2D transfer of the next batch overlaps the current step. A plain
-`MLUtils.DataLoader` does not implement the index-addressable trait that makes that concurrency
-possible, so setup prints a warning that the training data path runs in ONE producer task, and the
-binding report carries `prefetch_workers` and `prefetch_depth`. Both are expected for the loader
-above; the fix for a genuinely slow data path is implementing `ReactantNitro.batch_at` and
-`ReactantNitro.begin_epoch!` on the source.
+per thread), so the H2D transfer of the next batch overlaps the current step. The producers need the
+index-addressable trait, `ReactantNitro.batch_at` and `ReactantNitro.begin_epoch!` on the source,
+because a sequential Julia iterator cannot be consumed by several tasks: the expensive work happens
+inside `iterate` and there is no way to ask for batch *k* without walking to it. A plain
+`MLUtils.DataLoader` implements neither, so setup says the training data path runs in ONE producer
+task, and the binding report carries `prefetch_workers`, `prefetch_depth` and `prefetch_ordered`.
+
+Two things follow that are worth knowing before you go implementing the trait to silence a warning.
+**Adopting it is free**, because delivery is ordered by default: a reorder buffer emits batches in
+the source's own order, so a fixed seed still reproduces a run bitwise whatever the worker count is,
+and `ordered = false` is the explicit opt-out that trades that back for throughput. And **a `Vector`
+of batches never warns**, because `build_data` already built them: producing one is a pointer load,
+so there is no host work for several producers to spread and the trait would buy nothing. The
+warning is about a loader that does real work per batch, like the one above.
 
 `dist` is the distribution handle, `nothing` in this version, and nothing dispatches on it.
 
