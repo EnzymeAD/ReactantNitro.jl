@@ -100,6 +100,25 @@ at setup and passes exactly that subset. A keyword with a default is an optional
 works as you would expect. A method ending in `kwargs...` receives the **whole batch** and nothing
 is checked for it.
 
+**`outputs` is passed on as ONE positional argument.** Whatever goes in the first slot of this
+return is exactly what [`loss`](@ref), [`metrics`](@ref) and [`train_metrics`](@ref) receive in
+their second; nothing is splatted or unpacked in between. For more than one output, return a
+`NamedTuple` and destructure it by name downstream:
+
+```julia
+forward(e, model, ps, st; tokens) = ((; logits, energy), st_new)
+loss(e, out; target) = ce(out.logits, target) + e.w * mean(abs2, out.energy)
+```
+
+A `Tuple` or a nested structure works too, since the framework walks the output tree with
+`Functors`, but a `NamedTuple` is what [`export_outputs`](@ref) names leaves by.
+
+**Every array leaf of the output tree must have the batch dimension last, and must be an array.**
+Both follow from the short final eval batch, which is padded to the compiled width and sliced back:
+the framework asserts the last axis is the batch rather than slicing the wrong one, and a scalar you
+already reduced over the batch has nothing to slice. Reduce in [`loss`](@ref) or [`metrics`](@ref)
+instead of returning the scalar here.
+
 State threading is inherent to the contract: for a stateless model `st_new` is `st`. The framework
 owns the train/eval mode switch (`Lux.trainmode` / `Lux.testmode`) and users never call either.
 The `st_new` returned from an eval-mode call is discarded.

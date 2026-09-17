@@ -35,6 +35,91 @@ checkpoints with nothing else passed. That claim is stronger than each default b
 stated, and it is tested. When you are unsure whether something needs a hook, assume it does not and
 check the default first.
 
+## What each hook receives, and what it passes on
+
+Two things move between the hooks: the **batch**, which the framework routes, and the **outputs**,
+which [`forward`](@ref) produces and the framework hands on unchanged.
+
+### The batch arrives as keywords, and only the fields you declare
+
+A batch is a `NamedTuple` of host arrays with the batch dimension last. Each hook declares the
+fields it wants as keyword arguments, and the framework resolves that once at setup and passes
+exactly that subset:
+
+```julia
+forward(e, model, ps, st; img)        # gets `img` only
+loss(e, outputs; label)               # gets `label` only
+```
+
+A field no hook declares is never transferred to the device. A keyword with a default is an optional
+field. A method ending in `kwargs...` receives the whole batch, and nothing is checked for it.
+
+### `forward` returns `(outputs, st_new)`, and the framework keeps only the first
+
+```julia
+outputs, st_new = forward(e, model, ps, st; img)
+```
+
+The framework threads `st_new` back for you and discards it in eval mode. Everything downstream
+sees `outputs`, and sees it as **one positional argument**:
+
+```julia
+loss(e, outputs; label)
+metrics(e, outputs; label)
+train_metrics(e, outputs; label)
+```
+
+Nothing is splatted, unpacked, or renamed in between. Whatever `forward` put in the first slot is
+exactly what `loss` receives in its second.
+
+**The trap that follows from that** is worth stating once: if `forward` returns a bare array, then
+`first(outputs)` inside `loss` is element one of that array, not "the outputs". Every operation
+after it stays broadcast-legal, so the run trains on one number out of the batch and never raises.
+Do not unpack `outputs` a second time.
+
+### Multiple outputs are a `NamedTuple`
+
+When a model produces more than one thing, return them named and destructure by name downstream:
+
+```julia
+function ReactantNitro.forward(e::Seq2Seq, model, ps, st; tokens)
+    logits, st_dec = Lux.apply(model.decoder, tokens, ps.decoder, st.decoder)
+    energy, st_aux = Lux.apply(model.aux, tokens, ps.aux, st.aux)
+    return (; logits, energy), merge(st, (; decoder = st_dec, aux = st_aux))
+end
+
+ReactantNitro.loss(e::Seq2Seq, out; target) =
+    cross_entropy(out.logits, target) + e.aux_weight * mean(abs2, out.energy)
+
+ReactantNitro.metrics(e::Seq2Seq, out; target) =
+    (; acc = (n_correct(out.logits, target), size(target)[end]))
+```
+
+A `Tuple` works too, and so does a nested structure: the framework walks the output tree with
+`Functors`, so anything it walks is a legal shape. A `NamedTuple` is the one to prefer, because
+[`export_outputs`](@ref) names the leaves that ship by key, and because `out.logits` says what it is
+at every call site.
+
+**Two rules apply to every array leaf of the output tree**, and both exist because of the short
+final batch. The batch dimension must be **last**, and the framework asserts it before slicing
+rather than slicing the wrong axis and returning the wrong samples. And a leaf must be an array:
+a scalar you already reduced over the batch has no batch dimension to slice, so reduce it in
+[`loss`](@ref) or [`metrics`](@ref) instead of returning it from `forward`.
+
+### Where the outputs end up
+
+| Stage | What runs | What `outputs` is by the time you see it |
+| --- | --- | --- |
+| training | `forward` then `loss`, in one traced program | exactly what `forward` returned |
+| training metrics | `forward` then `train_metrics` | the same, once per micro-batch |
+| validation | `forward` then `metrics` | sliced back to the real sample count, so padding is invisible |
+| prediction | `forward` alone | sliced, and converted to host arrays |
+| export | `export_preprocess` then `forward` | the leaves [`export_outputs`](@ref) names, which may be a subset |
+
+The padding is the reason two of those rows differ. A short final eval batch is padded up to the
+compiled width, the program runs at that width, and the outputs are sliced back before any hook of
+yours sees them. [`metrics`](@ref) never sees a padded sample.
+
 ## The three markers, and the default
 
 An experiment field is one of three categories, chosen with a marker or, for the default, with
