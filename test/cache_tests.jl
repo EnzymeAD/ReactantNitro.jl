@@ -787,6 +787,10 @@
             @test occursin("2,944 of 3,001 samples", txt)
             @test occursin("57 dropped by drop-last", txt)
             @test occursin("final batch of 52 padded then sliced", txt)
+            # The batch count leads the notes. It moved out of the handle summary when the two
+            # displays became one table, so this band is now the only place it is stated.
+            @test occursin("46 batches", txt)
+            @test occursin("8 batches", txt)
         end
 
         @testset "the clip line states its own source, the one place a reader sees which won" begin
@@ -795,18 +799,20 @@
         end
 
         @testset "the groups block names the anchor per group" begin
-            # The groups block is a TABLE now, so the anchor is a cell under a `decay toward`
-            # column rather than a phrase on the line. Both facts still have to be there: the
-            # column that says what the number means, and a row per anchor.
-            @test occursin("decay toward", txt)
-            @test occursin(r"\bzero\b", txt) && occursin(r"\bw0\b", txt)
+            # The groups block is ONE ROW PER GROUP with its seven facts read as a phrase, which
+            # is what fitting it into a table whose columns are shared with every other section
+            # costs. Each fact still has to be there, and still has to be attributable to its own
+            # group, which is what the per-row match below checks.
+            @test occursin(r":default\s+eta 0\.001 \(x1\.0\), lambda 0\.0001 toward zero, RAdam", txt)
+            @test occursin(r":backbone\s+eta 0\.0001 \(x0\.1\), lambda 0\.001 toward w0, RAdam", txt)
             @test occursin("params", txt) && occursin("23,456,789", txt)
             @test occursin("G = 2", txt)
         end
 
         @testset "the level 2 block flags a scheduled value the factory did not apply" begin
-            @test occursin("NOT present: epsilon", txt)
             @test occursin("the factory did not apply it", txt)
+            @test occursin(r"NOT present.*epsilon", txt)
+            @test occursin("eta, beta", txt)
         end
 
         @testset "a source that cannot report samples omits the parenthetical rather than guessing" begin
@@ -821,7 +827,9 @@
                 clip = 0, clip_source = :field
             )
             @test !occursin("samples", bare)
-            @test occursin("(nothing resolved)", bare)
+            # The batch count is always resolvable, so it is what a split with nothing else to
+            # report shows. There is no "(nothing resolved)" case left for the data band.
+            @test occursin("4 batches", bare)
             @test occursin("none (threshold 0)", bare)
             @test occursin("[field on e]", bare)
         end

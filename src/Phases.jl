@@ -174,7 +174,8 @@ mutable struct Nitro
     total::Any                # step 11, the schedule horizon; `nothing` with no train split
     batch_size::Any           # inferred from the first batch, never read from config
     logger::Any               # step 12
-    report::Any               # the schedule binding report, as text
+    report::Any               # the schedule binding report, as text, for the log
+    sections::Any             # the same report as `TableSection`s, for `show`
     anchor_checksum::Any      # the per-group decay-anchor checksum; `nothing` if unanchored
     preset::Any               # the named configuration this run claimed; `nothing` if none
     # WHERE THESE WEIGHTS CAME FROM: the resolved checkpoint the restore actually read, or `nothing`
@@ -329,10 +330,14 @@ end
 """
     binding_report(nitro) -> String
 
-The binding report: where every configured value actually bound. It is a **diagnostic, not a
-check**; it computes nothing the run does not already compute and it never fails. The framework
-prints it once at the end of setup and hands the same text to
-`log_other!(lgr, "binding_report", str)`.
+The binding report as plain text: where every configured value actually bound. It is a
+**diagnostic, not a check**; it computes nothing the run does not already compute and it never
+fails. Setup hands this same text to `log_other!(lgr, "binding_report", str)`, so the run's record
+carries it whether or not anything displayed it.
+
+**What you read is normally `show(nitro)`**, which appends the report's sections to the handle's
+own, so one table answers both what the run holds and where each value came from. This accessor is
+for the text: a log line, a file, a diff between two runs.
 
 It exists because the rules that resolve a learning rate, a schedule key, and a per-group
 accessor are individually simple and jointly hard to hold in your head, and because a wrong
@@ -373,37 +378,32 @@ logger_info(nitro::Nitro) = logger_info(nitro.logger)
 
 # ── One table shape, several renderers ──────────────────────────────────────────────
 #
-# Every long `show` in this package produces the same thing: a title, an optional column header,
-# and rows of strings. Rendering that is a separate decision from deciding WHAT to show, and it is
-# the decision that depends on where Julia is running: a plain terminal wants aligned columns, and
-# a session with PrettyTables loaded can have boxes. Keeping the two apart means a new destination
-# is a renderer rather than another copy of every `show` in the package.
+# Every long `show` in this package produces the same thing: a title and a list of SECTIONS, each
+# with an optional column header and rows of strings. Rendering that is a separate decision from
+# deciding WHAT to show, and it is the decision that depends on where Julia is running: a log file
+# wants aligned columns, and a session with PrettyTables loaded can have one framed table.
+# Keeping the two apart means a new destination is a renderer rather than another copy of every
+# `show` in the package.
+#
+# ── Why sections, and why they share their columns ──────────────────────────────────
+#
+# The handle summary and the binding report used to be separate displays, each drawing its own
+# box, so looking at a run meant reading five boxes of three different widths with their titles
+# floating between them. They are one table now, and a section is the unit that makes that
+# possible: a labelled band inside one frame, carrying its own column header.
+#
+# The columns are GLOBAL, shared by every section, and that is a constraint rather than a
+# preference. A framed table has one column structure, so a section cannot set its own widths, and
+# the widest cell anywhere in a column sets that column for all of them. The consequence to design
+# around is that a short value in one section sits in a narrow strip with air to its right, which
+# is why the frame draws no vertical rules: unruled air is invisible, and a rule through it is
+# what would make the table look broken. The other consequence is the reason `parameter groups`
+# reads as prose rather than seven columns; see `binding_report_sections`.
 #
 # A `Ref` rather than dispatch, because the renderer is a process-wide setting with no argument to
 # dispatch on, and because an extension setting it in `__init__` is one assignment that cannot
 # invalidate anything already compiled.
 const _TABLE_RENDERER = Ref{Any}(nothing)
-
-"""
-    ReactantNitro.table_renderer!(f) -> previous
-
-Set the renderer every long `show` in this package goes through, and return the previous one.
-`f` is called as `f(io::IO, title::AbstractString, header::Vector{String},
-rows::`[`TableRows`](@ref)`, note::Union{AbstractString, Nothing})`, and `nothing` restores the
-built-in aligned-column renderer. **Write those argument types out in the renderer**: it is reached
-through a `Ref{Any}`, so nothing checks them for you, and five untyped arguments under a generic
-name is the signature that muddles a stack trace and looks applicable to calls that are not this
-one.
-
-Boxed tables are the DEFAULT and not something you opt into: `Reactant` depends on `PrettyTables`,
-so every session that loads this package loads it too and this package's extension installs the
-boxed renderer. `table_renderer!(nothing)` is the opt-out, and gives the plain display a log gets.
-"""
-function table_renderer!(f)
-    prev = _TABLE_RENDERER[]
-    _TABLE_RENDERER[] = f
-    return prev
-end
 
 """
     ReactantNitro.TableRows
@@ -414,47 +414,139 @@ than two that happen to agree today.
 """
 const TableRows = Vector{Vector{String}}
 
-# CONCRETELY TYPED, all five arguments, and not because this is hot: it is called once per display.
-# A renderer is reached through a `Ref{Any}`, so the call is already dynamic, and a generically
-# named `render(io, title, header, rows, note)` with five untyped arguments is the shape that
-# makes a stack trace ambiguous and invites a method from somewhere else to look applicable. The
-# types are the contract `table_renderer!` documents; an extension writes the same ones.
-function _render_table(
-        io::IO, title::AbstractString, header::Vector{String}, rows::TableRows;
+"""
+    ReactantNitro.CellStyles
+
+A section's per-cell styling, `Dict{Tuple{Int, Int}, Symbol}` from `(row, column)` into `rows` to
+one of the roles [`TableSection`](@ref) documents. Empty for a section that wants none.
+"""
+const CellStyles = Dict{Tuple{Int, Int}, Symbol}
+
+"""
+    ReactantNitro.TableSection(title, header, rows[, styles])
+
+One labelled band of a table: a section title, a column header, its [`TableRows`](@ref), and an
+optional [`CellStyles`](@ref).
+
+  * `title` is drawn as a full-width label above the section. **The empty string means no label**,
+    which is what the leading section uses: the table's own title already names it, and a band
+    labelled immediately under the title reads as a heading printed twice.
+  * `header` is the section's column header. An all-empty vector means the section has no column
+    names, which is the shape of a label-and-value band like the handle's `state`.
+  * `styles` maps a `(row, column)` of `rows` to a ROLE, never to a colour. The roles are
+    `:good`, `:busy`, `:warn`, `:bad`, `:muted` and `:accent`.
+
+Rows within a section may be short; a renderer reads missing cells as empty.
+
+**A role rather than a colour, and a lookup rather than an escape in the string.** Two things
+follow from it. The text stays plain, which matters because the same rows are rendered into
+`binding_report`'s string and handed to a logger, where an escape sequence is corruption rather
+than styling. And which colour a role gets is the renderer's decision, so a destination that
+cannot colour ignores the map entirely rather than having to strip anything out of the cells.
+"""
+struct TableSection
+    title::String
+    header::Vector{String}
+    rows::TableRows
+    styles::CellStyles
+end
+
+TableSection(title, header, rows) = TableSection(title, header, rows, CellStyles())
+
+"""
+    ReactantNitro.table_renderer!(f) -> previous
+
+Set the renderer every long `show` in this package goes through, and return the previous one.
+`f` is called as `f(io::IO, title::AbstractString, sections::Vector{`[`TableSection`](@ref)`},
+note::Union{AbstractString, Nothing})`, and `nothing` restores the built-in aligned-column
+renderer. **Write those argument types out in the renderer**: it is reached through a `Ref{Any}`,
+so nothing checks them for you, and four untyped arguments under a generic name is the signature
+that muddles a stack trace and looks applicable to calls that are not this one.
+
+One framed table is the DEFAULT and not something you opt into: `Reactant` depends on
+`PrettyTables`, so every session that loads this package loads it too and this package's extension
+installs the framed renderer. `table_renderer!(nothing)` is the opt-out, and gives the plain
+display a log gets.
+
+**The contract takes sections rather than one header and one set of rows**, which it did until the
+handle summary and the binding report became one table. The old five-argument form
+`f(io, title, header, rows, note)` is gone, and a renderer still written against it raises a
+`MethodError` on the first display rather than being quietly skipped.
+"""
+function table_renderer!(f)
+    prev = _TABLE_RENDERER[]
+    _TABLE_RENDERER[] = f
+    return prev
+end
+
+# CONCRETELY TYPED, all four arguments, and not because this is hot: it is called once per
+# display. A renderer is reached through a `Ref{Any}`, so the call is already dynamic, and a
+# generically named `render(io, title, sections, note)` with four untyped arguments is the shape
+# that makes a stack trace ambiguous and invites a method from somewhere else to look applicable.
+# The types are the contract `table_renderer!` documents; an extension writes the same ones.
+function _render_sections(
+        io::IO, title::AbstractString, sections::Vector{TableSection};
         note::Union{AbstractString, Nothing} = nothing
     )
     r = _TABLE_RENDERER[]
-    r === nothing || return r(io, title, header, rows, note)
-    return _render_table_plain(io, title, header, rows, note)
+    r === nothing || return r(io, title, sections, note)
+    return _render_sections_plain(io, title, sections, note)
 end
+
+# The one-section call, which is what a display with nothing to divide up wants: the experiment
+# table, and a caller assembling a single band by hand.
+_render_table(
+    io::IO, title::AbstractString, header::Vector{String}, rows::TableRows;
+    note::Union{AbstractString, Nothing} = nothing
+) = _render_sections(io, title, [TableSection("", header, rows)]; note)
 
 # The built-in: aligned columns, no rules, and NO TRAILING NEWLINE. That last point is the one a
 # `show` method has to get right, since Julia's REPL supplies the line break itself and a method
 # that prints its own leaves a blank line under every display.
-function _render_table_plain(
-        io::IO, title::AbstractString, header::Vector{String}, rows::TableRows,
+#
+# Widths are computed PER SECTION here, unlike the framed renderer, and the difference is not an
+# inconsistency. This output has no frame to keep aligned and its destination is a log file, where
+# a section hugging its own content is strictly easier to read than one padded to a width some
+# other section needed. What both renderers guarantee is the same FACTS in the same order, which
+# is the only thing a reader compares between them.
+#
+# `textwidth` rather than `length`, because a cell may carry a character that is two columns wide
+# and a count of characters would then pad it to the wrong place.
+function _render_sections_plain(
+        io::IO, title::AbstractString, sections::Vector{TableSection},
         note::Union{AbstractString, Nothing}
     )
     print(io, title)
-    isempty(rows) && return nothing
-    cols = maximum(length, rows)
-    show_header = any(!isempty, header)
-    widths = [
-        maximum(
-            length(get(r, c, "")) for r in (show_header ? vcat([header], rows) : rows)
-        ) for c in 1:cols
-    ]
-    # The last column is never padded: trailing blanks are invisible and would only widen a line
-    # that a terminal then wraps.
-    line(r) = "  " * rstrip(join((rpad(get(r, c, ""), widths[c]) for c in 1:cols), "  "))
-    show_header && (println(io); print(io, line(header)))
-    for r in rows
-        println(io)
-        print(io, line(r))
+    for sec in sections
+        isempty(sec.title) || (println(io); println(io); print(io, "  ", sec.title))
+        isempty(sec.rows) && continue
+        cols = maximum(length, sec.rows)
+        show_header = any(!isempty, sec.header)
+        widths = [
+            maximum(
+                textwidth(get(r, c, ""))
+                    for r in (show_header ? vcat([sec.header], sec.rows) : sec.rows)
+            ) for c in 1:cols
+        ]
+        # The last column is never padded: trailing blanks are invisible and would only widen a
+        # line that a terminal then wraps.
+        line(r) = "  " * rstrip(
+            join((_pad(get(r, c, ""), widths[c]) for c in 1:cols), "  ")
+        )
+        show_header && (println(io); print(io, line(sec.header)))
+        for r in sec.rows
+            println(io)
+            print(io, line(r))
+        end
     end
-    note === nothing || (println(io); print(io, "  ", note))
+    # A BLANK LINE before the note, which the single-table form did not need. Sections are
+    # separated by one, so a note butted against the last row reads as another of its rows.
+    note === nothing || (println(io); println(io); print(io, "  ", note))
     return nothing
 end
+
+# `rpad` counts characters, which is the wrong unit for a cell that holds a double-width one.
+_pad(s::AbstractString, w::Int) = s * " "^max(0, w - textwidth(s))
 
 # `nothing` rather than a guess for a handle whose layout is not a `FlatLayout`: a display reports
 # what it can read and invents nothing.
@@ -492,6 +584,32 @@ function _nitro_phase_label(nitro::Nitro)
         (nitro.stop_reason === nothing ? "" : " (" * string(nitro.stop_reason) * ")")
 end
 
+# ── What each phase MEANS, as one of the table's roles ───────────────────────────────
+#
+# The phase is the cell a reader looks at first and the only one whose value they are checking
+# against an expectation rather than reading, so it is the cell that earns colour. The mapping is
+# by what the phase says about the run and not by the type's place in the tree: `Checkpointing` and
+# `Stepping` are unrelated types that both mean "this is moving", and a reader scanning a wall of
+# handles wants those to look the same.
+#
+# `Repl` is MUTED rather than good, deliberately. It means the framework has handed control back
+# and is waiting on a person, which is neither progress nor a problem, and a green idle handle in
+# a list of running ones is the kind of thing that gets misread at a glance.
+_phase_role(p::Phase) = :busy
+_phase_role(::Terminal) = :good
+_phase_role(::Failed) = :bad
+_phase_role(::Repl) = :muted
+_phase_role(::Starting) = :muted
+
+# A run that stopped for a REASON is not simply done. `:error` is a failure whatever phase it was
+# recorded on, and any other reason (patience, a `request_stop!`, a budget) is a run that ended
+# early on purpose: worth seeing, not worth alarming about.
+function _phase_role(p::Phase, stop_reason)
+    stop_reason === nothing && return _phase_role(p)
+    stop_reason === :error && return :bad
+    return :warn
+end
+
 function _nitro_elapsed(sec)
     sec === nothing && return nothing
     sec < 60 && return string(round(sec; digits = 1)) * "s"
@@ -513,27 +631,18 @@ function _nitro_weights(nitro::Nitro)
         "trained here, resumed from " * string(src)
 end
 
-# A split's size WITHOUT iterating it. A loader that promises no length is reported as streaming
-# rather than counted: `length` on one is wrong at best, and at worst consumes the split that the
-# next epoch was going to read.
+# A split's size WITHOUT iterating it, as the cell under the data band's `batches` column. A
+# loader that promises no length is reported as streaming rather than counted: `length` on one is
+# wrong at best, and at worst consumes the split that the next epoch was going to read. The word
+# rather than a number is also why this is a string: there is no count to give, and a zero would
+# be a count that is wrong.
 function _nitro_split(v)
     return try
         Base.IteratorSize(typeof(v)) isa Union{Base.HasLength, Base.HasShape} ?
-            string(length(v)) * " batches" : "streaming"
+            string(length(v)) : "streaming"
     catch
         "?"
     end
-end
-
-function _nitro_splits(data)
-    data === nothing && return "none"
-    ks = try
-        keys(data)
-    catch
-        return "<" * string(nameof(typeof(data))) * ">"
-    end
-    isempty(ks) && return "none"
-    return join(("$k " * _nitro_split(data[k]) for k in ks), ", ")
 end
 
 function Base.show(io::IO, nitro::Nitro)
@@ -549,99 +658,111 @@ function Base.show(io::IO, nitro::Nitro)
     return nothing
 end
 
+# ONE TABLE, and the binding report is part of it rather than a second display printed beside it.
+# Both used to render themselves: the handle drew a box of its state and the binding report drew
+# one box per section, so a run opened with five frames of three widths and their titles floating
+# between them. They answer one question between them (what is this run) and they now share one
+# frame, which is also what stops the two from disagreeing about a fact they both print.
+#
+# The rule that kept them apart is still enforced, and it is about CONTENT rather than layout: a
+# value appears in exactly one section. The state band holds what the handle carries, the binding
+# bands hold where each configured value came from, and neither repeats the other.
 function Base.show(io::IO, ::MIME"text/plain", nitro::Nitro)
     pg = _nitro_params(nitro)
     devs = _nitro_devices(nitro)
-    rows = Vector{String}[
-        ["phase", _nitro_phase_label(nitro)],
-        ["epoch", string(nitro.epoch, " / ", nitro.max_epochs)],
+    state = TableRows(
         [
-            "step",
-            string(nitro.step) * (nitro.total === nothing ? "" : " / " * string(nitro.total)),
-        ],
-        [
-            "params",
-            pg === nothing ? "not built" :
-                _commas(pg[1]) * " in " * string(pg[2]) * (pg[2] == 1 ? " group" : " groups"),
-        ],
-        ["batch_size", string(something(nitro.batch_size, "pending"))],
-        [
-            "devices",
-            (devs === nothing ? "sharded" : string(devs)) *
-                (nitro.mesh === nothing ? "  (no mesh)" : "  (mesh :data)"),
-        ],
-        ["data", _nitro_splits(nitro.data)],
-    ]
-    el = _nitro_elapsed(nitro.elapsed)
-    el === nothing || push!(rows, ["elapsed", el * "  (this `train!` call)"])
-    # The selected checkpoint: which epoch won, on which metric, and a path short enough to paste.
-    # `relpath` is string arithmetic and touches no filesystem, which is what keeps it legal here.
-    bc = nitro.best_checkpoint
-    bc === nothing || push!(
-        rows, [
-            "checkpoint",
-            string("epoch ", bc.epoch, ", ", bc.metric, " ", _shown(bc.score), "  ->  ") *
-                _nitro_relpath(bc.path),
+            ["phase", _nitro_phase_label(nitro)],
+            ["epoch", string(nitro.epoch, " / ", nitro.max_epochs)],
+            [
+                "step",
+                string(nitro.step) *
+                    (nitro.total === nothing ? "" : " / " * string(nitro.total)),
+            ],
+            [
+                "params",
+                pg === nothing ? "not built" :
+                    _commas(pg[1]) * " in " * string(pg[2]) * (pg[2] == 1 ? " group" : " groups"),
+            ],
+            ["batch_size", string(something(nitro.batch_size, "pending"))],
+            [
+                "devices",
+                (devs === nothing ? "sharded" : string(devs)) *
+                    (nitro.mesh === nothing ? "  (no mesh)" : "  (mesh :data)"),
+            ],
         ]
     )
-    push!(rows, ["weights", _nitro_weights(nitro)])
-    push!(rows, ["run_dir", nitro.run_dir])
-    push!(rows, ["seed", string(nitro.seed, "   accum ", nitro.accum)])
-    nitro.preset === nothing || push!(rows, ["preset", string(nitro.preset)])
+    el = _nitro_elapsed(nitro.elapsed)
+    el === nothing || push!(state, ["elapsed", el * "  (this `train!` call)"])
+    push!(state, ["weights", _nitro_weights(nitro)])
+    push!(state, ["run_dir", nitro.run_dir])
+    push!(state, ["seed", string(nitro.seed, "   accum ", nitro.accum)])
+    nitro.preset === nothing || push!(state, ["preset", string(nitro.preset)])
+
+    # WHAT EARNS COLOUR IN THIS BAND, and the rest deliberately does not. The phase is the cell a
+    # reader checks against an expectation rather than reads, and `weights` is the one that has
+    # silently been wrong before: a trained handle used to claim `fresh from build_model`, and
+    # muting the untrained wording is what makes the two tell apart at a glance. A number is read,
+    # not checked, so `epoch`, `step` and `params` stay plain; colouring them would spend the
+    # signal on cells that do not carry one.
+    styles = CellStyles(
+        (1, 2) => _phase_role(nitro.phase, nitro.stop_reason),
+        (findfirst(r -> r[1] == "weights", state), 2) =>
+            nitro.elapsed === nothing ? :muted : :good,
+    )
+    sections = [TableSection("", String[], state, styles)]
+
+    # The selected checkpoint: which epoch won, on which metric, and a path short enough to paste.
+    # `relpath` is string arithmetic and touches no filesystem, which is what keeps it legal here.
+    #
+    # A SECTION, and the path on a row of its own, because it used to share a cell with the epoch
+    # and the score. That made it the longest cell in the table, and in a frame whose columns are
+    # global the longest cell is the one that sets the width every other section is padded to. A
+    # path also happens to be the cell a reader wants to select and paste, which a line holding
+    # nothing else makes easy.
+    bc = nitro.best_checkpoint
+    bc === nothing || push!(
+        sections, TableSection(
+            "checkpoint", String[], TableRows(
+                [
+                    [
+                        "selected",
+                        string("epoch ", bc.epoch, ", ", bc.metric, " ", _shown(bc.score)),
+                    ],
+                    ["path", _nitro_relpath(bc.path)],
+                ]
+            ),
+            # The path is what a reader is here to copy, so it is the accent; the epoch and score
+            # above it are the justification for that path and read as ordinary text.
+            CellStyles((2, 2) => :accent)
+        )
+    )
+
+    # Values, not tiles. The grid existed to keep a dozen metrics off a dozen lines of their own
+    # box; inside a shared frame a metric is a label and a value like everything else in the
+    # state band, and a row each is what lines them up with it.
+    isempty(nitro.last_metrics) || push!(
+        sections, TableSection(
+            "metrics  (validation, epoch " * string(nitro.epoch) * ")", String[],
+            TableRows([[string(k), _shown(v)] for (k, v) in pairs(nitro.last_metrics)])
+        )
+    )
+
+    # WHERE EACH VALUE BOUND, from the report the handle already built at setup. `nothing` on a
+    # handle assembled by hand in a test, which is not an error: the bands are omitted and the
+    # state band still displays, because a `show` that can throw is a `show` nobody can use while
+    # debugging the thing that broke.
+    nitro.sections === nothing || append!(sections, nitro.sections)
+
     # Named where the question is asked, exactly as the record's `show` names `checkpoint_info`:
-    # whoever printed this handle wanted one of these and the summary is not it. It rides on the
-    # LAST section, whichever that is, so it stays at the bottom.
+    # whoever printed this handle wanted one of these and the summary is not it. It rides under
+    # the frame, so it stays at the bottom.
     note = "ask it for more with `experiment`, `parameters`, `states`, `binding_report`, " *
         "`logger_info`"
     title = "Nitro for " * string(nameof(typeof(nitro.e))) *
         "  (the run handle; no weights are shown)"
-    tiles = _metric_tiles(nitro.last_metrics)
-    if tiles === nothing
-        _render_table(io, title, ["", ""], rows; note)
-        return nothing
-    end
-    _render_table(io, title, ["", ""], rows)
-    println(io)
-    println(io)
-    _render_table(
-        io, "  metrics  (validation, epoch " * string(nitro.epoch) * ")",
-        fill("", 2 * length(first(tiles)) ÷ 2), tiles; note
-    )
+    _render_sections(io, title, sections; note)
     return nothing
-end
-
-# How many `name value` tiles go on one row of the metrics section. Three is a compromise with one
-# real constraint behind it: a model reporting a dozen metrics is ordinary, and one row each turns
-# the handle's display into something you scroll, while one long row wraps in a terminal and stops
-# lining up. Three keeps a twelve-metric run to four rows and leaves the values in columns that
-# align down the section.
-const _METRIC_TILES_PER_ROW = 3
-
-# The metrics as a GRID rather than a list: each tile is a `name` column and a `value` column, and
-# `_METRIC_TILES_PER_ROW` tiles sit side by side. `nothing` when there are no metrics, which is how
-# the caller knows to skip the section rather than render an empty one.
-#
-# Values go through `_shown` like everything else here, because a metric may be a confusion matrix
-# and a summary that printed one would have reintroduced the problem this whole `show` exists to
-# solve.
-function _metric_tiles(m)
-    isempty(m) && return nothing
-    items = [(string(k), _shown(v)) for (k, v) in pairs(m)]
-    per = min(_METRIC_TILES_PER_ROW, length(items))
-    tiles = TableRows()
-    for i in 1:per:length(items)
-        chunk = items[i:min(i + per - 1, length(items))]
-        row = String[]
-        for (k, v) in chunk
-            push!(row, k)
-            push!(row, v)
-        end
-        # Padded to a full row: a short final row with fewer columns than the others is a table
-        # PrettyTables cannot build, and the plain renderer trims the blanks back off anyway.
-        append!(row, fill("", 2 * per - length(row)))
-        push!(tiles, row)
-    end
-    return tiles
 end
 
 # Relative to the working directory when it helps and absolute when it does not: a path that

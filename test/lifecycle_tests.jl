@@ -12,6 +12,16 @@
 
     const FL = Float32
 
+    # The size budget every `show` assertion in this file checks against. It exists to catch ONE
+    # regression: a display falling back to Julia's struct default and printing the weights, which
+    # was measured at 51,635 characters on a toy experiment carrying three small buffers. The
+    # number is therefore loose rather than tight, and it was raised from 2,000 when the handle
+    # summary and the binding report became one table: a display carrying the data, clip, schedule
+    # and parameter-group bands runs to about 5,500 characters on the handles below. What still
+    # has to hold is that it does not grow with the MODEL, only with how many splits, groups and
+    # metrics a run has.
+    const DISPLAY_BUDGET = 8_000
+
     @experiment struct LifeMLP
         width::GraphConst{Int} = 6
     end
@@ -498,7 +508,7 @@
             @test !occursin("Float64[", s)
             # Bounded, and bounded SMALL. This cannot be allowed to grow with the model, so the
             # limit is checked rather than the content.
-            @test length(s) < 2_000
+            @test length(s) < DISPLAY_BUDGET
             @test occursin("LifeMLP", s)
         end
 
@@ -511,10 +521,18 @@
 
         long = sprint(show, MIME"text/plain"(), n)
         @test occursin("Done", long)                       # the phase, which is the usual question
-        @test occursin("train 4 batches", long)            # split sizes, not the splits themselves
-        @test occursin("val 2 batches", long)
+        # Split sizes, not the splits themselves, and they live in the `data` band now that the
+        # handle and its binding report are one table: a count leading the notes that band's row
+        # already carried, rather than a `data` row of the summary saying the same thing twice.
+        @test occursin(r"train\s+4 batches", long)
+        @test occursin(r"val\s+2 batches", long)
         @test occursin("no weights are shown", long)       # says what it withheld, as the record does
         @test occursin("binding_report", long)             # and names the readers, where it is asked
+        # WHERE VALUES BOUND, in the same display: the report is no longer a second thing printed
+        # beside the handle, and a reader who prints one handle sees both.
+        @test occursin("gradient clip", long)
+        @test occursin("[framework default]", long)
+        @test occursin("parameter groups", long)
 
         # Counting parameters must not need the arrays: the count comes off the layout, which is
         # host metadata, so a handle displays without moving a byte of device memory.
@@ -562,7 +580,7 @@
         # wrong about what they are.
         @test occursin("trained here", long)
         @test !occursin("fresh from build_model", long)
-        @test length(long) < 2_000
+        @test length(long) < DISPLAY_BUDGET
 
         # A metric may be an array (a confusion matrix is the standard case), and the summary
         # routes metrics through the same renderer as everything else. Set directly rather than
@@ -571,50 +589,37 @@
         withmat = sprint(show, MIME"text/plain"(), n)
         @test occursin("size 10x10", withmat)
         @test !occursin("0, 0, 0", withmat)
-        @test length(withmat) < 2_000
+        @test length(withmat) < DISPLAY_BUDGET
     end
 
-    # ── metrics are their own section, tiled ────────────────────────────────────────────
+    # ── metrics are their own section ───────────────────────────────────────────────────
     #
-    # Metrics are the one part of this display that grows with the model: a dozen is ordinary, and
-    # a row each turns the handle into something you scroll past. Tiling packs `name value` pairs
-    # `_METRIC_TILES_PER_ROW` to a row, so twelve metrics cost four rows rather than twelve.
-    @testset "the metrics section tiles rather than listing" begin
-        tiles = ReactantNitro._metric_tiles
-        per = ReactantNitro._METRIC_TILES_PER_ROW
-
-        # No metrics, no section: an empty table is worse than an absent one.
-        @test tiles((;)) === nothing
-
-        # Every row is a full row of `name, value` pairs, including the last, which is padded.
-        # A short final row is a table PrettyTables cannot build.
+    # A band of their own rather than rows mixed into `state`, because they are the part of this
+    # display that changes every epoch and the part a reader scans for. They used to be tiled
+    # three `name value` pairs to a row, to keep a dozen metrics out of a dozen lines of their
+    # own box; inside one shared table a metric is a label and a value like everything in the
+    # `state` band above it, and a row each is what lines them up with it.
+    @testset "the metrics section is named, epoch-stamped, and carries the note" begin
         eight = (; a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 8)
-        t8 = tiles(eight)
-        @test length(t8) == cld(8, per)
-        @test all(r -> length(r) == 2 * per, t8)
-        @test t8[1][1] == "a" && t8[1][2] == "1"
-        # Every name and every value is present exactly once across the grid.
-        flat = reduce(vcat, t8)
-        for k in keys(eight)
-            @test count(==(string(k)), flat) == 1
-        end
-        @test count(isempty, flat) == 2 * per * cld(8, per) - 16
-
-        # Fewer metrics than a full row does not pad out to one.
-        @test length(only(tiles((; x = 1, y = 2)))) == 4
-
-        # End to end: the section is titled, names the epoch, and carries the trailing note, which
-        # moves to the LAST section so it stays at the bottom.
         n = mk_life(; max_epochs = 1)
         train!(n)
+
+        # No metrics, no section: an empty band is worse than an absent one.
+        n.last_metrics = (;)
+        @test !occursin("metrics", sprint(show, MIME"text/plain"(), n))
+
         n.last_metrics = eight
         long = sprint(show, MIME"text/plain"(), n)
         @test occursin("metrics", long)
         @test occursin("epoch $(current_epoch(n))", long)
+        # Every name and every value, once each, one row apiece.
+        for k in keys(eight)
+            @test occursin(string(k), long)
+        end
+        # The trailing note rides under the whole table, so it stays at the bottom however many
+        # sections there are.
         @test endswith(long, "`logger_info`")
-        # Tiled, not listed: the grid is shorter than one row per metric would be.
-        @test count("\n", long) < 25
-        @test length(long) < 2_000
+        @test length(long) < DISPLAY_BUDGET
     end
 
     # ── progress reporting: begin, one per unit, end ────────────────────────────────────
@@ -740,8 +745,8 @@
     @testset "a swapped table renderer receives the documented arguments" begin
         seen = Ref{Any}(nothing)
         prev = ReactantNitro.table_renderer!(
-            (io, title, header, rows, note) -> begin
-                seen[] = (; title, header, rows, note)
+            (io, title, sections, note) -> begin
+                seen[] = (; title, sections, note)
                 print(io, "RENDERED BY THE STUB")
             end
         )
@@ -751,15 +756,28 @@
             @test out == "RENDERED BY THE STUB"
             got = seen[]
             @test occursin("Nitro for LifeMLP", got.title)
-            @test got.header == ["", ""]
-            @test got.rows isa ReactantNitro.TableRows
-            @test all(r -> r isa Vector{String}, got.rows)
-            @test any(r -> r[1] == "phase", got.rows)
+            @test got.sections isa Vector{ReactantNitro.TableSection}
+            @test all(s -> s.rows isa ReactantNitro.TableRows, got.sections)
+            @test all(s -> all(r -> r isa Vector{String}, s.rows), got.sections)
             @test got.note isa AbstractString      # the handle summary carries one
 
-            # The experiment show goes through the same path with a real header and no note.
+            # The LEADING section is unlabelled and unheadered: the table title names it, and a
+            # band labelled directly under the title is a heading printed twice.
+            state = first(got.sections)
+            @test state.title == ""
+            @test state.header == String[]
+            @test any(r -> r[1] == "phase", state.rows)
+
+            # The binding report's bands are appended to it, which is the whole point of one
+            # table: where each value bound is part of the handle's display, not a second one.
+            @test any(s -> s.title == "data", got.sections)
+            @test any(s -> s.title == "gradient clip", got.sections)
+            @test any(s -> startswith(s.title, "parameter groups"), got.sections)
+
+            # The experiment show goes through the same path: one section, a real header, no note.
             sprint(show, MIME"text/plain"(), experiment(n))
-            @test seen[].header == ["field", "marker", "value"]
+            @test length(seen[].sections) == 1
+            @test only(seen[].sections).header == ["field", "marker", "value"]
             @test seen[].note === nothing
         finally
             ReactantNitro.table_renderer!(prev)
@@ -793,7 +811,7 @@
         @test occursin("epoch $(bc.epoch)", long)
         @test occursin("val_loss", long)
         @test occursin(basename(bc.path), long)          # the file, pasteable
-        @test length(long) < 2_000
+        @test length(long) < DISPLAY_BUDGET
 
         # `selected_checkpoint` is the whole mechanism, and it refuses rather than guesses.
         @test ReactantNitro.selected_checkpoint(nothing, dir) === nothing

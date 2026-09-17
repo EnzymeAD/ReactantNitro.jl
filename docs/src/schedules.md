@@ -152,10 +152,19 @@ specific one, silently and with no ambiguity warning, so a scalar schedule could
 
 ## The binding report
 
-Setup prints a binding report naming every schedule, where it resolved to, and whether it came
-from a keyword or an accessor, plus the per-group table with each group's rate, ratio, anchor,
-decay, rule, and parameter count. The same text is handed to [`log_other!`](@ref), so the run's
-record carries it; the terminal is not the only copy.
+The binding report names every schedule, where it resolved to, and whether it came from a keyword
+or an accessor, plus a row per parameter group carrying that group's rate, ratio, anchor, decay,
+rule, and parameter count.
+
+**It is part of `show(nitro)` rather than a display of its own.** Its sections are appended to the
+handle's, so printing a handle answers both what the run currently holds and where each configured
+value came from, in one table. Setup prints nothing itself: the REPL already displays the handle
+the constructor returns, and a constructor that also printed it would show you the same table
+twice. From a script, ask for it with `display(nitro)`.
+
+The plain text is handed to [`log_other!`](@ref) whether or not anything displayed it, so the
+run's record carries it and the terminal is never the only copy. [`binding_report`](@ref) returns
+that same text.
 
 Read it on the first run of any new config; it is the cheapest way to catch a group that came out
 empty, a ratio you did not intend, or a schedule that bound to the optimizer when you meant your

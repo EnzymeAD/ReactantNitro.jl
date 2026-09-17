@@ -809,47 +809,43 @@ function rebuild_rule_field(r, field::Symbol, value)
 end
 
 """
-    ReactantNitro.build_binding_report(nitro) -> String
+    ReactantNitro.binding_report_pieces(nitro) -> NamedTuple
 
-The binding report's text. **A diagnostic, not a check**: it computes nothing the run does not
-already compute and it never fails. It exists because the rules that resolve a learning rate, a
-schedule key, and a per-group accessor are individually simple and jointly hard to hold in your
-head.
+Everything the binding report says, read off a [`Nitro`](@ref) and handed to
+[`binding_report_sections`](@ref) or [`binding_report_text`](@ref) as keywords. **A diagnostic,
+not a check**: it computes nothing the run does not already compute and it never fails. It exists
+because the rules that resolve a learning rate, a schedule key, and a per-group accessor are
+individually simple and jointly hard to hold in your head.
 
 **One of three reports, and they do not overlap.** This one says where each configured value BOUND
 and from which source. What the handle currently holds, including the seed, the batch size, the
-split sizes and the preset, is `show(nitro)`. What has been redefined since the handle froze it is
-[`fixed_config_report`](@ref).
-
-Rendered through whatever table renderer is installed, which is the boxed one unless you called
-[`table_renderer!`](@ref)`(nothing)`; the copy stored on the handle and sent to the logger stays
-plain.
+split sizes and the preset, is the `state` band of `show(nitro)`, which these sections are
+appended to. What has been redefined since the handle froze it is [`fixed_config_report`](@ref).
 
 ```
-ReactantNitro: binding report for MyExp
-
   data
   split  resolved
-  train  2944 of 3001 samples; 57 dropped by drop-last; prefetch: 16 workers, depth 1
-  val    500 samples; final batch of 52 padded then sliced; prefetch: none; the eval path does not stream
+  train  46 batches; 2,944 of 3,001 samples; 57 dropped by drop-last; prefetch: 16 workers
+  val    8 batches; 500 samples; final batch of 52 padded then sliced; prefetch: 1 producer
 
   gradient clip
-    global norm 1.0   (optimizer program only; changing it recompiles it)       [train! keyword]
+  value            effect                                              source
+  global norm 1.0  optimizer program only; changing it recompiles it   [train! keyword]
 
   schedules
-  binding        what                                                        source
-  eta            optimizer field, all groups, per-group ratio applied         [train! keyword]
-  opt.lambda     optimizer field, all groups, per-group ratio applied         [schedules(e)]
-  device.lambda  Device field   e.lambda                                      [schedules(e)]
+  binding        what                                                  source
+  eta            optimizer field, all groups, per-group ratio applied   [train! keyword]
+  device.lambda  Device field   e.lambda                                [schedules(e)]
 
   parameter groups (G = 2)
-  group      base eta  ratio  decay toward  lambda  rule   params
-  :default   1.0e-3    1.0    zero          1.0e-4  RAdam  1,234,567
-  :backbone  1.0e-4    0.1    w0            1.0e-3  RAdam  23,456,789
+  group      settings                                              params
+  :default   eta 0.001 (x1.0), lambda 0.0001 toward zero, RAdam    1,234,567
+  :backbone  eta 0.0001 (x0.1), lambda 0.001 toward w0, RAdam      23,456,789
 
   level 2 chains
-    :backbone   scheduled values present in the returned chain: eta, beta
-                NOT present: epsilon        <- scheduled but the factory did not apply it
+  group      binding                                      values
+  :backbone  present in the returned chain                eta, beta
+             NOT present, the factory did not apply it    epsilon
 ```
 
 That last block is the point: the framework gives up **erroring** on an unapplied Level 2
@@ -859,17 +855,17 @@ legitimately transforms a value. As a report the same information costs nothing 
 The `data` block is the home of the one thing the framework deliberately does not raise on: samples
 a drop-last training loader discarded are invisible to every check the framework can make. The
 parenthetical appears only when the source supports `MLUtils.numobs`, and is **omitted rather than
-guessed** otherwise. The `gradient_clip_norm` line's source label is the one place a reader sees
+guessed** otherwise. The `gradient_clip_norm` row's source label is the one place a reader sees
 whether the keyword, a method, or a field won.
 
-Emitted through `@info` and handed to `log_other!(lgr, "binding_report", str)` so it lands in the
-run's record.
+The sections are shown as bands of `show(nitro)`; the plain text goes to
+`log_other!(lgr, "binding_report", str)` so it lands in the run's record.
 """
-function build_binding_report(nitro; plain::Bool = true)
+function binding_report_pieces(nitro)
     lay = nitro.layout
     splits = [
         (;
-            name = String(nm), batches = length(getproperty(nitro.data, nm)),
+            name = String(nm), batches = _nitro_split(getproperty(nitro.data, nm)),
             batch_size = something(nitro.batch_size, 0),
             samples = nothing, dropped = nothing, short_final = nothing,
             prefetch = prefetch_report_entry(nm, getproperty(nitro.data, nm)),
@@ -903,14 +899,29 @@ function build_binding_report(nitro; plain::Bool = true)
                 for (gi, g) in enumerate(lay.groups)
         ]
     end
-    return binding_report_text(;
+    return (;
         name = string(nameof(typeof(nitro.e))), splits,
         clip = nitro.gradient_clip_norm,
         clip_source = clip_source(nitro.e, nitro.gradient_clip_norm),
         schedules = nitro.schedules, groups,
-        manual = get(nitro.frozen, :manual, false), plain
+        manual = get(nitro.frozen, :manual, false),
     )
 end
+
+"""
+    ReactantNitro.build_binding_report(nitro) -> String
+
+The binding report's plain text, for [`binding_report`](@ref) and the logger.
+"""
+build_binding_report(nitro) = binding_report_text(; binding_report_pieces(nitro)...)
+
+"""
+    ReactantNitro.build_binding_sections(nitro) -> Vector{TableSection}
+
+The binding report's [`TableSection`](@ref)s, which `show(nitro)` appends to the handle's own
+bands so that a run displays as one table.
+"""
+build_binding_sections(nitro) = binding_report_sections(; binding_report_pieces(nitro)...)
 
 """
     ReactantNitro.clip_source(e, resolved) -> Symbol
@@ -960,6 +971,15 @@ _prefetch_buffers(pf) =
     "$(pf.device_batches) on device, $(pf.host_batches) on host" *
     (pf.ordered ? "" : ", UNORDERED")
 
+"""
+    ReactantNitro._batches_note(batches) -> String
+
+The data band's leading note. `batches` is a count, or the word [`_nitro_split`](@ref) reports for
+a loader that promises no length, and the two cannot share a phrasing: "streaming batches" claims
+a count the framework does not have.
+"""
+_batches_note(b) = b in ("streaming", "?") ? String(b) : "$b batches"
+
 _prefetch_note(pf) =
     pf.path === :fanout || pf.path === :fanout_unordered ?
     "prefetch: $(pf.workers) workers, $(_prefetch_buffers(pf))" :
@@ -973,27 +993,31 @@ _prefetch_note(pf) =
     "prefetch: $(pf.path)"
 
 """
-    ReactantNitro.binding_report_text(; name, splits, clip, clip_source,
-                                        schedules, groups, level2 = ()) -> String
+    ReactantNitro.binding_report_sections(; name, splits, clip, clip_source,
+                                            schedules, groups, level2 = ()) -> Vector{TableSection}
 
-The binding report's text, built from explicit pieces so it is testable without a run.
-`build_binding_report` assembles these from a [`Nitro`](@ref).
+The binding report's [`TableSection`](@ref)s, built from explicit pieces so they are testable
+without a run. [`build_binding_report`](@ref) assembles these from a [`Nitro`](@ref), and
+`show(nitro)` appends them to the handle's own bands so a run is one table.
 
-**It reports where values BOUND, and deliberately nothing else.** The seed, the accum, the schedule
-horizon, the batch size, the batch counts and the preset are all state the handle carries, so
-`show(nitro)` is where they are read; a fact printed by two reports is a fact that can disagree
-between them. What is redefined since construction is the third report,
+**They report where values BOUND, and deliberately nothing else.** The seed, the accum, the
+schedule horizon, the batch size, the batch counts and the preset are all state the handle
+carries, so the `state` band above these is where they are read; a fact printed by two sections is
+a fact that can disagree between them. What is redefined since construction is a separate report,
 [`fixed_config_report`](@ref).
 
   * `splits`: one `(; name, batches, batch_size, samples, dropped, short_final[, prefetch])` per
-    split. Only what the data path RESOLVED is printed: `samples`, `dropped`, and `short_final` may
-    be `nothing` and are then **omitted rather than guessed**, per the rule above for sources that
-    do not support `MLUtils.numobs`. `batches` and `batch_size` are accepted and not printed, since
-    the handle carries both. `prefetch` is optional and read with `get`, so a caller assembling the
-    pieces by hand may leave it out; `build_binding_report` always supplies it, from
-    [`prefetch_report_entry`](@ref).
-  * `clip_source`: `:keyword`, `:method`, `:field`, or `:default`. **This is the one place a reader
-    sees which of them won.** `:default` is the framework's own value and is what a bare
+    split. Only what the data path RESOLVED is printed: `samples`, `dropped`, and `short_final`
+    may be `nothing` and are then **omitted rather than guessed**, per the rule for sources that
+    do not support `MLUtils.numobs`. The batch count is always resolvable, so it is what a split
+    with nothing else to report shows, and the band has no empty case. `batches` and `batch_size` are accepted and not printed,
+    since the handle carries both. `prefetch` is optional and read with `get`, so a caller
+    assembling the pieces by hand may leave it out; `build_binding_report` always supplies it,
+    from [`prefetch_report_entry`](@ref). `batch_size` is accepted and not printed, since it is
+    one number for the run and the `state` band carries it. `batches` leads the resolved notes
+    and may be a count or the word a non-countable loader reports; see [`_batches_note`](@ref).
+  * `clip_source`: `:keyword`, `:method`, `:field`, or `:default`. **This is the one place a
+    reader sees which of them won.** `:default` is the framework's own value and is what a bare
     experiment reports; it is a separate label because "field on e" naming a field the experiment
     does not declare is a report that cannot be checked against the source.
   * `groups`: one `(; name, base_eta, ratio, anchor, lambda, rule, params)` per parameter group.
@@ -1001,32 +1025,20 @@ between them. What is redefined since construction is the third report,
     **erroring** on an unapplied Level 2 hyperparameter, because the identity check that would
     detect it also rejects a factory that legitimately transforms a value. As a report the same
     information costs nothing and rejects nothing.
+
+`name` is accepted and not printed: the table's title already names the experiment, and these
+sections are bands inside it.
 """
-function binding_report_text(;
-        name, splits = (), clip = 0,
+function binding_report_sections(;
+        name = "", splits = (), clip = 0,
         clip_source::Symbol = :default, schedules = nothing, groups = (),
-        level2 = (), manual = false, plain::Bool = true
+        level2 = (), manual = false
     )
-    io = IOBuffer()
-    # `plain = true` BY DEFAULT, and that default is load-bearing rather than conservative. This
-    # text is stored on the handle, returned by `binding_report`, and sent to `log_other!`: a
-    # machine-read artifact whose bytes must not depend on whether some other package in the
-    # session happened to load PrettyTables. Setup asks for the rendered version separately, for
-    # the human reading the `@info` at that moment, and keeps the plain one for everything else.
-    section(title, header, rows) = sprint() do buf
-        plain ? _render_table_plain(buf, title, header, rows, nothing) :
-            _render_table(buf, title, header, rows)
-    end
-    # WHERE VALUES BOUND, and nothing else. The seed, the accum, the horizon and the preset used to
-    # head this report and are all on the handle, so `show(nitro)` says them; a value repeated in
-    # two reports is a value that can disagree between them. A preset was never a per-value source
-    # anyway: by the time anything sees `e`, a preset's values ARE struct fields, indistinguishable
-    # from hand-set ones, so claiming provenance for them would be a lie the type system cannot
-    # back.
-    println(io, "ReactantNitro: binding report for $name")
+    sections = TableSection[]
 
     if !isempty(splits)
         rows = TableRows()
+        styles = CellStyles()
         for sp in splits
             notes = String[]
             if sp.samples !== nothing
@@ -1038,36 +1050,63 @@ function binding_report_text(;
             end
             sp.short_final === nothing ||
                 push!(notes, "final batch of $(sp.short_final) padded then sliced")
-            # `get` rather than `sp.prefetch`: this function is built to be callable from a test with
-            # explicit pieces, and the suites that do so construct their splits tuples by hand.
+            # `get` rather than `sp.prefetch`: this function is built to be callable from a test
+            # with explicit pieces, and the suites that do so construct their splits tuples by
+            # hand.
             pf = get(sp, :prefetch, nothing)
             pf === nothing || push!(notes, _prefetch_note(pf))
-            # No batch count and no batch size: `show(nitro)` carries both, and what belongs here
-            # is what the DATA PATH resolved to, which is drop-last, padding, and prefetch.
-            push!(rows, [sp.name, isempty(notes) ? "(nothing resolved)" : join(notes, "; ")])
+            # The batch count LEADS the resolved notes, and it moved here from the handle's own
+            # `data` row when the two displays became one table: it is the first thing anyone
+            # asks of a split, and a band headed `data` that did not say how many batches a split
+            # has would send the reader to a second display for it. The batch SIZE stays in the
+            # `state` band, since it is one number for the run rather than one per split.
+            #
+            # A note rather than a column of its own, because every section of this table shares
+            # its columns and a count is three characters wide: given a column, it would sit in
+            # one sized by `eta 0.001 (x1.0), lambda 0.0 toward zero, RAdam` and be separated
+            # from the rest of its own row by forty blanks.
+            pushfirst!(notes, _batches_note(sp.batches))
+            push!(rows, [sp.name, join(notes, "; ")])
+            # UNORDERED is the one resolved data setting worth a colour. It costs bitwise
+            # reproducibility, `_prefetch_note` already refuses to mention ordering on the runs
+            # where it holds, and a split that quietly gave it up is exactly what a reader is
+            # scanning this band for.
+            occursin("UNORDERED", last(rows)[2]) &&
+                (styles[(length(rows), 2)] = :warn)
         end
-        print(io, "\n", section("  data", ["split", "resolved"], rows), "\n")
+        push!(sections, TableSection("data", ["split", "resolved"], rows, styles))
     end
 
-    # A table, like every other section of this report, rather than the two hand-printed lines this
-    # used to be. The three pieces were always there (the resolved value, what it implies, and which
-    # source won); a table is what lines them up with the columns the rest of the report already
-    # uses, and it is the column a reader scans that makes `[train! keyword]` versus
-    # `[framework default]` findable in the same place here as in the schedules block.
-    clip_rows = TableRows(
-        [
-            [
-                clip > 0 ? "global norm $(_g(clip))" : "none (threshold 0)",
-                clip > 0 ? "optimizer program only; changing it recompiles it" :
-                    "a run with no clipping",
-                "[" * _source_label(clip_source) * "]",
-            ],
-        ]
+    # A section like every other part of this report, rather than the two hand-printed lines this
+    # used to be. The three pieces were always there (the resolved value, what it implies, and
+    # which source won); columns are what line them up with the ones the rest of the report
+    # already uses, and it is the column a reader scans that makes `[train! keyword]` versus
+    # `[framework default]` findable in the same place here as in the schedules band.
+    push!(
+        sections, TableSection(
+            "gradient clip", ["value", "effect", "source"], TableRows(
+                [
+                    [
+                        clip > 0 ? "global norm $(_g(clip))" : "none (threshold 0)",
+                        clip > 0 ? "optimizer program only; changing it recompiles it" :
+                            "a run with no clipping",
+                        "[" * _source_label(clip_source) * "]",
+                    ],
+                ]
+            ),
+            # A threshold of zero is the absence of a setting, so it is muted rather than stated:
+            # this row exists to be scanned past on the runs that do not clip, and to stand out on
+            # the ones that do.
+            merge(
+                CellStyles((1, 1) => clip > 0 ? :accent : :muted),
+                _source_styles([clip_source], 3)
+            )
+        )
     )
-    print(io, "\n", section("  gradient clip", ["value", "effect", "source"], clip_rows), "\n")
 
     if schedules !== nothing && !isempty(schedules)
         rows = TableRows()
+        srcs = Symbol[]
         for (ns, tbl) in ((:opt, schedules.opt), (:device, schedules.device))
             for k in keys(tbl)
                 disp = haskey(schedules.source, k) ? k : Symbol(ns, ".", k)
@@ -1077,55 +1116,104 @@ function binding_report_text(;
                 note = disp in schedules.constant ? "  (constant)" : ""
                 # The source keeps its brackets. It is the column a reader scans for, and "[train!
                 # keyword]" is the token that appears in every other report and in the docs.
-                push!(
-                    rows, [
-                        string(disp), what * note,
-                        "[" * _source_label(get(schedules.source, disp, :accessor)) * "]",
-                    ]
-                )
+                src = get(schedules.source, disp, :accessor)
+                push!(rows, [string(disp), what * note, "[" * _source_label(src) * "]"])
+                push!(srcs, src)
             end
         end
-        print(io, "\n", section("  schedules", ["binding", "what", "source"], rows), "\n")
+        push!(
+            sections, TableSection(
+                "schedules", ["binding", "what", "source"], rows, _source_styles(srcs, 3)
+            )
+        )
     end
 
     if !isempty(groups)
-        rows = TableRows[]
+        # SEVEN FACTS IN THREE COLUMNS, and the flattening is forced rather than chosen. Every
+        # section of this table shares one column structure, so a band wanting seven columns would
+        # set seven widths for the whole report and leave the two-column bands stranded across
+        # them. What is lost is scanning `ratio` or `decay toward` down a column; what is kept is
+        # every group on one line, which is the thing that matters as G grows.
         rows = TableRows(
             [
                 [
-                    repr(g.name), _g(g.base_eta),
-                    string(round(Float64(g.ratio); digits = 2)), string(g.anchor),
-                    _g(g.lambda), string(g.rule), _commas(g.params),
+                    repr(g.name),
+                    string(
+                        "eta ", _g(g.base_eta), " (x",
+                        string(round(Float64(g.ratio); digits = 2)), "), lambda ",
+                        _g(g.lambda), " toward ", g.anchor, ", ", g.rule
+                    ),
+                    _commas(g.params),
                 ] for g in groups
             ]
         )
-        print(
-            io, "\n",
-            section(
-                "  parameter groups (G = " * string(length(groups)) * ")",
-                ["group", "base eta", "ratio", "decay toward", "lambda", "rule", "params"],
-                rows
-            ), "\n"
+        push!(
+            sections, TableSection(
+                "parameter groups (G = " * string(length(groups)) * ")",
+                ["group", "settings", "params"], rows
+            )
         )
     end
 
     if !isempty(level2)
-        println(io, "\n  level 2 chains")
+        rows = TableRows()
         for l in level2
-            println(
-                io, "    ", rpad(repr(l.group), 12),
-                "scheduled values present in the returned chain: ",
-                isempty(l.present) ? "(none)" : join(l.present, ", ")
+            push!(
+                rows, [
+                    repr(l.group), "present in the returned chain",
+                    isempty(l.present) ? "(none)" : join(l.present, ", "),
+                ]
             )
-            isempty(l.absent) || println(
-                io, "    ", " "^12, "NOT present: ",
-                join(l.absent, ", "),
-                "        <- scheduled but the factory did not apply it"
+            isempty(l.absent) || push!(
+                rows, [
+                    "", "NOT present, the factory did not apply it", join(l.absent, ", "),
+                ]
             )
         end
+        push!(sections, TableSection("level 2 chains", ["group", "binding", "values"], rows))
     end
+
+    return sections
+end
+
+"""
+    ReactantNitro.binding_report_text(; kwargs...) -> String
+
+[`binding_report_sections`](@ref) rendered as plain aligned columns, which is the form stored on
+the handle, returned by [`binding_report`](@ref), and sent to `log_other!`.
+
+**Plain and never the installed renderer**, and that is load-bearing rather than conservative.
+This is a machine-read artifact whose bytes must not depend on whether some other package in the
+session happened to load PrettyTables. The human reading a run's opening display gets the framed
+form through `show(nitro)`, which is a different call with a different destination.
+"""
+function binding_report_text(; name = "", kwargs...)
+    io = IOBuffer()
+    _render_sections_plain(
+        io, "ReactantNitro: binding report for $name",
+        binding_report_sections(; name, kwargs...), nothing
+    )
     return String(take!(io))
 end
+
+
+"""
+    ReactantNitro._source_styles(sources, col) -> CellStyles
+
+The role for each row's source cell, in column `col`: `:accent` for a value a `train!` keyword set
+and `:muted` for the framework's own default.
+
+**This is the column a reader scans, and the two ends of it are the two questions they have.**
+`[train! keyword]` is what somebody changed for THIS run, which is the first thing to check when a
+run behaves unlike its neighbours; `[framework default]` is a value nobody chose, which is the
+first thing to check when a run behaves unlike its config implies. The accessor and method
+sources sit between them and stay plain, because a value that came from the experiment is the
+ordinary case and colouring the ordinary case spends the signal.
+"""
+_source_styles(sources, col::Int) = CellStyles(
+    (i, col) => (src === :keyword ? :accent : :muted)
+        for (i, src) in enumerate(sources) if src === :keyword || src === :default
+)
 
 _source_label(s::Symbol) = s === :keyword ? "train! keyword" :
     s === :accessor ? "schedules(e)" :

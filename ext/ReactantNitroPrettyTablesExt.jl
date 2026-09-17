@@ -1,7 +1,7 @@
 # ReactantNitroPrettyTablesExt.jl
 #
-# The PrettyTables renderer for this package's long `show` methods. Loading PrettyTables anywhere
-# in a session is the trigger, and `__init__` points `ReactantNitro._TABLE_RENDERER` here.
+# The framed renderer for this package's long `show` methods. Loading PrettyTables anywhere in a
+# session is the trigger, and `__init__` points `ReactantNitro._TABLE_RENDERER` here.
 #
 # ── Why an extension and not a dependency ────────────────────────────────────────────
 #
@@ -10,10 +10,23 @@
 # renderer, which needs no dependency and is what CI and a log file see; this is the upgrade a
 # human at a REPL gets for free once something in the session has already loaded PrettyTables.
 #
+# ── How several sections become one frame ────────────────────────────────────────────
+#
+# `row_group_labels` is the feature this rests on: a full-width labelled band drawn between data
+# rows. Each of our sections becomes one of those, and a section's own column header is emitted as
+# an ordinary first row of its band, since a table has exactly one real column-label row and it
+# would have to sit above every section at once.
+#
+# NO VERTICAL RULES, and that is the choice that makes the whole thing work rather than a style
+# preference. A table has one column structure, so the widest cell anywhere in a column sets that
+# column for every section, and a two-column band inside a three-column table therefore ends in a
+# stretch of air. Unruled, that air is invisible and the band reads as a short line. Ruled, it
+# reads as a cell somebody forgot to fill in.
+#
 # ── The one thing to know if the display changes under you ───────────────────────────
 #
 # This activates on LOAD, so a session that pulls PrettyTables in indirectly (DataFrames does)
-# gets boxed tables without asking for them. That is the intended behaviour and it is also the
+# gets the framed table without asking for it. That is the intended behaviour and it is also the
 # reason `ReactantNitro.table_renderer!(nothing)` exists: it puts the plain renderer back for the
 # rest of the process, and this extension never reclaims it.
 module ReactantNitroPrettyTablesExt
@@ -21,37 +34,120 @@ module ReactantNitroPrettyTablesExt
 import ReactantNitro
 import PrettyTables
 
-# The renderer contract, as `ReactantNitro.table_renderer!` documents it: a title, a column header,
-# rows, and a trailing note. An all-empty header means there are no column names to show, which is
-# the handle summary's shape (label and value, no heading over either).
+# ── The palette: six roles, and the eight-colour ANSI set ────────────────────────────
+#
+# THE BASIC EIGHT, not 256-colour and not truecolor, and that is the whole reason this reads well
+# on somebody else's terminal. The basic eight are the ones a theme remaps, so `:green` is
+# whatever green that person chose and is legible against whatever background they chose with it.
+# A hex colour picked here would look considered on the machine it was picked on and would be the
+# one unreadable cell on a light theme.
+#
+# `:dark_gray` for `:muted` is the one entry to be careful with. It is Crayons' name for bright
+# black, which is the theme's grey and is dim on both polarities; `faint` would be the obvious
+# alternative and is a terminal attribute that several emulators drop entirely and one or two
+# render as invisible.
+#
+# Nothing here sets a background. A background colour survives a copy-paste into a ticket as a
+# block of highlight, and these tables get pasted.
+#
+# ── TWO GATES DECIDE WHETHER A CRAYON IS EMITTED, and they read different things ──────
+#
+# PrettyTables decides whether to STYLE from the `IOContext` it is handed. Crayons decides whether
+# to emit the ESCAPE from the buffer it is printing into, which is one PrettyTables made and which
+# does not carry that context, so it falls back to the process-global `Base.get_have_color()`.
+#
+# In a process with colour on, which is every REPL, both are satisfied and none of this is
+# visible. In one with colour off, a caller that wraps the `io` in `IOContext(:color => true)`
+# satisfies the first gate and not the second, and gets a table carrying `\e[0m` resets with no
+# colour before them. `Crayons.force_color(true)` is what satisfies the second, and a test
+# asserting on a crayon has to set both.
+const _ROLE_CRAYONS = Dict{Symbol, PrettyTables.Crayon}(
+    :good => PrettyTables.Crayon(foreground = :green),
+    :busy => PrettyTables.Crayon(foreground = :cyan),
+    :warn => PrettyTables.Crayon(foreground = :yellow),
+    :bad => PrettyTables.Crayon(foreground = :red, bold = true),
+    :muted => PrettyTables.Crayon(foreground = :dark_gray),
+    :accent => PrettyTables.Crayon(foreground = :magenta),
+)
+
+# The renderer contract, as `ReactantNitro.table_renderer!` documents it: a title, the sections,
+# and a trailing note.
 #
 # NAMED AND TYPED SPECIFICALLY on purpose. It is reached through a `Ref{Any}`, so the call is
-# dynamic and nothing would check a looser signature; a bare `render` taking five untyped
-# arguments is the shape that reads as applicable to any five-argument call and turns a stack
+# dynamic and nothing would check a looser signature; a bare `render` taking four untyped
+# arguments is the shape that reads as applicable to any four-argument call and turns a stack
 # trace from this display path into a puzzle.
 function render_table(
-        io::IO, title::AbstractString, header::Vector{String},
-        rows::ReactantNitro.TableRows, note::Union{AbstractString, Nothing}
+        io::IO, title::AbstractString, sections::Vector{ReactantNitro.TableSection},
+        note::Union{AbstractString, Nothing}
     )
+    rows = ReactantNitro.TableRows()
+    labels = Pair{Int, String}[]
+    headers = Set{Int}()
+    # A section's styles are keyed by its OWN row numbers; the table's are keyed by the table's.
+    # This is where the two are reconciled, once, rather than at every lookup.
+    roles = Dict{Tuple{Int, Int}, Symbol}()
+    for sec in sections
+        # An empty section title draws no band label. The leading section uses it: the table's
+        # own title already names that band, and a label directly under the title is a heading
+        # printed twice. A label is placed at the row it precedes, so it is computed BEFORE the
+        # section's rows are appended.
+        isempty(sec.title) || push!(labels, (length(rows) + 1) => sec.title)
+        if any(!isempty, sec.header)
+            push!(rows, sec.header)
+            # Remembered so the highlighter below can BOLD it. A section's column header is an
+            # ordinary data row as far as the table is concerned, so nothing else distinguishes
+            # `group  settings  params` from the group rows underneath it, and a header that
+            # reads as data is worse than no header at all.
+            push!(headers, length(rows))
+        end
+        offset = length(rows)
+        append!(rows, sec.rows)
+        for ((r, c), role) in sec.styles
+            roles[(offset + r, c)] = role
+        end
+    end
     isempty(rows) && return print(io, title)
     cols = maximum(length, rows)
     data = [get(rows[r], c, "") for r in 1:length(rows), c in 1:cols]
-    kwargs = any(!isempty, header) ?
-        (; column_labels = [get(header, c, "") for c in 1:cols]) :
-        (; show_column_labels = false)
+
     # Rendered into a buffer for one reason: `pretty_table` ends its output with a newline and a
     # `show` method must not, or every display carries a blank line under it. `IOContext(buf, io)`
     # carries the caller's attributes across, `:color` above all, so the detour costs nothing else.
     buf = IOBuffer()
     PrettyTables.pretty_table(
         IOContext(buf, io), data;
-        alignment = :l, title,
+        alignment = :l, title, title_alignment = :l,
+        # The real column-label row is off: every section carries its own header as a data row,
+        # because one label row cannot describe five sections with different columns.
+        show_column_labels = false,
+        row_group_labels = isempty(labels) ? nothing : labels,
+        # ORDER IS THE PRECEDENCE: PrettyTables applies the FIRST highlighter that matches, so
+        # the header rule comes first and a section's column header stays bold even where a role
+        # was set on the same coordinates. Every crayon here is emitted solely when the
+        # destination declares color, so a `sprint` in a test or a redirect to a file still gets
+        # clean text.
+        highlighters = [
+            PrettyTables.TextHighlighter((_, i, _) -> i in headers; bold = true),
+            # A ROLE THIS PALETTE DOES NOT KNOW LEAVES THE CELL ALONE, which is why the
+            # predicate looks the role up here rather than only checking that one was set. The
+            # roles are a contract between a `show` in the core and whatever renderer is
+            # installed, so a core that grows a seventh must not take a `KeyError` out of the
+            # display of every handle in a session that has not upgraded this extension with it.
+            PrettyTables.TextHighlighter(
+                (_, i, j) -> haskey(_ROLE_CRAYONS, get(roles, (i, j), :none)),
+                (_, _, i, j) -> _ROLE_CRAYONS[roles[(i, j)]]
+            ),
+        ],
+        table_format = PrettyTables.TextTableFormat(;
+            vertical_lines_at_data_columns = :none,
+            horizontal_line_after_column_labels = false,
+        ),
         # NO CROPPING. The default fits the table to the display and drops what does not fit, and
-        # what does not fit here is the right-hand column: the metrics and the checkpoint path,
+        # what does not fit here is the right-hand column: the sources and the checkpoint path,
         # which are the reason someone printed the handle. A wrapped long line beats an elided one.
         fit_table_in_display_horizontally = false,
         fit_table_in_display_vertically = false,
-        kwargs...
     )
     print(io, rstrip(String(take!(buf)), '\n'))
     note === nothing || print(io, "\n  ", note)

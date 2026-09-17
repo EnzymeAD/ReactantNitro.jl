@@ -489,7 +489,7 @@ function _build_nitro(
 
     nitro = Nitro(
         e, model, ps, st, w0, layout, opt_state, collection, routing, schema, mesh,
-        Dict{Any, Any}(), resolved, total, batch_size, logger, nothing, checksums, preset,
+        Dict{Any, Any}(), resolved, total, batch_size, logger, nothing, nothing, checksums, preset,
         source === nothing ? nothing : String(source),
         # The provenance half: the record is in scope here for the compatibility check above, so the
         # training run's identity costs nothing to keep and cannot be recovered later, since the
@@ -506,13 +506,20 @@ function _build_nitro(
         # restored from a checkpoint, whose recorded metrics belong to the process that wrote it.
         (;), nothing, nothing
     )
-    # TWO BUILDS, and only when they would differ. The stored report is the machine-read one: it
-    # goes to `log_other!`, it is what `binding_report` returns, and its bytes must not depend on
-    # whether something else in the session loaded PrettyTables. The displayed one takes whatever
-    # renderer is installed, which is the whole point of installing one.
+    # TWO BUILDS, and they are not the same artifact. The stored report is the machine-read one:
+    # it goes to `log_other!`, it is what `binding_report` returns, and its bytes must not depend
+    # on whether something else in the session loaded PrettyTables. The sections are what the
+    # handle DISPLAYS, appended to its own bands by `show`, so a reader sees one table instead of
+    # a summary and a report that each drew their own boxes.
+    #
+    # NOTHING IS PRINTED HERE, and the binding report used to be `@info`-ed at exactly this point.
+    # It stopped being a separate artifact when it became part of `show(nitro)`: a constructor
+    # that also printed its own return value would display the handle twice in the REPL, which is
+    # where most of these are built. A script that wants it asks, with `display(nitro)` or
+    # `@info sprint(show, MIME"text/plain"(), nitro)`, and the run's record has it either way
+    # through `log_other!` on the next line.
     nitro.report = build_binding_report(nitro)
-    @info _TABLE_RENDERER[] === nothing ? nitro.report :
-        build_binding_report(nitro; plain = false)
+    nitro.sections = build_binding_sections(nitro)
     log_other!(logger, "binding_report", nitro.report)
     run_ref === nothing || (run_ref[] = nitro)
     # The per-run monitor copy, taken HERE and not only at `train!`. `train!` calls it again,
@@ -1510,8 +1517,11 @@ function fixed_config_report(nitro::Nitro; entry::Symbol = :train)
     return title * "\n" * body
 end
 
-# Printed rather than `@info`-ed: it is a report, like the binding report, not a diagnostic. And
-# printed only when there is something to say, which is why this is not simply `print`.
+# Printed rather than `@info`-ed: it is a report, not a diagnostic, and `@info`'s gutter would put
+# a `|` down the left of every line of it. And printed only when there is something to say, which
+# is why this is not simply `print`. Unlike the binding report, this one has no display of its own
+# to ride on: `show(nitro)` states what the handle IS HOLDING, and a value redefined since it
+# froze is by definition not that.
 function report_fixed_config(nitro::Nitro, entry::Symbol)
     CONFIG_REPORT[] || return nothing
     txt = fixed_config_report(nitro; entry)
