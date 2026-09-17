@@ -541,18 +541,14 @@ function warn_no_concurrency(train_split)
     src = prefetch_source(train_split)
     if cfg.path === :single_no_trait
         @warn """
-        ReactantNitro: the `train` split runs its host data path in ONE producer task, because
-        `$(typeof(src))` does not implement both halves of the index-addressable trait.
-        $(prefetch_workers(train_split)) workers were available and are unused.
-        DEPTH IS LOOKAHEAD, NOT CONCURRENCY: one producer that takes longer per batch than the
-        device takes per step cannot feed it at any depth, because the buffer stays empty. If this
-        model's host data path is slower than its step, this is a several-fold slowdown that
-        nothing else will report; watch `data_wait_frac` in the per-epoch metrics.
-        Implement both on the source: `ReactantNitro.batch_at(src, i)` producing batch `i`
-        independently (`i` is a BATCH index, not a sample offset), and
-        `ReactantNitro.begin_epoch!(src)` doing whatever the source's `iterate` initialization
-        does. Both are required: with only `batch_at`, every epoch after the first would train on
-        the first epoch's plan.""" available_workers = prefetch_workers(train_split)
+        ReactantNitro: the `train` split runs ONE producer task and leaves \
+        $(prefetch_workers(train_split)) workers idle, because `$(typeof(src))` implements \
+        neither half of the index-addressable trait.
+        Depth is lookahead, not concurrency: a producer slower per batch than the device is per \
+        step starves it at any depth. Watch `data_wait_frac` in the per-epoch metrics.
+        Implement BOTH `ReactantNitro.batch_at(src, i)`, where `i` is a BATCH index, and \
+        `ReactantNitro.begin_epoch!(src)`. With only `batch_at`, every epoch after the first \
+        replays the first epoch's plan."""
     elseif cfg.path === :inline
         @warn """
         ReactantNitro: the `train` split is wrapped in `NoPrefetch`, so its entire host data path
