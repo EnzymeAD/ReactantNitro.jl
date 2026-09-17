@@ -114,8 +114,6 @@ ReactantNitro.build_model(e::MnistMLP, rng) = begin
     (model, Lux.setup(rng, model)...)
 end
 
-# The batch dimension is LAST, so images are (784, B) and one-hot labels are (10, B). MLDatasets
-# prompts before its first download; `ENV["DATADEPS_ALWAYS_ACCEPT"] = "true"` skips the prompt.
 function ReactantNitro.build_data(::MnistMLP, dist)
     function batches(d, bs = 32)
         x = reshape(d.features, 28 * 28, :)              # Float32, already in [0, 1]
@@ -131,22 +129,15 @@ end
 
 ReactantNitro.forward(::MnistMLP, model, ps, st; img) = Lux.apply(model, img, ps, st)
 
-# `e.smoothing` is a `Device` field, so it is a traced INPUT: sweep it or schedule it across runs
-# with no recompile.
 function ReactantNitro.loss(e::MnistMLP, logits; label)
     smoothed = (1f0 - e.smoothing) .* label .+ e.smoothing / 10f0
     return -sum(smoothed .* logsoftmax(logits; dims = 1)) / size(label, 2)
 end
 
-# The reduction, in three lines: `metrics` returns (numerator, denominator) per batch, the
-# framework sums BOTH across the split and divides once at the end. That is the true accuracy over
-# the whole validation set, which is not the mean of the per-batch accuracies.
 function ReactantNitro.metrics(::MnistMLP, logits; label)
     return (; acc = (sum(argmax(logits; dims = 1) .== argmax(label; dims = 1)), size(label, 2)))
 end
 
-# Defining `metrics` replaces the framework's substituted `val_loss`, so the checkpointer is
-# pointed at a key this experiment actually emits. `:val_loss` was never magic.
 n = Nitro(MnistMLP(); checkpointer = TopKCheckpointer(; metric = :acc, mode = :max))
 train!(n)
 ```
