@@ -111,14 +111,6 @@ Four hooks are required. Everything else has a default: the optimizer (RAdam at 
 parameter group, no decay, no schedule, prefetching, validation, checkpointing, and a logging
 contract whose shipped default writes JSON Lines.
 
-Real MNIST, so the numbers at the end mean something. Neither `MLDatasets` nor `MLUtils` is a
-dependency of this package; `] add MLDatasets MLUtils` and the data downloads on first use.
-
-Any iterable of batches works as a data source, but **`MLUtils.DataLoader` is the recommended one**:
-batching and shuffling are its job rather than the framework's, its host data path fans out over
-every thread, and its settings are checked at setup, so a training loader that would yield a partial
-final batch is refused before the first compile instead of on the last batch of epoch one.
-
 ```julia
 using ReactantNitro, Lux, Random
 using MLDatasets: MNIST
@@ -140,19 +132,16 @@ ReactantNitro.build_model(e::MnistMLP, rng) = begin
 end
 
 function ReactantNitro.build_data(::MnistMLP, dist)
-    function fields(d)
-        x = reshape(d.features, 28 * 28, :)              # Float32, already in [0, 1]
-        y = zeros(Float32, 10, length(d.targets))
-        for (i, t) in pairs(d.targets)
-            y[t + 1, i] = 1f0                            # targets are 0..9
-        end
-        return (; img = x, label = y)                    # batch dimension LAST, always
+    d = MNIST(split = :train)
+    x = reshape(d.features, 28 * 28, :)                  # Float32, already in [0, 1]
+    y = zeros(Float32, 10, length(d.targets))
+    for (i, t) in pairs(d.targets)
+        y[t + 1, i] = 1f0                                # targets are 0..9
     end
-    # `shuffle = true` reshuffles every epoch, and the framework drives this loader by index rather
-    # than iterating it, so one producer per thread fills the pipeline.
+    part(idx) = (; img = x[:, idx], label = y[:, idx])   # batch dimension LAST, always
     return (;
-        train = DataLoader(fields(MNIST(split = :train)); batchsize = 32, shuffle = true, partial = false),
-        val = DataLoader(fields(MNIST(split = :test)); batchsize = 32),
+        train = DataLoader(part(1:55_000); batchsize = 32, shuffle = true, partial = false),
+        val = DataLoader(part(55_001:60_000); batchsize = 32),
     )
 end
 
@@ -170,9 +159,6 @@ end
 n = Nitro(MnistMLP(); checkpointer = TopKCheckpointer(; metric = :acc, mode = :max))
 train!(n)
 ```
-
-One epoch on CPU reaches about 94% on the test split, reported as `acc 0.9421073717948718`: 9406
-correct out of 9984, not an average of 312 per-batch fractions.
 
 `examples/mnist_tutorial.jl` is the same task with everything turned on, as one runnable file; see the [Tutorial](https://enzymead.github.io/ReactantNitro.jl/dev/tutorial/)
 

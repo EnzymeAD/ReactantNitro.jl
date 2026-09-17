@@ -2,8 +2,10 @@
 
 The example is MNIST, carried from configuration through training to prediction on new data. It is
 MNIST on purpose: the task is one nobody has to be told, so every line below is about the framework
-rather than about the problem. The model is the small one you would reach for first, an encoder, a
-`tanh` hidden layer, and a linear head over the ten classes.
+rather than about the problem. The model is the small one you would reach for first, an encoder and
+a linear head over the ten classes, and it is deliberately the same network, split, learning rate
+and epoch budget as the README's quick start, so the two runs are comparable and the difference
+between them is only the features this page adds.
 
 **The example below runs start to finish today, and so does an experiment configuring nothing at
 all.**
@@ -57,7 +59,7 @@ using ParameterSchedulers: OneCycle
     class_weights::Device{Vector{Float32}} = Float32[]
 
     "Epochs to train for. Driver-only: never read inside a traced function."
-    max_epochs::Int = 20
+    max_epochs::Int = 5
 end
 ```
 
@@ -152,7 +154,6 @@ function ReactantNitro.build_model(e::MnistMLP, rng)
     # keeping the compiled program logit-valued is also what makes it exportable as-is, with the
     # normalization applied outside it. `predict` below is where softmax appears, once.
     model = Chain(Dense(784 => e.width, relu),      # encoder
-                  Dense(e.width => e.width, tanh),  # hidden
                   Dense(e.width => 10))             # head, logits
     ps, st = Lux.setup(rng, model)
     (model, ps, st)
@@ -429,19 +430,19 @@ Everything that is part of what the experiment *is* goes on the experiment type,
 does not require remembering what it needed:
 
 ```julia
-# Two parameter groups. The defaults give one group, RAdam, and a fixed learning rate. The per-group
-# accessors define RATIOS against the base, which a schedule then scales as a whole, so the encoder
-# stays a tenth of the rest for the entire curve rather than drifting relative to it. `ks` is the
-# parameter's keypath, so this reads "layer_1 is the encoder".
+# Two parameter groups. The defaults give one group, RAdam, and a fixed learning rate. `ks` is the
+# parameter's keypath, so this reads "layer_1 is the encoder". The encoder here runs at the base
+# rate and differs only in its decay, which keeps this run comparable to the quick start's; a
+# per-group `learning_rate` method defines a RATIO against the base, which a schedule then scales as
+# a whole, so a group set to a tenth stays a tenth for the entire curve rather than drifting.
 ReactantNitro.param_group(::MnistMLP, ks) = ks[1] === :layer_1 ? :encoder : :default
-ReactantNitro.learning_rate(::MnistMLP)   = 3f-4
-ReactantNitro.learning_rate(::MnistMLP, ::Val{:encoder}) = 3f-5
-ReactantNitro.lambda(::MnistMLP, ::Val{:encoder})        = 1f-4   # decoupled decay, toward zero
+ReactantNitro.learning_rate(::MnistMLP) = 1f-3
+ReactantNitro.lambda(::MnistMLP, ::Val{:encoder}) = 1f-4   # decoupled decay, toward zero
 
 # The schedule is part of the recipe too. Every entry is a factory of the horizon: the framework
 # calls it once, with the total number of optimizer steps, and then calls what it returns once per
 # step. The key is `eta` because that is the rule's own field name, not `lr`.
-ReactantNitro.schedules(::MnistMLP) = (; eta = total -> OneCycle(total, 3f-4))
+ReactantNitro.schedules(::MnistMLP) = (; eta = total -> OneCycle(total, 1f-3))
 
 # Global norm over the fully accumulated gradient. 0 means off, and is the default.
 ReactantNitro.gradient_clip_norm(::MnistMLP) = 1f0

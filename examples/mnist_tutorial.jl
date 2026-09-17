@@ -8,12 +8,17 @@
 #     julia --project=examples -e 'using Pkg; Pkg.instantiate()'
 #     julia --project=examples examples/mnist_tutorial.jl
 #
-# The full run is 20 epochs. `NITRO_EXAMPLE_EPOCHS=1` makes it a smoke test, and
-# `NITRO_EXAMPLE_BACKEND=cuda` runs it on a GPU.
+# The full run is 5 epochs, on the same network, split, learning rate and epoch budget as the
+# README's quick start. Measured on CPU: acc 0.9584, macro_recall 0.9579, about 3 minutes.
 #
-# The schedule is sized for the full run, so a one-epoch smoke test is not representative: measured
-# on CPU it reaches macro_recall 0.35 at one epoch and 0.92 at six. Use it to check that the thing
-# runs, not to judge the model.
+# It lands below the quick start's 0.9796, and the reason is the STEP COUNT rather than the recipe.
+# At a batch size of 100 with `accum = 2` the effective batch is 200, so 5 epochs is 1,375 optimizer
+# steps against the quick start's 8,590 at a batch of 32. The larger batch is what makes gradient
+# accumulation worth demonstrating here; it also means an epoch buys fewer updates.
+#
+# `NITRO_EXAMPLE_EPOCHS=1` makes it a smoke test, and `NITRO_EXAMPLE_BACKEND=cuda` runs it on a GPU.
+# The schedule is sized for the full run, so a one-epoch smoke test is not representative. Use it to
+# check that the thing runs, not to judge the model.
 #
 # MLDatasets downloads MNIST on first use and prompts before it does; this file accepts on your
 # behalf, which is the one thing here you might not want done silently.
@@ -51,7 +56,7 @@ using ParameterSchedulers: OneCycle
     class_weights::Device{Vector{Float32}} = Float32[]
 
     "Epochs to train for. Driver-only: never read inside a traced function."
-    max_epochs::Int = 20
+    max_epochs::Int = 5
 end
 
 # ── Data ────────────────────────────────────────────────────────────────────────────
@@ -96,7 +101,6 @@ function ReactantNitro.build_model(e::MnistMLP, rng)
     # logit-valued is what makes it exportable as-is.
     model = Chain(
         Dense(784 => e.width, relu),      # encoder
-        Dense(e.width => e.width, tanh),  # hidden
         Dense(e.width => 10),             # head, logits
     )
     ps, st = Lux.setup(rng, model)
@@ -167,15 +171,17 @@ ReactantNitro.train_metrics(::MnistMLP, logits; label) =
 # Two parameter groups. The per-group accessors define RATIOS against the base, which a schedule
 # then scales as a whole, so the encoder stays a tenth of the rest for the entire curve. `ks` is the
 # parameter's keypath, so this reads "layer_1 is the encoder".
+# The encoder runs at the BASE rate and differs only in its decay, which keeps this run comparable
+# to the README's quick start. A per-group `learning_rate` method would define a ratio against the
+# base instead, which a schedule then scales as a whole.
 ReactantNitro.param_group(::MnistMLP, ks) = ks[1] === :layer_1 ? :encoder : :default
-ReactantNitro.learning_rate(::MnistMLP) = 3.0f-4
-ReactantNitro.learning_rate(::MnistMLP, ::Val{:encoder}) = 3.0f-5
+ReactantNitro.learning_rate(::MnistMLP) = 1.0f-3
 ReactantNitro.lambda(::MnistMLP, ::Val{:encoder}) = 1.0f-4   # decoupled decay, toward zero
 
 # Every schedule entry is a factory of the horizon: the framework calls it once, with the total
 # number of optimizer steps, and then calls what it returns once per step. The key is `eta` because
 # that is the rule's own field name, not `lr`.
-ReactantNitro.schedules(::MnistMLP) = (; eta = total -> OneCycle(total, 3.0f-4))
+ReactantNitro.schedules(::MnistMLP) = (; eta = total -> OneCycle(total, 1.0f-3))
 
 # Global norm over the fully accumulated gradient. 0 means off, and is the default.
 ReactantNitro.gradient_clip_norm(::MnistMLP) = 1.0f0
@@ -193,7 +199,9 @@ ReactantNitro.early_stop(::MnistMLP) =
 
 function main()
     setup_devices!(backend = get(ENV, "NITRO_EXAMPLE_BACKEND", "cpu"))
-    epochs = parse(Int, get(ENV, "NITRO_EXAMPLE_EPOCHS", "20"))
+    # The keyword WINS over the experiment's `max_epochs` field, which is the point of the run
+    # knobs being keywords too. Kept in agreement with the field so the two do not drift.
+    epochs = parse(Int, get(ENV, "NITRO_EXAMPLE_EPOCHS", "5"))
 
     e = MnistMLP()
     nitro = Nitro(e; max_epochs = epochs)
