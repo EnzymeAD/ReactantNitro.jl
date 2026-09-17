@@ -821,8 +821,9 @@ and from which source. What the handle currently holds, including the seed, the 
 split sizes and the preset, is `show(nitro)`. What has been redefined since the handle froze it is
 [`fixed_config_report`](@ref).
 
-Rendered through whatever table renderer is installed, so loading `PrettyTables` boxes it; the
-copy stored on the handle and sent to the logger stays plain.
+Rendered through whatever table renderer is installed, which is the boxed one unless you called
+[`table_renderer!`](@ref)`(nothing)`; the copy stored on the handle and sent to the logger stays
+plain.
 
 ```
 ReactantNitro: binding report for MyExp

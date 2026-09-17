@@ -395,9 +395,9 @@ through a `Ref{Any}`, so nothing checks them for you, and five untyped arguments
 name is the signature that muddles a stack trace and looks applicable to calls that are not this
 one.
 
-Loading `PrettyTables` sets this for you through this package's extension, which is the supported
-way to get boxed tables. `table_renderer!(nothing)` puts the plain renderer back, which is what to
-do when something else in a session pulled PrettyTables in and you did not want the change.
+Boxed tables are the DEFAULT and not something you opt into: `Reactant` depends on `PrettyTables`,
+so every session that loads this package loads it too and this package's extension installs the
+boxed renderer. `table_renderer!(nothing)` is the opt-out, and gives the plain display a log gets.
 """
 function table_renderer!(f)
     prev = _TABLE_RENDERER[]
