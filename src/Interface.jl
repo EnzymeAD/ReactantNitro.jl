@@ -36,6 +36,24 @@ supports `length`.** A `Vector` of batches, an `MLUtils.DataLoader`, or a bespok
 qualify. Loaders yield **host** arrays; the framework transfers each batch, applies batch-dimension
 sharding, and owns prefetching.
 
+**Use `MLUtils.DataLoader` unless you have a reason not to.** Any source works, and the framework
+plays no favourites at runtime, but a `DataLoader` is the one shape whose mistakes are caught before
+they cost anything. Three things follow from it that nothing else gets for free:
+
+  * **Its settings are checked at setup, from its own fields.** A `train` split that keeps its
+    partial final batch is refused before the first compile, rather than on the last batch of epoch
+    one after two compiles and a full epoch of stepping. An eval split that drops one is warned
+    about, because it silently shrinks the set every metric is computed over.
+  * **It fans out with no effort.** The MLUtils extension implements the index-addressable trait for
+    it, so its host data path uses every thread, in the source's order, while a source that
+    implements neither half runs one producer and says so.
+  * **Batching, shuffling and collation are its job**, and the framework deliberately ships none of
+    them. `shuffle = true` reshuffles every epoch, which a `Vector` of batches built once in this
+    function cannot do at all.
+
+A bespoke sampler is entirely supported and sometimes necessary; it just puts the three above back
+on you, and the first one is caught late rather than early.
+
 Three requirements on the source, each with a reason:
 
   * **Restartable.** Setup draws one batch to learn the schema and resolve routing, then discards
@@ -44,7 +62,10 @@ Three requirements on the source, each with a reason:
   * **`length`.** Read once, at setup, to fix the schedule horizon. It counts **batches**.
   * **The `train` split drops its partial final batch** (`partial = false` for
     `MLUtils.DataLoader`, `drop_last = true` elsewhere), and its batch count must divide by
-    `accum`. Eval splits should NOT drop theirs: the framework pads and slices.
+    `accum`. Eval splits should NOT drop theirs: the framework pads and slices, and padding is safe
+    there because `testmode` makes a standard model a per-sample function along the batch axis. A
+    model that genuinely mixes across the batch in test mode is the one case where dropping on eval
+    too is right, since it avoids padding rather than tolerating it.
 
 There is **no `prepare_epoch!` hook**: `for batch in loader` calls `iterate` afresh each epoch, so a
 loader that reshuffles or regenerates does so in its own iteration initialization.

@@ -167,14 +167,15 @@ per batch does not move. Each stream is built when its phase starts and torn dow
 training and validation prefetch memory never coexist.
 
 Several producers need the index-addressable trait, `ReactantNitro.batch_at` and
-`ReactantNitro.begin_epoch!` on the source, because a sequential Julia iterator cannot be consumed by
-several tasks: the expensive work happens inside `iterate` and there is no way to ask for batch *k*
-without walking to it. **An `MLUtils.DataLoader` gets both for free**, from the extension that loads
-with MLUtils: it reads the loader's declaration (the data, the batch size, the RNG, whether to
-shuffle) and rebuilds each epoch's plan with MLUtils' own `shuffleobs` and `BatchView` rather than
-iterating it, so the loader above uses every thread with nothing asked of you. A source the framework
-does not know still runs in ONE producer task and says so at setup; implementing the two methods is
-the fix, and `ReactantNitro.check_batch_at` is what verifies an implementation before a run does.
+`ReactantNitro.begin_epoch!` on the source, because a sequential Julia iterator cannot be consumed
+by several tasks: the expensive work happens inside `iterate` and there is no way to ask for
+batch *k* without walking to it. **An `MLUtils.DataLoader` gets both for free**, from the extension that loads
+with MLUtils, and it is the main reason `DataLoader` is the recommended source. The extension reads
+the loader's declaration (the data, the batch size, the RNG, whether to shuffle) and rebuilds each
+epoch's plan with MLUtils' own `shuffleobs` and `BatchView` rather than iterating it, so the loader
+above uses every thread with nothing asked of you. A source the framework does not know still runs
+in ONE producer task and says so at setup; implementing the two methods is the fix, and
+`ReactantNitro.check_batch_at` is what verifies an implementation before a run does.
 
 Two `DataLoader` options do not survive a prefetched pipeline and are checked at setup.
 `buffer = true` is refused: it reuses one batch through `getobs!`, and the framework holds several
@@ -185,8 +186,8 @@ bitwise.
 
 The binding report carries `prefetch_workers`, `prefetch_device_batches`, `prefetch_host_batches`
 and `prefetch_ordered`. The two batch counts are the pipeline's two buffers, one per side of the
-transfer: `device_batches` is how many sit on the device staged ahead, and `host_batches` is how many
-may exist on the host at once, built but not yet transferred.
+transfer: `device_batches` is how many sit on the device staged ahead, and `host_batches` is how
+many may exist on the host at once, built but not yet transferred.
 
 Two things follow that are worth knowing before you go implementing the trait to silence a warning.
 **Adopting it is free**, because delivery is ordered by default: a reorder buffer emits batches in

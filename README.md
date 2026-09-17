@@ -113,7 +113,11 @@ contract whose shipped default writes JSON Lines.
 
 Real MNIST, so the numbers at the end mean something. Neither `MLDatasets` nor `MLUtils` is a
 dependency of this package; `] add MLDatasets MLUtils` and the data downloads on first use.
-Batching and shuffling are `MLUtils`' job, deliberately: the framework ships neither.
+
+Any iterable of batches works as a data source, but **`MLUtils.DataLoader` is the recommended one**:
+batching and shuffling are its job rather than the framework's, its host data path fans out over
+every thread, and its settings are checked at setup, so a training loader that would yield a partial
+final batch is refused before the first compile instead of on the last batch of epoch one.
 
 ```julia
 using ReactantNitro, Lux, Random
