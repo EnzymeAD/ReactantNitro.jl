@@ -75,7 +75,8 @@ ReactantNitro.batch_at(dl::DataLoader, i::Integer, plan) = getobs(plan, i)
 """
     ReactantNitro.check_source_options(dl::MLUtils.DataLoader, name::Symbol, cfg) -> nothing
 
-`buffer` and `parallel`, judged against the path the split actually resolved to.
+`partial` on the training split, plus `buffer` and `parallel` judged against the path the split
+actually resolved to.
 
 **Both options live inside `DataLoader`'s `Base.iterate`**, and that is the whole of it. `parallel`
 selects which `iterate` method runs; `buffer` matters because the buffered `iterate` fills one
@@ -94,8 +95,24 @@ it to bound allocation should not be left believing it did something.
 is ignored and the user gets what they asked for anyway, from this framework's producers, in the
 source's order. On the single-producer path it does run, and MLUtils documents that it breaks
 ordering guarantees, so a fixed seed stops reproducing a run bitwise.
+
+**`partial = false` on an EVAL split warns**, which is the mirror image. The framework pads a short
+eval batch and slices the outputs back, so keeping it costs nothing and is the supported shape;
+dropping it silently shrinks the set the metric is computed over, and a test accuracy quoted over
+9,984 of 10,000 samples reads exactly like one over all of them. It stays legal because there are
+two good reasons for it, a deliberately truncated set and a model that mixes across the batch axis
+in test mode, for which dropping is how you avoid padding rather than tolerate it.
+
+**`partial = true` on the `train` split is refused, and refused HERE**, before anything compiles.
+The framework already rejects a short training batch, but it can only do so when one arrives, which
+is the last batch of the first epoch: a compile and a full epoch of training after the mistake was
+made. A `DataLoader` carries the answer in its fields, so the arithmetic is exact rather than a
+guess, and `partial = true` over an observation count that happens to divide evenly is left alone
+because no short batch will ever be produced.
 """
 function ReactantNitro.check_source_options(dl::DataLoader, name::Symbol, cfg)
+    _check_partial(dl, name)
+    cfg.path === :inline && return nothing
     fanned = cfg.path === :fanout || cfg.path === :fanout_unordered
     if fanned
         dl.buffer === false || @warn """
@@ -122,6 +139,43 @@ function ReactantNitro.check_source_options(dl::DataLoader, name::Symbol, cfg)
     bitwise, whatever `ordered` says.
     Give the split more workers to use this framework's fan-out instead, which preserves the \
     source's order, or keep it and treat the run as unordered.""" maxlog = 1
+    return nothing
+end
+
+# Exact rather than heuristic: a short final batch exists only when the observation count does not
+# divide by the batch size, and both are fields on the loader. `batchsize <= 0` is MLUtils' iterate
+# individual observations mode, where every batch is one observation and none can be short.
+function _check_partial(dl::DataLoader, name::Symbol)
+    dl.batchsize > 0 || return nothing
+    n = numobs(dl.data)
+    short = n % dl.batchsize
+    # Nothing to say either way when the count divides: no batch is ever short, so `partial` picks
+    # between two identical behaviours and the flag is inert.
+    short == 0 && return nothing
+    if name === :train
+        dl.partial || return nothing
+        error(
+            """
+            ReactantNitro: the `train` split is an `MLUtils.DataLoader` with `partial = true` over
+            $n observations at a batch size of $(dl.batchsize), so its final batch is $short wide.
+            A training loader must DROP its partial final batch: the compiled program has a fixed
+            shape and training cannot pad, because in train mode BatchNorm normalizes over the
+            batch, so padded rows change the real rows' outputs and no downstream slice undoes it.
+            Pass `partial = false`. With a shuffled loader this costs nothing over a run, since a
+            different tail is dropped each epoch. Eval splits should KEEP theirs; the framework pads
+            and slices those."""
+        )
+    end
+    dl.partial && return nothing
+    @warn """
+    ReactantNitro: the `$name` split is an `MLUtils.DataLoader` with `partial = false` over $n \
+    observations at a batch size of $(dl.batchsize), so $short samples are dropped and every metric \
+    on this split is computed over $(n - short) of them.
+    Eval splits do not need to drop: the framework pads a short final batch, runs the one compiled \
+    program, and slices the outputs back before `metrics` sees them, so padding is invisible. Pass \
+    `partial = true` unless you meant it. Two cases where dropping IS the right call: evaluating on \
+    a deliberately truncated set, and a model that mixes across the batch axis in test mode, for \
+    which dropping is how you avoid padding rather than tolerate it.""" maxlog = 1
     return nothing
 end
 

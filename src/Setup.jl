@@ -358,11 +358,13 @@ function _build_nitro(
     # a split the user declined with `NoPrefetch` runs its data path inline, consuming each batch
     # before the next is built, so a loader option that a producer running ahead would break is
     # perfectly safe there.
+    # EVERY split, including the ones that declined prefetch. Some of what a source type can get
+    # wrong depends on the resolved path and some does not: a training loader that keeps its partial
+    # final batch is wrong whether or not anything reads ahead, and `cfg` is passed so the hook can
+    # tell the two kinds apart rather than the caller guessing for it.
     for nm in keys(collection)
         split = getproperty(collection, nm)
-        cfg = prefetch_config(split)
-        cfg.path === :inline && continue
-        check_source_options(prefetch_source(split), nm, cfg)
+        check_source_options(prefetch_source(split), nm, prefetch_config(split))
     end
     training && warn_no_concurrency(collection.train)
 

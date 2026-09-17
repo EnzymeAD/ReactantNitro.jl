@@ -124,6 +124,57 @@
         end
     end
 
+    # The framework already refuses a short TRAINING batch, but only when one arrives, which is the
+    # last batch of the first epoch: a compile and a full epoch after the mistake. A `DataLoader`
+    # carries the answer in its fields, so it is caught before anything compiles.
+    @testset "`partial = true` on the train split is refused at setup" begin
+        # 40 observations at a batch size of 6 leaves a final batch of 4.
+        keeps_short = MLUtils.DataLoader((; x = ML_X, y = ML_Y); batchsize = 6, partial = true)
+        cfg = prefetch_config(PrefetchIterator(keeps_short; workers = 4))
+
+        err = try
+            check_source_options(keeps_short, :train, cfg)
+        catch ex
+            ex
+        end
+        @test err isa ErrorException
+        @test occursin("40 observations at a batch size of 6", err.msg)
+        @test occursin("final batch is 4 wide", err.msg)
+        @test occursin("partial = false", err.msg)
+
+        @testset "and only for `train`: eval splits keep theirs and are padded" begin
+            @test check_source_options(keeps_short, :val, cfg) === nothing
+            @test check_source_options(keeps_short, :test, cfg) === nothing
+        end
+
+        # The mirror image, and the reason it is a warning rather than an error: dropping on eval
+        # is legal, occasionally deliberate, and silently changes the denominator of every metric
+        # on that split.
+        @testset "`partial = false` on an eval split warns about the dropped samples" begin
+            drops = MLUtils.DataLoader((; x = ML_X, y = ML_Y); batchsize = 6, partial = false)
+            @test_logs (:warn, r"4 samples are dropped") check_source_options(drops, :val, cfg)
+            @test_logs (:warn, r"computed over 36 of them") check_source_options(drops, :test, cfg)
+            # Not on train, where dropping is the requirement.
+            @test_logs check_source_options(drops, :train, cfg)
+        end
+
+        @testset "`partial = true` that never yields a short batch is left alone" begin
+            # 40 observations at a batch size of 4 divides exactly, so no batch is ever short and
+            # the flag is harmless. Refusing on the flag alone would reject a working configuration.
+            @test check_source_options(ml_loader(; partial = true), :train, cfg) === nothing
+            # And the eval warning is keyed on the same arithmetic, so an exact division is silent
+            # whichever way `partial` is set.
+            @test_logs check_source_options(ml_loader(; partial = false), :val, cfg)
+            @test_logs check_source_options(ml_loader(; partial = true), :val, cfg)
+        end
+
+        @testset "the check runs even for a split that declined prefetch" begin
+            inline = prefetch_config(NoPrefetch(keeps_short))
+            @test inline.path === :inline
+            @test_throws ErrorException check_source_options(keeps_short, :train, inline)
+        end
+    end
+
     # ── end to end ──────────────────────────────────────────────────────────────────
 
     # The payoff, and the reason ordered delivery is the default: fanning a shuffled loader out over

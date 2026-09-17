@@ -53,6 +53,11 @@ option is dangerous, inert, or fine depends entirely on which path the split too
 lives inside a source's `Base.iterate` is live on the single-producer path, which iterates, and dead
 on the fan-out path, which asks for batch `i` and never iterates at all. Refusing such an option
 unconditionally would reject a configuration in which nothing can go wrong.
+
+**Called for every split, including `:inline` ones.** Not everything a source type can get wrong is
+path-dependent: a training loader that keeps its partial final batch is wrong however it is read,
+and catching that here is what turns an error on the last batch of epoch one into an error before
+anything compiles.
 """
 check_source_options(source, name::Symbol, cfg) = nothing
 
