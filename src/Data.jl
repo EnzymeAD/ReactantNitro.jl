@@ -1,6 +1,6 @@
 # Data.jl
 #
-# The data-source contract's checks, depth-N prefetch, and the pad-then-slice path for a short final
+# The data-source contract's checks, the staged prefetch pipeline, and the pad-then-slice path for a short final
 # eval batch. Nothing here is exported.
 #
 # The prefetch puts the H2D transfer INSIDE itself, so it depends on the device placement and the
@@ -348,7 +348,7 @@ end
 # A prior framework fanned out to `num_workers = threads ÷ 2` producers over two methods a model
 # supplied on its own loader, one returning the epoch's job list and one producing a batch from a
 # start offset. The port to this framework dropped both as "framework-owned now", the replacement
-# was ONE producer task with `depth` as a mere `Channel` capacity, and no layer picked the
+# was ONE producer task with the device staging as a mere `Channel` capacity, and no layer picked the
 # capability up. The first ported model then trained about four times slower than its reference,
 # entirely in the host data path.
 #
@@ -470,28 +470,39 @@ hyperparameter, not left to be inferred.
 """
 default_prefetch_workers() = max(1, Threads.nthreads(:default))
 
-const DEFAULT_PREFETCH_DEPTH = 1
+const DEFAULT_DEVICE_BATCHES = 1
 
 """
-    ReactantNitro.PrefetchIterator(source, depth = 1; workers = default_prefetch_workers(), ordered = true)
+    ReactantNitro.PrefetchIterator(source; workers = default_prefetch_workers(),
+                                   device_batches = 1, host_batches = 2 * workers, ordered = true)
 
 Prefetch: `workers` producer tasks building **host** batches, one transfer task performing the H2D
-copy, and a `Channel` of `depth` `(host, device)` pairs feeding the training loop. This is what
-keeps the device fed across variable host latency.
+copy, and a `Channel` of `device_batches` `(host, device)` pairs feeding the training loop. This is
+what keeps the device fed across variable host latency.
+
+**The two buffer knobs are one per side of the transfer, and each names what it costs.**
+`device_batches` is how many batches sit ON THE DEVICE staged ahead, and `host_batches` is how many
+may exist ON THE HOST at once: built but not yet transferred, counting the workers' hands, the
+hand-off channel, and the reorder buffer together. Neither is per-worker.
 
 **The framework wraps the `train` split with this automatically** (see [`auto_prefetch`](@ref)), at
 these defaults, so a user normally never writes it. It stays public for the case where the defaults
 are wrong, and [`NoPrefetch`](@ref) is how a split declines entirely.
 
-  * **`workers` is the knob that matters.** Depth is lookahead, not concurrency: one producer at
-    1.5 s/batch cannot feed a 0.4 s consumer at any depth, because the buffer simply stays empty. A
-    worker count is what turns `host + device` per batch into `max(host / workers, device)`, and it
-    requires [`batch_at`](@ref) and [`begin_epoch!`](@ref) on the source. Without them this falls
-    back to one producer and setup says so.
-  * **Device memory scales with `depth`, host memory with `workers`.** Resident device memory is
-    `(depth + 2) x batch`: `depth` in the channel, one in the transfer task's hand, one in the
-    consumer's. Host memory is about `(2 x workers + 1) x batch`, which is why `depth` defaults to 1
-    and why raising `workers` far past the thread count is a bad trade.
+  * **`workers` is the knob that matters.** Staging is lookahead, not concurrency: one producer at
+    1.5 s/batch cannot feed a 0.4 s consumer at any `device_batches`, because the buffer simply stays
+    empty. A worker count is what turns `host + device` per batch into `max(host / workers, device)`,
+    and it requires [`batch_at`](@ref) and [`begin_epoch!`](@ref) on the source. Without them this
+    falls back to one producer and setup says so.
+  * **Resident device memory is `(device_batches + 2) x batch`**: `device_batches` in the channel,
+    one in the transfer task's hand, one in the consumer's. That `+ 2` is why the default is 1.
+  * **Resident host memory is about `host_batches x batch`**, and the default of `2 x workers` is
+    what keeps every worker able to build one batch while another waits to be transferred.
+  * **The two bound different failures.** `device_batches` back-pressures a SLOW CONSUMER: when the
+    device channel fills, the transfer task blocks, stops draining the hand-off, and the workers
+    block behind it. `host_batches` back-pressures a SLOW BATCH, which the device side cannot see at
+    all: with ordered delivery a straggler leaves the device starving while finished batches pile up
+    behind it, so the ceiling has to sit upstream at the coordinator.
   * **The transfer is on ONE task, not on the workers.** Two reasons, and the first is fatal to the
     alternative: bounding device memory would need a semaphore released when the consumer is *done*
     with a batch, and there is no such moment (XLA execution is asynchronous and the executable holds
@@ -512,12 +523,11 @@ are wrong, and [`NoPrefetch`](@ref) is how a split declines entirely.
     no longer reproduces bitwise. It stays statistically equivalent to a different shuffle: every
     sample is seen exactly once, and `check_train_divisibility`'s invariant (a group never spans an
     epoch boundary) is preserved either way.
-  * **Ordered delivery bounds its own memory upstream.** A reorder buffer that simply drained the
-    workers would grow to a whole epoch behind one slow batch, so the coordinator hands out jobs
-    against a credit window of `2 x workers` instead: at most that many host batches exist at once,
-    across the workers' hands, the hand-off channel, and the reorder buffer together. The window is
-    never smaller than `workers`, so the batch everything is waiting for is always in flight and a
-    straggler stalls emission without deadlocking it.
+  * **`host_batches` is enforced upstream, at the coordinator.** A reorder buffer that simply
+    drained the workers would grow to a whole epoch behind one slow batch, so the coordinator takes
+    a credit before handing out a job and the transfer stage returns one after emitting a batch.
+    `host_batches` may not be smaller than `workers`, and the constructor says so: the batch ordered
+    delivery is waiting for must be inside the window, or a straggler deadlocks instead of stalling.
 
 **Batching, shuffling, and splitting are not shipped**: `MLUtils.jl` covers those.
 
@@ -543,20 +553,25 @@ one is accepted and ignored rather than rejected, for the benefit of a caller wh
 """
 struct PrefetchIterator{S}
     source::S
-    depth::Int
+    device_batches::Int
+    host_batches::Int
     workers::Int
     ordered::Bool
 
     function PrefetchIterator(
-            source::S, depth::Integer = DEFAULT_PREFETCH_DEPTH;
-            workers::Integer = default_prefetch_workers(), ordered::Bool = true
+            source::S;
+            workers::Integer = default_prefetch_workers(),
+            device_batches::Integer = DEFAULT_DEVICE_BATCHES,
+            host_batches::Integer = 2 * workers,
+            ordered::Bool = true
         ) where {S}
-        depth >= 1 || error(
+        device_batches >= 1 || error(
             """
-            ReactantNitro: `PrefetchIterator` depth is $depth; it must be at least 1. Depth is
-            how many batches are held ahead, and resident device memory is `(depth + 2) x batch`,
-            which is why the default is 1.
-            A DEPTH OF 0 IS NOT HOW YOU TURN PREFETCH OFF. Running the host data path inline on the
+            ReactantNitro: `PrefetchIterator` device_batches is $device_batches; it must be \
+            at least 1. It is how many batches sit on the DEVICE staged ahead, and resident device \
+            memory is
+            `(device_batches + 2) x batch`, which is why the default is 1.
+            ZERO IS NOT HOW YOU TURN PREFETCH OFF. Running the host data path inline on the
             training task is an intentionally suboptimal choice, so it is not reachable by setting a
             number: it needs a marker a reviewer will question. Write `NoPrefetch(source)` if that is
             genuinely what you want."""
@@ -564,7 +579,21 @@ struct PrefetchIterator{S}
         workers >= 1 || error("ReactantNitro: `PrefetchIterator` workers is $workers; it must be at \
             least 1. `workers = 1` is the single-producer path. To run the data path inline on the \
             training task instead, wrap the source in `NoPrefetch`.")
-        return new{S}(source, Int(depth), Int(workers), ordered)
+        # NOT merely a lower bound for sanity's sake. Ordered delivery holds finished batches until
+        # the one it is waiting for arrives, and that batch is only ever in flight if the window is
+        # at least as wide as the number of workers. Below that, every worker can be holding a batch
+        # the consumer cannot yet accept while the one it needs has not been handed out: a deadlock
+        # rather than a stall.
+        host_batches >= workers || error(
+            """
+            ReactantNitro: `PrefetchIterator` host_batches is $host_batches with $workers workers; it
+            must be at least `workers`. It is the ceiling on batches existing on the HOST at once,
+            across the producers' hands, the hand-off channel, and the reorder buffer together, and a
+            window narrower than the producer count can leave the batch ordered delivery is waiting
+            for outside it, which deadlocks the epoch rather than slowing it.
+            To hold fewer batches, lower `workers` too."""
+        )
+        return new{S}(source, Int(device_batches), Int(host_batches), Int(workers), ordered)
     end
 end
 
@@ -579,7 +608,7 @@ Base.eltype(::Type{PrefetchIterator{S}}) where {S} = eltype(S)
 
 The framework wraps the `train` split in a [`PrefetchIterator`](@ref) at its own defaults, so a split
 that must run its host data path inline on the training task says so with this. It is a visible,
-greppable declaration that a reviewer will question; a numeric `prefetch_depth = 0` field on an
+greppable declaration that a reviewer will question; a numeric `prefetch_device_batches = 0` field on an
 experiment reads as ordinary tuning, which is precisely how one model ran its entire data path inline
 for weeks with nothing contradicting it.
 
@@ -596,15 +625,17 @@ Base.eltype(::Type{NoPrefetch{S}}) where {S} = eltype(S)
 
 """
     ReactantNitro.prefetch_source(x)
-    ReactantNitro.prefetch_depth(x) -> Int
+    ReactantNitro.prefetch_device_batches(x) -> Int
+    ReactantNitro.prefetch_host_batches(x) -> Int
     ReactantNitro.prefetch_workers(x) -> Int
 
 Unwrap a split, and read its settings.
 
-`prefetch_depth` returns `0` for anything that is not a [`PrefetchIterator`](@ref), which is the "this
-split does not stream" case rather than a depth. **That `0` is an internal dispatch result and never a
-user-settable value**: the constructor rejects a depth below 1, and [`NoPrefetch`](@ref) is the
-supported way to say it. Do not resurrect `depth = 0` as an input on the strength of this.
+`prefetch_device_batches` returns `0` for anything that is not a [`PrefetchIterator`](@ref), which is
+the "this split does not stream" case rather than a count. **That `0` is an internal dispatch result
+and never a user-settable value**: the constructor rejects anything below 1, and [`NoPrefetch`](@ref)
+is the supported way to say it. Do not resurrect `device_batches = 0` as an input on the strength of
+this.
 
 Setup goes through `prefetch_source` for the schema probe and the contract checks, so a wrapped
 source is validated as itself rather than through the wrapper.
@@ -612,8 +643,10 @@ source is validated as itself rather than through the wrapper.
 prefetch_source(p::PrefetchIterator) = p.source
 prefetch_source(n::NoPrefetch) = n.source
 prefetch_source(x) = x
-prefetch_depth(p::PrefetchIterator) = p.depth
-prefetch_depth(x) = 0
+prefetch_device_batches(p::PrefetchIterator) = p.device_batches
+prefetch_device_batches(x) = 0
+prefetch_host_batches(p::PrefetchIterator) = p.host_batches
+prefetch_host_batches(x) = 0
 prefetch_workers(p::PrefetchIterator) = p.workers
 prefetch_workers(x) = 0
 prefetch_ordered(p::PrefetchIterator) = p.ordered
@@ -647,7 +680,7 @@ _auto_wrap(split::NoPrefetch) = split
 _auto_wrap(split) = PrefetchIterator(split)
 
 """
-    ReactantNitro.prefetch_config(split) -> (; depth, workers, path)
+    ReactantNitro.prefetch_config(split) -> (; device_batches, host_batches, workers, ordered, path)
 
 The **resolved** prefetch settings for a split, which is not the same as the requested ones: a
 `workers > 1` request over a source that does not implement the index-addressable trait resolves to
@@ -665,19 +698,24 @@ one producer.
   * `:inline`: no stream at all, meaning a [`NoPrefetch`](@ref) split or one setup did not wrap.
 """
 function prefetch_config(split)
-    d = prefetch_depth(split)
+    d = prefetch_device_batches(split)
+    h = prefetch_host_batches(split)
     o = prefetch_ordered(split)
-    d == 0 && return (; depth = 0, workers = 0, ordered = o, path = :inline)
+    d == 0 && return (;
+        device_batches = 0, host_batches = 0, workers = 0, ordered = o, path = :inline,
+    )
     w = prefetch_workers(split)
     src = prefetch_source(split)
+    cfg(workers, path) = (;
+        device_batches = d, host_batches = h, workers = workers, ordered = o, path = path,
+    )
     if fanout_capable(src)
-        w == 1 && return (; depth = d, workers = 1, ordered = o, path = :single)
-        return (; depth = d, workers = w, ordered = o, path = o ? :fanout : :fanout_unordered)
+        w == 1 && return cfg(1, :single)
+        return cfg(w, o ? :fanout : :fanout_unordered)
     end
-    w == 1 && return (; depth = d, workers = 1, ordered = o, path = :single)
-    materialized_source(src) &&
-        return (; depth = d, workers = 1, ordered = o, path = :materialized)
-    return (; depth = d, workers = 1, ordered = o, path = :single_no_trait)
+    w == 1 && return cfg(1, :single)
+    materialized_source(src) && return cfg(1, :materialized)
+    return cfg(1, :single_no_trait)
 end
 
 """
@@ -764,7 +802,7 @@ schema and shape checks and for a `:host`-residency `train_metrics`, and the **d
 the gradient program.
 
 Without a [`PrefetchIterator`](@ref) this is a lazy generator and the transfer happens inline,
-exactly as it did before prefetch existed. With one it is a `Channel` of that depth fed by a
+exactly as it did before prefetch existed. With one it is a `Channel` of `device_batches` fed by a
 spawned producer, so the transfer overlaps the previous step's compute.
 
 **A producer that throws surfaces at the consumer.** `Channel`'s task form closes the channel with
@@ -782,20 +820,22 @@ check fires, which is one wasted transfer on a path that is about to raise.
   1. **Fan-out** ([`PrefetchStream`](@ref)), when `workers > 1` and the source is
      [`fanout_capable`](@ref). N workers build host batches, one task transfers, the consumer sees the
      same pair type as always.
-  2. **One producer**, a `Channel` of `depth` fed by a single task iterating the source. What this
+  2. **One producer**, a `Channel` of `device_batches` fed by a single task iterating the source. What this
      function used to do unconditionally, and the fallback when the source does not implement the
      index-addressable trait.
-  3. **Inline**, a lazy generator, when `prefetch_depth == 0`: a [`NoPrefetch`](@ref) split, or an eval
+  3. **Inline**, a lazy generator, when `prefetch_device_batches == 0`: a [`NoPrefetch`](@ref) split, or an eval
      split, which setup never wraps.
 """
 function batch_stream(split, routing, mesh = nothing)
-    depth = prefetch_depth(split)
-    depth == 0 && return ((b, to_device_batch(b, routing, mesh)) for b in split)
+    device_batches = prefetch_device_batches(split)
+    device_batches == 0 && return ((b, to_device_batch(b, routing, mesh)) for b in split)
     src = prefetch_source(split)
     workers = prefetch_workers(split)
-    (workers > 1 && fanout_capable(src)) &&
-        return fanout_stream(src, workers, depth, routing, mesh, prefetch_ordered(split))
-    return Channel{Tuple{Any, Any}}(depth; spawn = true) do ch
+    (workers > 1 && fanout_capable(src)) && return fanout_stream(
+        src, workers, device_batches, prefetch_host_batches(split),
+        routing, mesh, prefetch_ordered(split)
+    )
+    return Channel{Tuple{Any, Any}}(device_batches; spawn = true) do ch
         for b in src
             put!(ch, (b, to_device_batch(b, routing, mesh)))
         end
@@ -812,15 +852,15 @@ is what keeps the training loop's body identical across all three.
 ```
 coordinator  ->  Channel{Int}(workers)             the batch indices 1:n
    N workers ->  Channel{Tuple{Int,Any}}(workers)  HOST batches, with the index that produced them
-      1 transfer task -> Channel{Tuple{Any,Any}}(depth)   (host, device) pairs
+      1 transfer task -> Channel{Tuple{Any,Any}}(device_batches)  (host, device) pairs
          the training loop
 
-   credits  <-  Channel{Nothing}(2 x workers)      one token per job in flight, returned on emit
+   credits  <-  Channel{Nothing}(host_batches)     one token per host batch, returned on emit
 ```
 
-`credits` is the upstream bound on ordered delivery. The coordinator takes a token before handing
-out a job and the transfer stage returns one after emitting a batch, so at most `2 x workers`
-host batches exist at once across the workers, `hostch`, and the reorder buffer together. It is a
+`credits` is `host_batches` made literal. The coordinator takes a token before handing out a job and
+the transfer stage returns one after emitting a batch, so at most that many host batches exist at
+once across the workers, `hostch`, and the reorder buffer together. It is a
 `Channel` rather than a `Semaphore` for one reason: teardown closes it, and a coordinator blocked on
 `take!` of a closed channel unwinds into its own `finally`, whereas one blocked on a semaphore would
 be a leaked task with no way to reach it.
@@ -847,7 +887,10 @@ Base.iterate(s::PrefetchStream, state) = iterate(s.devch, state)
 # The error-propagation shape here is a prior framework's, reused rather than reinvented: its data
 # path carried two comments that each recorded a real deadlock in production, and a hang is the
 # failure mode this path is most able to produce.
-function fanout_stream(src, workers::Int, depth::Int, routing, mesh, ordered::Bool = true)
+function fanout_stream(
+        src, workers::Int, device_batches::Int, host_batches::Int = 2 * workers,
+        routing = nothing, mesh = nothing, ordered::Bool = true
+    )
     token_before = epoch_token(src)
     # BEFORE `length`, and before any job exists. A source whose plan changes its batch count is
     # correct only if the count is read after the re-plan.
@@ -859,19 +902,19 @@ function fanout_stream(src, workers::Int, depth::Int, routing, mesh, ordered::Bo
 
     jobs = Channel{Int}(workers)
     hostch = Channel{Tuple{Int, Any}}(workers)
-    devch = Channel{Tuple{Any, Any}}(depth)
+    devch = Channel{Tuple{Any, Any}}(device_batches)
     marks = zeros(UInt8, n)
 
-    # The credit window, and the reason it is never smaller than `workers`: the batch ordered
-    # delivery is waiting for is always inside the window, so a straggler stalls emission without
-    # being able to deadlock it. UNORDERED DELIVERY NEEDS NO WINDOW, because it holds nothing back
-    # and `hostch` already bounds it, so it leaves the channel empty and never takes from it.
-    window = 2 * workers
-    credits = Channel{Nothing}(window)
-    if ordered
-        for _ in 1:min(window, n)
-            put!(credits, nothing)
-        end
+    # `host_batches` made literal. One token per batch allowed to exist on the host: the coordinator
+    # takes one before handing out a job and the transfer stage returns one after emitting, so the
+    # ceiling covers the producers' hands, `hostch`, and the reorder buffer together.
+    #
+    # BOTH DELIVERY MODES take the window, so the knob means the same thing either way. Unordered
+    # delivery would be bounded anyway, by `hostch` plus one batch per worker, but leaving it to fall
+    # out of two unrelated capacities is how a documented number stops matching the code.
+    credits = Channel{Nothing}(host_batches)
+    for _ in 1:min(host_batches, n)
+        put!(credits, nothing)
     end
 
     # One shared job channel rather than a per-worker stride, and that is the point: exactly-once
@@ -879,7 +922,7 @@ function fanout_stream(src, workers::Int, depth::Int, routing, mesh, ordered::Bo
     # property of index arithmetic somebody has to get right.
     coord = Threads.@spawn try
         for i in 1:n
-            ordered && take!(credits)
+            take!(credits)
             put!(jobs, i)
         end
     finally
@@ -955,6 +998,7 @@ function prefetch_transfer(
         for (i, b) in hostch
             if !ordered
                 put!(devch, (b, to_device_batch(b, routing, mesh)))
+                return_credit!(credits)
                 continue
             end
             pending[i] = b
@@ -1086,7 +1130,7 @@ end
 
 The cleanup half, and the reason [`batch_stream`](@ref)'s consumer runs inside a `try`/`finally`:
 **early exit must stop the producer and free the device buffers it is holding, or it leaks a task and
-`depth x batch` of device memory.** An early exit is not exotic here: `request_stop!` from a monitor,
+`device_batches x batch` of device memory.** An early exit is not exotic here: `request_stop!` from a monitor,
 a non-finite loss, and any error mid-epoch all leave the loop with a full channel behind it.
 
 `close` is what stops the producer: a blocked `put!` on a closed channel raises, which ends the task.
@@ -1172,7 +1216,7 @@ teardown. A batch that has been handed to a compiled program is NOT freed by the
 is asynchronous, the executable holds its inputs for the duration, and freeing at the point the Julia
 call returns would race it. Those batches are dropped and reclaimed by the finalizer exactly as they
 were before prefetch existed. The rule "explicit rather than left to the GC" is about the resident
-`depth x batch` this iterator introduces, and that is what this frees.
+`device_batches x batch` this iterator introduces, and that is what this frees.
 """
 function free_batch!(batch)
     _each_array_leaf(batch) do leaf

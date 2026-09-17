@@ -189,7 +189,7 @@
             # did not substitute anything for it.
             @test n.data.train isa PrefetchIterator
             @test ReactantNitro.prefetch_source(n.data.train) === BARE_TRAIN
-            @test ReactantNitro.prefetch_depth(n.data.train) == 1                      # the default depth
+            @test ReactantNitro.prefetch_device_batches(n.data.train) == 1             # the default staging
             @test ReactantNitro.prefetch_workers(n.data.train) == max(1, Threads.nthreads(:default))
             # And only `train`: `run_eval` iterates its split directly, so wrapping one would advertise a
             # worker count nothing uses.

@@ -1,6 +1,6 @@
-# Prefetch tests: depth-N prefetch and its cleanup requirement.
+# Prefetch tests: the staged prefetch pipeline and its cleanup requirement.
 #
-# This is the one optional prefetch helper. The mechanism is a `Channel` of depth N with a
+# This is the one optional prefetch helper. The mechanism is a `Channel` of `device_batches` with a
 # producer task, and the part that needs testing is not the happy path: it is that A PRODUCER THAT
 # THROWS SURFACES AT THE CONSUMER RATHER THAN HANGING IT, and that an early exit stops the producer
 # and frees the device buffers it is holding. The framework's cleanup contract asks for exactly
@@ -14,8 +14,9 @@
     using ReactantNitro
     using ReactantNitro: PrefetchStream, auto_prefetch, batch_stream, check_batch_at,
         check_prefetch_delivery, close_stream!, default_prefetch_workers, epoch_token, fanout_capable,
-        free_batch!, materialized_source, prefetch_config, prefetch_depth, prefetch_ordered,
-        prefetch_source, prefetch_workers, routed_fields, to_device_batch
+        free_batch!, materialized_source, prefetch_config, prefetch_device_batches,
+        prefetch_host_batches, prefetch_ordered, prefetch_source, prefetch_workers, routed_fields,
+        to_device_batch
     using Functors, Lux, Optimisers, Random, Reactant, Statistics
 
     const PF = Float32
@@ -67,17 +68,17 @@
 
     @testset "`PrefetchIterator` is a declaration, and a valid data source on its own" begin
         src = PF_TRAIN
-        p = PrefetchIterator(src, 3)
+        p = PrefetchIterator(src; device_batches = 3)
         @test prefetch_source(p) === src
-        @test prefetch_depth(p) == 3
-        # Anything else is the no-prefetch case rather than a depth, which is why `0` is not a legal
-        # depth to construct.
-        @test prefetch_depth(src) == 0
+        @test prefetch_device_batches(p) == 3
+        # Anything else is the no-prefetch case rather than a count, which is why `0` is not a
+        # legal `device_batches` to construct.
+        @test prefetch_device_batches(src) == 0
         @test prefetch_source(src) === src
-        @test PrefetchIterator(src).depth == 1          # the default depth
+        @test PrefetchIterator(src).device_batches == 1     # the default device staging
         @test PrefetchIterator(src).workers == default_prefetch_workers()
         @test default_prefetch_workers() == max(1, Threads.nthreads(:default))
-        @test PrefetchIterator(src, 2; workers = 5).workers == 5
+        @test PrefetchIterator(src; device_batches = 2, workers = 5).workers == 5
         @test prefetch_workers(src) == 0
         # Ordered delivery is the DEFAULT, and the opt-out is explicit. That default is what makes
         # adopting the index-addressable trait free: it changes a run's throughput and nothing else.
@@ -87,13 +88,41 @@
         @test prefetch_ordered(src)
         @test prefetch_ordered(NoPrefetch(src))
 
-        @testset "a depth of 0 RAISES and names the marker, rather than meaning `off`" begin
+        @testset "the two buffer knobs are one per side of the transfer" begin
+            p2 = PrefetchIterator(src; workers = 4)
+            # Device staging defaults to 1, because resident device memory is
+            # `(device_batches + 2) x batch` and the `+ 2` is already two batches.
+            @test prefetch_device_batches(p2) == 1
+            # The host ceiling defaults PROPORTIONALLY to the producer count: enough for every
+            # worker to hold one batch while another waits to be transferred.
+            @test prefetch_host_batches(p2) == 8
+            @test prefetch_host_batches(PrefetchIterator(src; workers = 4, host_batches = 6)) == 6
+            # And `0` is the "does not stream" sentinel for both, on anything unwrapped.
+            @test prefetch_device_batches(src) == 0
+            @test prefetch_host_batches(src) == 0
+
+            # NOT a tidiness bound. Ordered delivery holds finished batches until the one it waits
+            # for arrives, and that batch is only ever in flight if the window is at least as wide
+            # as the producer count; below it the epoch deadlocks rather than slowing down.
+            err = try
+                PrefetchIterator(src; workers = 4, host_batches = 3)
+            catch ex
+                ex
+            end
+            @test err isa ErrorException
+            @test occursin("host_batches is 3 with 4 workers", err.msg)
+            @test occursin("deadlock", err.msg)
+            # Exactly `workers` is legal: the batch being waited on is still inside the window.
+            @test prefetch_host_batches(PrefetchIterator(src; workers = 4, host_batches = 4)) == 4
+        end
+
+        @testset "`device_batches = 0` RAISES and names the marker, rather than meaning `off`" begin
             # The whole point of the rule: running the host data path inline on the training task is
             # an intentionally suboptimal choice, so it must not be reachable by setting a number. The old
             # message advised "to turn prefetch off, do not wrap the source", which is wrong now that
             # setup wraps an unwrapped split itself.
             err = try
-                PrefetchIterator(src, 0)
+                PrefetchIterator(src; device_batches = 0)
             catch ex
                 ex
             end
@@ -103,7 +132,7 @@
             @test !occursin("do not wrap the source", err.msg)
 
             werr = try
-                PrefetchIterator(src, 1; workers = 0)
+                PrefetchIterator(src; device_batches = 1, workers = 0)
             catch ex
                 ex
             end
@@ -114,7 +143,7 @@
         @testset "`NoPrefetch` is the only opt-out, and is a passthrough source" begin
             n = NoPrefetch(src)
             @test prefetch_source(n) === src
-            @test prefetch_depth(n) == 0                # the internal "does not stream" sentinel
+            @test prefetch_device_batches(n) == 0                # the internal "does not stream" sentinel
             @test length(n) == length(src)
             @test collect(n) == collect(src)
             @test prefetch_config(n).path === :inline
@@ -154,8 +183,8 @@
             @test close_stream!(s) === nothing           # a no-op, and it must not raise
         end
 
-        @testset "the prefetch path is a channel of that depth, with the same contents" begin
-            s = batch_stream(PrefetchIterator(PF_TRAIN, 2), routing)
+        @testset "the prefetch path is a channel of that staging depth, with the same contents" begin
+            s = batch_stream(PrefetchIterator(PF_TRAIN; device_batches = 2), routing)
             @test s isa Channel
             pairs = collect(s)
             @test length(pairs) == length(PF_TRAIN)
@@ -182,7 +211,7 @@
             # A hang is the failure this asserts against, so it is run under a watchdog: the assertion
             # is that the consumer FINISHES, with the producer's exception, rather than blocking on a
             # channel nobody will feed again.
-            s = batch_stream(PrefetchIterator(src, 2), n.routing)
+            s = batch_stream(PrefetchIterator(src; device_batches = 2), n.routing)
             done = Threads.Atomic{Bool}(false)
             result = Ref{Any}(nothing)
             t = @async begin
@@ -209,7 +238,7 @@
             PrefetchMLP(); run_dir = mktempdir(),
             data = (; train = PF_TRAIN, val = PF_VAL)
         )
-        s = batch_stream(PrefetchIterator(PF_TRAIN, 2), n.routing)
+        s = batch_stream(PrefetchIterator(PF_TRAIN; device_batches = 2), n.routing)
 
         # Take one and walk away, which is what `request_stop!` and a non-finite loss both do.
         _, first_dev = take!(s)
@@ -361,16 +390,27 @@
         @test !fanout_capable(Iterators.filter(_ -> true, PF_MANY))
 
         @testset "`prefetch_config` reports the RESOLVED path, not the requested one" begin
-            @test prefetch_config(PrefetchIterator(IndexedSource(PF_MANY), 2; workers = 4)) ==
-                (; depth = 2, workers = 4, ordered = true, path = :fanout)
+            @test prefetch_config(
+                PrefetchIterator(IndexedSource(PF_MANY); device_batches = 2, workers = 4)
+            ) == (;
+                device_batches = 2, host_batches = 8, workers = 4, ordered = true, path = :fanout,
+            )
             # The opt-out is a different resolved path, so the report and the warning can tell the
             # two apart without carrying the flag around separately.
             @test prefetch_config(
-                PrefetchIterator(IndexedSource(PF_MANY), 2; workers = 4, ordered = false)
-            ) == (; depth = 2, workers = 4, ordered = false, path = :fanout_unordered)
+                PrefetchIterator(
+                    IndexedSource(PF_MANY); device_batches = 2, workers = 4, ordered = false
+                )
+            ) == (;
+                device_batches = 2, host_batches = 8, workers = 4, ordered = false,
+                path = :fanout_unordered,
+            )
             # Asked for 4, got 1, and the label says which case it is so the setup warning can differ.
             @test prefetch_config(PrefetchIterator(HalfTraitSource(collect(PF_MANY)); workers = 4)) ==
-                (; depth = 1, workers = 1, ordered = true, path = :single_no_trait)
+                (;
+                device_batches = 1, host_batches = 8, workers = 1, ordered = true,
+                path = :single_no_trait,
+            )
             @test prefetch_config(PrefetchIterator(IndexedSource(PF_MANY); workers = 1)).path === :single
             @test prefetch_config(PF_MANY).path === :inline   # unwrapped: no stream at all
         end
@@ -380,7 +420,10 @@
         # answer and saying so as a warning would teach people to ignore the real one.
         @testset "a materialized `Vector` source resolves to its own path, not to a complaint" begin
             @test prefetch_config(PrefetchIterator(PF_MANY; workers = 8)) ==
-                (; depth = 1, workers = 1, ordered = true, path = :materialized)
+                (;
+                device_batches = 1, host_batches = 16, workers = 1, ordered = true,
+                path = :materialized,
+            )
             @test ReactantNitro.materialized_source(PF_MANY)
             # Narrow on purpose: a custom `AbstractVector` can compute in `getindex`, so it is not
             # covered and still hears the warning.
@@ -407,7 +450,7 @@
         # of who finished when.
         @testset "with a source whose first batch is the slowest" begin
             src = SkewedSource(PF_MANY)
-            split = PrefetchIterator(src, 2; workers = 4)
+            split = PrefetchIterator(src; device_batches = 2, workers = 4)
             @test prefetch_config(split).path === :fanout
             ok, res, t = pf_await() do
                 collect(batch_stream(split, n.routing))
@@ -423,7 +466,7 @@
         @testset "an epoch shorter than the credit window still completes" begin
             src = SkewedSource(PF_TRAIN)
             ok, res, t = pf_await() do
-                collect(batch_stream(PrefetchIterator(src, 2; workers = 8), n.routing))
+                collect(batch_stream(PrefetchIterator(src; device_batches = 2, workers = 8), n.routing))
             end
             @test ok
             @test [h for (h, _) in res] == collect(PF_TRAIN)
@@ -435,7 +478,7 @@
         # the invariant the ledger checks, that every batch is delivered exactly once.
         @testset "the unordered opt-out still delivers every batch exactly once" begin
             src = SkewedSource(PF_MANY)
-            split = PrefetchIterator(src, 2; workers = 4, ordered = false)
+            split = PrefetchIterator(src; device_batches = 2, workers = 4, ordered = false)
             @test prefetch_config(split).path === :fanout_unordered
             ok, res, t = pf_await() do
                 collect(batch_stream(split, n.routing))
@@ -456,10 +499,10 @@
         @test c.val === PF_VAL
 
         @testset "an explicit wrap wins entirely, and is never double-wrapped" begin
-            p = PrefetchIterator(PF_TRAIN, 7; workers = 3)
+            p = PrefetchIterator(PF_TRAIN; device_batches = 7, workers = 3)
             c2 = auto_prefetch((; train = p, val = PF_VAL))
             @test c2.train === p
-            @test prefetch_depth(c2.train) == 7 && prefetch_workers(c2.train) == 3
+            @test prefetch_device_batches(c2.train) == 7 && prefetch_workers(c2.train) == 3
         end
 
         @testset "`NoPrefetch` survives the auto-wrap, which is the whole point of it" begin
@@ -479,7 +522,7 @@
             data = (; train = PF_TRAIN, val = PF_VAL)
         )
         src = IndexedSource(PF_MANY)
-        s = batch_stream(PrefetchIterator(src, 2; workers = 4), n.routing, n.mesh)
+        s = batch_stream(PrefetchIterator(src; device_batches = 2, workers = 4), n.routing, n.mesh)
         @test s isa PrefetchStream
 
         ok, pairs, t = pf_await(() -> collect(s))
@@ -499,7 +542,7 @@
 
         @testset "`begin_epoch!` fires exactly once per stream, BEFORE any job" begin
             @test epoch_token(src) == 1
-            s2 = batch_stream(PrefetchIterator(src, 2; workers = 4), n.routing, n.mesh)
+            s2 = batch_stream(PrefetchIterator(src; device_batches = 2, workers = 4), n.routing, n.mesh)
             @test epoch_token(src) == 2
             close_stream!(s2)
         end
@@ -507,7 +550,7 @@
         @testset "a token that does not advance is an ERROR naming the stale-plan failure" begin
             # This stands in for the mistake that would otherwise be silent: an epoch re-plan still living
             # in `Base.iterate`'s initialization, which the index path never calls.
-            stuck = PrefetchIterator(StuckTokenSource(collect(PF_MANY)), 2; workers = 4)
+            stuck = PrefetchIterator(StuckTokenSource(collect(PF_MANY)); device_batches = 2, workers = 4)
             err = try
                 batch_stream(stuck, n.routing, n.mesh)
             catch ex
@@ -520,7 +563,7 @@
 
         @testset "a source with only `batch_at` falls back to one producer, not to a stale plan" begin
             s3 = batch_stream(
-                PrefetchIterator(HalfTraitSource(collect(PF_MANY)), 2; workers = 4),
+                PrefetchIterator(HalfTraitSource(collect(PF_MANY)); device_batches = 2, workers = 4),
                 n.routing, n.mesh
             )
             @test s3 isa Channel && !(s3 isa PrefetchStream)
@@ -543,7 +586,7 @@
         # blocks in `put!`
         # on a full job channel that nobody will drain again.
         src = IndexedSource(PF_MANY; fail_at = 5)
-        s = batch_stream(PrefetchIterator(src, 2; workers = 4), n.routing, n.mesh)
+        s = batch_stream(PrefetchIterator(src; device_batches = 2, workers = 4), n.routing, n.mesh)
 
         ok, result, t = pf_await(() -> collect(s))
         @test ok                                            # false here means it hung
@@ -561,7 +604,7 @@
             PrefetchMLP(); run_dir = mktempdir(),
             data = (; train = PF_TRAIN, val = PF_VAL)
         )
-        s = batch_stream(PrefetchIterator(IndexedSource(PF_MANY), 2; workers = 4), n.routing, n.mesh)
+        s = batch_stream(PrefetchIterator(IndexedSource(PF_MANY); device_batches = 2, workers = 4), n.routing, n.mesh)
 
         # Take one and walk away, which is what `request_stop!` and a non-finite loss both do.
         _, first_dev = take!(s.devch)
@@ -642,7 +685,7 @@
         )
         pref = train!(
             PrefetchMLP(); run_dir = mktempdir(),
-            data = (; train = PrefetchIterator(PF_TRAIN, 2), val = PF_VAL)
+            data = (; train = PrefetchIterator(PF_TRAIN; device_batches = 2), val = PF_VAL)
         )
 
         @test current_epoch(pref) == current_epoch(plain) == 1
@@ -660,7 +703,7 @@
         # changes throughput and nothing else.
         fanned = train!(
             PrefetchMLP(); run_dir = mktempdir(),
-            data = (; train = PrefetchIterator(SkewedSource(PF_TRAIN), 2; workers = 4), val = PF_VAL)
+            data = (; train = PrefetchIterator(SkewedSource(PF_TRAIN); device_batches = 2, workers = 4), val = PF_VAL)
         )
         @test current_step(fanned) == current_step(plain)
         for (a, b) in zip(Functors.fleaves(parameters(plain)), Functors.fleaves(parameters(fanned)))
@@ -678,7 +721,7 @@
             err = try
                 Nitro(
                     PrefetchMLP(); run_dir = mktempdir(),
-                    data = (; train = PrefetchIterator(lengthless, 2), val = PF_VAL)
+                    data = (; train = PrefetchIterator(lengthless; device_batches = 2), val = PF_VAL)
                 )
             catch ex
                 ex
@@ -695,7 +738,7 @@
         src = IndexedSource(PF_MANY)
         fan = train!(
             PrefetchMLP(); run_dir = mktempdir(),
-            data = (; train = PrefetchIterator(src, 2; workers = 4), val = PF_VAL)
+            data = (; train = PrefetchIterator(src; device_batches = 2, workers = 4), val = PF_VAL)
         )
         @test current_epoch(fan) == 1
         @test current_step(fan) == length(PF_MANY)          # accum 1, so one step per batch

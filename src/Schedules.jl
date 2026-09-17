@@ -938,7 +938,7 @@ _commas(n::Integer) = replace(string(n), r"(?<=[0-9])(?=(?:[0-9]{3})+$)" => ",")
 _g(x) = string(round(Float64(x); sigdigits = 3))
 
 """
-    ReactantNitro.prefetch_report_entry(name, split) -> (; depth, workers, path)
+    ReactantNitro.prefetch_report_entry(name, split) -> (; device_batches, host_batches, workers, ordered, path)
 
 The per-split prefetch fact, resolved rather than requested (see `prefetch_config`).
 
@@ -948,16 +948,28 @@ Reporting `:inline` for it would be true but would read as a choice, and reporti
 be false.
 """
 prefetch_report_entry(name::Symbol, split) =
-    name === :train ? prefetch_config(split) : (; depth = 0, workers = 0, path = :eval)
+    name === :train ? prefetch_config(split) :
+    (; device_batches = 0, host_batches = 0, workers = 0, ordered = true, path = :eval)
 
 # The rule for the data block: state what is known and omit what is not. `path` is the resolved
 # one, so `:single_no_trait` reads differently from `:single` on purpose: the first is a capability
 # the source does not have and the second is a number somebody chose.
+# The two buffer counts read as "on the device / on the host", which is what they are: one batch
+# staged past the transfer and `host_batches` allowed to exist before it. `ordered` appears only
+# when it is FALSE, because that is the setting that costs bitwise reproducibility and a line that
+# says so on every ordinary run would be noise rather than a warning.
+_prefetch_buffers(pf) =
+    "$(pf.device_batches) on device, $(pf.host_batches) on host" *
+    (pf.ordered ? "" : ", UNORDERED")
+
 _prefetch_note(pf) =
-    pf.path === :fanout ? "prefetch: $(pf.workers) workers, depth $(pf.depth)" :
-    pf.path === :single ? "prefetch: 1 producer, depth $(pf.depth)" :
+    pf.path === :fanout || pf.path === :fanout_unordered ?
+    "prefetch: $(pf.workers) workers, $(_prefetch_buffers(pf))" :
+    pf.path === :single ? "prefetch: 1 producer, $(_prefetch_buffers(pf))" :
+    pf.path === :materialized ?
+    "prefetch: 1 producer, $(_prefetch_buffers(pf)); source is a materialized `Vector`" :
     pf.path === :single_no_trait ?
-    "prefetch: 1 producer, depth $(pf.depth); source is NOT index-addressable" :
+    "prefetch: 1 producer, $(_prefetch_buffers(pf)); source is NOT index-addressable" :
     pf.path === :inline ? "prefetch: none (NoPrefetch)" :
     pf.path === :eval ? "prefetch: none; the eval path does not stream" :
     "prefetch: $(pf.path)"

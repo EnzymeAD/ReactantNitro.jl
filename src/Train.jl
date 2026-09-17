@@ -972,9 +972,9 @@ function report_data_wait!(nitro::Nitro, t_wait::Float64, t_step::Float64)
     $(nitro.epoch) BLOCKED waiting for the data source. The device is idle for
     that fraction of the epoch, so this is close to a $(round(1 / max(1 - frac, 1.0e-3); digits = 1))x
     wall-clock penalty against a run whose loader keeps up.
-    Resolved prefetch for the `train` split: $(pf.workers) worker(s), depth $(pf.depth), path
-    $(pf.path). $(
-        pf.path === :fanout ?
+    Resolved prefetch for the `train` split: $(pf.workers) worker(s), $(pf.device_batches) batch(es)
+    on device, $(pf.host_batches) on host, path $(pf.path). $(
+        (pf.path === :fanout || pf.path === :fanout_unordered) ?
             "The fan-out is active, so the source itself is the limit: profile it in a CPU gate by iterating `build_data(e, nothing).train` directly, and check for a decoded-cache cap or a contended sample server." :
             "There is no host-side concurrency here; see the prefetch warning at setup for the two methods that enable it."
     )""" maxlog = 1

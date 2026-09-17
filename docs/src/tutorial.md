@@ -159,13 +159,17 @@ function ReactantNitro.build_model(e::MnistMLP, rng)
 end
 ```
 
-The framework wraps the `train` split in a `PrefetchIterator` automatically (depth 1, one producer
-per thread), so the H2D transfer of the next batch overlaps the current step. The producers need the
+The framework wraps the `train` split in a `PrefetchIterator` automatically (one producer per
+thread, one batch staged on the device), so the H2D transfer of the next batch overlaps the current
+step. The producers need the
 index-addressable trait, `ReactantNitro.batch_at` and `ReactantNitro.begin_epoch!` on the source,
 because a sequential Julia iterator cannot be consumed by several tasks: the expensive work happens
 inside `iterate` and there is no way to ask for batch *k* without walking to it. A plain
 `MLUtils.DataLoader` implements neither, so setup says the training data path runs in ONE producer
-task, and the binding report carries `prefetch_workers`, `prefetch_depth` and `prefetch_ordered`.
+task, and the binding report carries `prefetch_workers`, `prefetch_device_batches`,
+`prefetch_host_batches` and `prefetch_ordered`. The two batch counts are the pipeline's two buffers,
+one per side of the transfer: `device_batches` is how many sit on the device staged ahead, and
+`host_batches` is how many may exist on the host at once, built but not yet transferred.
 
 Two things follow that are worth knowing before you go implementing the trait to silence a warning.
 **Adopting it is free**, because delivery is ordered by default: a reorder buffer emits batches in
