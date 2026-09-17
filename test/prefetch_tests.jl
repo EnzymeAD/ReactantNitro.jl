@@ -494,9 +494,12 @@
         c = auto_prefetch((; train = PF_TRAIN, val = PF_VAL))
         @test c.train isa PrefetchIterator
         @test prefetch_source(c.train) === PF_TRAIN
-        # `run_eval` iterates its split directly and never enters `batch_stream`, so a wrapped eval split
-        # would advertise a worker count nothing uses.
-        @test c.val === PF_VAL
+        # Eval splits are wrapped too, now that `run_eval` streams through `eval_stream`. That used
+        # not to be true, and the reason it changed is that evaluation is the phase MORE exposed to a
+        # slow host path: a validation step is forward-only, so device time per batch falls sharply
+        # while host time per batch does not move.
+        @test c.val isa PrefetchIterator
+        @test prefetch_source(c.val) === PF_VAL
 
         @testset "an explicit wrap wins entirely, and is never double-wrapped" begin
             p = PrefetchIterator(PF_TRAIN; device_batches = 7, workers = 3)
@@ -510,9 +513,10 @@
             @test auto_prefetch((; train = n)).train === n
         end
 
-        @testset "a collection with no train split is returned untouched" begin
-            c3 = (; val = PF_VAL)
-            @test auto_prefetch(c3) === c3
+        @testset "a collection with no train split still has its eval splits wrapped" begin
+            c3 = auto_prefetch((; val = PF_VAL))
+            @test c3.val isa PrefetchIterator
+            @test prefetch_source(c3.val) === PF_VAL
         end
     end
 
@@ -729,6 +733,50 @@
             @test err isa ErrorException
             @test occursin("does not support `length`", err.msg)
         end
+    end
+
+    # ── evaluation, which streams too ───────────────────────────────────────────────────
+    #
+    # Validation is the phase MORE exposed to a slow host path, not less: a validation step is
+    # forward-only, so device time per batch falls sharply while host time per batch does not move at
+    # all. It used to run its whole host path inline on the eval task.
+    @testset "evaluation streams, and its result does not depend on the stream's shape" begin
+        # Eval splits KEEP their partial final batch, unlike train, so this also exercises the pad
+        # moving into the producer: the stream transfers the padded batch and the consumer recomputes
+        # `n_real` from the unpadded host batch handed to it alongside.
+        rng = Random.MersenneTwister(77)
+        val_short = [
+            (; x = randn(rng, PF, 3, 4), y = randn(rng, PF, 1, 4)),
+            (; x = randn(rng, PF, 3, 4), y = randn(rng, PF, 1, 4)),
+            (; x = randn(rng, PF, 3, 2), y = randn(rng, PF, 1, 2)),   # short final batch
+        ]
+
+        inline = Nitro(
+            PrefetchMLP(); run_dir = mktempdir(),
+            data = (; train = PF_TRAIN, val = NoPrefetch(val_short))
+        )
+        single = Nitro(
+            PrefetchMLP(); run_dir = mktempdir(),
+            data = (; train = PF_TRAIN, val = val_short)
+        )
+        fanned = Nitro(
+            PrefetchMLP(); run_dir = mktempdir(),
+            data = (; train = PF_TRAIN, val = PrefetchIterator(IndexedSource(val_short); workers = 4))
+        )
+
+        # Three different pipelines behind the same pass.
+        @test prefetch_config(inline.data.val).path === :inline
+        @test prefetch_config(single.data.val).path === :materialized
+        @test prefetch_config(fanned.data.val).path === :fanout
+
+        # No training has happened, and the seed is the same, so the weights are identical and the
+        # metric must agree EXACTLY. Ordered delivery is what makes that true of the fan-out: metrics
+        # accumulate by summation, so a different arrival order would disagree in the last bits.
+        a = validate(inline).val_loss
+        @test validate(single).val_loss == a
+        @test validate(fanned).val_loss == a
+        # And the pass is repeatable on a handle whose stream was already built and torn down once.
+        @test validate(fanned).val_loss == a
     end
 
     @testset "a fan-out train split trains end to end, and sees every batch once" begin

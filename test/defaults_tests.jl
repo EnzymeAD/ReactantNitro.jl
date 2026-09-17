@@ -191,9 +191,10 @@
             @test ReactantNitro.prefetch_source(n.data.train) === BARE_TRAIN
             @test ReactantNitro.prefetch_device_batches(n.data.train) == 1             # the default staging
             @test ReactantNitro.prefetch_workers(n.data.train) == max(1, Threads.nthreads(:default))
-            # And only `train`: `run_eval` iterates its split directly, so wrapping one would advertise a
-            # worker count nothing uses.
-            @test n.data.val === BARE_VAL
+            # Eval splits too: `run_eval` builds an `eval_stream` when its phase starts, so the pad
+            # and the transfer overlap the previous batch's forward.
+            @test n.data.val isa PrefetchIterator
+            @test ReactantNitro.prefetch_source(n.data.val) === BARE_VAL
             # `checkpoint = nothing` and `resume = :auto` into an empty directory: a FRESH init, so the
             # trajectory starts at zero rather than being restored from something.
             @test current_step(n) == 0 && current_epoch(n) == 0

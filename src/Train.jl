@@ -1725,8 +1725,14 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
         String(split), _split_length(getproperty(nitro.data, split)),
         nitro.epoch, nitro.max_epochs
     )
+    # BUILT HERE, WHEN THE PHASE STARTS, and closed in the `finally` below. The producers, their
+    # channels and every buffered batch therefore exist only for the duration of this pass, which is
+    # the same lifetime the training loop gives its own stream: `train!` closes the epoch's stream
+    # before it calls this, so training prefetch memory and evaluation prefetch memory never
+    # coexist.
+    stream = eval_stream(getproperty(nitro.data, split), xfer, nitro.batch_size, nitro.mesh)
     try
-        for (idx, batch) in enumerate(getproperty(nitro.data, split))
+        for (idx, (batch, b)) in enumerate(stream)
             # `honor_stop`: the standalone eval entry points stop the split at its next batch
             # boundary when Ctrl+C requested a stop (their `with_repl` interrupt handler).
             # `train!`'s own per-epoch validation keeps the default `false`, so the epoch that
@@ -1738,8 +1744,11 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
             # a watchdog measuring time since progress.
             note_progress!()
             check_batch_schema(batch, nitro.schema, split, idx)
-            padded, n_real = pad_batch(batch, nitro.batch_size, xfer)
-            b = to_device_batch(padded, xfer, nitro.mesh)
+            # Recomputed rather than carried through the stream, and it cannot disagree with what the
+            # producer padded to: `pad_batch` derives it from this same host batch and the same
+            # routing, so both sides call one function on one object. `eval_stream` says why it is
+            # not a third element of the pair.
+            n_real = batch_size_of(batch, xfer)
             outputs = eval_forward(nitro, ev, st, b, routing.forward)
             m = if traced
                 # Host-side, against the width the program was compiled at, and only when there is
@@ -1765,11 +1774,20 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
             # being freed eagerly. Do not leave it to the GC.
             free_device_buffers!(protected, b, outputs)
         end
+        # The exactly-once ledger, on a pass that ran to completion. An `honor_stop` break leaves it
+        # legitimately partial, exactly as a requested stop does on the training side.
+        (honor_stop && nitro.stop_requested) || check_prefetch_delivery(stream)
     catch
         set_phase!(nitro, prev_phase)
         progress_end!()
         report && progress_done!()
         rethrow()
+    finally
+        # ONE teardown for both paths, in the `finally` rather than duplicated into the `catch` and
+        # the fall-through, exactly as the training loop's epoch stream is closed. `honor_stop`, an
+        # error in a hook, and a clean pass all leave here, and each of them leaves producers to
+        # stop and buffered device batches to free.
+        close_stream!(stream)
     end
     progress_end!()
     # `report` is already the standalone-versus-inside-a-training-epoch distinction: `train!`'s own

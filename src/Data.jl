@@ -546,10 +546,9 @@ iterates it. That is deliberate: an `iterate` that spawned a task would have now
 teardown, which is the exact leak this file warns about. It is also what keeps `render` and
 `predict(nitro, loader)` unaffected by the auto-wrap.
 
-**Prefetch applies to the training split**, and `auto_prefetch` wraps only that one. An eval split is
-not merely a poor candidate, it is inert: `run_eval` iterates its split directly and never enters
-[`batch_stream`](@ref), so a wrapped eval split would report a worker count it does not use. Wrapping
-one is accepted and ignored rather than rejected, for the benefit of a caller who wraps uniformly.
+**Prefetch applies to every split**, and `auto_prefetch` wraps them all. The eval splits go through
+[`eval_stream`](@ref), which pads a short final batch inside the producer so that the pad and the
+transfer both overlap the previous batch's forward.
 """
 struct PrefetchIterator{S}
     source::S
@@ -657,7 +656,7 @@ prefetch_ordered(x) = true
 """
     ReactantNitro.auto_prefetch(collection) -> collection
 
-Wrap the **`train`** split in a [`PrefetchIterator`](@ref) at the framework's defaults, unless it is
+Wrap **every** split in a [`PrefetchIterator`](@ref) at the framework's defaults, unless it is
 already a `PrefetchIterator` or a [`NoPrefetch`](@ref).
 
 **This is the change that addresses the footgun rather than only the symptom.** Before it, prefetch
@@ -665,15 +664,17 @@ was opt-in through a wrapper the user had to remember in `build_data`, one model
 the framework was handling it, and for weeks nothing contradicted that. The default now has to be
 declined rather than requested, and the resolved settings appear in the binding report.
 
-**Only `train`.** `run_eval` iterates its split directly (it never enters [`batch_stream`](@ref)), so
-wrapping an eval split would put a worker count in the report for a path that does not use one, which
-is the same untrue statement in a friendlier voice.
+**Every split, including the eval ones**, which was not always true here: while `run_eval` iterated
+its split directly, a worker count on an eval split would have been a number in the report that
+nothing used. [`eval_stream`](@ref) is what changed that, and the reason it exists is that evaluation
+is the phase MORE likely to be starved, not less: a validation step is forward-only, so device time
+per batch falls sharply while host time per batch does not move.
 
 Called at setup **after** `derive`, the schema probe, and the contract checks, so all three see
 exactly what `build_data` returned.
 """
-auto_prefetch(collection::NamedTuple) = haskey(collection, :train) ?
-    merge(collection, (; train = _auto_wrap(collection.train))) : collection
+auto_prefetch(collection::NamedTuple) =
+    NamedTuple{keys(collection)}(map(_auto_wrap, values(collection)))
 
 _auto_wrap(split::PrefetchIterator) = split
 _auto_wrap(split::NoPrefetch) = split
@@ -823,24 +824,68 @@ check fires, which is one wasted transfer on a path that is about to raise.
   2. **One producer**, a `Channel` of `device_batches` fed by a single task iterating the source. What this
      function used to do unconditionally, and the fallback when the source does not implement the
      index-addressable trait.
-  3. **Inline**, a lazy generator, when `prefetch_device_batches == 0`: a [`NoPrefetch`](@ref) split, or an eval
-     split, which setup never wraps.
+  3. **Inline**, a lazy generator, when `prefetch_device_batches == 0`: a [`NoPrefetch`](@ref) split.
+
+## `prepare` is what makes one pipeline serve both phases
+
+The producer's job is "host batch in, device payload out", and the only difference between training
+and evaluation is what that payload is: training transfers the batch as it stands, evaluation pads a
+short final batch to the compiled width first. Passing the step as a closure keeps ONE fan-out, one
+credit window, one joiner, and one teardown, rather than a second copy of the machinery that the
+tests would have to cover twice and that would drift the first time either is fixed.
+
+The three-argument form is the training one and is what every existing caller writes;
+[`eval_stream`](@ref) supplies the evaluation closure.
 """
-function batch_stream(split, routing, mesh = nothing)
+batch_stream(split, routing, mesh = nothing) =
+    prepared_stream(split, b -> to_device_batch(b, routing, mesh))
+
+"""
+    ReactantNitro.prepared_stream(split, prepare) -> stream
+
+The shared pipeline behind [`batch_stream`](@ref) and [`eval_stream`](@ref), parameterized by the
+step that turns one host batch into the device payload its phase wants.
+
+**A distinct name rather than a two-argument `batch_stream` method.** `batch_stream(split, routing)`
+already means "training, on the default mesh", and a `(split, prepare)` method has the identical
+signature, so defining both silently replaces one with the other and every existing two-argument call
+starts trying to call a routing `NamedTuple`.
+"""
+function prepared_stream(split, prepare)
     device_batches = prefetch_device_batches(split)
-    device_batches == 0 && return ((b, to_device_batch(b, routing, mesh)) for b in split)
+    device_batches == 0 && return ((b, prepare(b)) for b in split)
     src = prefetch_source(split)
     workers = prefetch_workers(split)
     (workers > 1 && fanout_capable(src)) && return fanout_stream(
         src, workers, device_batches, prefetch_host_batches(split),
-        routing, mesh, prefetch_ordered(split)
+        prepare, prefetch_ordered(split)
     )
     return Channel{Tuple{Any, Any}}(device_batches; spawn = true) do ch
         for b in src
-            put!(ch, (b, to_device_batch(b, routing, mesh)))
+            put!(ch, (b, prepare(b)))
         end
     end
 end
+
+"""
+    ReactantNitro.eval_stream(split, xfer, batch_size, mesh) -> stream
+
+[`batch_stream`](@ref) for an evaluation pass: the producer pads a short final batch up to
+`batch_size` and transfers the padded one, so the pad and the H2D copy both overlap the previous
+batch's forward instead of running between them.
+
+**`n_real` is deliberately NOT carried through the stream.** It is `batch_size_of(batch, xfer)`, a
+pure function of the unpadded host batch that the consumer already receives, so recomputing it there
+costs one `size` read and cannot disagree with what the producer padded to. Carrying it would widen
+the pair every stage of the pipeline passes around, for one consumer.
+
+**Why evaluation wants this at all, given it is the cheaper phase:** it is the cheaper phase on the
+DEVICE. A validation step is forward-only, so device time per batch falls sharply while host time per
+batch does not move at all, which makes the host:device ratio worse than training's, not better.
+"""
+eval_stream(split, xfer, batch_size::Integer, mesh = nothing) = prepared_stream(
+    split, b -> to_device_batch(first(pad_batch(b, batch_size, xfer)), xfer, mesh)
+)
 
 """
     ReactantNitro.PrefetchStream
@@ -888,8 +933,7 @@ Base.iterate(s::PrefetchStream, state) = iterate(s.devch, state)
 # path carried two comments that each recorded a real deadlock in production, and a hang is the
 # failure mode this path is most able to produce.
 function fanout_stream(
-        src, workers::Int, device_batches::Int, host_batches::Int = 2 * workers,
-        routing = nothing, mesh = nothing, ordered::Bool = true
+        src, workers::Int, device_batches::Int, host_batches::Int, prepare, ordered::Bool = true
     )
     token_before = epoch_token(src)
     # BEFORE `length`, and before any job exists. A source whose plan changes its batch count is
@@ -931,7 +975,7 @@ function fanout_stream(
 
     wtasks = [Threads.@spawn(prefetch_worker(src, jobs, hostch, marks)) for _ in 1:workers]
     joiner = Threads.@spawn prefetch_joiner(coord, wtasks, hostch)
-    xfer = Threads.@spawn prefetch_transfer(hostch, devch, routing, mesh, ordered, credits)
+    xfer = Threads.@spawn prefetch_transfer(hostch, devch, prepare, ordered, credits)
 
     return PrefetchStream(devch, hostch, jobs, credits, [coord; wtasks; joiner; xfer], marks)
 end
@@ -984,7 +1028,7 @@ function prefetch_joiner(coord::Task, wtasks::Vector{Task}, hostch::Channel)
 end
 
 function prefetch_transfer(
-        hostch::Channel, devch::Channel, routing, mesh, ordered::Bool, credits::Channel{Nothing}
+        hostch::Channel, devch::Channel, prepare, ordered::Bool, credits::Channel{Nothing}
     )
     err = nothing
     # The reorder buffer. Keyed on the batch index the worker carried through `hostch`, which the
@@ -997,7 +1041,7 @@ function prefetch_transfer(
         # worker's error reaches the consumer: this task then closes `devch` with it.
         for (i, b) in hostch
             if !ordered
-                put!(devch, (b, to_device_batch(b, routing, mesh)))
+                put!(devch, (b, prepare(b)))
                 return_credit!(credits)
                 continue
             end
@@ -1007,7 +1051,7 @@ function prefetch_transfer(
             # the kind of thing that stops being true later.
             while haskey(pending, next)
                 hb = pop!(pending, next)
-                put!(devch, (hb, to_device_batch(hb, routing, mesh)))
+                put!(devch, (hb, prepare(hb)))
                 next += 1
                 # The credit goes back only once the batch has LEFT, which is what makes the window
                 # bound what exists rather than what has been started.

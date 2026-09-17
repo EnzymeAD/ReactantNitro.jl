@@ -942,14 +942,11 @@ _g(x) = string(round(Float64(x); sigdigits = 3))
 
 The per-split prefetch fact, resolved rather than requested (see `prefetch_config`).
 
-An eval split gets `path = :eval` rather than its own resolved configuration, because whatever it is
-wrapped in is **inert**: `run_eval` iterates its split directly and never enters `batch_stream`.
-Reporting `:inline` for it would be true but would read as a choice, and reporting a worker count would
-be false.
+Every split reports its own resolved configuration now that the eval path streams too. It did not
+always: while `run_eval` iterated its split directly, an eval entry reported `path = :eval`, because a
+worker count for a path that never entered `batch_stream` would have been false.
 """
-prefetch_report_entry(name::Symbol, split) =
-    name === :train ? prefetch_config(split) :
-    (; device_batches = 0, host_batches = 0, workers = 0, ordered = true, path = :eval)
+prefetch_report_entry(::Symbol, split) = prefetch_config(split)
 
 # The rule for the data block: state what is known and omit what is not. `path` is the resolved
 # one, so `:single_no_trait` reads differently from `:single` on purpose: the first is a capability

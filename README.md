@@ -159,8 +159,8 @@ has the rules for what a change costs.
 `train!` sequences the forwards, the backwards, the optimizer steps, and the metrics, and wraps the
 run in a lifecycle with monitorable phases (`Starting`, `Compiling`, `Stepping`, `Checkpointing`,
 `Terminal`, `Done`, `Failed`), `request_stop!` for graceful interruption, and a progress counter.
-The `train` split is wrapped in a `PrefetchIterator` automatically, so the next batch's
-host-to-device transfer overlaps the current step.
+Every split is wrapped in a `PrefetchIterator` automatically, so the next batch's host-to-device
+transfer overlaps the current step, and each stream lives only for the phase that uses it.
 
 Metrics are `(sum, count)` pairs with a per-hook residency choice, `:host` or `:device`, detailed
 in the next section; `finalize_metrics` reduces host-side when a macro-averaged recall is not the
