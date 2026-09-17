@@ -1259,6 +1259,13 @@ const _BAR_DIRTY = Ref(false)
 # The live bar's description without any phase suffix, so a `:phase` can be taken back off again.
 const _BAR_DESC = Ref("")
 
+# ONE COLOUR, PASSED TO BOTH DRAWS. A counted stretch is drawn by ProgressMeter and a unit-less one
+# by `printover`, and their defaults do not agree: a meter defaults to `:green` and `printover` to
+# `:color_normal`, so `checkpoint` came out in the terminal's plain text beside a green `train`.
+# ProgressMeter does not export its default, so naming it here and handing it to both is what keeps
+# the two halves of one display the same colour rather than the same by coincidence.
+const _BAR_COLOR = :green
+
 # Drawn only where a person is watching. A bar is a cursor animation: in a CI log, a `nohup` file,
 # or a captured gate transcript it renders as thousands of carriage returns and escape codes,
 # which is worse than nothing and is precisely what a long unattended training run produces. Read
@@ -1313,10 +1320,12 @@ function progress_bar_reporter(
         # cleared identically and the next stretch's bar lands on top of it as usual.
         if total <= 0
             _BAR[] = nothing
-            on && ProgressMeter.printover(stderr, rstrip(desc))
+            on && ProgressMeter.printover(stderr, rstrip(desc), _BAR_COLOR)
             return nothing
         end
-        p = ProgressMeter.Progress(total; desc, output = stderr, enabled = on)
+        p = ProgressMeter.Progress(
+            total; desc, output = stderr, enabled = on, color = _BAR_COLOR
+        )
         _BAR[] = p
         # AN OPENING FRAME, so the bar is up before the stretch's first unit rather than after it,
         # and `force = true` IS WHAT MAKES IT ONE. The constructor draws nothing, and `update!`

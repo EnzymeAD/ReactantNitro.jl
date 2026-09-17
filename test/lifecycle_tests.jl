@@ -794,9 +794,19 @@
         # Setup compiles before any stretch has begun, so a `:phase` with no live bar is ordinary
         # and must be a no-op rather than a crash inside a training run.
         @test ReactantNitro.progress_bar_reporter(:phase, "compiling gradient", 0, 0, 0) === nothing
-        # An unknown length is an indeterminate bar rather than an error.
-        @test ReactantNitro.progress_bar_reporter(:begin, "test", 0, 0, 0) === nothing
-        ReactantNitro.progress_bar_reporter(:end, "", 0, 0, 0)
+        # A stretch with NO UNITS gets its name on the line and NO METER, so it leaves no bar
+        # behind to step or close. `ProgressUnknown` was what this used to build, and it renders a
+        # counter stuck at zero next to a clock that never advances, since nothing drives a redraw
+        # between the one opening frame and the end: a seven-second checkpoint displaying
+        # `Time: 0:00:00` reads as hung at exactly the moment the label exists to say otherwise.
+        @test ReactantNitro.progress_bar_reporter(:begin, "checkpoint", 0, 1, 5) === nothing
+        @test ReactantNitro._BAR[] === nothing
+        # And the verbs that follow one stay no-ops rather than reaching for the bar it did not
+        # build. This is the path every `checkpoint`, `planning` and `finalize metrics` takes.
+        @test ReactantNitro.progress_bar_reporter(:step, "", 0, 0, 0) === nothing
+        @test ReactantNitro.progress_bar_reporter(:phase, "x", 0, 0, 0) === nothing
+        @test ReactantNitro.progress_bar_reporter(:end, "", 0, 0, 0) === nothing
+        @test ReactantNitro._BAR[] === nothing
     end
 
     # ── the table renderer, which the PrettyTables extension swaps ───────────────────────
