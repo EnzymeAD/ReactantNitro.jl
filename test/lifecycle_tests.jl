@@ -526,7 +526,9 @@
         # already carried, rather than a `data` row of the summary saying the same thing twice.
         @test occursin(r"train\s+4 batches", long)
         @test occursin(r"val\s+2 batches", long)
-        @test occursin("no weights are shown", long)       # says what it withheld, as the record does
+        # What it withheld is said by the `weights` row and by the note naming `parameters`, so
+        # the title is just the name; the assertions that no array reaches the output are above.
+        @test occursin("Nitro for LifeMLP", long)
         @test occursin("binding_report", long)             # and names the readers, where it is asked
         # WHERE VALUES BOUND, in the same display: the report is no longer a second thing printed
         # beside the handle, and a reader who prints one handle sees both.
@@ -643,9 +645,15 @@
         end
 
         begins = [e for e in events if e[1] === :begin]
-        # Two epochs, each a training stretch then a validation stretch over the `val` split.
-        @test [(e[2], e[3], e[4], e[5]) for e in begins] ==
-            [("train", 4, 1, 2), ("val", 2, 1, 2), ("train", 4, 2, 2), ("val", 2, 2, 2)]
+        # Two epochs, each a training stretch, then a validation stretch over the `val` split, then
+        # the metric reduction. That last one is UNCOUNTED (`total = 0`) and everything it covers
+        # runs after the validation bar has closed: `reduce_metrics` folds the accumulator and
+        # `finalize_metrics` is user code, so without a stretch of its own it is a silent stall
+        # between the last batch and the checkpoint.
+        @test [(e[2], e[3], e[4], e[5]) for e in begins] == [
+            ("train", 4, 1, 2), ("val", 2, 1, 2), ("finalize metrics", 0, 1, 2),
+            ("train", 4, 2, 2), ("val", 2, 2, 2), ("finalize metrics", 0, 2, 2),
+        ]
         # Every stretch closes. An unbalanced pair is a bar left on someone's terminal.
         @test count(e -> e[1] === :end, events) == length(begins)
         # One `:step` per unit, and the same units the counter counts: 4 train steps and 2 val
@@ -673,6 +681,9 @@
         # `save_checkpoint!(::Nothing, ...)` is a no-op, so reporting one would open and close a
         # bar for a write that never happens.
         @test !any(e -> occursin("checkpoint", e[2]), events)
+        # The stream teardown is a PHASE, not a stretch: it stalls a bar that is still open, with
+        # the last batch already counted, so it decorates that bar rather than opening another.
+        @test any(e -> e[1] === :phase && e[2] == "closing data stream", events)
     end
 
     # ── the checkpoint write, which emits no units and used to emit no bar ───────────────
@@ -813,7 +824,14 @@
             # The binding report's bands are appended to it, which is the whole point of one
             # table: where each value bound is part of the handle's display, not a second one.
             @test any(s -> s.title == "data", got.sections)
-            @test any(s -> s.title == "gradient clip", got.sections)
+            # The gradient clip shares the `bindings` band with the schedules rather than having
+            # one of its own: a labelled heading and a column header around a single row read as a
+            # section only because the value needed somewhere to live.
+            @test any(s -> s.title == "bindings", got.sections)
+            @test any(
+                s -> s.title == "bindings" && any(r -> r[1] == "gradient clip", s.rows),
+                got.sections
+            )
             @test any(s -> startswith(s.title, "parameter groups"), got.sections)
 
             # The experiment show goes through the same path: one section, a real header, no note.

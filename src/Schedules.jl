@@ -828,14 +828,11 @@ appended to. What has been redefined since the handle froze it is [`fixed_config
   train  46 batches; 2,944 of 3,001 samples; 57 dropped by drop-last; prefetch: 16 workers
   val    8 batches; 500 samples; final batch of 52 padded then sliced; prefetch: 1 producer
 
-  gradient clip
-  value            effect                                              source
-  global norm 1.0  optimizer program only; changing it recompiles it   [train! keyword]
-
-  schedules
-  binding        what                                                  source
-  eta            optimizer field, all groups, per-group ratio applied   [train! keyword]
-  device.lambda  Device field   e.lambda                                [schedules(e)]
+  bindings
+  binding        what                                                   source
+  gradient clip  global norm 1.0; optimizer program only, and changing  [train! keyword]
+  eta            optimizer field, all groups, per-group ratio applied    [train! keyword]
+  device.lambda  Device field   e.lambda                                 [schedules(e)]
 
   parameter groups (G = 2)
   group      settings                                              params
@@ -856,7 +853,8 @@ The `data` block is the home of the one thing the framework deliberately does no
 a drop-last training loader discarded are invisible to every check the framework can make. The
 parenthetical appears only when the source supports `MLUtils.numobs`, and is **omitted rather than
 guessed** otherwise. The `gradient_clip_norm` row's source label is the one place a reader sees
-whether the keyword, a method, or a field won.
+whether the keyword, a method, or a field won, and it shares the `bindings` band with the
+schedules because it answers the same three questions they do.
 
 The sections are shown as bands of `show(nitro)`; the plain text goes to
 `log_other!(lgr, "binding_report", str)` so it lands in the run's record.
@@ -1077,36 +1075,28 @@ function binding_report_sections(;
         push!(sections, TableSection("data", ["split", "resolved"], rows, styles))
     end
 
-    # A section like every other part of this report, rather than the two hand-printed lines this
-    # used to be. The three pieces were always there (the resolved value, what it implies, and
-    # which source won); columns are what line them up with the ones the rest of the report
-    # already uses, and it is the column a reader scans that makes `[train! keyword]` versus
-    # `[framework default]` findable in the same place here as in the schedules band.
+    # ONE BAND FOR EVERYTHING THAT HAS A SOURCE, rather than a band per kind of value. The
+    # gradient clip had one of its own, which meant a labelled heading, a column header and two
+    # rules around a single row, and a section that size reads as a section only because the value
+    # needed somewhere to live. It answers the same three questions a schedule binding does, in
+    # the same order, so it belongs in the same table: what bound, what that means, and which
+    # route supplied it. Its source then lands in the column a reader is already scanning down.
+    #
+    # THE CLIP LEADS AND IS ALWAYS PRESENT, where a schedule may not be: it is the one value here
+    # that every run has, including a run that schedules nothing.
+    rows = TableRows()
+    srcs = Symbol[clip_source]
     push!(
-        sections, TableSection(
-            "gradient clip", ["value", "effect", "source"], TableRows(
-                [
-                    [
-                        clip > 0 ? "global norm $(_g(clip))" : "none (threshold 0)",
-                        clip > 0 ? "optimizer program only; changing it recompiles it" :
-                            "a run with no clipping",
-                        "[" * _source_label(clip_source) * "]",
-                    ],
-                ]
-            ),
-            # A threshold of zero is the absence of a setting, so it is muted rather than stated:
-            # this row exists to be scanned past on the runs that do not clip, and to stand out on
-            # the ones that do.
-            merge(
-                CellStyles((1, 1) => clip > 0 ? :accent : :muted),
-                _source_styles([clip_source], 3)
-            )
-        )
+        rows, [
+            "gradient clip",
+            clip > 0 ?
+                "global norm $(_g(clip)); optimizer program only, and changing it recompiles it" :
+                "none, threshold 0; a run with no clipping",
+            "[" * _source_label(clip_source) * "]",
+        ]
     )
 
     if schedules !== nothing && !isempty(schedules)
-        rows = TableRows()
-        srcs = Symbol[]
         for (ns, tbl) in ((:opt, schedules.opt), (:device, schedules.device))
             for k in keys(tbl)
                 disp = haskey(schedules.source, k) ? k : Symbol(ns, ".", k)
@@ -1121,12 +1111,13 @@ function binding_report_sections(;
                 push!(srcs, src)
             end
         end
-        push!(
-            sections, TableSection(
-                "schedules", ["binding", "what", "source"], rows, _source_styles(srcs, 3)
-            )
-        )
     end
+    # A threshold of zero is the absence of a setting, so the clip's own cell is muted rather than
+    # stated: that row is there to be scanned past on the runs that do not clip, and to stand out
+    # on the ones that do.
+    styles = _source_styles(srcs, 3)
+    styles[(1, 2)] = clip > 0 ? :accent : :muted
+    push!(sections, TableSection("bindings", ["binding", "what", "source"], rows, styles))
 
     if !isempty(groups)
         # SEVEN FACTS IN THREE COLUMNS, and the flattening is forced rather than chosen. Every

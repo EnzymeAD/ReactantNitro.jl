@@ -616,6 +616,9 @@ function _train!(nitro::Nitro)
                 # never, which no count can see.
                 nitro.stop_requested || check_prefetch_delivery(stream)
             finally
+                # Named for the same reason the eval pass names it: the epoch's last step has
+                # been counted and the bar sits full while the producers stop.
+                progress_phase!("closing data stream")
                 close_stream!(stream)
                 # In the `finally` with the stream: a non-finite loss, a `request_stop!`, and an
                 # error all leave the epoch early, and a bar left open would sit on the terminal
@@ -854,6 +857,9 @@ function _train_manual!(nitro::Nitro)
                 end
                 nitro.stop_requested || check_prefetch_delivery(stream)
             finally
+                # Named for the same reason the eval pass names it: the epoch's last step has
+                # been counted and the bar sits full while the producers stop.
+                progress_phase!("closing data stream")
                 close_stream!(stream)
                 # In the `finally` with the stream: a non-finite loss, a `request_stop!`, and an
                 # error all leave the epoch early, and a bar left open would sit on the terminal
@@ -1815,21 +1821,44 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
         # the fall-through, exactly as the training loop's epoch stream is closed. `honor_stop`, an
         # error in a hook, and a clean pass all leave here, and each of them leaves producers to
         # stop and buffered device batches to free.
+        #
+        # NAMED, because this one stalls a bar that is still open: the pass's last batch has been
+        # counted and the bar sits full while producers stop and buffered device batches are freed.
+        # A `:phase` rather than a stretch for that reason, and it costs no extra redraw on a fast
+        # teardown, since the reporter ignores a phase label it is already showing.
+        progress_phase!("closing data stream")
         close_stream!(stream)
     end
     progress_end!()
+    # A STRETCH, not a `:phase`, and it has to be: the pass's bar closed on the line above, and a
+    # phase decorates a bar that is open.
+    #
+    # Everything in here runs AFTER the last batch, with nothing counting and nothing to see.
+    # `reduce_metrics` folds the accumulator, and `finalize_metrics` is USER CODE whose cost is a
+    # property of the model rather than of the framework: a confusion matrix, an AUC, a per-class
+    # reduction over a whole split. Unreported, that is a silent stall between the validation bar
+    # and the checkpoint, which is exactly where "the epoch finished and then hung" comes from.
+    #
+    # It will flash on a model whose metrics are trivial, and that is the accepted cost. The label
+    # names the hook, so on a run where this IS the slow part it points at the code to go and read.
+    out = with_progress_stretch("finalize metrics", 0, nitro.epoch, nitro.max_epochs) do
+        # The boundary assertion, placed on the OUTPUT rather than the input because the input is
+        # `host_metrics`' product and already host. `finalize_metrics` is user code, and what it
+        # returns reaches three consumers that all assume host values: the logger, the phase
+        # monitors, and the checkpoint metric. One assertion covers all three, and it is here
+        # rather than at each of them because here is where the value is produced.
+        assert_host(
+            finalize_metrics(e, reduce_metrics(acc), split),
+            "the metrics `finalize_metrics` returned for the `$split` split"
+        )
+    end
     # `report` is already the standalone-versus-inside-a-training-epoch distinction: `train!`'s own
     # per-epoch validation passes `false`, and the last stretch of THAT entry point is the run.
+    #
+    # AFTER the finalize stretch, not before it. `:done` means the last stretch of this entry point
+    # is over, and it is what prints the newline closing the reused terminal line; a stretch opened
+    # after it would draw onto a line something else is about to use.
     report && progress_done!()
-    # The boundary assertion, placed on the OUTPUT rather than the input because the input is
-    # `host_metrics`' product and already host. `finalize_metrics` is user code, and what it returns
-    # reaches three consumers that all assume host values: the logger, the phase monitors, and the
-    # checkpoint metric. One assertion covers all three, and it is here
-    # rather than at each of them because here is where the value is produced.
-    out = assert_host(
-        finalize_metrics(e, reduce_metrics(acc), split),
-        "the metrics `finalize_metrics` returned for the `$split` split"
-    )
     # The transition OUT of `EvalStepping` is the one that carries `info.metrics`, and this is the
     # first moment those numbers exist. That transition is what replaces an earlier design's
     # `on_validation_end` hook: a user wanting to log something custom at validation time has the

@@ -629,11 +629,17 @@ end
 # different questions that one field cannot answer. `checkpoint_source` is a construction-time
 # fact, so reporting it alone made a trained handle claim its weights were "fresh from
 # build_model": true of where they started and wrong about what they are.
+#
+# THE FOUR WORDINGS SHARE A SHAPE on purpose: an origin (`build_model` or a path), and, when this
+# handle trained them, `trained here` in front of it. The trained-from-scratch case used to read
+# "trained here, from fresh init", which named the origin a fourth way (`init`) that appears
+# nowhere else in this display, so the one case a reader most wants to tell from `fresh from
+# build_model` was the one phrased least like it.
 function _nitro_weights(nitro::Nitro)
     src = nitro.checkpoint_source
     nitro.elapsed === nothing && return src === nothing ?
         "fresh from build_model" : "restored from " * string(src)
-    return src === nothing ? "trained here, from fresh init" :
+    return src === nothing ? "trained here, from build_model" :
         "trained here, resumed from " * string(src)
 end
 
@@ -765,8 +771,11 @@ function Base.show(io::IO, ::MIME"text/plain", nitro::Nitro)
     # the frame, so it stays at the bottom.
     note = "ask it for more with `experiment`, `parameters`, `states`, `binding_report`, " *
         "`logger_info`"
-    title = "Nitro for " * string(nameof(typeof(nitro.e))) *
-        "  (the run handle; no weights are shown)"
+    # JUST THE NAME. The title used to carry "(the run handle; no weights are shown)", which was
+    # a disclaimer for a display that has a `weights` row saying where they came from and a note
+    # naming `parameters` as the way to get the arrays themselves. Saying it a third time in the
+    # title told a reader nothing the table was not already telling them.
+    title = "Nitro for " * string(nameof(typeof(nitro.e)))
     _render_sections(io, title, sections; note)
     return nothing
 end

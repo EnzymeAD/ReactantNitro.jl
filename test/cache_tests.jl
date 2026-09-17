@@ -830,7 +830,7 @@
             # The batch count is always resolvable, so it is what a split with nothing else to
             # report shows. There is no "(nothing resolved)" case left for the data band.
             @test occursin("4 batches", bare)
-            @test occursin("none (threshold 0)", bare)
+            @test occursin("none, threshold 0", bare)
             @test occursin("[field on e]", bare)
         end
     end
