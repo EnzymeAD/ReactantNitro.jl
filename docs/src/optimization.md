@@ -108,6 +108,52 @@ ReactantNitro.learning_rate(::MyExp) = 1f-3
 ReactantNitro.learning_rate(::MyExp, ::Val{:backbone}) = 1f-4   # a tenth of the head
 ```
 
+## The flat parameter layout
+
+Parameter groups are not only a way to give the backbone its own learning rate. They are also the
+unit the optimizer actually runs on.
+
+At setup the framework builds a **flat layout**: every parameter array in the tree is assigned to a
+group, and the arrays of each group are concatenated into one buffer. The gradient accumulator and
+the optimizer state then cross the program boundary as an `NTuple{G}`, one buffer per group, and the
+optimizer program applies each rule `G` times rather than once per parameter array.
+
+**Parameters themselves stay a tree.** `ps` is the Lux tree `build_model` returned, everywhere and
+at every boundary. Each program flattens on entry and unflattens on exit, inside the trace. That
+keeps `Duplicated(ps, dps)` in exactly the form Lux's Reactant extension verifies, and every other
+consumer of `ps` already wants a tree.
+
+### Why it matters
+
+**Compile size.** A tree-level `Optimisers.update` emits the rule's operations once per parameter
+array. A model with several hundred arrays therefore produces an optimizer program with several
+hundred copies of them, and XLA compiles all of it. Flattening collapses that to `G`, which for most
+models is one or two.
+
+**`apply!` is array-level.** `Optimisers.apply!` works on an array, not a tree, so a flat group
+buffer hands it exactly what it wants and skips the tree walk. Per-group calls also solve the
+scalar-`eta` limitation that a single whole-model buffer would run into, since each group carries
+its own hyperparameters.
+
+### What it costs, and what it does not
+
+`flatten` is a **concatenate**, so it is a real copy of the parameter set rather than a fold into a
+consumer. It is not a runtime permuted gather: the permutation is one row per leaf, not one entry
+per element, so the operand order is known at trace time and grouping by leaf costs nothing beyond
+the copy. That is also why it emits no control flow.
+
+`unflatten` is a **reshape over a contiguous slice**, per leaf. Under trace both the slice and the
+reshape fold into the consuming operation, so the reconstruction is free.
+
+### The layout is stable, and the checkpoint depends on it
+
+The layout is a stable sort of the tree's traversal-order leaves by group index: `:default` is group
+one, the rest follow first-appearance order, and within a group leaves keep traversal order. That
+determinism is what lets a checkpoint store the permutation and a resume verify the restored tree
+against it, so a model whose structure changed is refused rather than silently reloaded into the
+wrong slots. The layout is built unconditionally, including for an evaluation handle, because it is
+host-side bookkeeping rather than device memory.
+
 ## Decay, and what it decays toward
 
 [`Decay`](@ref) is one rule that differs only in the anchor:

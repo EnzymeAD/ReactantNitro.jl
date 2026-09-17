@@ -162,7 +162,9 @@ train!(n2)
 ## When a compile is genuinely slow
 
 When the acceptance check says the cache is healthy and a compile is still slow, the cost is
-dominated by what the tracer walks. The usual cause is dataset-sized state reachable from the
+dominated by what the tracer walks, and by how many operations the emitted graph contains. The
+optimizer program's size is governed by the flat parameter layout, which collapses it from one update
+per parameter array to one per parameter group; [Optimization](optimization.md) covers it. The usual cause is dataset-sized state reachable from the
 experiment, which Enzyme traverses element by element on one thread every time. Leave such fields
 unmarked ([`Host`](@ref) is the default) or keep them off the experiment entirely;
 [Experiments](experiments.md) covers the details.

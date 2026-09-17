@@ -41,6 +41,7 @@ ReactantNitro.with_io_retry
 ReactantNitro.PrefetchStream
 ReactantNitro.auto_prefetch
 ReactantNitro.batch_stream
+ReactantNitro.eval_stream
 ReactantNitro.check_batch_at
 ReactantNitro.close_stream!
 ReactantNitro.fanout_capable

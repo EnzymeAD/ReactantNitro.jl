@@ -27,11 +27,32 @@ checkpointing, and the run's lifecycle. Training and serving both stay in Julia,
 
 The design follows PyTorch Lightning, pointed at Reactant. Lux has a training loop, but a
 Reactant-first stack also needs gradient accumulation, a phase system, schedules, and control over
-when XLA compiles, because with Reactant an unneeded compile is the easiest way to lose time. The
-framework does not spend your time compiling when no compile is needed: the three field markers
-below tell it which values shape the program and which only flow through it, so sweeping a
-hyperparameter, scheduling a value, changing the learning rate, reseeding, or restarting a run
-reuses the program it already has.
+when XLA compiles.
+
+## What it takes care of
+
+Reactant and Enzyme are fast. These are the common ways that speed is lost, and what the framework
+does about each.
+
+**Your dataset is never traced.** Fields are `Host` unless marked otherwise, and the trace sees a
+stripped view of the experiment. A dataset reachable from traced code is walked element by element
+on every compile.
+
+**Only a `GraphConst` change recompiles.** `Host` values never reach the compiled program, and a
+`Device` value changes without a recompile unless its shape or element type changes. Sweeping a
+hyperparameter, scheduling a value, changing the learning rate and reseeding are all free.
+
+**Device transfers happen at known times.** A scheduled `Device` value uploads once per step; a
+constant one uploads once, at the start of training.
+
+**Parameters are flattened into one buffer per parameter group.** The gradient accumulator and the
+optimizer state cross the program boundary as `NTuple{G}`, so the optimizer program emits G updates
+rather than one per parameter array. An unflattened tree makes that program grow with the model's
+array count, and the compile with it.
+
+**Device buffers are freed per batch.** Host GC pressure does not track device memory, so the host
+can stay comfortable while the device fills and the run dies out of memory. Each batch's buffers are
+released explicitly once the step that used them has read back.
 
 ## The three field markers
 
