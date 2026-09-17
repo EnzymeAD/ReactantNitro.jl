@@ -26,13 +26,13 @@ checkpointing, and the run's lifecycle. Training and serving both stay in Julia,
 `train!` to the exported [bundle](#export-training-and-serving-julia-native).
 
 The design follows PyTorch Lightning, pointed at Reactant. Lux has a training loop, but a
-Reactant-first stack also needs gradient accumulation, a phase system, schedules, and control over
+batteries included training stack also needs gradient accumulation, a phase system, schedules, and control over
 when XLA compiles.
 
-A Reactant-first stack also has snags that are easy to hit and hard to diagnose, and none of them
-raise: a compile that balloons for no visible reason, an edit that silently reuses a stale program,
-a run that dies out of memory hours in. The ones the framework handles for you are collected under
-[Pitfalls](https://enzymead.github.io/ReactantNitro.jl/dev/pitfalls/).
+A Reactant-first stack also has [pitfalls](https://enzymead.github.io/ReactantNitro.jl/dev/pitfalls/) that are easy to 
+hit and hard to diagnose: a compile that balloons for no visible reason, an edit that silently reuses a stale program, 
+a run that goes OoM hours in. Directly addressing these concerns is what sets ReactantNitro apart from just a standard 
+ML framework.
 
 ## The three field markers
 
@@ -61,11 +61,10 @@ Unmarked means `Host` because that is the common case. In the first model ported
 end
 ```
 
-Programs are keyed and stored once per process, not once per `Nitro`, and
-`ReactantNitro.cache_stats()` is the acceptance check that a change did not recompile.
+Programs are keyed and stored once per process, not once per `Nitro`.
 
-[Recompilation](https://enzymead.github.io/ReactantNitro.jl/dev/recompilation/)
-has what is in the key, the guard that catches a redefinition below the hooks, and the two holes.
+[Recompilation](https://enzymead.github.io/ReactantNitro.jl/dev/recompilation/) documents how invalidation works as well 
+as any current limitations.
 
 ## Quick start
 
@@ -80,8 +79,7 @@ julia> using Pkg; Pkg.add(url = "https://github.com/EnzymeAD/ReactantNitro.jl")
 ### MNIST
 
 Four hooks are required. Everything else has a default: the optimizer (RAdam at 1e-3), one
-parameter group, no decay, no schedule, prefetching, validation, checkpointing, and a logging
-contract whose shipped default writes JSON Lines.
+parameter group, no decay, no schedule, prefetching, validation, checkpointing, and a `.jsonl` logger.
 
 ```julia
 using ReactantNitro, Lux, Random
@@ -273,20 +271,3 @@ The repository ships agent skills under `skills/`, one per concern, each written
 it teaches so they version with the framework: experiments, metrics, the optimizer, manual mode,
 recompiles, checkpoint and resume, the device boundary, visualization, export, and Kaimon. Start at
 `reactantnitro-experiment`, which indexes the rest. See [`skills/README.md`](skills/README.md).
-
-## Documentation
-
-The full documentation lives at <https://enzymead.github.io/ReactantNitro.jl/>:
-
-- [Tutorial](https://enzymead.github.io/ReactantNitro.jl/dev/tutorial/): MNIST from configuration to prediction, end to end.
-- [Pitfalls](https://enzymead.github.io/ReactantNitro.jl/dev/pitfalls/): the Reactant-first snags the framework takes care of.
-- [Experiments](https://enzymead.github.io/ReactantNitro.jl/dev/experiments/): the hook contract, the three markers, and the Revise workflow.
-- [Recompilation](https://enzymead.github.io/ReactantNitro.jl/dev/recompilation/): the compile cache, and when a change costs a compile.
-- [Optimization](https://enzymead.github.io/ReactantNitro.jl/dev/optimization/): parameter groups, decay, and clipping.
-- [Schedules](https://enzymead.github.io/ReactantNitro.jl/dev/schedules/): what varies with the step.
-- [Metrics](https://enzymead.github.io/ReactantNitro.jl/dev/metrics/): `(sum, count)`, residency, and `finalize_metrics`.
-- [Logging](https://enzymead.github.io/ReactantNitro.jl/dev/logging/): the ten verbs, the JSON default, and the TensorBoard extension.
-- [Export](https://enzymead.github.io/ReactantNitro.jl/dev/export/): the wire contract and the ReactantServer bundle.
-- [Manual training](https://enzymead.github.io/ReactantNitro.jl/dev/manual/): owning the step, GANs and beyond.
-- [Kaimon](https://enzymead.github.io/ReactantNitro.jl/dev/kaimon/): the `nitro_*` tools.
-- [API reference](https://enzymead.github.io/ReactantNitro.jl/dev/api/): the docstrings, collected automatically.
