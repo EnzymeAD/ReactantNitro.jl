@@ -551,7 +551,8 @@ ReactantNitro.cache_stats()                                          # (; hits =
 Two details make that cheap. `data = n.data` re-uses the collection instead of re-running
 [`build_data`](@ref), and `resume = :auto` searches `run_dir`, so the new handle finds the
 latest checkpoint in [`run_dir`](@ref) and continues from the trained weights rather than fresh
-ones. For evaluation and inference, `checkpoint = path` restores weights *and* the derived values
+ones. **Resuming is opt-in**: the default is `resume = false`, so constructing a [`Nitro`](@ref)
+never picks up weights nobody named. For evaluation and inference, `checkpoint = path` restores weights *and* the derived values
 from the record, so it skips [`derive`](@ref) as well.
 
 What a rebuild still costs is setup, not compilation: device conversion, one batch pulled to infer

@@ -69,6 +69,37 @@ change every step.
 The payoff is the marker scheme's practical rule: changing a [`GraphConst`](@ref) field misses,
 changing a `Device` field hits, and changing a `Host` field hits.
 
+## The second guard: the dependency closure
+
+The key covers the hooks. It does not cover what the hooks *call*, and a redefined helper two
+levels below [`forward`](@ref) leaves every hook's world age untouched, so on the key alone it
+would hit the cache and silently run the old program.
+
+The entry points close that. Each cached program also records the transitive closure of the
+methods it was compiled against, and [`train!`](@ref), [`validate`](@ref), [`evaluate`](@ref) and
+[`predict`](@ref) re-resolve that closure against live dispatch on entry, **poisoning** any entry
+whose methods moved. A redefinition anywhere below the hooks therefore misses for a new
+[`Nitro`](@ref), which recompiles against current dispatch.
+
+The scan is memoized on the world counter, so an entry point that follows no redefinition pays one
+counter comparison and skips the re-resolution entirely.
+
+An existing handle is unaffected by design, because it is a fixed point. It keeps the programs it
+was built with, now stale, and the entry-point report says so. There are two messages and they are
+not the same message:
+
+- **The cache-level line** names how many entries were poisoned and which methods drifted. It is
+  informational and fires once per redefinition, whichever handle happens to run next. Seeing it
+  while running a freshly built handle is the *good* case: the poisoning is what makes that handle
+  recompile against your edit.
+- **The per-handle line**, `! this handle's compiled programs had dependency methods redefined`,
+  fires only when the handle actually running holds one of the poisoned programs. That is the one
+  that means "rebuild the `Nitro`".
+
+What neither guard can see is values rather than methods: a `const` redefined, a global, or a
+literal edited in place. Those are the first of [the two holes](#The-two-holes,-stated-plainly)
+below, and `ReactantNitro.cache_reset!()` is the escape hatch.
+
 ## Hashing the GraphConsts
 
 `ReactantNitro.graphconst_field_hash` hashes [`compile_view`](@ref)`(e)`'s `GraphConst` fields

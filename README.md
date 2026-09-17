@@ -60,33 +60,23 @@ Unmarked means `Host` because that is the common case. In the first model ported
 end
 ```
 
-Programs are keyed and stored once per process, not once per `Nitro`. The key holds the function,
-its argument types and shapes, a hash of the `GraphConst` fields only, and the resolved method world
-of every user hook, so a redefined function is never silently ignored. `Device` fields are excluded
-because they are traced inputs rebuilt every step, and `Host` fields because they are not in the
-traced view at all.
+Programs are keyed and stored once per process, not once per `Nitro`, and
+`ReactantNitro.cache_stats()` is the acceptance check that a change did not recompile.
 
-The entry points add a second guard on top of the key: each cached program also records the
-transitive closure of the methods it was compiled against, and `train!`/`validate`/`predict`
-re-resolve that closure against live dispatch, poisoning any entry whose methods moved. A
-redefinition anywhere below the hooks, a helper `forward` calls or a dependency method, therefore
-misses for a new `Nitro`, which recompiles against current dispatch; an existing `Nitro` keeps the
-programs it was built with, now stale, and the entry-point report says so. The one class that still
-needs a REPL restart is values, not methods: a `const` redefined, a global, or a literal edited in
-place.
-
-The `Host` marker also keeps compiles fast. Reactant and Enzyme traverse the whole experiment while
-tracing, so a dataset-sized field reachable from it gets walked element by element on every
-compile. The framework hands the trace a stripped view of the experiment, `compile_view(e)`, in
-which every `Host` field is a sentinel carrying only the field's name. The real `e` runs everywhere
-outside the trace: `build_data`, `derive`, metric finalization, checkpointing, and every driver
-decision read it normally.
-
-`ReactantNitro.cache_stats()` shows from the REPL whether a change recompiled, and
-`ReactantNitro.cache_reset!()` clears the module-level cache. A `GraphConst` change misses the
-cache; a `Device` change or a `Host` change hits.
+[Recompilation](https://enzymead.github.io/ReactantNitro.jl/dev/recompilation/)
+has what is in the key, the guard that catches a redefinition below the hooks, and the two holes.
 
 ## Quick start
+
+### Installation
+
+The package is not in the General registry yet, so install it from the repository:
+
+```julia
+julia> using Pkg; Pkg.add(url = "https://github.com/EnzymeAD/ReactantNitro.jl")
+```
+
+### MNIST
 
 Four hooks are required. Everything else has a default: the optimizer (RAdam at 1e-3), one
 parameter group, no decay, no schedule, prefetching, validation, checkpointing, and a logging
@@ -142,22 +132,10 @@ n = Nitro(MnistMLP(); checkpointer = TopKCheckpointer(; metric = :acc, mode = :m
 train!(n)
 ```
 
-One epoch on CPU reaches about 94% on the test split, in a couple of minutes, and the handle
-reports it: `acc 0.9421073717948718`, which is 9406 correct out of 9984, not an average of 312
-per-batch fractions.
+One epoch on CPU reaches about 94% on the test split, reported as `acc 0.9421073717948718`: 9406
+correct out of 9984, not an average of 312 per-batch fractions.
 
-That is the bare minimum. `examples/mnist_tutorial.jl` is the same task with everything the
-framework offers turned on, as one runnable file: derived values, two parameter groups, a
-schedule, gradient clipping, a confusion matrix reduced across the split, checkpointing and early
-stopping on a metric of its own, and prediction with a swept temperature. The prose that goes with
-it is the [Tutorial](https://enzymead.github.io/ReactantNitro.jl/dev/tutorial/).
-
-Drop the `setup_devices!` line to take whatever backend Reactant finds, which is a GPU wherever one
-is visible, or name one with `backend = "cuda"`. `Nitro(e)` runs the setup sequence and nothing
-else, so validation, evaluation, and prediction never depend on a `train!` having happened in the
-process, and a follow-up handle costs no compiles because the compile cache is module-level. **A
-fresh handle does not resume**: the default is `resume = false`, so constructing a `Nitro` never
-picks up weights nobody named.
+`examples/mnist_tutorial.jl` is the same task with everything turned on, as one runnable file; see the [Tutorial](https://enzymead.github.io/ReactantNitro.jl/dev/tutorial/)
 
 ## Built for the REPL and Revise
 
@@ -299,21 +277,6 @@ The repository ships agent skills under `skills/`, one per concern, each written
 it teaches so they version with the framework: experiments, metrics, the optimizer, manual mode,
 recompiles, checkpoint and resume, the device boundary, visualization, export, and Kaimon. Start at
 `reactantnitro-experiment`, which indexes the rest. See [`skills/README.md`](skills/README.md).
-
-## Installation
-
-Requires Julia 1.12. `[compat]` floors Reactant at `0.2.264`, the release carrying the memory-leak
-fix, and Optimisers at `0.4.8`, the first release whose Reactant extension can trace `RAdam`.
-
-The package is not in the General registry yet, so install it from the repository:
-
-```julia
-julia> using Pkg; Pkg.add(url = "https://github.com/EnzymeAD/ReactantNitro.jl")
-```
-
-To hack on it instead, `Pkg.develop(url = ...)` clones a working copy into `~/.julia/dev`.
-
-The test suite runs on CPU, needs no GPU, and is exercised in CI on every push.
 
 ## Documentation
 
