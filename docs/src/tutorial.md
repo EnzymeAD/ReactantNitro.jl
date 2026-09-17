@@ -8,6 +8,18 @@ rather than about the problem. The model is the small one you would reach for fi
 **The example below runs start to finish today, and so does an experiment configuring nothing at
 all.**
 
+!!! tip "The whole thing, runnable"
+    `examples/mnist_tutorial.jl` in the repository is this model as one self-contained file, with
+    its own environment. This page is the reasoning; that file is the code, filled in and runnable:
+
+    ```
+    julia --project=examples -e 'using Pkg; Pkg.instantiate()'
+    julia --project=examples examples/mnist_tutorial.jl
+    ```
+
+    `NITRO_EXAMPLE_EPOCHS=1` turns it into a smoke test, and `NITRO_EXAMPLE_BACKEND=cuda` puts it
+    on a GPU.
+
 This page trains the automatic way, with the framework sequencing every optimizer step. When your
 algorithm needs to sequence its own steps, a GAN with one optimizer per network, say, the
 [Manual training](manual.md) page shows the other mode: you define `train_step` and own the step;
@@ -191,11 +203,10 @@ function ReactantNitro.loss(e::MnistMLP, logits; label)
     # baked into the graph as a constant and walked by the tracer on every compile.
     smoothed = (1f0 - e.smoothing) .* label .+ e.smoothing / 10f0
     # NNlib's log-softmax, re-exported by Lux, which subtracts the row max. Reach for it rather
-    # than writing `logits .- log.(sum(exp, logits; dims = 1))`: that spelling is the same
-    # function on paper and overflows Float32 above 88.7 in practice, and `forward` divides by
-    # `e.smoothing`, so a logit of 5 arrives here as 100. Hand-rolled, this loss is `Inf` on
-    # roughly a quarter of freshly initialized batches and the run dies at step 1 on the
-    # non-finite check.
+    # than writing `logits .- log.(sum(exp, logits; dims = 1))`: the two are the same function on
+    # paper, and the hand-rolled one overflows Float32 for any logit above 88.7, producing an `Inf`
+    # loss that the framework's non-finite check turns into a dead run. `forward` divides by
+    # `e.temperature`, so a calibration sweep toward zero is exactly the case that reaches it.
     logp = logsoftmax(logits; dims = 1)
     return -sum(smoothed .* logp .* e.class_weights) / size(label, 2)
 end

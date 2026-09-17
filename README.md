@@ -138,11 +138,28 @@ function ReactantNitro.loss(e::MnistMLP, logits; label)
     return -sum(smoothed .* logsoftmax(logits; dims = 1)) / size(label, 2)
 end
 
-n = Nitro(MnistMLP())
+# The reduction, in three lines: `metrics` returns (numerator, denominator) per batch, the
+# framework sums BOTH across the split and divides once at the end. That is the true accuracy over
+# the whole validation set, which is not the mean of the per-batch accuracies.
+function ReactantNitro.metrics(::MnistMLP, logits; label)
+    return (; acc = (sum(argmax(logits; dims = 1) .== argmax(label; dims = 1)), size(label, 2)))
+end
+
+# Defining `metrics` replaces the framework's substituted `val_loss`, so the checkpointer is
+# pointed at a key this experiment actually emits. `:val_loss` was never magic.
+n = Nitro(MnistMLP(); checkpointer = TopKCheckpointer(; metric = :acc, mode = :max))
 train!(n)
 ```
 
-One epoch on CPU reaches about 94% on the test split, in a couple of minutes.
+One epoch on CPU reaches about 94% on the test split, in a couple of minutes, and the handle
+reports it: `acc 0.9421073717948718`, which is 9406 correct out of 9984, not an average of 312
+per-batch fractions.
+
+That is the bare minimum. `examples/mnist_tutorial.jl` is the same task with everything the
+framework offers turned on, as one runnable file: derived values, two parameter groups, a
+schedule, gradient clipping, a confusion matrix reduced across the split, checkpointing and early
+stopping on a metric of its own, and prediction with a swept temperature. The
+[Tutorial](https://enzymead.github.io/ReactantNitro.jl/tutorial/) is the prose that goes with it.
 
 Drop the `setup_devices!` line to take whatever backend Reactant finds, which is a GPU wherever one
 is visible, or name one with `backend = "cuda"` and pin how many devices the batch shards over with
