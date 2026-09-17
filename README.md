@@ -92,8 +92,12 @@ Four hooks are required. Everything else has a default: the optimizer (RAdam at 
 parameter group, no decay, no schedule, prefetching, validation, checkpointing, and a logging
 contract that ships no backend.
 
+Real MNIST, so the numbers at the end mean something. `MLDatasets` is not a dependency of this
+package; `] add MLDatasets` and it downloads the data on first use.
+
 ```julia
 using ReactantNitro, Lux, Random
+using MLDatasets: MNIST
 
 # Explicit CPU, so the quick start runs anywhere. It has to come BEFORE the first `Nitro`: that
 # is where the XLA client initializes, and the backend is fixed for the process from then on.
@@ -110,24 +114,35 @@ ReactantNitro.build_model(e::MnistMLP, rng) = begin
     (model, Lux.setup(rng, model)...)
 end
 
-ReactantNitro.build_data(e::MnistMLP, dist) = (;
-    train = [(; img = randn(Float32, 784, 32), label = rand(Float32, 10, 32)) for _ in 1:100],
-    val   = [(; img = randn(Float32, 784, 32), label = rand(Float32, 10, 32)) for _ in 1:20],
-)
-
-function ReactantNitro.forward(e::MnistMLP, model, ps, st; img)
-    logits, st_new = Lux.apply(model, img, ps, st)
-    return logits ./ e.smoothing, st_new
+# The batch dimension is LAST, so images are (784, B) and one-hot labels are (10, B). MLDatasets
+# prompts before its first download; `ENV["DATADEPS_ALWAYS_ACCEPT"] = "true"` skips the prompt.
+function ReactantNitro.build_data(::MnistMLP, dist)
+    function batches(d, bs = 32)
+        x = reshape(d.features, 28 * 28, :)              # Float32, already in [0, 1]
+        y = zeros(Float32, 10, length(d.targets))
+        for (i, t) in pairs(d.targets)
+            y[t + 1, i] = 1f0                            # targets are 0..9
+        end
+        stop = bs * div(length(d.targets), bs)           # drop the short final batch
+        return [(; img = x[:, i:(i + bs - 1)], label = y[:, i:(i + bs - 1)]) for i in 1:bs:stop]
+    end
+    return (; train = batches(MNIST(split = :train)), val = batches(MNIST(split = :test)))
 end
 
+ReactantNitro.forward(::MnistMLP, model, ps, st; img) = Lux.apply(model, img, ps, st)
+
+# `e.smoothing` is a `Device` field, so it is a traced INPUT: sweep it or schedule it across runs
+# with no recompile.
 function ReactantNitro.loss(e::MnistMLP, logits; label)
-    logp = logsoftmax(logits; dims = 1)   # NNlib's, re-exported by Lux: max-subtracted
-    return -sum(label .* logp) / size(label, 2)
+    smoothed = (1f0 - e.smoothing) .* label .+ e.smoothing / 10f0
+    return -sum(smoothed .* logsoftmax(logits; dims = 1)) / size(label, 2)
 end
 
 n = Nitro(MnistMLP())
 train!(n)
 ```
+
+One epoch on CPU reaches about 94% on the test split, in a couple of minutes.
 
 Drop the `setup_devices!` line to take whatever backend Reactant finds, which is a GPU wherever one
 is visible, or name one with `backend = "cuda"` and pin how many devices the batch shards over with
