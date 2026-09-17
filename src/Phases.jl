@@ -601,11 +601,17 @@ _phase_role(::Failed) = :bad
 _phase_role(::Repl) = :muted
 _phase_role(::Starting) = :muted
 
-# A run that stopped for a REASON is not simply done. `:error` is a failure whatever phase it was
-# recorded on, and any other reason (patience, a `request_stop!`, a budget) is a run that ended
-# early on purpose: worth seeing, not worth alarming about.
+# The stop reason overrides the phase, because both ways a run can end badly end on `Done`.
+#
+# `:completed` IS THE ORDINARY SUCCESSFUL RUN and must not divert, which is the whole reason this
+# names the reasons rather than treating "has a reason at all" as the signal: `train!` sets
+# `:completed` on every normal finish, so a catch-all painted the success case as a warning. The
+# reasons that do divert are `:error`, a failure whatever phase it was recorded on, and an early
+# exit (patience, a `request_stop!`), which is a run that ended on purpose before its last epoch:
+# worth seeing, not worth alarming about. An unrecognized reason warns, since a run that ended for
+# a reason this display cannot name is not one to call green.
 function _phase_role(p::Phase, stop_reason)
-    stop_reason === nothing && return _phase_role(p)
+    (stop_reason === nothing || stop_reason === :completed) && return _phase_role(p)
     stop_reason === :error && return :bad
     return :warn
 end
@@ -1180,6 +1186,27 @@ progress_begin!(label::AbstractString, total::Integer, epoch::Integer, max_epoch
 progress_end!() = _progress_report(:end, "", 0, 0, 0)
 
 """
+    ReactantNitro.with_progress_stretch(f, label, total, epoch, max_epochs)
+
+Run `f` as one reported stretch of work: [`progress_begin!`](@ref) around it and
+[`progress_end!`](@ref) in a `finally`, returning whatever `f` returns.
+
+**The `finally` is the point.** A stretch that threw and never closed leaves its bar on the
+terminal for whatever the run prints next to land on top of, and the call sites that need this
+most are the ones doing I/O, which is where the throwing happens.
+"""
+function with_progress_stretch(
+        f, label::AbstractString, total::Integer, epoch::Integer, max_epochs::Integer
+    )
+    progress_begin!(label, total, epoch, max_epochs)
+    return try
+        f()
+    finally
+        progress_end!()
+    end
+end
+
+"""
     ReactantNitro.progress_done!() -> nothing
 
 Tell the reporter that the last stretch of an entry point is over. Separate from
@@ -1262,9 +1289,16 @@ function progress_bar_reporter(
         _BAR_DESC[] = desc
         on = _drawing_progress()
         on && (_BAR_DIRTY[] = true)
-        _BAR[] = total > 0 ?
+        p = total > 0 ?
             ProgressMeter.Progress(total; desc, output = stderr, enabled = on) :
             ProgressMeter.ProgressUnknown(; desc, output = stderr, enabled = on)
+        _BAR[] = p
+        # AN OPENING FRAME, forced, because neither ProgressMeter constructor draws one: a bar
+        # first appears on its first `next!`. For a stretch that emits no units at all, which is
+        # what a checkpoint write is, that means it never appears, and the terminal holds the
+        # PREVIOUS stretch's finished bar for the length of the write. Forcing it here is also
+        # what puts an epoch's bar up before its first batch rather than after.
+        ProgressMeter.update!(p, p.counter; keep = false)
     elseif verb === :phase
         p = _BAR[]
         p === nothing && return nothing

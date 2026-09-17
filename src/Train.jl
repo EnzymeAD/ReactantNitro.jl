@@ -641,7 +641,7 @@ function _train!(nitro::Nitro)
                 context = "validate"
             )
             set_phase!(nitro, Checkpointing())
-            save_checkpoint!(nitro.checkpointer, nitro.epoch, metrics_out, snapshot(nitro))
+            save_checkpoint_reported!(nitro, "checkpoint", nitro.epoch, metrics_out)
             wrote_epoch = true
 
             # Both stopping routes set the same flag and are checked once per epoch, AFTER
@@ -687,7 +687,10 @@ function _train!(nitro::Nitro)
     # dropping that epoch out of the top-K ranking. Silent, on the default path, and it needs only a
     # second `train!` in the same directory. There is nothing of this call's to rewrite when this
     # call wrote nothing; the record already carries the outcome of the process that did.
-    wrote_epoch && save_checkpoint!(nitro.checkpointer, nitro.epoch, last_metrics, snapshot(nitro))
+    # LABELLED APART from the per-epoch writes, because it immediately follows the last one and
+    # two identical `checkpoint` stretches back to back read as a stutter rather than as the two
+    # different writes they are: the epoch's own, and this rewrite carrying the final metrics.
+    wrote_epoch && save_checkpoint_reported!(nitro, "final checkpoint", nitro.epoch, last_metrics)
     # `Done` for both stopping routes: exiting through the normal Done path is what makes an early
     # stop a finished run rather than a failure. `stop_reason` is where the difference lives, and
     # the checkpoint record keeps it, since "completed 40/40" and "stopped at 37 on patience" are
@@ -876,7 +879,7 @@ function _train_manual!(nitro::Nitro)
                 context = "validate"
             )
             set_phase!(nitro, Checkpointing())
-            save_checkpoint!(nitro.checkpointer, nitro.epoch, metrics_out, snapshot(nitro))
+            save_checkpoint_reported!(nitro, "checkpoint", nitro.epoch, metrics_out)
             wrote_epoch = true
 
             stopped = should_stop(nitro.early_stop, nitro.epoch, metrics_out)
@@ -904,7 +907,10 @@ function _train_manual!(nitro::Nitro)
     nitro.stop_reason === nothing && (nitro.stop_reason = :completed)
     # The final rewrite, identical to the automatic loop: the last epoch's record is rewritten
     # once the outcome is known, gated on this call having written an epoch at all.
-    wrote_epoch && save_checkpoint!(nitro.checkpointer, nitro.epoch, last_metrics, snapshot(nitro))
+    # LABELLED APART from the per-epoch writes, because it immediately follows the last one and
+    # two identical `checkpoint` stretches back to back read as a stutter rather than as the two
+    # different writes they are: the epoch's own, and this rewrite carrying the final metrics.
+    wrote_epoch && save_checkpoint_reported!(nitro, "final checkpoint", nitro.epoch, last_metrics)
     nitro.elapsed = time() - t_started
     # The last stretch of this entry point is over, so a reporter reusing one terminal line can
     # close it. Per entry point, not per epoch: an epoch is followed by a validation pass and then
@@ -1129,6 +1135,28 @@ function finite_only(metrics::NamedTuple)
     return assert_host(
         NamedTuple{Tuple(ks)}(Tuple(vs)), "the metrics being handed to the logger"
     )
+end
+
+"""
+    ReactantNitro.save_checkpoint_reported!(nitro, label, epoch, metrics) -> nothing
+
+[`save_checkpoint!`](@ref) as one REPORTED stretch of work, so a progress reporter can say that a
+checkpoint is being written.
+
+It emits no units, so this is an unknown-length stretch rather than a counted one, and what a
+watcher gets from it is the label. That is the whole value: the write is the one per-epoch stretch
+that used to be silent, and an epoch whose weights are going to a slow or remote filesystem
+otherwise looks exactly like an epoch that finished and then hung.
+
+**Nothing is reported when there is no checkpointer.** `save_checkpoint!(::Nothing, ...)` is a
+no-op, and a stretch announcing a write that never happens is worse than no stretch: it puts a bar
+on the terminal, and an open/close pair into the event stream, for a run with checkpointing
+switched off.
+"""
+function save_checkpoint_reported!(nitro::Nitro, label::AbstractString, epoch, metrics)
+    write() = save_checkpoint!(nitro.checkpointer, epoch, metrics, snapshot(nitro))
+    nitro.checkpointer === nothing && return write()
+    return with_progress_stretch(write, label, 0, epoch, nitro.max_epochs)
 end
 
 """

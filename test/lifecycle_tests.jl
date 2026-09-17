@@ -668,6 +668,48 @@
             v === :end && (depth -= 1)
         end
         @test depth == 0
+
+        # NO CHECKPOINT STRETCH HERE. `mk_life` passes `checkpointer = nothing`, and
+        # `save_checkpoint!(::Nothing, ...)` is a no-op, so reporting one would open and close a
+        # bar for a write that never happens.
+        @test !any(e -> occursin("checkpoint", e[2]), events)
+    end
+
+    # ── the checkpoint write, which emits no units and used to emit no bar ───────────────
+    #
+    # A write is not a countable stretch, so nothing on the progress path noticed it and an epoch
+    # spent writing weights to a slow or remote filesystem looked exactly like an epoch that
+    # finished and then hung. It is reported as an unknown-length stretch: no counting, just the
+    # label and the epoch it belongs to.
+    @testset "a checkpointed run reports its writes" begin
+        events = Tuple{Symbol, String, Int, Int, Int}[]
+        prev = ReactantNitro.progress_reporter!(
+            (v, l, t, e, m) -> (push!(events, (v, l, t, e, m)); nothing)
+        )
+        try
+            train!(Nitro(LifeMLP(); run_dir = mktempdir(), max_epochs = 2, resume = false))
+        finally
+            ReactantNitro.progress_reporter!(prev)
+        end
+
+        begins = [e for e in events if e[1] === :begin]
+        # One per epoch, carrying the epoch it belongs to, plus the final rewrite. The rewrite is
+        # LABELLED APART: it lands immediately after the last epoch's own write, and two identical
+        # stretches back to back read as a stutter rather than as two different writes.
+        @test [(e[2], e[4], e[5]) for e in begins if occursin("checkpoint", e[2])] ==
+            [("checkpoint", 1, 2), ("checkpoint", 2, 2), ("final checkpoint", 2, 2)]
+        # UNKNOWN LENGTH, never a count. A write emits no units, and claiming a total the stretch
+        # will never reach leaves a bar stuck short of its own end.
+        @test all(e -> e[3] == 0, [e for e in begins if occursin("checkpoint", e[2])])
+        # Still balanced with the write in the brackets, which is what keeps a failed write from
+        # leaving its bar on the terminal.
+        @test count(e -> e[1] === :end, events) == length(begins)
+        # And no units are attributed to it: every `:step` still belongs to a train or val stretch.
+        open_label = ""
+        for (v, l, _, _, _) in events
+            v === :begin && (open_label = l)
+            v === :step && (@test !occursin("checkpoint", open_label))
+        end
     end
 
     # ── the bar's one blind spot: a compile produces no units ────────────────────────────
