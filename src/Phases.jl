@@ -1279,7 +1279,9 @@ The built-in progress reporter, installed by default, and the reference implemen
 contract [`progress_reporter!`](@ref) documents.
 
 **One bar per stretch of work**, an epoch of training or one pass over an evaluation split,
-counting the steps left in THAT stretch. The epoch position rides in the bar's description as
+counting the steps left in THAT stretch. A stretch with `total = 0` emits no units, so it gets its
+NAME on the line and no meter: a counter stuck at zero beside a clock that never advances is what
+`ProgressUnknown` renders for one, and it reads as hung rather than busy. The epoch position rides in the bar's description as
 text rather than as a second bar, because "epoch 3/40" is a fact to read and not a thing to watch
 fill. No metrics on the bar: the contract carries a label and counts, and widening it is a change
 to the contract rather than to this function.
@@ -1298,22 +1300,30 @@ function progress_bar_reporter(
         _BAR_DESC[] = desc
         on = _drawing_progress()
         on && (_BAR_DIRTY[] = true)
-        p = total > 0 ?
-            ProgressMeter.Progress(total; desc, output = stderr, enabled = on) :
-            ProgressMeter.ProgressUnknown(; desc, output = stderr, enabled = on)
-        _BAR[] = p
-        # AN OPENING FRAME, and `force = true` IS WHAT MAKES IT ONE. Neither ProgressMeter
-        # constructor draws, so a bar first appears on its first `next!`; a stretch that emits no
-        # units at all therefore never appears by itself. That much was known. What was missed is
-        # that `update!` alone does not draw either: `_updateProgress!` returns early unless
-        # `force || t > p.tlast + p.dt`, and on a bar constructed microseconds ago `t` is not past
-        # `tlast + dt`, so the opening frame was silently throttled away.
+        # A STRETCH WITH NO UNITS GETS NO METER, just its own name on the line.
         #
-        # The consequence was the whole point of these stretches going missing. A checkpoint opens
-        # its bar, nothing draws, JLD2 blocks for seconds with no further update, and `finish!`
-        # then bails on its own `if p.printed` because nothing ever printed. `planning epoch`,
-        # `finalize metrics` and `checkpoint` were all invisible in a real terminal, which is
-        # exactly the work these were added to make visible.
+        # `ProgressUnknown` was the obvious choice and is the wrong one. It formats as
+        # `"<desc> <counter>    Time: <elapsed>"`, and a stretch that emits nothing has no counter
+        # to show and nothing to drive a redraw, so it renders once as `checkpoint epoch 1/5  0
+        # Time: 0:00:00` and then sits there. The zero counter is noise; the frozen clock is worse
+        # than noise, because a seven-second write showing `Time: 0:00:00` reads as hung at exactly
+        # the moment the label exists to say the opposite.
+        #
+        # `printover` is the same call the meter itself draws through, so the line is reused and
+        # cleared identically and the next stretch's bar lands on top of it as usual.
+        if total <= 0
+            _BAR[] = nothing
+            on && ProgressMeter.printover(stderr, rstrip(desc))
+            return nothing
+        end
+        p = ProgressMeter.Progress(total; desc, output = stderr, enabled = on)
+        _BAR[] = p
+        # AN OPENING FRAME, so the bar is up before the stretch's first unit rather than after it,
+        # and `force = true` IS WHAT MAKES IT ONE. The constructor draws nothing, and `update!`
+        # alone draws nothing either: `_updateProgress!` returns early unless
+        # `force || t > p.tlast + p.dt`, and on a bar constructed microseconds ago `t` is not past
+        # `tlast + dt`, so an unforced frame here is silently throttled away. That omission is what
+        # made a compile's first seconds show the PREVIOUS frame.
         ProgressMeter.update!(p, p.counter; keep = false, force = true)
     elseif verb === :phase
         p = _BAR[]
