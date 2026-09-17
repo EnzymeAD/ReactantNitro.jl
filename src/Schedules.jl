@@ -1048,12 +1048,22 @@ function binding_report_text(;
         print(io, "\n", section("  data", ["split", "resolved"], rows), "\n")
     end
 
-    println(io, "\n  gradient clip")
-    println(
-        io, "    ", clip > 0 ? "global norm $(_g(clip))   (optimizer program only; changing it recompiles it)" :
-            "none (threshold 0)   (a run with no clipping)",
-        "        [", _source_label(clip_source), "]"
+    # A table, like every other section of this report, rather than the two hand-printed lines this
+    # used to be. The three pieces were always there (the resolved value, what it implies, and which
+    # source won); a table is what lines them up with the columns the rest of the report already
+    # uses, and it is the column a reader scans that makes `[train! keyword]` versus
+    # `[framework default]` findable in the same place here as in the schedules block.
+    clip_rows = TableRows(
+        [
+            [
+                clip > 0 ? "global norm $(_g(clip))" : "none (threshold 0)",
+                clip > 0 ? "optimizer program only; changing it recompiles it" :
+                    "a run with no clipping",
+                "[" * _source_label(clip_source) * "]",
+            ],
+        ]
     )
+    print(io, "\n", section("  gradient clip", ["value", "effect", "source"], clip_rows), "\n")
 
     if schedules !== nothing && !isempty(schedules)
         rows = TableRows()
