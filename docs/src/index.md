@@ -81,6 +81,7 @@ The package is meant to be driven from a REPL with Revise loaded. The rules are 
 ## Start here
 
 - The [Tutorial](tutorial.md): an MNIST run from configuration to prediction, end to end.
+- [Pitfalls](pitfalls.md): the Reactant-first snags the framework takes care of, and why none of them raise.
 - [Experiments](experiments.md): the hook contract, the three markers, and the Revise workflow.
 - [Recompilation](recompilation.md): the compile cache and when a change costs a compile.
 - [Optimization](optimization.md): parameter groups, decay, and clipping.
