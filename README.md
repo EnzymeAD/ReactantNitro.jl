@@ -48,9 +48,7 @@ all free.
 world age of every hook, and each cached program also records the transitive closure of the methods
 it was traced against, so editing a helper `forward` calls several levels down is caught too. A new
 `Nitro` recompiles against the current code; an existing handle keeps the programs it was built with
-and says so, because a handle that changed underneath a running loop would be worse. What neither
-guard sees is a value rather than a method: a redefined `const`, a global, or an edited literal,
-for which `ReactantNitro.cache_reset!()` is the escape hatch.
+and says so.
 
 **Device transfers happen at known times.** A scheduled `Device` value uploads once per step; a
 constant one uploads once, at the start of training.
