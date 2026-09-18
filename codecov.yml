@@ -1,0 +1,26 @@
+# Codecov configuration.
+#
+# INFORMATIONAL, deliberately. Coverage here is a number to look at on a pull request, not a gate:
+# the test job already decides whether the suite passed, and a status check that fails on a
+# fraction of a percent teaches people to merge past a red mark, which costs more than the signal
+# is worth on a package this age.
+#
+# Coverage is measured on ONE matrix job (ubuntu, the floor Julia), so there is a single report
+# rather than four to reconcile; see .github/workflows/ci.yml for why.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# `ext/` is shipped code and is measured with `src/`. Everything below is not: the tests are not
+# the subject, and the example and the scripts are not loaded by the suite at all, so counting
+# them would move the number without anyone changing the package.
+ignore:
+  - "test/**"
+  - "examples/**"
+  - "scripts/**"
+  - "docs/**"

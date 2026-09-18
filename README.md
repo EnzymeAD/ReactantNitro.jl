@@ -12,6 +12,7 @@
 <p align="center">
   <a href="https://github.com/EnzymeAD/ReactantNitro.jl/actions/workflows/ci.yml"><img src="https://github.com/EnzymeAD/ReactantNitro.jl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://enzymead.github.io/ReactantNitro.jl/"><img src="https://github.com/EnzymeAD/ReactantNitro.jl/actions/workflows/docs.yml/badge.svg" alt="Docs"></a>
+  <a href="https://codecov.io/gh/EnzymeAD/ReactantNitro.jl"><img src="https://codecov.io/gh/EnzymeAD/ReactantNitro.jl/branch/main/graph/badge.svg" alt="Coverage"></a>
   <img src="https://img.shields.io/badge/Julia-1.12-9558b2" alt="Julia 1.12">
   <a href="https://github.com/fredrikekre/Runic.jl"><img src="https://img.shields.io/badge/code_style-%E1%9A%B1%E1%9A%A2%E1%9A%BE%E1%9B%81%E1%9A%B2-black" alt="code style: runic"></a>
 </p>
