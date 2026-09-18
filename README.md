@@ -23,7 +23,7 @@ and [Lux.jl](https://github.com/LuxDL/Lux.jl). The model is an ordinary Lux mode
 program is Reactant, and XLA runs it. You write the experiment as a struct plus a handful of hooks;
 the framework supplies the compiled programs, the device transfers, the optimizer, the schedules,
 checkpointing, and the run's lifecycle. Training and serving both stay in Julia, from the first
-`train!` to the exported [bundle](#export-training-and-serving-julia-native).
+`train!` to the exported [bundle](https://enzymead.github.io/ReactantNitro.jl/dev/export/).
 
 The design follows PyTorch Lightning, pointed at Reactant. Lux has a training loop, but a
 batteries included training stack also needs gradient accumulation, a phase system, schedules, and control over
