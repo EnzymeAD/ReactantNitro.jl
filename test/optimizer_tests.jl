@@ -61,6 +61,53 @@
         return Array(flat[1]), state[1], types
     end
 
+    # ── comparing a traced result to a host one ─────────────────────────────────────────
+    #
+    # BITWISE EQUALITY IS NOT A PORTABLE INVARIANT, and that is the whole reason these helpers
+    # exist. Whether a multiply feeding an add is contracted into an FMA is a legal, TARGET-
+    # DEPENDENT choice: XLA makes it per backend and LLVM makes it per architecture, so a rule that
+    # is bitwise on x86-64 Linux can disagree by one representable float on aarch64 without either
+    # result being wrong. A registration reviewer hit exactly that on Apple Silicon, where
+    # `Nesterov` disagreed while every printed digit matched.
+    #
+    # What IS portable is the SIZE of a disagreement. The control test above pins a genuinely wrong
+    # normalization at more than 1e-4 over three steps, and `X0` is `randn`, so at those magnitudes
+    # that is upwards of 800 ulps against a contraction's one: three orders of magnitude of daylight
+    # between the bug this suite exists to catch and a rounding that happened once instead of twice.
+    #
+    # Ulps rather than an absolute bound, because an absolute one does not mean the same thing
+    # twice. `eps(Float32)` is 1 ulp only in `[1, 2)`; at 0.01 it is 128 ulps and at 1e6 it is less
+    # than one, so a fixed tolerance is simultaneously too loose and too tight depending on where
+    # the values land.
+
+    # A float's position in the total ordering of Float32, so subtracting two of them counts the
+    # representable values between them. The sign-magnitude fixup is what makes the ordering
+    # continuous across zero, and it maps `-0.0` and `0.0` to the same key, which is correct: they
+    # are the same number and no ulps apart.
+    _ulp_key(x::F) = (b = Int64(reinterpret(Int32, x)); b >= 0 ? b : Int64(typemin(Int32)) - b)
+
+    function _ulps(a::F, b::F)
+        (isnan(a) || isnan(b)) && return a === b ? 0 : typemax(Int64)
+        (isinf(a) || isinf(b)) && return a === b ? 0 : typemax(Int64)
+        return abs(_ulp_key(a) - _ulp_key(b))
+    end
+
+    # Everything a reader needs to tell a contraction difference from a real numerical bug, on a
+    # machine they do not have. `worst` is reported with `repr`, which round-trips a Float32
+    # exactly, because "the values agree to all printed digits" is precisely the report that made
+    # this hard to act on the first time.
+    function ulp_report(name, xd, xh)
+        gaps = _ulps.(xd, xh)
+        i = argmax(gaps)
+        return (;
+            name, bitwise = xd == xh, max_ulps = gaps[i],
+            differing = count(!iszero, gaps), n = length(gaps),
+            at = i, traced = repr(xd[i]), host = repr(xh[i]),
+            max_absdiff = maximum(abs.(xd .- xh)),
+            platform = string(Sys.MACHINE, ", julia ", VERSION),
+        )
+    end
+
     Random.seed!(0x00C0FFEE)
     const X0 = randn(F, 64)
     const GS = [randn(F, 64) .* 0.1f0 for _ in 1:3]
@@ -184,23 +231,42 @@
                 ),
             ),
         ]
-        # `Descent` alone is not bitwise, because XLA contracts its `x - eta*g` into a fused
-        # multiply-add. It gets a 1-ulp bound here and an EXACT assertion against the FMA reference in
-        # the addendum below, so nothing is merely tolerated.
-        fma_contracted = ("Descent",)
+        # ONE ULP FOR EVERY RULE, rather than bitwise for all but a hand-maintained list of the
+        # ones that contract. The list was `("Descent",)` and it was right about x86-64 Linux and
+        # wrong as a general claim: which multiply-add XLA contracts is a property of the target,
+        # so on aarch64 `Nesterov` joins it and on some future backend another rule will. A list
+        # like that fails on the machine nobody here is testing on, which is what happened during
+        # registration.
+        #
+        # The bound is not a softening. The control test above drifts by more than 1e-4, which at
+        # these magnitudes is upwards of 800 ulps, so this still separates a wrong normalization
+        # from a rounding that happened once instead of twice. `Descent` additionally has an EXACT
+        # assertion against the FMA reference in the addendum below, which is where "nothing is
+        # merely tolerated" is actually enforced.
+        reports = NamedTuple[]
         for (name, chain) in admitted
             @testset "$name" begin
                 @test check_allowlist(chain) === nothing
                 xh, _ = host_run(chain, X0, GS)
                 xd, _, types = traced_run(chain, X0, GS)
                 @test allequal(types)                     # type fixed point across the boundary
-                if name in fma_contracted
-                    @test maximum(abs.(xd .- xh)) <= eps(F)
-                else
-                    @test xd == xh
-                end
+                rep = ulp_report(name, xd, xh)
+                push!(reports, rep)
+                # LOGGED BEFORE THE ASSERTION, and for any disagreement rather than only a failing
+                # one. `@test` reports a comparison, not the numbers behind it, and the numbers are
+                # the whole diagnosis: one ulp on one element is a contraction, a large gap on
+                # every element is a broken update. Captured logs carry this to whoever reads a
+                # failure on a machine they cannot reproduce.
+                rep.bitwise || @info "optimizer: traced and host differ" rep...
+                @test rep.max_ulps <= 1
             end
         end
+        # The per-platform record, always emitted. Which rules are bitwise HERE is exactly the
+        # fact a maintainer needs when a new target shows up, and it is invisible if it is only
+        # logged on failure.
+        @info "optimizer: bitwise agreement by rule" platform = string(Sys.MACHINE) bitwise =
+            [r.name for r in reports if r.bitwise] contracted =
+            [(r.name, r.max_ulps) for r in reports if !r.bitwise]
     end
 
     @testset "addendum: Descent is 1 ulp, and exactly XLA's fused multiply-add" begin
