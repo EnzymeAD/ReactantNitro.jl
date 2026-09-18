@@ -1,17 +1,4 @@
-# The test suite. Runs on CPU: test/runtests.jl sets CUDA_VISIBLE_DEVICES=""
-# itself (see its header comment), so no GPU is needed and the full suite runs
-# here on an ordinary GitHub-hosted runner.
 name: CI
-
-# Only when something the suite can actually read changes. The lists below are
-# DENYLISTS on purpose: a path nobody thought about runs the tests, so a new
-# directory of Julia is covered on the day it lands rather than the day someone
-# remembers to add it here. `paths-ignore` skips a run only when EVERY changed
-# file matches, so a commit touching both `src/` and `README.md` still runs.
-#
-# The two lists are duplicated because GitHub's workflow parser does not resolve
-# YAML anchors, so `&x`/`*x` here would be a silent no-op rather than an error:
-# edit both, or the push build and the PR build disagree about what is prose.
 on:
   push:
     branches: [main]
@@ -48,23 +35,11 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        # 1.12 is the floor `[compat] julia = "1.12"` sets; that bound is a caret
-        # and so already admits 1.13, and this matrix is what backs the claim
-        # rather than leaving it asserted. Both are supported: neither is
-        # advisory, and a failure on either is a failure.
         version: ['1.12', '1.13']
-        # macOS IS AARCH64, and that is the reason it is here rather than a wish
-        # to cover another operating system. Float contraction is a property of
-        # the target: whether a multiply feeding an add becomes an FMA is decided
-        # per backend by XLA and per architecture by LLVM, so the optimizer
-        # suite's traced-versus-host comparisons can hold on x86-64 and not on
-        # Apple Silicon. A registration reviewer found exactly that, on a rule
-        # the x86 runners agreed on, which is the failure mode an x86-only matrix
-        # cannot see. `Reactant_jll` ships `aarch64-apple-darwin`, so the runner
-        # installs the same stack rather than a reduced one.
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
@@ -75,30 +50,14 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
         with:
-          # ON ONE JOB ONLY. Coverage instrumentation costs wall clock on every test, and four
-          # instrumented jobs buy nothing over one: the line set does not depend on the operating
-          # system or the Julia version. The floor version is the one that runs it, so what gets
-          # measured is the code paths the lowest supported Julia takes.
-          #
-          # It reaches the WORKERS, which is the part worth knowing: ReTestItems spawns them from
-          # `Base.julia_cmd()`, and that reproduces `--code-coverage` from the parent. Were it not
-          # so, every test would run in an uninstrumented process and the report would be empty
-          # while still uploading cleanly.
           coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.version == '1.12' }}
         env:
-          # ReTestItems workers. The ncores/2 default already yields 2 on this runner; pin it
-          # for determinism. retries is a load-flake safety net, not a fix for real failures.
           RETESTITEMS_NWORKERS: 2
           RETESTITEMS_RETRIES: 2
-      # No `directories` input: it already defaults to `src,ext`, which is what this package wants,
-      # since the extensions are shipped code with tests of their own.
+          RETESTITEMS_TIMEOUT_PROFILE_WAIT: 30
+          RETESTITEMS_TESTITEM_TIMEOUT: 1200
       - uses: julia-actions/julia-processcoverage@v1
         if: matrix.os == 'ubuntu-latest' && matrix.version == '1.12'
-      # v7 AND THE SAME SECRET NAME AS Reactant.jl, deliberately: EnzymeAD's other packages upload
-      # this way, so an organization-level `CODECOV_TOKEN` covers this repository without anyone
-      # provisioning a second one, and a maintainer reading two repositories in the org sees one
-      # pattern. An absent secret is an empty string and the upload fails; `fail_ci_if_error`
-      # defaults to false, so that failure is reported without turning a green suite red.
       - uses: codecov/codecov-action@v7
         if: matrix.os == 'ubuntu-latest' && matrix.version == '1.12'
         with:

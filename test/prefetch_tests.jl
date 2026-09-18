@@ -8,6 +8,19 @@
 #
 # A hang is the failure mode to fear here, so every test that could hang is written so that a hang
 # fails the suite rather than stalling it.
+#
+# THE WATCHDOG ONLY WORKS IF NOTHING RE-BLOCKS ON THE TASK IT GAVE UP ON. Every site below reads
+# `ok, result, t = pf_await(...)`, asserts `ok`, and then waits on `t` to surface anything the task
+# raised after the fact. That `wait` is guarded by `ok`, and the guard is load bearing rather than
+# tidiness: when the pipeline really does deadlock, `pf_await` returns `ok = false` with the task
+# still parked on a channel nobody will feed, and an unguarded `wait(t)` parks the test on it
+# forever. The watchdog then detects the hang and the next line reinstates it, which is worse than
+# having no watchdog at all, because a whole CI job stalls where a red test would have named the
+# bug. Measured: unguarded, this file wedged roughly one run in two with two default threads and
+# had to be SIGKILLed; guarded, the same deadlock fails in about twenty seconds and says so.
+#
+# The watched task is `Threads.@spawn`, not `@async`. `@async` is sticky, so the task would share
+# a thread with the loop timing it, which is the one place it must not be.
 
 @testitem "prefetch" begin
     using Test
@@ -214,7 +227,7 @@
             s = batch_stream(PrefetchIterator(src; device_batches = 2), n.routing)
             done = Threads.Atomic{Bool}(false)
             result = Ref{Any}(nothing)
-            t = @async begin
+            t = Threads.@spawn begin
                 result[] = try
                     collect(s)
                     :no_error
@@ -229,7 +242,7 @@
             end
             @test done[]                                  # false here means it hung
             @test result[] isa Exception
-            wait(t)
+            done[] && wait(t)
         end
     end
 
@@ -365,7 +378,7 @@
     function pf_await(f; timeout_s = 20.0)
         done = Threads.Atomic{Bool}(false)
         result = Ref{Any}(nothing)
-        t = @async begin
+        t = Threads.@spawn begin
             result[] = try
                 f()
             catch ex
@@ -458,7 +471,7 @@
             @test ok                                        # false here means it hung
             @test res isa Vector
             @test [h for (h, _) in res] == collect(PF_MANY)
-            wait(t)
+            ok && wait(t)
         end
 
         # The credit window is `2 x workers`, so this exercises the branch where the whole epoch is
@@ -470,7 +483,7 @@
             end
             @test ok
             @test [h for (h, _) in res] == collect(PF_TRAIN)
-            wait(t)
+            ok && wait(t)
         end
 
         # The opt-out. Deliberately NOT asserting that the order differs: that would be a timing
@@ -486,7 +499,7 @@
             @test ok
             @test length(res) == length(PF_MANY)
             @test sort([findfirst(==(h), collect(PF_MANY)) for (h, _) in res]) == collect(1:length(PF_MANY))
-            wait(t)
+            ok && wait(t)
         end
     end
 
@@ -531,7 +544,7 @@
 
         ok, pairs, t = pf_await(() -> collect(s))
         @test ok                                            # false here means it hung
-        wait(t)
+        ok && wait(t)
         @test pairs isa Vector
         @test length(pairs) == length(PF_MANY)
         hosts = [h for (h, _) in pairs]
@@ -573,7 +586,7 @@
             @test s3 isa Channel && !(s3 isa PrefetchStream)
             ok3, pairs3, t3 = pf_await(() -> collect(s3))
             @test ok3
-            wait(t3)
+            ok3 && wait(t3)
             # One producer preserves the source's order, which is what makes this fallback safe.
             @test [h for (h, _) in pairs3] == collect(PF_MANY)
             close_stream!(s3)
@@ -594,7 +607,7 @@
 
         ok, result, t = pf_await(() -> collect(s))
         @test ok                                            # false here means it hung
-        wait(t)
+        ok && wait(t)
         @test result isa Exception
         # Unwrapped, so the consumer sees the loader's own error rather than a `TaskFailedException`,
         # matching the inline path's semantics that this file asserts by type above.
