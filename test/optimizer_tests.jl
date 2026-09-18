@@ -96,7 +96,12 @@
     # machine they do not have. `worst` is reported with `repr`, which round-trips a Float32
     # exactly, because "the values agree to all printed digits" is precisely the report that made
     # this hard to act on the first time.
-    function ulp_report(name, xd, xh)
+    function ulp_report(name, xd_, xh_)
+        # MATERIALIZED FIRST, both of them. Not every rule here hands back a plain `Array`:
+        # `Decay(anchored)` carries a device anchor, so its HOST run returns a `ConcreteRArray`,
+        # and broadcasting over one builds traced operations instead of computing numbers. This is
+        # a host-side diagnostic and wants host values. `Array` on an `Array` is just a copy.
+        xd, xh = Array(xd_), Array(xh_)
         gaps = _ulps.(xd, xh)
         i = argmax(gaps)
         return (;
