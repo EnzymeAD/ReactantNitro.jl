@@ -56,6 +56,7 @@ html:root:not(.theme--documenter-dark):not([class*="theme--catppuccin"]) {
     --brand-heading: #7c2d12;
     --brand-link: #b45309;
     --brand-link-hover: #7c2d12;
+    --brand-focus-ring: rgba(180, 83, 9, 0.25);
     --brand-sidebar-bg: #efe6d6;
     --brand-sidebar-border: #ddcba4;
     --brand-sidebar-structure: #c9a86a;
@@ -97,6 +98,7 @@ html.theme--documenter-dark {
     --brand-heading: #e3b341;
     --brand-link: #f0a23c;
     --brand-link-hover: #ffc46b;
+    --brand-focus-ring: rgba(240, 162, 60, 0.25);
     --brand-sidebar-bg: #1d160d;
     --brand-sidebar-border: #3a2c1a;
     --brand-sidebar-structure: #6b5428;
@@ -464,6 +466,29 @@ html:root .admonition.is-compat > .admonition-header,
 html:root .admonition.is-todo > .admonition-header,
 html:root .admonition > .admonition-header {
     color: var(--brand-admonition-header, inherit);
+}
+
+/* ---- Form controls: the theme switcher and the search box ---- */
+/* The theme accents a focused control and the select's arrow with its own link colour, and that
+ * colour is a green (#1abc9c in documenter-dark, the catppuccin greens elsewhere). Unbranded, a
+ * focused theme switcher glows a colour nothing else on the page uses.
+ *
+ * Specificity matches the theme's (the `:not()`s count toward it) and this file loads last, so the
+ * ties resolve here, the same way the admonition rules above work. */
+html:root .select select:focus,
+html:root .select select:active,
+html:root .select select.is-focused,
+html:root .select select.is-active,
+html:root .input:focus,
+html:root .input:active,
+html:root .textarea:focus,
+html:root #documenter .docs-sidebar form.docs-search > input:focus {
+    border-color: var(--brand-link, currentColor);
+    box-shadow: 0 0 0 0.125em var(--brand-focus-ring, transparent);
+}
+/* The dropdown arrow, drawn as two rotated borders on `::after`. */
+html:root .select:not(.is-multiple):not(.is-loading)::after {
+    border-color: var(--brand-link, currentColor);
 }
 
 /* ---- Code tokens: a warm pass over the highlight.js palette ---- */
