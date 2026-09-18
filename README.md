@@ -70,10 +70,9 @@ as any current limitations.
 
 ### Installation
 
-The package is not in the General registry yet, so install it from the repository:
-
 ```julia
-julia> using Pkg; Pkg.add(url = "https://github.com/EnzymeAD/ReactantNitro.jl")
+using Pkg
+Pkg.add("ReactantNitro")
 ```
 
 ### MNIST
