@@ -130,4 +130,5 @@ n = Nitro(MnistMLP(); checkpointer = TopKCheckpointer(; metric = :acc, mode = :m
 train!(n)
 ```
 
-`examples/mnist_tutorial.jl` is the same task with everything turned on, as one runnable file; see the [Tutorial](https://enzymead.github.io/ReactantNitro.jl/dev/tutorial/)
+See the [tutorial](https://enzymead.github.io/ReactantNitro.jl/dev/tutorial/) for a more indepth walkthrough covering
+a wider range of framework features and explaining how they actually work.
