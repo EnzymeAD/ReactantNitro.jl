@@ -56,7 +56,16 @@ jobs:
         # rather than leaving it asserted. Both are supported: neither is
         # advisory, and a failure on either is a failure.
         version: ['1.12', '1.13']
-        os: [ubuntu-latest]
+        # macOS IS AARCH64, and that is the reason it is here rather than a wish
+        # to cover another operating system. Float contraction is a property of
+        # the target: whether a multiply feeding an add becomes an FMA is decided
+        # per backend by XLA and per architecture by LLVM, so the optimizer
+        # suite's traced-versus-host comparisons can hold on x86-64 and not on
+        # Apple Silicon. A registration reviewer found exactly that, on a rule
+        # the x86 runners agreed on, which is the failure mode an x86-only matrix
+        # cannot see. `Reactant_jll` ships `aarch64-apple-darwin`, so the runner
+        # installs the same stack rather than a reduced one.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
