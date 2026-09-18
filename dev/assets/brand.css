@@ -420,32 +420,50 @@ html:root .admonition.is-compat,
 html:root .admonition.is-todo {
     background-color: var(--brand-admonition-bg, transparent);
 }
-html:root .admonition > .admonition-header {
-    color: var(--brand-admonition-header, inherit);
-}
+/* `border-color`, not `border-left-color` plus `border-top-color`. The theme sets the variant
+ * colour on ALL FOUR sides (`.admonition.is-success { border-color: #259a12 }`), so overriding two
+ * of them left the right and bottom edges in the theme's green while the rest of the box was warm.
+ * Specificity here is (0,3,1), the same as the dark theme's `html.theme--documenter-dark
+ * .admonition.is-success`, and a tie goes to the later stylesheet: this file loads after both
+ * themes, which is the same thing the background rule above relies on. */
 html:root .admonition.is-info {
-    border-left-color: var(--brand-admonition-info, currentColor);
-    border-top-color: var(--brand-admonition-info, currentColor);
+    border-color: var(--brand-admonition-info, currentColor);
 }
 html:root .admonition.is-success {
-    border-left-color: var(--brand-admonition-success, currentColor);
-    border-top-color: var(--brand-admonition-success, currentColor);
+    border-color: var(--brand-admonition-success, currentColor);
 }
 html:root .admonition.is-warning {
-    border-left-color: var(--brand-admonition-warning, currentColor);
-    border-top-color: var(--brand-admonition-warning, currentColor);
+    border-color: var(--brand-admonition-warning, currentColor);
 }
 html:root .admonition.is-danger {
-    border-left-color: var(--brand-admonition-danger, currentColor);
-    border-top-color: var(--brand-admonition-danger, currentColor);
+    border-color: var(--brand-admonition-danger, currentColor);
 }
 html:root .admonition.is-compat {
-    border-left-color: var(--brand-admonition-compat, currentColor);
-    border-top-color: var(--brand-admonition-compat, currentColor);
+    border-color: var(--brand-admonition-compat, currentColor);
 }
 html:root .admonition.is-todo {
-    border-left-color: var(--brand-admonition-todo, currentColor);
-    border-top-color: var(--brand-admonition-todo, currentColor);
+    border-color: var(--brand-admonition-todo, currentColor);
+}
+
+/* The header colour, per variant, and the variant is why these exist rather than the one unqualified
+ * rule that used to be here.
+ *
+ * THE DARK THEME QUALIFIES ITS HEADER RULE AND THE LIGHT THEME DOES NOT, which is what made this a
+ * dark-only bug: light says `.admonition.is-success > .admonition-header` at (0,3,0), which an
+ * unqualified `html:root .admonition > .admonition-header` at (0,3,1) already beats, while dark
+ * says `html.theme--documenter-dark .admonition.is-success > .admonition-header` at (0,4,1), which
+ * it does not. Naming the variant brings these to (0,4,1) as well, and the tie resolves here
+ * because this file is last. A `tip` on a dark page therefore stops printing its title in the
+ * theme's green. */
+html:root .admonition.is-default > .admonition-header,
+html:root .admonition.is-info > .admonition-header,
+html:root .admonition.is-success > .admonition-header,
+html:root .admonition.is-warning > .admonition-header,
+html:root .admonition.is-danger > .admonition-header,
+html:root .admonition.is-compat > .admonition-header,
+html:root .admonition.is-todo > .admonition-header,
+html:root .admonition > .admonition-header {
+    color: var(--brand-admonition-header, inherit);
 }
 
 /* ---- Code tokens: a warm pass over the highlight.js palette ---- */
