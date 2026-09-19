@@ -590,4 +590,43 @@
         @test occursin("n", sprint(show, PlainExp())) && occursin("3", sprint(show, PlainExp()))
     end
 
+    @testset "the macro qualifies its definitions by symbol where it can" begin
+        using ReactantNitro: _qual
+        # Here `ReactantNitro` is bound, so the heads are symbol chains, which is what Pluto's
+        # expression explorer needs to read them as qualified rather than as new globals.
+        q = _qual(:device_fields, @__MODULE__)
+        @test q.args[1] == esc(:ReactantNitro)          # the caller's binding, not ours
+        @test q.args[2] == QuoteNode(:device_fields)
+        ex = string(
+            macroexpand(
+                @__MODULE__, :(
+                    @experiment struct QualA
+                        x::Int = 1
+                    end
+                )
+            )
+        )
+        @test occursin("ReactantNitro.device_fields", ex)
+        @test occursin("ReactantNitro.compile_view", ex)
+        @test !occursin("Main.ReactantNitro.device_fields", ex)
+        # A module that imported only the macro binds no module name, and one that binds the
+        # name to something else is not this module: both get the module object, and the macro
+        # works there all the same.
+        M = Module()
+        Core.eval(M, :(using ReactantNitro: @experiment, Device, Host, GraphConst))
+        @test _qual(:device_fields, M).args[1] === ReactantNitro
+        Core.eval(
+            M, :(
+                @experiment struct QualB
+                    y::Device{Float32} = 1.0f0
+                    z::Int = 2
+                end
+            )
+        )
+        @test ReactantNitro.device_fields(M.QualB) == (:y,)
+        @test ReactantNitro.host_fields(M.QualB) == (:z,)
+        N = Module()
+        Core.eval(N, :(ReactantNitro = 1))
+        @test _qual(:device_fields, N).args[1] === ReactantNitro
+    end
 end

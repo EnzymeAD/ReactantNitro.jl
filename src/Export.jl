@@ -904,7 +904,7 @@ function export_provenance(nitro::Nitro)
     cfg = config_params(nitro.e; seed = nitro.seed)
     prov = Dict{String, Any}(
         "framework" => "ReactantNitro.jl",
-        "reactantnitro_version" => string(pkgversion(@__MODULE__)),
+        "reactantnitro_version" => framework_version(),
         "seed" => nitro.seed,
         "run_dir" => nitro.run_dir,
         "config" => Dict{String, Any}(String(k) => _prov_value(v) for (k, v) in pairs(cfg)),

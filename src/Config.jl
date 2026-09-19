@@ -435,10 +435,11 @@ end
 # ── Macro implementation. Split out so it is testable and so the macro body stays one line. ──
 
 """
-    ReactantNitro._qual(name::Symbol) -> Expr
+    ReactantNitro._qual(name::Symbol, [caller::Module]) -> Expr
 
-Name one of this module's functions through the module **object**, for a method definition emitted
-by [`@experiment`](@ref).
+Name one of this module's functions for a method definition emitted by [`@experiment`](@ref):
+through the symbol `ReactantNitro` when the caller has this module bound under that name, and
+through the module **object** otherwise.
 
 This is not cosmetic. Hygiene treats a short-form definition `f(x) = y` as introducing a binding, so
 an unescaped `device_fields(::Type{<:MyExp}) = ...` in macro output is renamed to a gensym and the
@@ -446,11 +447,17 @@ method lands on a function nobody can call: the generated traits silently do not
 accessor falls through to the empty default. `esc` is not the fix either, since a name reaching the
 user's module through `using` cannot be extended there without an explicit `import`.
 
-Naming the module by its object rather than by the symbol `ReactantNitro` also drops the requirement
-that the module be bound in the caller's scope, which `using ReactantNitro: @experiment` would not
-provide.
+The object form works wherever the macro is called, including after `using ReactantNitro:
+@experiment`, which binds no module name. The symbolic form is preferred when available because
+Pluto's expression explorer reads a definition head only as a chain of symbols: a module object
+there is dropped, the definition is read as an unqualified `device_fields`, and the cell conflicts
+with the one that imported the name.
 """
 _qual(name::Symbol) = Expr(:., @__MODULE__, QuoteNode(name))
+function _qual(name::Symbol, caller::Module)
+    bound = isdefined(caller, :ReactantNitro) && getfield(caller, :ReactantNitro) === @__MODULE__
+    return bound ? Expr(:., esc(:ReactantNitro), QuoteNode(name)) : _qual(name)
+end
 
 struct _FieldDecl
     name::Symbol
@@ -618,8 +625,8 @@ function _experiment(expr, source, mod = @__MODULE__)
     # types rather than device ones.
     dnames = Expr(:tuple, (QuoteNode(f.name) for f in fields if f.kind === :device)...)
     hnames = Expr(:tuple, (QuoteNode(f.name) for f in fields if f.kind === :host)...)
-    df_def = :($(_qual(:device_fields))(::Type{<:$(esc(name))}) = $dnames)
-    hf_def = :($(_qual(:host_fields))(::Type{<:$(esc(name))}) = $hnames)
+    df_def = :($(_qual(:device_fields, mod))(::Type{<:$(esc(name))}) = $dnames)
+    hf_def = :($(_qual(:host_fields, mod))(::Type{<:$(esc(name))}) = $hnames)
 
     # ── config_metadata. Built in the function body rather than a module-level const, so a default
     # expression is resolved at call time exactly as the constructor resolves it.
@@ -636,19 +643,19 @@ function _experiment(expr, source, mod = @__MODULE__)
             :call, Expr(:curly, :NamedTuple, Expr(:tuple, (QuoteNode(f.name) for f in fields)...)),
             Expr(:tuple, (entry(f) for f in fields)...)
         )
-    cm_def = :($(_qual(:config_metadata))(::Type{<:$(esc(name))}) = $meta_body)
+    cm_def = :($(_qual(:config_metadata, mod))(::Type{<:$(esc(name))}) = $meta_body)
 
     # ── compile_view, specialized. Generated per type so the reconstruction is type-stable: the
     # tracer sees this on every trace, and the framework rebuilds `e` every optimizer step.
     hostset = Set(f.name for f in fields if f.kind === :host)
     cv_def = if isempty(hostset)
-        :($(_qual(:compile_view))(e::$(esc(name))) = e)
+        :($(_qual(:compile_view, mod))(e::$(esc(name))) = e)
     else
         args = [
             f.name in hostset ? :($(_qual(:StrippedHost)){$(QuoteNode(f.name))}()) :
                 :(getfield(e, $(QuoteNode(f.name)))) for f in fields
         ]
-        :($(_qual(:compile_view))(e::$(esc(name))) = $(esc(name))($(args...)))
+        :($(_qual(:compile_view, mod))(e::$(esc(name))) = $(esc(name))($(args...)))
     end
 
     docstr = _experiment_docstring(name, fields)
