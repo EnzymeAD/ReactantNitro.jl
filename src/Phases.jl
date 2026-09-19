@@ -1328,39 +1328,46 @@ end
 # ── The log reporter, for a notebook ─────────────────────────────────────────────────
 #
 # A notebook has no cursor for a bar but does have a logger. This emits ProgressLogging records,
-# which Pluto, VS Code and TerminalLoggers render and other loggers drop. Steps are throttled to a
-# frame per tenth of a second; the first and last frame of a stretch always go out.
+# which Pluto, VS Code and TerminalLoggers render and other loggers drop. ONE bar per entry point,
+# not per stretch: Pluto keeps every finished bar in the cell's log pane, and a run is many
+# stretches. The name says which stretch is running; the fraction is epochs done, with the current
+# stretch interpolated, and never moves backwards. Steps are throttled to a frame per tenth of a
+# second; the opening frame and the closing frame always go out.
 
 mutable struct _ProgressLog
     const id::UUIDs.UUID
-    const name::String
+    label::String
     phase::String
-    const total::Int
+    epoch::Int
+    max_epochs::Int
+    total::Int
     counter::Int
+    floor::Float64
     last_emit::Float64
 end
 
 const _PLOG = Ref{Union{Nothing, _ProgressLog}}(nothing)
 const _PLOG_INTERVAL = 0.1
 
+function _plog_fraction(st::_ProgressLog)
+    within = st.total > 0 ? min(1.0, st.counter / st.total) : 0.0
+    st.max_epochs > 0 || return st.total > 0 ? within : nothing
+    st.floor = max(st.floor, min(1.0, (st.epoch - 1 + within) / st.max_epochs))
+    return st.floor
+end
+
 # The record `@logprogress` emits, both halves: the `progress` keyword is the old API Pluto and
 # VS Code read, the `ProgressString` message is the new one TerminalLoggers reads.
 function _plog_emit!(st::_ProgressLog; done::Bool = false)
-    fraction = st.total > 0 ? min(1.0, st.counter / st.total) : nothing
-    name = isempty(st.phase) ? st.name : st.name * " [" * st.phase * "]"
+    fraction = _plog_fraction(st)
+    name = st.max_epochs > 0 ? "epoch $(st.epoch)/$(st.max_epochs): $(st.label)" : st.label
+    isempty(st.phase) || (name *= " [" * st.phase * "]")
     msg = ProgressLogging.ProgressString(
         ProgressLogging.Progress(st.id, fraction; name, done)
     )
     Logging.@logmsg ProgressLogging.ProgressLevel msg progress = (done ? "done" : fraction) _id =
         st.id
     st.last_emit = time()
-    return nothing
-end
-
-function _plog_close!()
-    st = _PLOG[]
-    _PLOG[] = nothing
-    st === nothing || _plog_emit!(st; done = true)
     return nothing
 end
 
@@ -1374,11 +1381,15 @@ _logging_progress() =
 
 The progress reporter for an environment that renders log records rather than a terminal: Pluto,
 VS Code, a REPL with TerminalLoggers, and any notebook whose logger accepts ProgressLogging's
-`ProgressLevel`. Implements the contract [`progress_reporter!`](@ref) documents by emitting one
-[`ProgressLogging.Progress`](https://github.com/JuliaLogging/ProgressLogging.jl) record per frame,
-under one id per stretch of work: a fraction of zero at `:begin`, the fraction done on `:step` at
-most every tenth of a second, the phase appended to the name on `:phase`, and `done = true` at
-`:end`. A stretch with `total = 0` carries no fraction, which the renderers draw as busy.
+`ProgressLevel`. Implements the contract [`progress_reporter!`](@ref) documents by emitting
+[`ProgressLogging.Progress`](https://github.com/JuliaLogging/ProgressLogging.jl) records under
+**one id per entry point**, opened at the first `:begin` and closed with `done = true` at `:done`.
+
+The name is the current stretch, `"epoch 3/40: train"`, with the phase appended while one is set.
+The fraction is epochs completed over `max_epochs`, with the running stretch's own progress
+interpolated, and it never decreases; a run with `max_epochs = 0` reports the stretch's own
+fraction, or none when the stretch has no units. Frames go out at `:begin`, on a `:phase` change,
+on `:step` at most every tenth of a second, and at `:done`.
 
 Emits regardless of whether anything is listening; the logger drops what it does not accept. The
 default reporter, [`default_progress_reporter`](@ref), picks this one when no terminal is watching
@@ -1388,10 +1399,14 @@ function progress_log_reporter(
         verb::Symbol, label::String, total::Int, epoch::Int, max_epochs::Int
     )
     if verb === :begin
-        _plog_close!()
-        name = max_epochs > 0 ? "$label epoch $epoch/$max_epochs" : label
-        st = _ProgressLog(UUIDs.uuid4(), name, "", total, 0, 0.0)
-        _PLOG[] = st
+        st = _PLOG[]
+        if st === nothing
+            st = _ProgressLog(UUIDs.uuid4(), label, "", epoch, max_epochs, total, 0, 0.0, 0.0)
+            _PLOG[] = st
+        else
+            st.label, st.phase, st.epoch, st.max_epochs = label, "", epoch, max_epochs
+            st.total, st.counter = total, 0
+        end
         _plog_emit!(st)
     elseif verb === :phase
         st = _PLOG[]
@@ -1407,8 +1422,10 @@ function progress_log_reporter(
         if st.counter >= st.total || time() - st.last_emit >= _PLOG_INTERVAL
             _plog_emit!(st)
         end
-    elseif verb === :end || verb === :done
-        _plog_close!()
+    elseif verb === :done
+        st = _PLOG[]
+        _PLOG[] = nothing
+        st === nothing || _plog_emit!(st; done = true)
     end
     return nothing
 end

@@ -815,44 +815,53 @@
     # The record shape is ProgressLogging's, so it is asserted against what ProgressLogging's own
     # macros emit: same level, same message type, same `_id` convention. A renderer that draws one
     # draws the other.
-    @testset "the log reporter emits ProgressLogging records, one id per stretch" begin
+    @testset "the log reporter emits ProgressLogging records, one id per run" begin
         logger = Test.TestLogger(; min_level = ProgressLevel)
+        rep = ReactantNitro.progress_log_reporter
         with_logger(logger) do
-            ReactantNitro.progress_log_reporter(:begin, "train", 4, 2, 5)
-            ReactantNitro.progress_log_reporter(:phase, "compiling gradient", 0, 0, 0)
-            ReactantNitro.progress_log_reporter(:phase, "compiling gradient", 0, 0, 0)  # same, no frame
-            ReactantNitro.progress_log_reporter(:phase, "", 0, 0, 0)
+            rep(:begin, "train", 4, 2, 5)
+            rep(:phase, "compiling gradient", 0, 0, 0)
+            rep(:phase, "compiling gradient", 0, 0, 0)  # same phase, no frame
+            rep(:phase, "", 0, 0, 0)
             for _ in 1:4
-                ReactantNitro.progress_log_reporter(:step, "", 0, 0, 0)
+                rep(:step, "", 0, 0, 0)
             end
-            ReactantNitro.progress_log_reporter(:end, "", 0, 0, 0)
+            rep(:end, "", 0, 0, 0)
+            rep(:begin, "val", 2, 2, 5)
+            rep(:step, "", 0, 0, 0)
+            rep(:step, "", 0, 0, 0)
+            rep(:end, "", 0, 0, 0)
+            rep(:done, "", 0, 0, 0)
         end
         recs = logger.logs
         @test all(r -> r.level == ProgressLevel, recs)
         @test all(r -> r.message isa ProgressLogging.ProgressString, recs)
         ps = [ProgressLogging.asprogress(r.level, r.message) for r in recs]
+        @test allequal(p.id for p in ps)                  # one bar for the whole run
+        @test all(r -> r.id == ProgressLogging.asprogress(r.level, r.message).id, recs)
         # The legacy keyword Pluto and VS Code read: the fraction, or "done".
         @test all(r -> haskey(r.kwargs, :progress), recs)
-        @test recs[1].kwargs[:progress] == 0.0
+        @test recs[1].kwargs[:progress] == 0.2
         @test recs[end].kwargs[:progress] == "done"
-        @test allequal(p.id for p in ps)
-        @test all(r -> r.id == r.message.id, recs)
-        @test ps[1].fraction == 0.0
-        @test ps[1].name == "train epoch 2/5"
+        # Epoch 2 of 5 opens at one fifth done, names the stretch, and carries the phase.
+        @test ps[1].fraction == 0.2
+        @test ps[1].name == "epoch 2/5: train"
         @test !ps[1].done
-        @test ps[2].name == "train epoch 2/5 [compiling gradient]"
-        @test ps[3].name == "train epoch 2/5"
-        # Steps are throttled to a frame per tenth of a second, but the last one always lands.
+        @test ps[2].name == "epoch 2/5: train [compiling gradient]"
+        @test ps[3].name == "epoch 2/5: train"
+        # The fraction interpolates the stretch and never moves backwards: training epoch 2 ends
+        # at two fifths, and the validation pass that follows holds there.
         fractions = [p.fraction for p in ps if !p.done]
         @test issorted(fractions)
-        @test fractions[end] == 1.0
+        itrain = findlast(p -> p.name == "epoch 2/5: train" && !p.done, ps)
+        @test ps[itrain].fraction == 0.4
+        @test all(p -> p.fraction == 0.4, filter(p -> startswith(p.name, "epoch 2/5: val"), ps))
+        @test count(p -> p.done, ps) == 1
         @test ps[end].done
         @test ReactantNitro._PLOG[] === nothing
 
         # Compared with the reference producer, `@withprogress`: same level, same `_id`
-        # convention, and both messages resolve through `asprogress`, which is what every
-        # renderer calls to read a record. The macro wraps its message in a `ProgressString`;
-        # ours is the bare `Progress` the package documents for a record provider.
+        # convention, same message type and keyword set.
         ref = Test.TestLogger(; min_level = ProgressLevel)
         with_logger(ref) do
             @withprogress name = "ref" begin
@@ -863,39 +872,34 @@
         @test r1.level == recs[1].level
         @test typeof(r1.message) == typeof(recs[1].message)
         @test keys(r1.kwargs) == keys(recs[1].kwargs)
-        @test ProgressLogging.asprogress(r1.level, r1.message) isa Progress
         @test r1.id == ProgressLogging.asprogress(r1.level, r1.message).id
 
-        # A stretch with no units carries no fraction: busy, not stuck at zero.
+        # No epoch budget: the stretch's own fraction, and none for a unit-less stretch.
         logger = Test.TestLogger(; min_level = ProgressLevel)
         with_logger(logger) do
-            ReactantNitro.progress_log_reporter(:begin, "checkpoint", 0, 1, 5)
-            ReactantNitro.progress_log_reporter(:step, "", 0, 0, 0)
-            ReactantNitro.progress_log_reporter(:end, "", 0, 0, 0)
+            rep(:begin, "checkpoint", 0, 1, 0)
+            rep(:step, "", 0, 0, 0)
+            rep(:begin, "val", 2, 1, 0)
+            rep(:step, "", 0, 0, 0)
+            rep(:step, "", 0, 0, 0)
+            rep(:done, "", 0, 0, 0)
         end
         ps0 = [ProgressLogging.asprogress(r.level, r.message) for r in logger.logs]
-        @test [p.fraction for p in ps0] == [nothing, nothing]
-        @test ps0[1].name == "checkpoint epoch 1/5"
-        @test ps0[end].done
+        @test [(p.name, p.fraction) for p in ps0[1:2]] == [("checkpoint", nothing), ("val", 0.0)]
         @test logger.logs[1].kwargs[:progress] === nothing
-        # `:done` with nothing open is a no-op, and a `:begin` closes a stretch left open.
+        @test ps0[end].done
+        @test allequal(p.id for p in ps0)
+        # `:done` with nothing open is a no-op.
         logger = Test.TestLogger(; min_level = ProgressLevel)
         with_logger(logger) do
-            ReactantNitro.progress_log_reporter(:done, "", 0, 0, 0)
-            ReactantNitro.progress_log_reporter(:begin, "a", 2, 1, 0)   # no epochs: bare name
-            ReactantNitro.progress_log_reporter(:begin, "b", 2, 1, 0)
-            ReactantNitro.progress_log_reporter(:done, "", 0, 0, 0)
+            rep(:done, "", 0, 0, 0)
         end
-        names = [
-            (p.name, p.done) for
-                p in (ProgressLogging.asprogress(r.level, r.message) for r in logger.logs)
-        ]
-        @test names == [("a", false), ("a", true), ("b", false), ("b", true)]
+        @test isempty(logger.logs)
     end
 
     @testset "the default reporter routes a stretch to a logger when no terminal is watching" begin
         @test ReactantNitro._drawing_progress() == false        # the suite is not a terminal
-        # Under a logger that accepts progress, a training run's stretches are logged.
+        # Under a logger that accepts progress, a training run is one logged bar.
         logger = Test.TestLogger(; min_level = ProgressLevel)
         prev = ReactantNitro.progress_reporter!(ReactantNitro.default_progress_reporter)
         try
@@ -918,13 +922,12 @@
                 r in logger.logs if r.message isa ProgressLogging.ProgressString
         ]
         @test !isempty(ps)
-        @test any(p -> p.name == "train epoch 1/1" && p.fraction == 0.0, ps)
-        @test any(p -> p.name == "train epoch 1/1" && p.done, ps)
-        @test any(p -> startswith(p.name, "val epoch 1/1") && p.done, ps)
-        # Every stretch that opened was closed.
-        opened = Set(p.id for p in ps if !p.done)
-        closed = Set(p.id for p in ps if p.done)
-        @test opened == closed
+        @test allequal(p.id for p in ps)
+        @test any(p -> p.name == "epoch 1/1: train" && p.fraction == 0.0, ps)
+        @test any(p -> startswith(p.name, "epoch 1/1: val"), ps)
+        @test issorted([p.fraction for p in ps if !p.done])
+        @test count(p -> p.done, ps) == 1
+        @test ps[end].done
         @test ReactantNitro._PLOG[] === nothing
         @test ReactantNitro._PROGRESS_ROUTE[] === :none
     end
