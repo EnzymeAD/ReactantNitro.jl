@@ -26,14 +26,15 @@ the framework supplies the compiled programs, the device transfers, the optimize
 checkpointing, and the run's lifecycle. Training and serving both stay in Julia, from the first
 `train!` to the exported [bundle](https://enzymead.github.io/ReactantNitro.jl/dev/export/).
 
-The design follows PyTorch Lightning, pointed at Reactant. Lux has a training loop, but a
-batteries included training stack also needs gradient accumulation, a phase system, schedules, and control over
-when XLA compiles.
+The design follows PyTorch Lightning, pointed at Reactant. Lux has a training loop; a Reactant-first
+stack also needs precision over when XLA compiles, control over what the tracer walks, device memory
+freed per batch rather than at the host GC's convenience, and binding by name between loaders, hooks,
+schedules and optimizer rules. On top of those it supplies what Lightning does: gradient
+accumulation, phases, schedules, checkpoint and resume, logging, and export.
 
-A Reactant-first stack also has [pitfalls](https://enzymead.github.io/ReactantNitro.jl/dev/pitfalls/) that are easy to 
-hit and hard to diagnose: a compile that balloons for no visible reason, an edit that silently reuses a stale program, 
-a run that goes OoM hours in. Directly addressing these concerns is what sets ReactantNitro apart from just a standard 
-ML framework.
+A Reactant-first stack has [pitfalls](https://enzymead.github.io/ReactantNitro.jl/dev/pitfalls/) that are easy to
+hit and hard to diagnose: a compile that balloons for no visible reason, an edit that reuses a stale program,
+a run that goes OoM hours in. None of them raise, and the framework handles each one.
 
 ## The three field markers
 

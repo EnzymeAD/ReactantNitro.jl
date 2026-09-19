@@ -912,6 +912,15 @@ function export_provenance(nitro::Nitro)
     nitro.preset === nothing || (prov["preset"] = String(nitro.preset))
     nitro.checkpoint_source === nothing ||
         (prov["checkpoint"] = String(nitro.checkpoint_source))
+    # A warm start names the handle it took its weights from, which has no path: the experiment,
+    # the epoch and step it had reached, and its run directory are what a reader can chase.
+    ws = nitro.weights_source
+    ws === nothing || (
+        prov["weights_from"] = Dict{String, Any}(
+            "experiment" => String(ws.experiment), "epoch" => ws.epoch,
+            "step" => ws.step, "run_dir" => ws.run_dir,
+        )
+    )
     # The training run, from the record rather than from this handle's logger, which on an export is
     # a fresh one. Omitted rather than empty when there is none, exactly as `checkpoint` is.
     nitro.trained_run_id === nothing ||

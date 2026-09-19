@@ -1,18 +1,15 @@
 # Schedules: what varies with the step
 
-A schedule varies one quantity per optimizer step, the learning rate, a decay coefficient, a
-`Device` field read inside a traced hook, and everything else stays fixed at setup. This page covers
-the contract, the two namespaces a key can live in, how schedules interact with `Device` values, the
-binding report, and the ecosystem packages worth reaching for.
+A schedule varies one quantity per optimizer step: the learning rate, a decay coefficient, or a
+`Device` field read inside a traced hook. Everything else is fixed at setup.
 
 ## The contract
 
 [`schedules`](@ref)`(e)` returns a NamedTuple; the default is `(;)`, meaning everything constant.
 Every entry is a **factory of the horizon**: the framework calls `f(total)` once, at setup, with the
 total number of optimizer steps, then calls what it returned once per optimizer step. A bare
-`Number` normalizes to `_ -> (_ -> value)`, which makes constants setup-fixed by construction: a
-constant is a `Number` and a schedule is a callable, so the per-step transfer count equals the
-number of quantities actually varying.
+`Number` normalizes to `_ -> (_ -> value)`, so the per-step transfer count equals the number of
+quantities that vary.
 
 ```julia
 schedules(e::MyExp) = (;
@@ -43,9 +40,8 @@ schedule with the upcoming optimizer step, counting from 1.
 ## The two namespaces
 
 A schedule key is either a [`Device`](@ref) field name or a rule field name, resolved against the
-union of the two. The two route to different places: an `opt` key is applied to the
-optimizer, a `device` key is written into the experiment and reaches traced code as `e.field`; there
-is no third destination, which is what makes the resolution total.
+union of the two. An `opt` key is applied to the optimizer; a `device` key is written into the experiment and
+reaches traced code as `e.field`. There is no third destination.
 
 `device` and `opt` are reserved at the top level and name the two namespaces; every other top-level
 key is unqualified and must resolve to exactly one of them. A key matching neither is an error
@@ -166,10 +162,9 @@ The plain text is handed to [`log_other!`](@ref) whether or not anything display
 run's record carries it and the terminal is never the only copy. [`binding_report`](@ref) returns
 that same text.
 
-Read it on the first run of any new config; it is the cheapest way to catch a group that came out
-empty, a ratio you did not intend, or a schedule that bound to the optimizer when you meant your
-experiment. It is a diagnostic, not a check: it never fails, and it computes nothing the run
-does not already compute.
+Read it on the first run of any new config: it catches a group that came out empty, a ratio you
+did not intend, or a schedule that bound to the optimizer when you meant your experiment. It is a
+diagnostic, not a check: it never fails.
 
 The schedule belongs to the experiment by default, and the `schedules` keyword on [`Nitro`](@ref)
 and [`train!`](@ref) is the per-run override. It replaces wholesale; it does not merge, because a
@@ -182,20 +177,18 @@ train!(e; schedules = merge(schedules(e), (; eta = total -> OneCycle(total, 3f-4
 
 ## Use the ecosystem
 
-[ParameterSchedulers.jl](https://github.com/FluxML/ParameterSchedulers.jl) is a documented
-recommendation with no dependency, not even a weakdep, because the framework never dispatches on a
-schedule: a schedule is any callable of the step, so there is no interface to satisfy and nothing to
-import from us.
+[ParameterSchedulers.jl](https://github.com/FluxML/ParameterSchedulers.jl) is the recommendation,
+with no dependency on it, not even a weakdep: a schedule is any callable of the step, so there is
+no interface to satisfy.
 
 Its schedules are 1-indexed and align with the framework's step counting: the framework calls a
 schedule with the upcoming optimizer step, counting from 1, so `s(t)` lines up with no offset. That
 is worth checking for any library you bring; a schedule that is 0-indexed needs `t -> s(t - 1)` and
 gets the first step wrong if you forget.
 
-Do not check a library's index convention at step 1. Most schedules start on a flat part: a cosine's
-derivative is zero at its endpoint, so the first two steps can differ by less than `Float32` eps and
-round to the same number, which is exactly how you conclude the convention does not matter when it
-does. Check mid-curve, where the slope is steepest.
+Do not check a library's index convention at step 1. Most schedules start on a flat part, so the
+first two steps can differ by less than `Float32` eps and round to the same number. Check mid-curve,
+where the slope is steepest.
 
 If you are reproducing a run from a codebase that used PyTorch's
 `torch.optim.lr_scheduler.OneCycleLR`, the curve is reproducible exactly, but only by mapping every

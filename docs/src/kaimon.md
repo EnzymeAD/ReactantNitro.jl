@@ -4,15 +4,12 @@ ReactantNitro ships a KaimonGate extension that registers a set of `nitro_*` too
 running Kaimon gate, so an agent can start and watch training, validation, evaluation,
 prediction, and export from the session where the model code is loaded.
 
-This page is about the tool interface, what the tools can and cannot do, and why they work the
-way they do. The extension is a dev tool: nothing in `src/` knows it exists, it costs nothing
-until KaimonGate is loaded, and the tools are a thin interface over entry points the framework
-already ships.
+The extension is a dev tool: nothing in `src/` knows it exists, it costs nothing until KaimonGate
+is loaded, and the tools are a thin interface over entry points the framework already ships.
 
 ## When the tools appear
 
-The extension activates when KaimonGate and ReactantNitro are both loaded in one process, which
-is exactly the shape of a Kaimon-hosted session. The one thing to know:
+The extension activates when KaimonGate and ReactantNitro are both loaded in one process.
 
 **`using ReactantNitro` is the first step of any session.** Kaimon's `start_session` boots the
 gate but does not load your model code; the extension registers its tools the moment the model
@@ -147,9 +144,8 @@ and validation metrics, the run directory, the result summary on completion, or 
 on failure. Every launch kind drives the phase monitor: an export run reports
 `ExportCompiling` while the trace is in flight (the framework publishes it around the backend
 call), a predict run reports `EvalCompiling` when its `forward` has to compile, and a completed
-run's phase reads `Repl`. The loss and metrics come from a recording logger the tools install for each run,
-which also tees to the experiment's own logger, so a hosted tracker keeps receiving what it
-always received. A run that names no logger gets the framework's JSON default, which writes
+run's phase reads `Repl`. The loss and metrics come from a recording logger the tools install for each run, which tees to
+the experiment's own logger. A run that names no logger gets the framework's JSON default, which writes
 `metrics.jsonl` into the run's directory, and `nitro_status` carries a one-line logger summary.
 
 **`nitro_logger` reports the logger itself.** For any run, it names the backend's type and the
@@ -163,9 +159,7 @@ written, and the run exits through the normal `Done` path with `stop_reason = re
 
 ## What the tools do not do
 
-They do not replace the framework. The tools are the agent's interface to `train!`, `validate`,
-`evaluate`, `predict`, and `export_model`; anything those entry points cannot do, the tools
-cannot do. They also do not manage checkpoints or resumes beyond passing the knobs through: a
-a `run_dir` is trained fresh unless `resume = "auto"` asks for the latest checkpoint in it, and
-`resume = "false"` is the default that starts
-over, exactly as with `Nitro`.
+The tools are the agent's interface to `train!`, `validate`, `evaluate`, `predict`, and
+`export_model`; anything those entry points cannot do, the tools cannot do. They do not manage
+checkpoints or resumes beyond passing the knobs through: a `run_dir` is trained fresh unless
+`resume = "auto"` asks for the latest checkpoint in it, the same default as `Nitro`.

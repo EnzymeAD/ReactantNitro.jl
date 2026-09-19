@@ -1170,19 +1170,19 @@ end
 """
     ReactantNitro.binding_report_text(; kwargs...) -> String
 
-[`binding_report_sections`](@ref) rendered as plain aligned columns, which is the form stored on
-the handle, returned by [`binding_report`](@ref), and sent to `log_other!`.
+[`binding_report_sections`](@ref) rendered as text, which is the form stored on the handle,
+returned by [`binding_report`](@ref), and sent to `log_other!`.
 
-**Plain and never the installed renderer**, and that is load-bearing rather than conservative.
-This is a machine-read artifact whose bytes must not depend on whether some other package in the
-session happened to load PrettyTables. The human reading a run's opening display gets the framed
-form through `show(nitro)`, which is a different call with a different destination.
+Rendered through the installed table renderer into a plain `IOBuffer`, so the text carries the
+frame and none of the colour: an `IOBuffer` declares no `:color`, and every crayon the renderer
+emits is gated on that. There is one renderer in this package, the PrettyTables extension's, and
+Reactant loads PrettyTables, so the bytes are the same in every session.
 """
 function binding_report_text(; name = "", kwargs...)
     io = IOBuffer()
-    _render_sections_plain(
+    _render_sections(
         io, "ReactantNitro: binding report for $name",
-        binding_report_sections(; name, kwargs...), nothing
+        binding_report_sections(; name, kwargs...); note = nothing
     )
     return String(take!(io))
 end

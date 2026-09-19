@@ -857,8 +857,8 @@
         finally
             ReactantNitro.table_renderer!(prev)
         end
-        # Restoring `nothing` puts the built-in aligned renderer back, which is what a user does
-        # when something else in a session pulled PrettyTables in.
+        # Restoring the previous renderer, which in every real session is the PrettyTables
+        # extension's, since Reactant loads PrettyTables.
         @test ReactantNitro._TABLE_RENDERER[] === prev
     end
 

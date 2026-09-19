@@ -11,8 +11,14 @@ nworkers = parse(
 )
 worker_init = nworkers > 0 ? (worker_init_expr = :(ENV["CUDA_VISIBLE_DEVICES"] = ""),) : (;)
 
+# `Pkg.test(; test_args = ["history", "weights"])` runs only the testitems whose names match,
+# so one file's items can be iterated on without paying for the whole suite. No arguments runs
+# everything, which is what CI does.
+name = isempty(ARGS) ? nothing : Regex(join(ARGS, "|"))
+
 runtests(
     ReactantNitro;
+    name,
     nworkers,
     worker_init...,
     retries = parse(Int, get(ENV, "RETESTITEMS_RETRIES", "2")),

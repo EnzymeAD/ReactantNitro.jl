@@ -70,6 +70,7 @@ include("JSONLog.jl")     # the shipped JSON default logger
 include("EarlyStop.jl")   # early stopping
 include("IORetry.jl")     # retrying I/O
 include("Checkpoint.jl")  # checkpointing and resume
+include("History.jl")     # the per-epoch metric history a handle keeps, and its table
 # Visualization needs `predict` and the batch routers, so it follows `Train.jl`; it is placed here
 # rather than immediately after it because nothing between the two depends on it.
 include("Visualize.jl")   # rendering
@@ -154,6 +155,10 @@ export Stepping, TrainStepping, EvalStepping, Checkpointing, Terminal, Done, Fai
 export register_phase_monitor!, unregister_phase_monitor!, progress_counter
 export request_stop!, run_dir, current_step, current_epoch, phase
 export experiment, parameters, states, binding_report, EarlyStopping, should_stop
+# What the run produced, per epoch, as data that also displays as a table. A handle is not a
+# metrics store in the sense of a logger backend; it keeps the one series a person at a REPL asks
+# for after `train!` returns, and `history` is how they ask.
+export history
 
 # Export. The hooks, the spec carrier, the entry point, and the backend seam.
 #

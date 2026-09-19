@@ -9,7 +9,7 @@
 
 """
     Nitro(e; seed, resume, run_dir, data, n_devs, checkpoint, accum, max_epochs, schedules,
-             gradient_clip_norm, logger, checkpointer, early_stop, run_ref) -> Nitro
+             gradient_clip_norm, logger, checkpointer, early_stop, run_ref, weights, w0) -> Nitro
 
 Run the setup sequence and return the resulting handle. **No training.**
 
@@ -75,6 +75,21 @@ boundary.
     **That is the single most dangerous omission this framework could have**, because the symptom is
     a plausible loss curve and no error.
 
+## A warm start inserts one step
+
+`weights = other::Nitro` takes `ps` and `st` from a handle in this process and otherwise runs the
+fresh sequence: `derive` runs against THIS run's data, the optimizer state is fresh, and `step` and
+`epoch` are zero. It is the in-memory sibling of `checkpoint = path`, for the REPL case where the
+trained handle is right there. The transfer happens **after 7**, through host memory, so the source
+may sit on a different mesh; the trees must match leaf for leaf in keypath and size, and a mismatch
+is refused with a diff. `weights` together with `checkpoint` or `resume` is an error: two sources
+for one thing.
+
+`w0` says what `decay_anchor = :w0` anchors to for such a run. `:build_model`, the default, keeps
+today's meaning, the freshly initialized parameters. `:weights` anchors to the transferred ones,
+which is the L2-SP fine-tuning setup: initialize from A, anchor to A. A parameter tree anchors to
+that tree: initialize from A, anchor to B. `:weights` without `weights` is an error.
+
 ## The no-train variant
 
 A `Nitro` built without a `train` split **skips steps 9 and 11**, since both are training-only and
@@ -124,8 +139,14 @@ function _build_nitro(
         resume = false,
         data = nothing,
         checkpoint = nothing,
-        run_ref = nothing
+        run_ref = nothing,
+        # A warm start: the initial weights from another handle in this process, and what `:w0`
+        # anchoring means for a run that starts from them. Keyword-only for the same reason as the
+        # four above: both are facts about THIS construction.
+        weights = nothing,
+        w0 = :build_model
     )
+    check_weights_kwargs(weights, w0; checkpoint, resume)
 
     # ── before step 2: locate a checkpoint (the resume path) ───────────────────────
     # `run_dir` is the one path concept in the framework, so a checkpointer constructed without an
@@ -266,7 +287,7 @@ function _build_nitro(
     # identically on every device; only the batch is sharded.
     ps = place_replicated(ps, mesh)
     st = place_replicated(st, mesh)
-    w0 = deepcopy(ps)                 # step 7: before any restore or step
+    w0_tree = deepcopy(ps)            # step 7: before any restore or step
 
     # ── after 7: restore the weights. `w0` above is the FRESH capture, deliberately ─
     # Step 6's rebuild happens before the restore in spite of being thrown away, because the anchor
@@ -280,9 +301,21 @@ function _build_nitro(
         st = place_replicated(from_host(to_host(record.st)), mesh)
     end
 
+    # ── after 7: a warm start from another handle ──────────────────────────────────
+    # Through host memory, exactly as the record path above: the source may live on another mesh,
+    # and `to_host` is the one walker that knows every device leaf. The structural check runs
+    # against the FRESH layout, because that is the model this experiment builds; the transferred
+    # tree has to fit it, not the other way round.
+    if weights !== nothing
+        check_weights_compatible(weights, build_layout(e, ps))
+        ps = place_replicated(from_host(to_host(weights.ps)), mesh)
+        st = place_replicated(from_host(to_host(weights.st)), mesh)
+    end
+    w0_tree = resolve_w0(w0, w0_tree, ps, e, mesh)
+
     # ── 8. the flat layout. UNCONDITIONAL, including for an evaluation Nitro ───────
     layout = build_layout(e, ps)
-    anchors = decay_anchors(e, w0, layout, mesh)
+    anchors = decay_anchors(e, w0_tree, layout, mesh)
     checksums = anchor_checksums(anchors)
 
     # ── after 8: the permutation and the decay anchor, both refusals ───────────────
@@ -488,7 +521,7 @@ function _build_nitro(
     end
 
     nitro = Nitro(
-        e, model, ps, st, w0, layout, opt_state, collection, routing, schema, mesh,
+        e, model, ps, st, w0_tree, layout, opt_state, collection, routing, schema, mesh,
         Dict{Any, Any}(), resolved, total, batch_size, logger, nothing, nothing, checksums, preset,
         source === nothing ? nothing : String(source),
         # The provenance half: the record is in scope here for the compatibility check above, so the
@@ -504,7 +537,9 @@ function _build_nitro(
         false, nothing,
         # No metrics and no elapsed time yet: a fresh handle has run nothing, including one
         # restored from a checkpoint, whose recorded metrics belong to the process that wrote it.
-        (;), nothing, nothing
+        (;), nothing, nothing,
+        weights === nothing ? nothing : weights_origin(weights),
+        NamedTuple[]
     )
     # TWO BUILDS, and they are not the same artifact. The stored report is the machine-read one:
     # it goes to `log_other!`, it is what `binding_report` returns, and its bytes must not depend
@@ -538,6 +573,102 @@ function _build_nitro(
     # ambient driver re-declared an idle budget every ten seconds. Under a supervisor that declares
     # idle once and lets it decay, an undeclared window is charged against whatever is LEFT of it.
     return nitro
+end
+
+"""
+    ReactantNitro.check_weights_kwargs(weights, w0; checkpoint, resume) -> nothing
+
+The warm-start keywords, validated before anything is built: `weights` is a `Nitro` or `nothing`
+and names the only weight source; `w0` is `:build_model`, `:weights`, or a parameter tree, and
+`:weights` needs a `weights` to point at.
+"""
+function check_weights_kwargs(weights, w0; checkpoint, resume)
+    if weights !== nothing
+        weights isa Nitro || error(
+            "ReactantNitro: `weights` takes a `Nitro` whose `ps` and `st` become this run's \
+             initial weights, and was given a `$(typeof(weights))`. For a checkpoint file use \
+             `checkpoint = path`."
+        )
+        (checkpoint !== nothing || resume !== false) && error(
+            "ReactantNitro: `weights = ` names a handle to take the initial weights from, and \
+             `$(checkpoint !== nothing ? "checkpoint" : "resume")` names a file to restore them \
+             from. Two sources for one set of weights; pass one."
+        )
+    end
+    w0 === :build_model || w0 === :weights || w0 isa NamedTuple || error(
+        "ReactantNitro: `w0` is `:build_model` (the freshly initialized parameters, the default), \
+         `:weights` (the parameters transferred through `weights = `), or a parameter tree to \
+         anchor `decay_anchor = :w0` groups to; got `$(repr(w0))`."
+    )
+    w0 === :weights && weights === nothing && error(
+        "ReactantNitro: `w0 = :weights` anchors to the transferred weights, and no `weights = ` \
+         was given to transfer them from."
+    )
+    return nothing
+end
+
+# What `show` and the export provenance say about a warm start: the handle it came from, by the
+# facts a reader can chase. Taken at construction, because the source handle may train on
+# afterwards and this run's weights are the ones it had THEN.
+weights_origin(src::Nitro) = (;
+    experiment = nameof(typeof(src.e)), epoch = src.epoch, step = src.step,
+    run_dir = src.run_dir,
+)
+
+"""
+    ReactantNitro.check_weights_compatible(source::Nitro, layout::FlatLayout) -> nothing
+
+Refuse a warm start whose parameter tree does not fit this model, with a diff by keypath. Only
+the keypaths and sizes are compared: the group a leaf belongs to is this experiment's
+`param_group`'s business and may legitimately differ from the source's.
+"""
+function check_weights_compatible(source::Nitro, layout::FlatLayout)
+    return _check_tree_fits(source.layout.permutation, layout.permutation) do diff
+        """
+        ReactantNitro: `weights = ` names a Nitro($(nameof(typeof(source.e)))) whose parameter tree
+        does not match the model this experiment builds:
+        $diff
+        A warm start copies leaf for leaf, so the two trees must agree on every keypath and size.
+        This usually means the architecture fields differ between the two experiments."""
+    end
+end
+
+# The shared diff: two permutations compared on keypath and size, and `msg(diff)` composes the
+# error around the lines. Six lines then an ellipsis, as the resume check prints.
+function _check_tree_fits(msg, was, now)
+    same = length(was) == length(now) &&
+        all(a.keypath == b.keypath && a.size == b.size for (a, b) in zip(was, now))
+    same && return nothing
+    diff = String[]
+    length(was) == length(now) || push!(
+        diff, "  the source has $(length(was)) parameter leaves and this model has $(length(now))"
+    )
+    for (a, b) in zip(was, now)
+        (a.keypath == b.keypath && a.size == b.size) && continue
+        push!(diff, "  $(a.keypath) size $(a.size) -> $(b.keypath) size $(b.size)")
+        length(diff) >= 6 && (push!(diff, "  ..."); break)
+    end
+    error(msg(join(diff, "\n")))
+end
+
+"""
+    ReactantNitro.resolve_w0(w0, fresh, ps, e, mesh) -> tree
+
+The anchor `decay_anchor = :w0` groups decay toward, per the `w0` keyword: `fresh` is step 7's
+capture, `ps` the parameters after any transfer, and a tree is placed and checked against `ps`.
+"""
+function resolve_w0(w0, fresh, ps, e, mesh)
+    w0 === :build_model && return fresh
+    w0 === :weights && return deepcopy(ps)
+    tree = place_replicated(from_host(to_host(w0)), mesh)
+    _check_tree_fits(build_layout(e, tree).permutation, build_layout(e, ps).permutation) do diff
+        """
+        ReactantNitro: the `w0 = ` tree does not match this model's parameters:
+        $diff
+        A `:w0` anchor is subtracted leaf for leaf, so the tree must agree with `ps` on every
+        keypath and size."""
+    end
+    return tree
 end
 
 """

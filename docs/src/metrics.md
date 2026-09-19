@@ -74,9 +74,9 @@ arrive already divided and `nothing`-counted keys as raw totals, so `acc.confusi
 split's matrix and `macro_recall` is computed once at the end rather than averaged per batch.
 Neither hook is traced, so editing either recompiles nothing.
 
-That is also the general rule for `finalize_metrics`: reduce host-side for anything that is not a
-mean of per-batch values. A macro-averaged recall is the standard case, and averaging the per-batch
-recalls instead gives a different, wrong number that still looks plausible.
+The general rule for `finalize_metrics`: reduce host-side for anything that is not a mean of
+per-batch values. Averaging per-batch recalls instead of computing recall from the split's
+confusion matrix gives a different, wrong number that still looks plausible.
 
 ## See also
 

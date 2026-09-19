@@ -90,6 +90,9 @@
         :request_stop!, :run_dir,
         :current_step, :current_epoch, :phase, :experiment, :parameters, :states,
         :binding_report, :EarlyStopping, :should_stop,
+        # The run's per-epoch series, as data that displays as a table: what a REPL asks a
+        # finished handle, so it is a public verb like `binding_report`.
+        :history,
     ]
     const DISTRIBUTION = [:rank, :world_size]
     # Export. The hooks are here rather than in HOOKS because they are optional in a different

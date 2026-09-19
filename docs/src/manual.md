@@ -1,11 +1,9 @@
 # Manual training mode: you own the step
 
-The automatic loop is one way to train, and it is the default: you declare `forward`, `loss`, and
-the optimizer accessors, and the framework sequences the forwards, the backwards, the optimizer
-steps, and the metrics. **Manual mode is the other way.** You define `train_step` for your
-experiment type and the framework hands you the whole optimizer step: you sequence the forwards,
-the backwards, the optimizer steps, and the device metrics, in whatever order your algorithm
-demands. The framework keeps everything outside the step.
+In the automatic loop you declare `forward`, `loss`, and the optimizer accessors, and the
+framework sequences the forwards, the backwards, the optimizer steps, and the metrics. In **manual
+mode** you define `train_step` and own the whole optimizer step, in whatever order your algorithm
+demands; the framework keeps everything outside it.
 
 Reach for it when the automatic loop cannot express your algorithm. The canonical case is a GAN:
 one generator and one discriminator in a single parameter tree, each with its own optimizer, two
@@ -91,7 +89,7 @@ end
 train!(Nitro(ToyGAN()))
 ```
 
-Four things in the example are the whole of the contract, and each has a reason:
+Four things in the example are the contract:
 
 - **Noise rides in the batch.** `z` is a batch field like any other, routed from the keyword the
   closure declares, so it is transferred per step. Draw it fresh per batch: a GAN's generator must
@@ -171,14 +169,14 @@ recompiles nothing.
 ## Everything else is unchanged
 
 Validation, checkpointing, early stopping, `request_stop!`, phases, `data_wait_frac`, and the
-prefetch pipeline all work exactly as in the automatic loop. The eval side (`validate`,
+prefetch pipeline work as in the automatic loop. The eval side (`validate`,
 `evaluate`, `predict`) never consults the mode: it uses `forward` and `metrics`, so a manual
 experiment defines those for its eval surface, and `loss` is only needed if you want the framework
 to substitute `val_loss` when `metrics` is absent.
 
 ## Deferred
 
-Explicitly out of v1, and the natural next rounds:
+Out of v1:
 
 - **`accum > 1`**, via a closure per micro-batch with a type-level last-in-group flag, or by
   handing the closure a tuple of micro-batches.

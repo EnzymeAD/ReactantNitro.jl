@@ -43,7 +43,7 @@ Export is a single-device CPU trace, so it needs no GPU and no accelerator lease
 (config, seed, preset, framework version, and on a dirty tree a full working-tree patch) lands in
 the bundle automatically, so a served artifact can be traced back to the code that produced it.
 
-## Caveats worth knowing up front
+## Caveats
 
 A view-shaped program output has to be `copy`ed before it leaves the traced graph, or the bundle
 carries a wrapper rather than an array. This does not apply to parameters, which the flat layout

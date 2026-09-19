@@ -462,6 +462,9 @@ function _train!(nitro::Nitro)
             set_phase!(nitro, TrainStepping())
             st = Lux.trainmode(nitro.st)
             seen = 0
+            # The epoch's mean train loss, for `history`: summed over micro-batches as host
+            # values the step already read back, so it costs no transfer of its own.
+            loss_sum, loss_n = 0.0, 0
             # The per-epoch host-wait accounting, which is the generic guard on the whole data
             # path. Two `time()` calls per micro-batch, about 25 ns each, so under 50 us across an
             # epoch of 500. It catches EVERY variant of "the loader is the bottleneck", including the
@@ -543,6 +546,8 @@ function _train!(nitro::Nitro)
                     # The readback is kept, not repeated: the divergence check already paid the
                     # D2H for this scalar, and logging it again would pay it twice for one number.
                     lh = check_finite(l, nitro.step, nitro.epoch)
+                    loss_sum += Float64(lh)
+                    loss_n += 1
                     # ── SEPARABLE EDIT, revert this one line and this comment together ──────
                     #
                     # The batch free, on the beat that makes it safe. `free_batch!`'s own note
@@ -656,6 +661,7 @@ function _train!(nitro::Nitro)
             # On the handle too, not only in this local: the local exists for the final checkpoint
             # rewrite and dies with the call, and the handle is what a REPL is holding afterwards.
             nitro.last_metrics = metrics_out
+            push!(nitro.history, history_row(nitro, loss_sum, loss_n, metrics_out))
             isempty(metrics_out) || log_metrics!(
                 nitro.logger, finite_only(metrics_out);
                 step = nitro.step, epoch = nitro.epoch,
@@ -801,6 +807,9 @@ function _train_manual!(nitro::Nitro)
             set_phase!(nitro, TrainStepping())
             st = Lux.trainmode(nitro.st)
             seen = 0
+            # The epoch's mean train loss, for `history`: summed over micro-batches as host
+            # values the step already read back, so it costs no transfer of its own.
+            loss_sum, loss_n = 0.0, 0
             # Per-epoch host-wait accounting, identical to the automatic loop.
             t_wait = 0.0
             t_step = 0.0
@@ -857,6 +866,8 @@ function _train_manual!(nitro::Nitro)
                     # The divergence check, on the readback that also feeds the log line, so the
                     # D2H is paid once for one number, exactly as in the automatic loop.
                     lh = check_finite(out.loss, nitro.step, nitro.epoch)
+                    loss_sum += Float64(lh)
+                    loss_n += 1
                     nitro.ps = out.ps
                     st = out.st
                     # Rules in, states out: re-attach the rules the closure was handed (which are
@@ -913,6 +924,7 @@ function _train_manual!(nitro::Nitro)
             # On the handle too, not only in this local: the local exists for the final checkpoint
             # rewrite and dies with the call, and the handle is what a REPL is holding afterwards.
             nitro.last_metrics = metrics_out
+            push!(nitro.history, history_row(nitro, loss_sum, loss_n, metrics_out))
             isempty(metrics_out) || log_metrics!(
                 nitro.logger, finite_only(metrics_out);
                 step = nitro.step, epoch = nitro.epoch,

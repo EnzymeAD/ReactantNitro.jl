@@ -1,30 +1,25 @@
 # Optimization: groups, decay, and clipping
 
-The optimizer is where the framework composes with an existing ecosystem package structurally:
-rules are `Optimisers.jl` rules, and the framework owns everything around them. This page covers the
-defaults, the allowlist of rules that can be traced, the three levels at which you configure the
-optimizer, parameter groups, decay, per-leaf decay exclusion, and gradient clipping. The schedule
-that drives the learning-rate curve is a sibling topic and lives on the
-[Schedules](schedules.md) page.
+Rules are `Optimisers.jl` rules, and the framework owns everything around them: which rules may
+be traced, parameter groups, decay, per-leaf decay exclusion, and gradient clipping. The
+learning-rate curve is on the [Schedules](schedules.md) page.
 
 ## The defaults get you a working run
 
 Declare nothing and setup resolves a complete optimizer: [`optimizer`](@ref) is `RAdam` at `1f-3`
 over one parameter group, [`lambda`](@ref) is zero so there is no [`Decay`](@ref) in the chain,
-[`gradient_clip_norm`](@ref) is zero so clipping is off, and no schedule is configured, so the
-learning rate is the fixed base. Every accessor below exists only to change a part of that picture.
-The [Tutorial](tutorial.md) page walks such a run end to end.
+[`gradient_clip_norm`](@ref) is zero so clipping is off, and no schedule is configured. Every
+accessor below changes one part of that picture.
 
-Gradient accumulation is a separate knob that changes none of the above: `accum` folds N
-micro-batches into one optimizer step, and the optimizer still runs once per accumulated gradient,
-so every accessor on this page means the same thing whether `accum` is 1 or 16. The [Tutorial](tutorial.md)
-shows it in the MNIST recipe; the schedule horizon is the only other place it appears
+Gradient accumulation changes none of it: `accum` folds N micro-batches into one optimizer step,
+and the optimizer runs once per accumulated gradient, so every accessor here means the same thing
+whether `accum` is 1 or 16. Its only other appearance is in the schedule horizon
 ([Schedules](schedules.md)).
 
-`RAdam` is the default rather than `Adam` deliberately: it rectifies the adaptive variance term over
-the first steps instead of leaving you to hand-tune a warmup that does the same job by feel. `Adam`
-is one line away at Level 1, shown below. The price of the choice is a hard floor of
-`Optimisers` 0.4.8, the first release whose Reactant extension can trace `RAdam`.
+`RAdam` is the default rather than `Adam` because it rectifies the adaptive variance term over the
+first steps instead of leaving you to hand-tune a warmup. `Adam` is one line away at Level 1. The
+price is a hard floor of `Optimisers` 0.4.8, the first release whose Reactant extension can trace
+`RAdam`.
 
 ## Rules are Optimisers.jl rules, and that is structural
 
@@ -38,8 +33,7 @@ are deliberate rather than untested: `AccumGrad` traces and is numerically wrong
 and layer-adaptive rules such as LARS and LAMB would compute one trust ratio per
 parameter group rather than per layer.
 
-So write `Optimisers.Adam`, not your own. A custom rule is possible, but it is a rule that must
-satisfy the same three properties, not a free hand.
+A custom rule is possible if it satisfies the same three properties.
 
 ## Three levels of optimizer
 
@@ -110,8 +104,7 @@ ReactantNitro.learning_rate(::MyExp, ::Val{:backbone}) = 1f-4   # a tenth of the
 
 ## The flat parameter layout
 
-Parameter groups are not only a way to give the backbone its own learning rate. They are also the
-unit the optimizer actually runs on.
+Parameter groups are also the unit the optimizer runs on.
 
 At setup the framework builds a **flat layout**: every parameter array in the tree is assigned to a
 group, and the arrays of each group are concatenated into one buffer. The gradient accumulator and
@@ -223,12 +216,10 @@ overrides it for one run:
 ReactantNitro.gradient_clip_norm(::MyExp) = 1f0
 ```
 
-The threshold is a trace-time host constant, which is what buys the property that a disabled clip
-emits no ops at all. The price is that changing it recompiles the optimizer program, and only the
-optimizer program, so a clip sweep re-pays the cheap compile rather than the expensive one. A
-device-resident threshold could not keep "off": `0` would scale the gradient to zero norm, and on an
-all-zero gradient `0/0` yields `NaN` silently. The [Recompilation](recompilation.md) page explains
-why that asymmetry is the point.
+The threshold is a trace-time host constant, so a disabled clip emits no ops at all. The price is
+that changing it recompiles the optimizer program, and only that one, so a clip sweep re-pays the
+cheap compile rather than the expensive one. A device-resident threshold could not keep "off": `0`
+would scale the gradient to zero norm, and on an all-zero gradient `0/0` yields `NaN` silently.
 
 ## A complete recipe
 
@@ -243,8 +234,5 @@ ReactantNitro.learning_rate(::MnistMLP, ::Val{:encoder}) = 3f-5
 ReactantNitro.lambda(::MnistMLP, ::Val{:encoder})        = 1f-4   # decoupled decay, toward zero
 ```
 
-The schedule that turns that `3f-4` base into a curve is the one remaining knob, and it lives on the
-[Schedules](schedules.md) page: it is part of the recipe, not a separate concern. Every name on
-this page, [`optimizer`](@ref), [`param_group`](@ref), [`learning_rate`](@ref), [`lambda`](@ref),
-[`decay_anchor`](@ref), [`no_decay`](@ref), [`default_no_decay`](@ref),
-[`gradient_clip_norm`](@ref), and [`Decay`](@ref), is documented on the [API](api.md) page.
+The schedule that turns the `3f-4` base into a curve is on the [Schedules](schedules.md) page.
+Every name on this page is documented on the [API](api.md) page.

@@ -1,13 +1,10 @@
 # Pitfalls: what the framework takes care of
 
-Reactant and Enzyme are fast, but a Reactant-first stack has snags that are easy to hit and hard to
-diagnose: a compile that balloons for no visible reason, an edit that silently reuses a stale
-program, a run that dies out of memory hours in. None of them raise. Each one presents as something
-else, usually as "training is mysteriously slow" or as a process that vanishes overnight, which is
-why they are collected here rather than left to be met one at a time.
-
-These are the ones the framework handles for you. Each section says what the framework does and
-points at the page that owns the mechanism.
+A Reactant-first stack has snags that are easy to hit and hard to diagnose: a compile that
+balloons for no visible reason, an edit that reuses a stale program, a run that dies out of memory
+hours in. None of them raise; each presents as slow training or as a process that vanishes
+overnight. Each section below says what the framework does about one and points at the page that
+owns the mechanism.
 
 ## Your dataset is never traced
 
@@ -53,9 +50,11 @@ Parameter groups, decay and clipping are on the [Optimization](optimization.md) 
 
 ## Device buffers are freed per batch
 
-Host GC pressure does not track device memory, so the host can stay comfortable while the device
-fills and the run dies out of memory. Each batch's buffers are released explicitly once the step
-that used them has read back.
+The host GC runs on host pressure and cannot see the device filling, so a run that leaves batch
+buffers to the finalizer can die out of memory while the host looks idle. The loop frees each
+batch's buffers as soon as the loss readback confirms the step has finished, and the prefetch
+pipeline frees what it staged when a phase ends. Freeing nulls the buffer pointer, so a
+use-after-free raises on readback instead of returning stale memory.
 
 The host/device boundary, and what a model author may and may not do at it, is the subject of the
 `reactantnitro-device-boundary` skill.

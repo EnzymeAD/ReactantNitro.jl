@@ -177,13 +177,17 @@
         @test !occursin("\e[3", out)
     end
 
-    @testset "the plain renderer is restorable" begin
+    @testset "with no renderer installed a long show says so instead of drawing" begin
+        # There is deliberately no second renderer in the core: the framed one is the display,
+        # and a process that somehow has none gets the title and a pointer, never a half-table.
         prev = ReactantNitro.table_renderer!(nothing)
         try
-            plain = sprint(show, MIME"text/plain"(), PTExp())
-            @test !occursin("│", plain)
-            @test occursin("width", plain) && occursin("GraphConst", plain)
-            @test !endswith(plain, "\n")
+            bare = sprint(show, MIME"text/plain"(), PTExp())
+            @test !occursin("│", bare)
+            @test occursin("PTExp", bare)
+            @test occursin("no table renderer is installed", bare)
+            @test occursin("using PrettyTables", bare)
+            @test !endswith(bare, "\n")
         finally
             ReactantNitro.table_renderer!(prev)
         end

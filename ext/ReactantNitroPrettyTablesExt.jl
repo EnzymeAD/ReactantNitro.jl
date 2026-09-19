@@ -1,14 +1,16 @@
 # ReactantNitroPrettyTablesExt.jl
 #
-# The framed renderer for this package's long `show` methods. Loading PrettyTables anywhere in a
-# session is the trigger, and `__init__` points `ReactantNitro._TABLE_RENDERER` here.
+# The framed renderer for this package's long `show` methods, and the `history` table. Loading
+# PrettyTables anywhere in a session is the trigger, and `__init__` points
+# `ReactantNitro._TABLE_RENDERER` here.
 #
 # ── Why an extension and not a dependency ────────────────────────────────────────────
 #
 # A framework whose display pulls in a table library has made every deployment of it carry that
-# library, including a serving process that renders nothing. The core keeps its own aligned-column
-# renderer, which needs no dependency and is what CI and a log file see; this is the upgrade a
-# human at a REPL gets for free once something in the session has already loaded PrettyTables.
+# library, including a serving process that renders nothing. In practice Reactant depends on
+# PrettyTables, so every session that loads this package loads this extension too, and it is THE
+# renderer: the core keeps no second one to maintain beside it. Without this extension a long
+# `show` prints its title and a line saying so.
 #
 # ── How several sections become one frame ────────────────────────────────────────────
 #
@@ -25,10 +27,9 @@
 #
 # ── The one thing to know if the display changes under you ───────────────────────────
 #
-# This activates on LOAD, so a session that pulls PrettyTables in indirectly (DataFrames does)
-# gets the framed table without asking for it. That is the intended behaviour and it is also the
-# reason `ReactantNitro.table_renderer!(nothing)` exists: it puts the plain renderer back for the
-# rest of the process, and this extension never reclaims it.
+# This activates on LOAD, so a session that pulls PrettyTables in indirectly (Reactant does)
+# gets the framed table without asking for it. `ReactantNitro.table_renderer!(nothing)` uninstalls
+# it for the rest of the process, and this extension never reclaims it.
 module ReactantNitroPrettyTablesExt
 
 import ReactantNitro
@@ -151,6 +152,44 @@ function render_table(
     )
     print(io, rstrip(String(take!(buf)), '\n'))
     note === nothing || print(io, "\n  ", note)
+    return nothing
+end
+
+# ── The history table ────────────────────────────────────────────────────────────────
+#
+# Everything decided here was decided in the core: `history_table` picked the rows that fit the
+# terminal, dropped the columns that did not, formatted the cells and wrote the note. This method
+# draws them, and it is the only `show` of a `MetricHistory` longer than one line, so a process
+# without PrettyTables sees the compact form.
+function Base.show(io::IO, ::MIME"text/plain", h::ReactantNitro.MetricHistory)
+    isempty(h) && return show(io, h)
+    height, width = displaysize(io)
+    t = ReactantNitro.history_table(h, height, width)
+    buf = IOBuffer()
+    PrettyTables.pretty_table(
+        IOContext(buf, io), t.cells;
+        column_labels = [t.labels], alignment = t.alignment,
+        title = t.title, title_alignment = :l,
+        highlighters = [
+            # The best epoch is the row a reader is looking for, so it is the one that earns
+            # colour; a gap row is filler and is muted so the eye skips it.
+            PrettyTables.TextHighlighter(
+                (_, i, _) -> i == t.best_row, _ROLE_CRAYONS[:good]
+            ),
+            PrettyTables.TextHighlighter(
+                (_, i, _) -> i in t.gap_rows, _ROLE_CRAYONS[:muted]
+            ),
+        ],
+        table_format = PrettyTables.TextTableFormat(;
+            vertical_lines_at_data_columns = :none,
+        ),
+        # The core already fitted the table to `displaysize(io)`; PrettyTables cropping on top of
+        # that would elide what the thinning deliberately kept.
+        fit_table_in_display_horizontally = false,
+        fit_table_in_display_vertically = false,
+    )
+    print(io, rstrip(String(take!(buf)), '\n'))
+    isempty(t.note) || print(io, "\n  ", t.note)
     return nothing
 end
 

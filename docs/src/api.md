@@ -28,6 +28,9 @@ They are collected here so those links resolve; they are implementation details 
 without a breaking release.
 
 ```@docs
+ReactantNitro.MetricHistory
+ReactantNitro.history_table
+ReactantNitro.thin_rows
 ReactantNitro.StrippedHost
 ReactantNitro.publish_phase
 ReactantNitro.work_in_flight

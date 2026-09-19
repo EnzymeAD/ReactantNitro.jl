@@ -253,6 +253,18 @@ mutable struct Nitro
     # end of `train!` rather than on demand. A `show` must not do I/O, and this is the one piece of
     # the summary that lives on disk instead of in the handle.
     best_checkpoint::Any
+    # WHERE TRANSFERRED WEIGHTS CAME FROM: `(; experiment, epoch, step, run_dir)` when the handle was
+    # built with `weights = other_nitro`, else `nothing`. Distinct from `checkpoint_source`, which
+    # names a FILE a restore read; this names a handle in the same process, which has no path. The
+    # `weights` row of `show` and the export provenance both read it.
+    weights_source::Any
+    # ONE ROW PER VALIDATED EPOCH this handle's `train!` calls produced: `(; epoch, step, loss,
+    # metrics...)`, where `loss` is the epoch's mean train loss over its micro-batches and the rest
+    # are that epoch's finalized validation metrics as host values. `last_metrics` above is the last
+    # of these; the series exists so that `history(nitro)` can answer "how did it go" without a
+    # logger backend. Fresh per handle: a resumed run's earlier epochs belong to the process that
+    # trained them, and `history` says so.
+    history::Vector{NamedTuple}
 end
 
 # ── The accessors, which are reads and which everything downstream is specified in terms of.
@@ -463,10 +475,12 @@ renderer. **Write those argument types out in the renderer**: it is reached thro
 so nothing checks them for you, and four untyped arguments under a generic name is the signature
 that muddles a stack trace and looks applicable to calls that are not this one.
 
-One framed table is the DEFAULT and not something you opt into: `Reactant` depends on
-`PrettyTables`, so every session that loads this package loads it too and this package's extension
-installs the framed renderer. `table_renderer!(nothing)` is the opt-out, and gives the plain
-display a log gets.
+The framed table is the only long display there is: `Reactant` depends on `PrettyTables`, so every
+session that loads this package loads it too and this package's extension installs the framed
+renderer in its `__init__`. There is no built-in fallback renderer to maintain beside it. With
+`nothing` installed, a long `show` prints the table's title, its trailing note, and one line saying
+the renderer is missing, which is what a process that loaded neither PrettyTables nor its extension
+sees.
 
 **The contract takes sections rather than one header and one set of rows**, which it did until the
 handle summary and the binding report became one table. The old five-argument form
@@ -484,13 +498,22 @@ end
 # generically named `render(io, title, sections, note)` with four untyped arguments is the shape
 # that makes a stack trace ambiguous and invites a method from somewhere else to look applicable.
 # The types are the contract `table_renderer!` documents; an extension writes the same ones.
+#
+# NO SECOND RENDERER. There was a plain aligned-column fallback here, and it was a second display
+# path to keep in step with the framed one for a process that never exists in practice, since
+# Reactant loads PrettyTables. With no renderer installed the display says so and prints what it
+# can without one: the title and the note, which between them name the handle and the accessors
+# that answer the same questions as data.
 function _render_sections(
         io::IO, title::AbstractString, sections::Vector{TableSection};
         note::Union{AbstractString, Nothing} = nothing
     )
     r = _TABLE_RENDERER[]
     r === nothing || return r(io, title, sections, note)
-    return _render_sections_plain(io, title, sections, note)
+    print(io, title)
+    print(io, "\n  (no table renderer is installed: `using PrettyTables` renders this display)")
+    note === nothing || print(io, "\n  ", note)
+    return nothing
 end
 
 # The one-section call, which is what a display with nothing to divide up wants: the experiment
@@ -499,54 +522,6 @@ _render_table(
     io::IO, title::AbstractString, header::Vector{String}, rows::TableRows;
     note::Union{AbstractString, Nothing} = nothing
 ) = _render_sections(io, title, [TableSection("", header, rows)]; note)
-
-# The built-in: aligned columns, no rules, and NO TRAILING NEWLINE. That last point is the one a
-# `show` method has to get right, since Julia's REPL supplies the line break itself and a method
-# that prints its own leaves a blank line under every display.
-#
-# Widths are computed PER SECTION here, unlike the framed renderer, and the difference is not an
-# inconsistency. This output has no frame to keep aligned and its destination is a log file, where
-# a section hugging its own content is strictly easier to read than one padded to a width some
-# other section needed. What both renderers guarantee is the same FACTS in the same order, which
-# is the only thing a reader compares between them.
-#
-# `textwidth` rather than `length`, because a cell may carry a character that is two columns wide
-# and a count of characters would then pad it to the wrong place.
-function _render_sections_plain(
-        io::IO, title::AbstractString, sections::Vector{TableSection},
-        note::Union{AbstractString, Nothing}
-    )
-    print(io, title)
-    for sec in sections
-        isempty(sec.title) || (println(io); println(io); print(io, "  ", sec.title))
-        isempty(sec.rows) && continue
-        cols = maximum(length, sec.rows)
-        show_header = any(!isempty, sec.header)
-        widths = [
-            maximum(
-                textwidth(get(r, c, ""))
-                    for r in (show_header ? vcat([sec.header], sec.rows) : sec.rows)
-            ) for c in 1:cols
-        ]
-        # The last column is never padded: trailing blanks are invisible and would only widen a
-        # line that a terminal then wraps.
-        line(r) = "  " * rstrip(
-            join((_pad(get(r, c, ""), widths[c]) for c in 1:cols), "  ")
-        )
-        show_header && (println(io); print(io, line(sec.header)))
-        for r in sec.rows
-            println(io)
-            print(io, line(r))
-        end
-    end
-    # A BLANK LINE before the note, which the single-table form did not need. Sections are
-    # separated by one, so a note butted against the last row reads as another of its rows.
-    note === nothing || (println(io); println(io); print(io, "  ", note))
-    return nothing
-end
-
-# `rpad` counts characters, which is the wrong unit for a cell that holds a double-width one.
-_pad(s::AbstractString, w::Int) = s * " "^max(0, w - textwidth(s))
 
 # `nothing` rather than a guess for a handle whose layout is not a `FlatLayout`: a display reports
 # what it can read and invents nothing.
@@ -637,10 +612,13 @@ end
 # build_model` was the one phrased least like it.
 function _nitro_weights(nitro::Nitro)
     src = nitro.checkpoint_source
-    nitro.elapsed === nothing && return src === nothing ?
-        "fresh from build_model" : "restored from " * string(src)
-    return src === nothing ? "trained here, from build_model" :
-        "trained here, resumed from " * string(src)
+    ws = nitro.weights_source
+    origin = ws !== nothing ?
+        "from Nitro(" * string(ws.experiment) * ") epoch " * string(ws.epoch) * ", " * ws.run_dir :
+        src === nothing ? "from build_model" : "restored from " * string(src)
+    nitro.elapsed === nothing && return src === nothing && ws === nothing ?
+        "fresh " * origin : origin
+    return "trained here, " * (src === nothing ? origin : "resumed " * origin)
 end
 
 # A split's size WITHOUT iterating it, as the cell under the data band's `batches` column. A

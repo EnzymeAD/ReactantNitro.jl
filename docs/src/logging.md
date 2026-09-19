@@ -6,17 +6,16 @@ The logging contract is ten verbs on your own type:
 `run_url`, `logger_state`, `reattach!`
 
 It is **duck-typed**: no supertype, no registration, and `nothing` is the public "no logging" value
-with a no-op method for every verb. A missing method is a loud `MethodError` rather than a silent
-no-op, so a backend opts into silence per verb rather than inheriting it. Optional-no-op contracts
-make wrappers quietly lossy, and this one refuses to be.
+with a no-op method for every verb. A missing method is a `MethodError` rather than a silent no-op,
+because optional-no-op contracts make wrappers quietly lossy; a backend opts into silence per verb.
 
 The step counter lives in the driver, not the logger, which is what makes the contract stateless.
 Train metrics carry `step`, validation metrics carry `epoch` plus the current step so the two
 overlay, and a third context, `"data"`, carries the host data path's per-epoch `data_wait_frac`.
 
-## Three legal ways to get a backend
+## Three ways to get a backend
 
-None of them blocks on another, which is the point:
+None of them blocks on another:
 
 1. **Your own logger** defines the verbs in your own code, with no extension and no supertype.
 2. **A common public logger** gets an extension here, with the logger as a weak dependency.
