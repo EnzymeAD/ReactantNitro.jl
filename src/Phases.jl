@@ -1203,139 +1203,15 @@ function note_progress!()
     return nothing
 end
 
-# The one live bar. There is exactly one stretch of work in flight per process: the loops do not
-# nest, and a validation pass inside a training epoch happens after that epoch's bar has closed.
-const _BAR = Ref{Any}(nothing)
-
-# Whether a bar has written to the terminal line and not yet closed it. ONE LINE IS REUSED across
-# every stretch of a run, which is the difference between a forty-epoch run leaving eighty lines
-# of finished bars and leaving one that updates. The mechanism is ProgressMeter's `keep = false`:
-# it skips the newline after the final frame, `printover` opens the next frame with a carriage
-# return and clears to end of line, and the next bar therefore lands on the same line. What that
-# costs is the newline nobody prints at the end, which is what `:done` is for.
-const _BAR_DIRTY = Ref(false)
-
-# The live bar's description without any phase suffix, so a `:phase` can be taken back off again.
-const _BAR_DESC = Ref("")
-
-# ONE COLOUR, PASSED TO BOTH DRAWS. A counted stretch is drawn by ProgressMeter and a unit-less one
-# by `printover`, and their defaults do not agree: a meter defaults to `:green` and `printover` to
-# `:color_normal`, so `checkpoint` came out in the terminal's plain text beside a green `train`.
-# ProgressMeter does not export its default, so naming it here and handing it to both is what keeps
-# the two halves of one display the same colour rather than the same by coincidence.
-const _BAR_COLOR = :green
-
-# Drawn only where a person is watching. A bar is a cursor animation: in a CI log, a `nohup` file,
-# or a captured gate transcript it renders as thousands of carriage returns and escape codes,
-# which is worse than nothing and is precisely what a long unattended training run produces. Read
-# at each `:begin` rather than cached at load, because a session can gain or lose a terminal.
-_drawing_progress() = isinteractive() && (stderr isa Base.TTY)
-
-function _close_bar!()
-    p = _BAR[]
-    _BAR[] = nothing
-    p === nothing || ProgressMeter.finish!(p; keep = false)
-    return nothing
-end
-
-"""
-    ReactantNitro.progress_bar_reporter(verb, label, total, epoch, max_epochs) -> nothing
-
-The built-in progress reporter, installed by default, and the reference implementation of the
-contract [`progress_reporter!`](@ref) documents.
-
-**One bar per stretch of work**, an epoch of training or one pass over an evaluation split,
-counting the steps left in THAT stretch. A stretch with `total = 0` emits no units, so it gets its
-NAME on the line and no meter: a counter stuck at zero beside a clock that never advances is what
-`ProgressUnknown` renders for one, and it reads as hung rather than busy. The epoch position rides in the bar's description as
-text rather than as a second bar, because "epoch 3/40" is a fact to read and not a thing to watch
-fill. No metrics on the bar: the contract carries a label and counts, and widening it is a change
-to the contract rather than to this function.
-
-Draws only when the session is interactive and `stderr` is a terminal. Everything else, including
-the per-epoch metrics a run logs, is unaffected either way.
-"""
-function progress_bar_reporter(
-        verb::Symbol, label::String, total::Int, epoch::Int, max_epochs::Int
-    )
-    if verb === :begin
-        # Defensive, not expected: a stretch that never closed would otherwise leave its bar on
-        # the terminal while the next one draws over it.
-        _close_bar!()
-        desc = max_epochs > 0 ? "$label epoch $epoch/$max_epochs " : "$label "
-        _BAR_DESC[] = desc
-        on = _drawing_progress()
-        on && (_BAR_DIRTY[] = true)
-        # A STRETCH WITH NO UNITS GETS NO METER, just its own name on the line.
-        #
-        # `ProgressUnknown` was the obvious choice and is the wrong one. It formats as
-        # `"<desc> <counter>    Time: <elapsed>"`, and a stretch that emits nothing has no counter
-        # to show and nothing to drive a redraw, so it renders once as `checkpoint epoch 1/5  0
-        # Time: 0:00:00` and then sits there. The zero counter is noise; the frozen clock is worse
-        # than noise, because a seven-second write showing `Time: 0:00:00` reads as hung at exactly
-        # the moment the label exists to say the opposite.
-        #
-        # `printover` is the same call the meter itself draws through, so the line is reused and
-        # cleared identically and the next stretch's bar lands on top of it as usual.
-        if total <= 0
-            _BAR[] = nothing
-            on && ProgressMeter.printover(stderr, rstrip(desc), _BAR_COLOR)
-            return nothing
-        end
-        p = ProgressMeter.Progress(
-            total; desc, output = stderr, enabled = on, color = _BAR_COLOR
-        )
-        _BAR[] = p
-        # AN OPENING FRAME, so the bar is up before the stretch's first unit rather than after it,
-        # and `force = true` IS WHAT MAKES IT ONE. The constructor draws nothing, and `update!`
-        # alone draws nothing either: `_updateProgress!` returns early unless
-        # `force || t > p.tlast + p.dt`, and on a bar constructed microseconds ago `t` is not past
-        # `tlast + dt`, so an unforced frame here is silently throttled away. That omission is what
-        # made a compile's first seconds show the PREVIOUS frame.
-        ProgressMeter.update!(p, p.counter; keep = false, force = true)
-    elseif verb === :phase
-        p = _BAR[]
-        p === nothing && return nothing
-        want = isempty(label) ? _BAR_DESC[] : _BAR_DESC[] * "[" * label * "] "
-        p.core.desc == want && return nothing
-        p.core.desc = want
-        # FORCED REDRAW, and `force = true` is load-bearing for the same reason it is on `:begin`.
-        # Nothing else will draw this: a compile emits no `next!`, so without a frame here the new
-        # description would first appear on the step AFTER the compile everyone was waiting on, and
-        # without `force` the frame is thrown away whenever the phase changes within `dt` of the
-        # last one, which is precisely the case of a phase entered immediately after a step.
-        ProgressMeter.update!(p, p.counter; keep = false, force = true)
-    elseif verb === :step
-        p = _BAR[]
-        # `keep = false` on EVERY update, not only the last. `finish!` is a no-op once the counter
-        # has reached the total, so a bar that completed through `next!` never sees the close, and
-        # its final frame is the one that would otherwise have printed the newline.
-        p === nothing || ProgressMeter.next!(p; keep = false)
-    elseif verb === :end
-        _close_bar!()
-    elseif verb === :done
-        _close_bar!()
-        # The newline nobody else printed. Without it the run's last bar is still on the cursor's
-        # line and whatever prints next, a returned handle's summary or the prompt, lands on top
-        # of it.
-        _BAR_DIRTY[] || return nothing
-        _BAR_DIRTY[] = false
-        println(stderr)
-    end
-    return nothing
-end
-
-# ── The log reporter, for a notebook ─────────────────────────────────────────────────
+# ── Run progress, the model both reporters draw ──────────────────────────────────────
 #
-# A notebook has no cursor for a bar but does have a logger. This emits ProgressLogging records,
-# which Pluto, VS Code and TerminalLoggers render and other loggers drop. ONE bar per entry point,
-# not per stretch: Pluto keeps every finished bar in the cell's log pane, and a run is many
-# stretches. The name says which stretch is running; the fraction is epochs done, with the current
-# stretch interpolated, and never moves backwards. Steps are throttled to a frame per tenth of a
-# second; the opening frame and the closing frame always go out.
+# One run is many stretches. What a person wants to watch is the RUN: how far along, and when it
+# ends, so both reporters draw one bar per entry point from this model. The name is the current
+# stretch and phase; the fraction is epochs completed with the running stretch interpolated, and
+# it never moves backwards. A run without an epoch budget reports each stretch's own fraction, or
+# none for a stretch with no units.
 
-mutable struct _ProgressLog
-    const id::UUIDs.UUID
+mutable struct _RunProgress
     label::String
     phase::String
     epoch::Int
@@ -1343,25 +1219,154 @@ mutable struct _ProgressLog
     total::Int
     counter::Int
     floor::Float64
+end
+_RunProgress() = _RunProgress("", "", 0, 0, 0, 0, 0.0)
+
+function _begin_stretch!(r::_RunProgress, label::String, total::Int, epoch::Int, max_epochs::Int)
+    r.label, r.phase, r.epoch, r.max_epochs = label, "", epoch, max_epochs
+    r.total, r.counter = total, 0
+    return r
+end
+
+function _run_fraction(r::_RunProgress)
+    within = r.total > 0 ? min(1.0, r.counter / r.total) : 0.0
+    r.max_epochs > 0 || return r.total > 0 ? within : nothing
+    r.floor = max(r.floor, min(1.0, (r.epoch - 1 + within) / r.max_epochs))
+    return r.floor
+end
+
+function _run_name(r::_RunProgress)
+    name = r.max_epochs > 0 ? "epoch $(r.epoch)/$(r.max_epochs): $(r.label)" : r.label
+    return isempty(r.phase) ? name : name * " [" * r.phase * "]"
+end
+
+_done_name(r::_RunProgress) = r.max_epochs > 0 ? "done: $(r.epoch)/$(r.max_epochs) epochs" : "done"
+
+# ── The terminal bar ─────────────────────────────────────────────────────────────────
+
+# The one live bar and its run. ONE LINE IS REUSED for the whole run through ProgressMeter's
+# `keep = false`, and `:done` prints the final frame with the newline nobody else prints.
+const _BAR = Ref{Any}(nothing)
+const _BAR_RUN = Ref{Union{Nothing, _RunProgress}}(nothing)
+const _BAR_DIRTY = Ref(false)
+# The bar's counter runs to this, so a run fraction maps onto a fixed resolution.
+const _BAR_RES = 1000
+
+# ONE COLOUR, PASSED TO BOTH DRAWS. A meter defaults to `:green` and `printover` to
+# `:color_normal`, and a name-only line beside a green bar reads as a different display.
+const _BAR_COLOR = :green
+
+# Drawn only where a person is watching: in a CI log or a captured transcript a bar is thousands
+# of carriage returns. Read at each `:begin` rather than cached, since a session can gain or lose
+# a terminal.
+_drawing_progress() = isinteractive() && (stderr isa Base.TTY)
+
+# A frame. A run with a fraction draws the meter at it; one without draws its name alone,
+# because `ProgressUnknown` renders a zero counter beside a frozen clock and reads as hung.
+# `force = true` is load-bearing: an unforced frame within `dt` of the last is thrown away, and
+# the frames here are the ones announcing a new stretch or phase.
+function _bar_frame!(r::_RunProgress)
+    f = _run_fraction(r)
+    name = _run_name(r)
+    if f === nothing
+        _BAR[] = nothing
+        ProgressMeter.printover(stderr, name, _BAR_COLOR)
+        return nothing
+    end
+    p = _BAR[]
+    if p === nothing
+        p = ProgressMeter.Progress(_BAR_RES; desc = name * " ", output = stderr, color = _BAR_COLOR)
+        _BAR[] = p
+    end
+    p.core.desc = name * " "
+    ProgressMeter.update!(p, round(Int, f * _BAR_RES); keep = false, force = true)
+    return nothing
+end
+
+"""
+    ReactantNitro.progress_bar_reporter(verb, label, total, epoch, max_epochs) -> nothing
+
+The built-in terminal reporter, and the reference implementation of the contract
+[`progress_reporter!`](@ref) documents.
+
+**One bar per entry point**, on one terminal line, filled by the run's fraction: epochs completed
+over `max_epochs`, with the running stretch interpolated, so the ETA is the run's. The description
+names the current stretch and phase, `epoch 3/40: train [compiling gradient]`, and ends as
+`done: 40/40 epochs`. A run without an epoch budget fills the bar per stretch, and a stretch there
+with no units shows its name alone.
+
+Draws only when the session is interactive and `stderr` is a terminal.
+"""
+function progress_bar_reporter(
+        verb::Symbol, label::String, total::Int, epoch::Int, max_epochs::Int
+    )
+    if verb === :begin
+        r = _BAR_RUN[]
+        if r === nothing
+            _drawing_progress() || return nothing
+            r = _RunProgress()
+            _BAR_RUN[] = r
+            _BAR_DIRTY[] = true
+        end
+        _begin_stretch!(r, label, total, epoch, max_epochs)
+        _bar_frame!(r)
+    elseif verb === :phase
+        r = _BAR_RUN[]
+        r === nothing && return nothing
+        r.phase == label && return nothing
+        r.phase = label
+        _bar_frame!(r)
+    elseif verb === :step
+        r = _BAR_RUN[]
+        (r === nothing || r.total <= 0) && return nothing
+        r.counter += 1
+        p = _BAR[]
+        f = _run_fraction(r)
+        # ProgressMeter throttles these by its own `dt`; only the announcing frames are forced.
+        p === nothing || f === nothing ||
+            ProgressMeter.update!(p, round(Int, f * _BAR_RES); keep = false)
+    elseif verb === :done
+        r = _BAR_RUN[]
+        _BAR_RUN[] = nothing
+        p = _BAR[]
+        _BAR[] = nothing
+        r === nothing && return nothing
+        _BAR_DIRTY[] = false
+        if p === nothing
+            # A name-only run: the line is still open, so the final word and the newline.
+            ProgressMeter.printover(stderr, _done_name(r), _BAR_COLOR)
+            println(stderr)
+        else
+            # Not `finish!`, which is a no-op once the counter has reached the total and would
+            # leave the last stretch's name on the line. `keep = true` prints the newline.
+            p.core.desc = _done_name(r) * " "
+            ProgressMeter.update!(p, _BAR_RES; keep = true, force = true)
+        end
+    end
+    return nothing
+end
+
+# ── The log reporter, for a notebook ─────────────────────────────────────────────────
+#
+# A notebook has no cursor for a bar but does have a logger. This emits ProgressLogging records,
+# which Pluto, VS Code and TerminalLoggers render and other loggers drop, from the same run model
+# as the terminal bar, under one id per entry point. Steps are throttled to a frame per tenth of
+# a second; the opening frame and the closing frame always go out.
+
+mutable struct _ProgressLog
+    const id::UUIDs.UUID
+    const run::_RunProgress
     last_emit::Float64
 end
 
 const _PLOG = Ref{Union{Nothing, _ProgressLog}}(nothing)
 const _PLOG_INTERVAL = 0.1
 
-function _plog_fraction(st::_ProgressLog)
-    within = st.total > 0 ? min(1.0, st.counter / st.total) : 0.0
-    st.max_epochs > 0 || return st.total > 0 ? within : nothing
-    st.floor = max(st.floor, min(1.0, (st.epoch - 1 + within) / st.max_epochs))
-    return st.floor
-end
-
 # The record `@logprogress` emits, both halves: the `progress` keyword is the old API Pluto and
 # VS Code read, the `ProgressString` message is the new one TerminalLoggers reads.
 function _plog_emit!(st::_ProgressLog; done::Bool = false)
-    fraction = _plog_fraction(st)
-    name = st.max_epochs > 0 ? "epoch $(st.epoch)/$(st.max_epochs): $(st.label)" : st.label
-    isempty(st.phase) || (name *= " [" * st.phase * "]")
+    fraction = _run_fraction(st.run)
+    name = done ? _done_name(st.run) : _run_name(st.run)
     msg = ProgressLogging.ProgressString(
         ProgressLogging.Progress(st.id, fraction; name, done)
     )
@@ -1385,11 +1390,10 @@ VS Code, a REPL with TerminalLoggers, and any notebook whose logger accepts Prog
 [`ProgressLogging.Progress`](https://github.com/JuliaLogging/ProgressLogging.jl) records under
 **one id per entry point**, opened at the first `:begin` and closed with `done = true` at `:done`.
 
-The name is the current stretch, `"epoch 3/40: train"`, with the phase appended while one is set.
-The fraction is epochs completed over `max_epochs`, with the running stretch's own progress
-interpolated, and it never decreases; a run with `max_epochs = 0` reports the stretch's own
-fraction, or none when the stretch has no units. Frames go out at `:begin`, on a `:phase` change,
-on `:step` at most every tenth of a second, and at `:done`.
+The name and fraction are the run's, as [`progress_bar_reporter`](@ref) draws them: the current
+stretch and phase, and epochs completed with the running stretch interpolated, never decreasing.
+Frames go out at `:begin`, on a `:phase` change, on `:step` at most every tenth of a second, and
+at `:done`, whose name is `done: 40/40 epochs`.
 
 Emits regardless of whether anything is listening; the logger drops what it does not accept. The
 default reporter, [`default_progress_reporter`](@ref), picks this one when no terminal is watching
@@ -1401,25 +1405,22 @@ function progress_log_reporter(
     if verb === :begin
         st = _PLOG[]
         if st === nothing
-            st = _ProgressLog(UUIDs.uuid4(), label, "", epoch, max_epochs, total, 0, 0.0, 0.0)
+            st = _ProgressLog(UUIDs.uuid4(), _RunProgress(), 0.0)
             _PLOG[] = st
-        else
-            st.label, st.phase, st.epoch, st.max_epochs = label, "", epoch, max_epochs
-            st.total, st.counter = total, 0
         end
+        _begin_stretch!(st.run, label, total, epoch, max_epochs)
         _plog_emit!(st)
     elseif verb === :phase
         st = _PLOG[]
         st === nothing && return nothing
-        st.phase == label && return nothing
-        st.phase = label
+        st.run.phase == label && return nothing
+        st.run.phase = label
         _plog_emit!(st)
     elseif verb === :step
         st = _PLOG[]
-        # A unit-less stretch has no fraction to advance, so a stray step draws nothing.
-        (st === nothing || st.total <= 0) && return nothing
-        st.counter += 1
-        if st.counter >= st.total || time() - st.last_emit >= _PLOG_INTERVAL
+        (st === nothing || st.run.total <= 0) && return nothing
+        st.run.counter += 1
+        if st.run.counter >= st.run.total || time() - st.last_emit >= _PLOG_INTERVAL
             _plog_emit!(st)
         end
     elseif verb === :done

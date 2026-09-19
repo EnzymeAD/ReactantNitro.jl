@@ -661,8 +661,10 @@ save("history.png", plot(h))
 ## Progress, in a terminal or a notebook
 
 `train!` reports each stretch of work, an epoch or an evaluation pass, through one reporter
-contract, and the default reporter picks the display per stretch. In an interactive terminal it
-draws a ProgressMeter bar. Where there is no terminal but the current logger accepts
+contract, and the default reporter picks the display per stretch. Either way the display is one
+bar for the whole run, filled by epochs completed with the running stretch interpolated, so the
+ETA is the run's, and named by the current stretch: `epoch 3/40: train [compiling gradient]`,
+ending as `done: 40/40 epochs`. In an interactive terminal it draws a ProgressMeter bar. Where there is no terminal but the current logger accepts
 [ProgressLogging](https://github.com/JuliaLogging/ProgressLogging.jl) records, which is Pluto, VS
 Code, or a REPL running [TerminalLoggers](https://github.com/JuliaLogging/TerminalLoggers.jl), it
 emits those records and the environment draws them its own way. In a CI log or a captured

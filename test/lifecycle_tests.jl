@@ -781,33 +781,22 @@
     end
 
     @testset "the built-in reporter is installed and draws nothing off a terminal" begin
-        # `__init__` installs it, so a fresh process has a reporter without anyone asking.
+        # `__init__` installs it, so a fresh process has a reporter without anyone asking. The
+        # suite is not interactive, so every verb is a no-op and no bar or run is left behind.
         @test ReactantNitro.progress_bar_reporter isa Function
-        # Driving it directly must not throw, and must not draw here: the suite is not
-        # interactive, so `_drawing_progress()` is false and the bar is created disabled.
         @test ReactantNitro._drawing_progress() == false
-        @test ReactantNitro.progress_bar_reporter(:begin, "train", 3, 1, 2) === nothing
-        @test ReactantNitro.progress_bar_reporter(:phase, "compiling gradient", 0, 0, 0) === nothing
-        @test ReactantNitro.progress_bar_reporter(:phase, "", 0, 0, 0) === nothing
-        @test ReactantNitro.progress_bar_reporter(:step, "", 0, 0, 0) === nothing
-        @test ReactantNitro.progress_bar_reporter(:end, "", 0, 0, 0) === nothing
-        @test ReactantNitro._BAR[] === nothing            # closed, not left open
-        # Setup compiles before any stretch has begun, so a `:phase` with no live bar is ordinary
-        # and must be a no-op rather than a crash inside a training run.
-        @test ReactantNitro.progress_bar_reporter(:phase, "compiling gradient", 0, 0, 0) === nothing
-        # A stretch with NO UNITS gets its name on the line and NO METER, so it leaves no bar
-        # behind to step or close. `ProgressUnknown` was what this used to build, and it renders a
-        # counter stuck at zero next to a clock that never advances, since nothing drives a redraw
-        # between the one opening frame and the end: a seven-second checkpoint displaying
-        # `Time: 0:00:00` reads as hung at exactly the moment the label exists to say otherwise.
-        @test ReactantNitro.progress_bar_reporter(:begin, "checkpoint", 0, 1, 5) === nothing
-        @test ReactantNitro._BAR[] === nothing
-        # And the verbs that follow one stay no-ops rather than reaching for the bar it did not
-        # build. This is the path every `checkpoint`, `planning` and `finalize metrics` takes.
-        @test ReactantNitro.progress_bar_reporter(:step, "", 0, 0, 0) === nothing
-        @test ReactantNitro.progress_bar_reporter(:phase, "x", 0, 0, 0) === nothing
-        @test ReactantNitro.progress_bar_reporter(:end, "", 0, 0, 0) === nothing
-        @test ReactantNitro._BAR[] === nothing
+        rep = ReactantNitro.progress_bar_reporter
+        for args in (
+                (:begin, "train", 3, 1, 2), (:phase, "compiling gradient", 0, 0, 0),
+                (:phase, "", 0, 0, 0), (:step, "", 0, 0, 0), (:end, "", 0, 0, 0),
+                (:begin, "checkpoint", 0, 1, 5), (:step, "", 0, 0, 0), (:done, "", 0, 0, 0),
+            )
+            @test rep(args...) === nothing
+            @test ReactantNitro._BAR[] === nothing
+            @test ReactantNitro._BAR_RUN[] === nothing
+        end
+        # Setup compiles before any stretch has begun, so a `:phase` with no run is ordinary.
+        @test rep(:phase, "compiling gradient", 0, 0, 0) === nothing
     end
 
     # ── the log reporter, for a notebook ─────────────────────────────────────────────────
@@ -858,7 +847,28 @@
         @test all(p -> p.fraction == 0.4, filter(p -> startswith(p.name, "epoch 2/5: val"), ps))
         @test count(p -> p.done, ps) == 1
         @test ps[end].done
+        @test ps[end].name == "done: 2/5 epochs"
         @test ReactantNitro._PLOG[] === nothing
+
+        # The run model itself, which the terminal bar draws from as well.
+        r = ReactantNitro._RunProgress()
+        ReactantNitro._begin_stretch!(r, "train", 10, 3, 4)
+        @test ReactantNitro._run_fraction(r) == 0.5
+        @test ReactantNitro._run_name(r) == "epoch 3/4: train"
+        r.counter = 5
+        @test ReactantNitro._run_fraction(r) == 0.625
+        r.phase = "compiling gradient"
+        @test ReactantNitro._run_name(r) == "epoch 3/4: train [compiling gradient]"
+        ReactantNitro._begin_stretch!(r, "val", 2, 3, 4)          # holds, does not drop to 0.5
+        @test ReactantNitro._run_fraction(r) == 0.625
+        @test ReactantNitro._done_name(r) == "done: 3/4 epochs"
+        e = ReactantNitro._RunProgress()
+        ReactantNitro._begin_stretch!(e, "val", 4, 1, 0)
+        @test ReactantNitro._run_fraction(e) == 0.0
+        @test ReactantNitro._run_name(e) == "val"
+        @test ReactantNitro._done_name(e) == "done"
+        ReactantNitro._begin_stretch!(e, "checkpoint", 0, 1, 0)
+        @test ReactantNitro._run_fraction(e) === nothing
 
         # Compared with the reference producer, `@withprogress`: same level, same `_id`
         # convention, same message type and keyword set.
@@ -888,6 +898,7 @@
         @test [(p.name, p.fraction) for p in ps0[1:2]] == [("checkpoint", nothing), ("val", 0.0)]
         @test logger.logs[1].kwargs[:progress] === nothing
         @test ps0[end].done
+        @test ps0[end].name == "done"
         @test allequal(p.id for p in ps0)
         # `:done` with nothing open is a no-op.
         logger = Test.TestLogger(; min_level = ProgressLevel)
