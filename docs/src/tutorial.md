@@ -605,6 +605,7 @@ h                          # every epoch that fits, thinned around the first, be
 h[10:20]                   # epochs 10 to 20
 h[:acc, :macro_recall]     # two metrics, every epoch
 h[10:20, :acc]             # both
+h[step = 2_000:6_000]      # the epochs that closed within those steps
 h[end]                     # the last epoch's row, a NamedTuple
 h.macro_recall             # the column, as a Vector
 ```
@@ -631,7 +632,7 @@ history of MnistMLP  (runs/mnist, 13 of 40 epochs)
 │    40  11000  0.02531        0.9334  0.9310   0.11096    │
 └──────────────────────────────────────────────────────────┘
   * best macro_recall (max), the checkpointer's metric
-  27 of 40 epochs thinned to fit; select an epoch range, `h[1:40]`, for every row
+  27 of 40 epochs thinned to fit; select fewer, `h[16:30]` say, for every row
   not tabulated: confusion (10x10)
 ```
 
@@ -639,6 +640,23 @@ The columns are fixed: epoch, step, the train loss, the checkpointer's metric, t
 metric that is not a scalar, the confusion matrix above, is named in the footer and reachable as
 `h.confusion`. The history is the handle's own: a resumed handle starts at the epoch it resumed
 from and the footer says so.
+
+The history is also a Tables.jl table, so `DataFrame(h)` and `CSV.write("run.csv", h)` take it
+directly, and in a notebook it displays as the same table in HTML with every row. Slicing keeps
+all of that: `h[10:20, :acc]` is a `MetricHistory` too, and shows, plots and converts the same way.
+
+With a Makie backend loaded, `plot(h)` or `plot(n)` draws the same history. The default is one
+axis, the checkpointer's metric over epochs with the best epoch starred, since that is the curve
+the run was selecting on. The same selections change the figure: `plot(h[10:20])` for a window,
+`plot(h[:acc, :val_loss])` for those two curves as two axes, `plot(h; x = :step)` for the step
+axis, and `plot(h; metrics = :all)` for every column. The extension is on Makie itself, so
+CairoMakie, GLMakie and WGLMakie all activate it, and `plot(fig[2, 1], h)` places the whole grid
+inside a figure of your own.
+
+```julia
+using CairoMakie
+save("history.png", plot(h))
+```
 
 ## Predicting on new data
 

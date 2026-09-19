@@ -193,6 +193,47 @@ function Base.show(io::IO, ::MIME"text/plain", h::ReactantNitro.MetricHistory)
     return nothing
 end
 
+# ── The history table, for a notebook ────────────────────────────────────────────────
+#
+# Jupyter, VS Code and Pluto ask for `text/html` before `text/plain`, so without this method a
+# notebook shows the terminal table in a `<pre>`, thinned against the 24 lines a terminal-less
+# `IO` claims to have. This is the same table drawn by the HTML backend, with NO thinning and no
+# column dropped: a notebook scrolls, and the cell is the record. Decimals, column order, the
+# best-epoch mark and the footer notes are `history_table`'s, unchanged.
+function Base.show(io::IO, ::MIME"text/html", h::ReactantNitro.MetricHistory)
+    if isempty(h)
+        print(io, "<p><code>", _html_escape(sprint(show, h)), "</code></p>")
+        return nothing
+    end
+    t = ReactantNitro.history_table(h, typemax(Int32), typemax(Int32))
+    PrettyTables.pretty_table(
+        io, t.cells;
+        backend = :html,
+        column_labels = [t.labels], alignment = t.alignment,
+        title = t.title,
+        highlighters = [
+            PrettyTables.HtmlHighlighter(
+                (_, i, _) -> i == t.best_row, ["font-weight" => "bold"]
+            ),
+        ],
+    )
+    for note in split(t.note, "\n  "; keepempty = false)
+        print(io, "<p style=\"font-size: smaller; margin: 2px 0;\">", _html_note(note), "</p>")
+    end
+    return nothing
+end
+
+_html_escape(s::AbstractString) =
+    replace(s, "&" => "&amp;", "<" => "&lt;", ">" => "&gt;")
+
+# A footer note with its backticked selections, `h[:acc]` say, as `<code>`.
+function _html_note(note::AbstractString)
+    parts = split(_html_escape(note), '`')
+    return join(
+        (isodd(i) ? p : "<code>" * p * "</code>" for (i, p) in enumerate(parts))
+    )
+end
+
 function __init__()
     ReactantNitro.table_renderer!(render_table)
     return nothing

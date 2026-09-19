@@ -4,7 +4,7 @@
     using Test
     using ReactantNitro
     using ReactantNitro: MetricHistory, history_table, thin_rows
-    using Lux, Random, Statistics
+    using Lux, Random, Statistics, Tables
     # The shared toy model from the test kit, whose precompile workload already trained it once,
     # so this item starts with the framework's specializations for it warm. Its `metrics` emit one
     # scalar (`mae`) and one summed matrix (`cm`), which is the pair the table has to handle.
@@ -43,7 +43,22 @@
         @test h[:, :mae].columns == [:epoch, :step, :mae]
         @test h[:cm].hidden == h.hidden               # a non-scalar is selectable too
         @test h[:mae].hidden == []                    # and dropped when not selected
+        # By step: the epochs whose closing step falls in the range, columns untouched.
+        @test h[step = 5:8].epoch == [2]
+        @test h[step = 5:8].columns == h.columns
+        @test h[step = 5:8].hidden == h.hidden
+        @test h[:mae, step = 8:12].epoch == [2, 3]
+        @test h[:mae, step = 8:12].columns == [:epoch, :step, :mae]
+        @test isempty(h[step = 100:200])
         @test collect(h) == h.rows
+        # A Tables.jl table with column access: the scalar columns, and not the matrix.
+        @test Tables.istable(h)
+        @test Tables.columnaccess(h)
+        @test !Tables.rowaccess(h)
+        @test keys(Tables.columntable(h)) == (:epoch, :step, :loss, :mae)
+        @test Tables.columntable(h).mae == h.mae
+        @test Tables.rowtable(h)[2].epoch == 2
+        @test Tables.schema(h).names == (:epoch, :step, :loss, :mae)
         err = try
             h[9]
         catch e
@@ -147,7 +162,10 @@
         @test all(i -> t.cells[i, 1] == "⋮", t.gap_rows)
         @test occursin("best mae (min)", t.note)
         @test occursin("thinned", t.note)
-        @test occursin("`h[1:40]`", t.note)
+        # The suggested selection is one that fits: fifteen rows around the best epoch, not
+        # the whole run, which would only come back thinned the same way.
+        @test occursin("`h[16:30]`", t.note)
+        @test size(history_table(h[16:30], 24, 80).cells, 1) == 15
         @test occursin("not tabulated: cm (2x2)", t.note)
         @test occursin("12 of 40 epochs", t.title) || occursin("of 40 epochs", t.title)
 
@@ -192,5 +210,124 @@
         wide = sprint(show, MIME"text/plain"(), h; context = :displaysize => (60, 200))
         @test count("\n", wide) >= 40
         @test occursin("extra_long_metric_name", wide)
+
+        # As HTML, for a notebook: every row and every column, the best row bold, the notes
+        # under it with their selections as code, and nothing thinned.
+        @test showable(MIME"text/html"(), h)
+        html = sprint(show, MIME"text/html"(), h)
+        @test occursin("<table", html)
+        @test count("<tr", html) >= 41
+        @test occursin("extra_long_metric_name", html)
+        # Bold on the best row's cells and on no other data row.
+        @test occursin("<td style = \"font-weight: bold; text-align: right;\">23</td>", html)
+        @test occursin("<td style = \"text-align: right;\">22</td>", html)
+        # Right-aligned bold cells: the column labels and the best row, less the marker column,
+        # which is left-aligned in both.
+        @test count("font-weight: bold; text-align: right;\">", html) == 2 * (length(t.labels) - 1)
+        @test !occursin("⋮", html)
+        @test !occursin("thinned", html)
+        @test occursin("best mae (min)", html)
+        @test occursin("not tabulated: cm (2x2)", html)
+        @test occursin("<code>", html) || !occursin("`", html)
+        @test !occursin("`", html)
+        empty = MetricHistory(
+            :Synth, "runs/synth", NamedTuple[], [:epoch, :step, :loss],
+            Pair{Symbol, String}[], nothing, 1
+        )
+        @test occursin("0 epochs", sprint(show, MIME"text/html"(), empty))
+    end
+
+    @testset "columns are typed, and a gap is missing" begin
+        rows = NamedTuple[(; epoch = i, step = i, loss = 1.0, acc = 0.5f0) for i in 1:4]
+        rows[3] = (; epoch = 3, step = 3, loss = 1.0)
+        h = MetricHistory(
+            :Synth, "runs/synth", rows, [:epoch, :step, :loss, :acc], Pair{Symbol, String}[],
+            nothing, 1
+        )
+        @test h.loss isa Vector{Float64}
+        @test h.epoch isa Vector{Int}
+        @test h.acc isa Vector{Union{Missing, Float32}}
+        @test ismissing(h.acc[3])
+        @test Tables.schema(h).types == (Int, Int, Float64, Union{Missing, Float32})
+        @test ismissing(Tables.rowtable(h)[3].acc)
+        # The HTML table shows the gap as an empty cell, like the terminal table.
+        @test occursin("<td", sprint(show, MIME"text/html"(), h))
+    end
+
+    @testset "history_series picks the curves a plot draws" begin
+        using ReactantNitro: history_series
+        rows = NamedTuple[
+            (; epoch = i, step = 4i, loss = 1.0 / i, mae = 0.5 + abs(i - 23) / 100, another = i / 7)
+                for i in 1:40
+        ]
+        # Epoch 30 never reported `another`, and epoch 31's mae is NaN.
+        rows[30] = (; epoch = 30, step = 120, loss = 1 / 30, mae = 0.57)
+        rows[31] = (; epoch = 31, step = 124, loss = 1 / 31, mae = NaN, another = 31 / 7)
+        best = (; metric = :mae, mode = :min, epoch = 23)
+        h = MetricHistory(
+            :Synth, "runs/synth", rows, [:epoch, :step, :loss, :mae, :another],
+            Pair{Symbol, String}[:cm => "2x2"], best, 1
+        )
+        # The default is the checkpointer's metric alone, with its best epoch marked.
+        s = history_series(h)
+        @test s.title == "history of Synth"
+        @test s.xlabel == "epoch"
+        @test [p.name for p in s.panels] == [:mae]
+        p = s.panels[1]
+        @test p.x == 1:40
+        @test length(p.y) == 40
+        @test isnan(p.y[31])                           # kept, so the line breaks there
+        @test p.best == (23, 0.5)
+        @test p.subtitle == "mae (min), best at epoch 23"
+        # By step, the mark moves with the axis.
+        @test history_series(h; x = :step).panels[1].best == (92, 0.5)
+        @test history_series(h; x = :step).xlabel == "step"
+        # `:all` is every column but the axes; a name or names select in column order.
+        @test [p.name for p in history_series(h; metrics = :all).panels] == [:loss, :mae, :another]
+        @test [p.name for p in history_series(h; metrics = :another).panels] == [:another]
+        @test [p.name for p in history_series(h; metrics = (:another, :loss)).panels] ==
+            [:another, :loss]
+        # A row without the metric is skipped, not zeroed; the other panels carry no mark.
+        pa = history_series(h; metrics = :another).panels[1]
+        @test length(pa.x) == 39
+        @test !(30 in pa.x)
+        @test pa.best === nothing
+        @test pa.subtitle == "another"
+        # A selection that dropped the best epoch draws no mark; one that kept it does.
+        @test history_series(h[30:40]).panels[1].best === nothing
+        @test history_series(h[20:25]).panels[1].best == (23, 0.5)
+        # Without a checkpointer's metric in the columns, the default is every metric, and a
+        # history of only loss draws the loss.
+        @test [p.name for p in history_series(h[:another]).panels] == [:another]
+        nb = MetricHistory(
+            :Synth, "runs/synth", rows, [:epoch, :step, :loss, :mae, :another],
+            Pair{Symbol, String}[], nothing, 1
+        )
+        @test [p.name for p in history_series(nb).panels] == [:mae, :another]
+        @test [p.name for p in history_series(nb[:loss]).panels] == [:loss]
+        # Refusals name the problem.
+        for (kw, needle) in (
+                ((; x = :time), "`:epoch` or `:step`"),
+                ((; metrics = :cm), "not a scalar metric (2x2)"),
+                ((; metrics = :nope), "not a metric in this history"),
+            )
+            err = try
+                history_series(h; kw...)
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin(needle, err.msg)
+        end
+        empty = MetricHistory(
+            :Synth, "runs/synth", NamedTuple[], [:epoch, :step, :loss],
+            Pair{Symbol, String}[], nothing, 1
+        )
+        err = try
+            history_series(empty)
+        catch e
+            e
+        end
+        @test occursin("nothing to plot", err.msg)
     end
 end

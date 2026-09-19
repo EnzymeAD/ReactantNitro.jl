@@ -30,6 +30,7 @@ without a breaking release.
 ```@docs
 ReactantNitro.MetricHistory
 ReactantNitro.history_table
+ReactantNitro.history_series
 ReactantNitro.thin_rows
 ReactantNitro.StrippedHost
 ReactantNitro.publish_phase

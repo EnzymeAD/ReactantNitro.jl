@@ -75,7 +75,7 @@ On top of those it is the loop Lux does not ship: gradient accumulation, phases,
 
 ## Working from the REPL
 
-The package is meant to be driven from a REPL with Revise loaded. A `Nitro` is a fixed point: revise a hook, build a new handle, and the module-level compile cache recompiles only the programs the edit touched. A stale handle says so on every entry point. The one value that changes on a live handle is a `Device` field, through [`set_device!`](@ref), which never recompiles. `Nitro(e; weights = n)` starts a new run from a trained handle's weights, and [`history`](@ref)`(n)` is the finished run as a table that indexes by epoch and metric.
+The package is meant to be driven from a REPL with Revise loaded. A `Nitro` is a fixed point: revise a hook, build a new handle, and the module-level compile cache recompiles only the programs the edit touched. A stale handle says so on every entry point. The one value that changes on a live handle is a `Device` field, through [`set_device!`](@ref), which never recompiles. `Nitro(e; weights = n)` starts a new run from a trained handle's weights, and [`history`](@ref)`(n)` is the finished run as a table that indexes by epoch and metric, and as a Makie figure with `plot(n)` when a backend is loaded.
 
 ## Start here
 

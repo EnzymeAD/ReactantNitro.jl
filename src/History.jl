@@ -39,9 +39,21 @@ h[end]                       # the last epoch's row
 h[10:20]                     # epochs 10 to 20, still a MetricHistory
 h[:acc, :macro_recall]       # two metrics, every epoch
 h[10:20, :acc]               # both
+h[step = 5_000:20_000]       # the epochs whose closing step is in that range
+h[:acc, step = 5_000:20_000] # both
 h.acc                        # the column as a Vector, for a plot or a threshold
 h.epoch, h.step, h.loss      # the axes and the train loss
 ```
+
+A row's `step` is the global step at the END of its epoch, so `step = a:b` selects the epochs that
+closed within it. With a Makie backend loaded, `plot(h)` draws it; see [`history_series`](@ref)
+for what the plot shows by default.
+
+It is a Tables.jl table with column access, so `DataFrame(h)`, `CSV.write(path, h)` and anything
+else that consumes one take it directly. The table view has the scalar columns in the order above;
+a column with a gap, an epoch that did not report the metric, has `missing` there and a
+`Union{Missing, T}` element type. A non-scalar metric is not a column of the table view. In a
+notebook the display is the same table as HTML, every row, since a notebook scrolls.
 
 The column order is fixed: `epoch`, `step`, `loss`, the checkpointer's selection metric when the
 handle has one, then the remaining scalar metrics in the order they first appeared. A metric that
@@ -137,11 +149,34 @@ Base.propertynames(h::MetricHistory) = Tuple(vcat(_columns(h), first.(_hidden(h)
 
 function Base.getproperty(h::MetricHistory, name::Symbol)
     if name in _columns(h) || any(p -> first(p) == name, _hidden(h))
-        col = Any[get(r, name, missing) for r in _rows(h)]
-        return any(ismissing, col) ? col : identity.(col)
+        return _column(h, name)
     end
     return getfield(h, name)
 end
+
+# A column as a vector with the narrowest element type its values allow, `Union{Missing, T}`
+# when an epoch lacks the metric, so a consumer sees `Vector{Float64}` and not `Vector{Any}`.
+function _column(h::MetricHistory, name::Symbol)
+    col = Any[get(r, name, missing) for r in _rows(h)]
+    present = Any[v for v in col if !ismissing(v)]
+    isempty(present) && return Vector{Missing}(missing, length(col))
+    T = mapreduce(typeof, typejoin, present)
+    return length(present) == length(col) ? Vector{T}(col) : Vector{Union{Missing, T}}(col)
+end
+
+# ── Tables.jl ──────────────────────────────────────────────────────────────────────
+#
+# Column access ONLY, and that is a display decision as much as an interface one. Pluto shows any
+# table that reports ROW access in its own paginated grid of raw values, ahead of the `text/html`
+# method below; a column-access table falls through to ours. Every consumer this is for,
+# `DataFrame`, `CSV.write`, a plotting recipe, reads columns, and Tables.jl derives rows from
+# columns for the rest.
+Tables.istable(::Type{MetricHistory}) = true
+Tables.columnaccess(::Type{MetricHistory}) = true
+Tables.columns(h::MetricHistory) =
+    NamedTuple{Tuple(_columns(h))}(Tuple(_column(h, c) for c in _columns(h)))
+Tables.schema(h::MetricHistory) =
+    Tables.Schema(_columns(h), [eltype(_column(h, c)) for c in _columns(h)])
 
 function _row_at(h::MetricHistory, epoch::Integer)
     i = findfirst(r -> r.epoch == epoch, _rows(h))
@@ -170,7 +205,7 @@ function Base.getindex(h::MetricHistory, epochs::AbstractVector{<:Integer})
     )
 end
 
-function Base.getindex(h::MetricHistory, names::Symbol...)
+function Base.getindex(h::MetricHistory, names::Symbol...; step = nothing)
     available = vcat(_columns(h), first.(_hidden(h)))
     for n in names
         n in available || error(
@@ -178,13 +213,16 @@ function Base.getindex(h::MetricHistory, names::Symbol...)
                 join(("`$c`" for c in available if !(c in (:epoch, :step))), ", ") * "."
         )
     end
-    columns = Symbol[:epoch, :step]
-    for c in _columns(h)
-        c in names && push!(columns, c)
+    # No names selects every column, so `h[step = a:b]` is a row selection alone.
+    if isempty(names)
+        columns, hidden = copy(_columns(h)), copy(_hidden(h))
+    else
+        columns = Symbol[c for c in _columns(h) if c in (:epoch, :step) || c in names]
+        hidden = Pair{Symbol, String}[p for p in _hidden(h) if first(p) in names]
     end
-    hidden = Pair{Symbol, String}[p for p in _hidden(h) if first(p) in names]
+    rows = step === nothing ? copy(_rows(h)) : NamedTuple[r for r in _rows(h) if r.step in step]
     return MetricHistory(
-        getfield(h, :experiment), getfield(h, :run_dir), copy(_rows(h)), columns, hidden,
+        getfield(h, :experiment), getfield(h, :run_dir), rows, columns, hidden,
         _best(h), getfield(h, :first_epoch),
     )
 end
@@ -340,11 +378,17 @@ function history_table(h::MetricHistory, height::Integer, width::Integer)
     best === nothing || push!(
         notes, "* best $(best.metric) ($(best.mode)), the checkpointer's metric"
     )
-    shown < n && push!(
-        notes,
-        "$(n - shown) of $n epochs thinned to fit; select an epoch range, " *
-            "`h[$(rows[1].epoch):$(rows[end].epoch)]`, for every row",
-    )
+    if shown < n
+        # A window of `budget` rows around the best epoch, or the end, is one that shows every
+        # row when selected; the whole range would only come back thinned the same way.
+        lo = clamp(something(ibest, n) - budget ÷ 2, 1, n - budget + 1)
+        hi = lo + budget - 1
+        push!(
+            notes,
+            "$(n - shown) of $n epochs thinned to fit; select fewer, " *
+                "`h[$(rows[lo].epoch):$(rows[hi].epoch)]` say, for every row",
+        )
+    end
     isempty(dropped) || push!(
         notes,
         "not shown for width: " * join(string.(dropped), ", ") * "; select them with `h[" *
@@ -375,4 +419,85 @@ function _table_width(rows, picks, keep)
         w += cw + 2
     end
     return w + 2 + 3          # the outer rules, and the marker column
+end
+
+# ── The plot ───────────────────────────────────────────────────────────────────────
+#
+# Same split as the table: which curves a plot draws, against which axis, with which point marked,
+# is arithmetic over the data and is decided here; drawing them is the Makie extension's job, and
+# there is no plotting package in this environment to draw them with.
+
+"""
+    ReactantNitro.history_series(h; x = :epoch, metrics = nothing) -> NamedTuple
+
+Everything a plot of `h` draws, computed without a plotting package: `title`, `xlabel`, and
+`panels`, one per curve, each `(; name, x, y, best, subtitle)`.
+
+`x` is `:epoch` or `:step`, the axis. `metrics` picks the curves:
+
+- `nothing`, the default: the checkpointer's metric when the history has it as a column, which is
+  the one curve the run was selecting on; otherwise every metric column; otherwise `loss`
+- `:all`: every column, `loss` included
+- one name, or a collection of names, in the history's column order
+
+`best` is the `(x, y)` of the checkpointer's chosen epoch on that metric's panel when the selection
+still holds that epoch, and `nothing` on every other panel. A row that lacks a metric is skipped; a
+non-finite value is kept, so the drawn line breaks where the run did. The Makie extension turns
+this into `plot(h)`, so `plot(h[10:20, :acc])` and `plot(h; x = :step, metrics = :all)` are both
+how to ask for a different figure.
+"""
+function history_series(h::MetricHistory; x::Symbol = :epoch, metrics = nothing)
+    x in (:epoch, :step) || error("ReactantNitro: `x` must be `:epoch` or `:step`, got `$x`.")
+    isempty(h) && error(
+        "ReactantNitro: this history is empty, the handle has not validated an epoch; " *
+            "there is nothing to plot."
+    )
+    plottable = Symbol[c for c in _columns(h) if !(c in (:epoch, :step))]
+    best = _best(h)
+    names = if metrics === nothing
+        if best !== nothing && best.metric in plottable
+            [best.metric]
+        else
+            rest = filter(!=(:loss), plottable)
+            isempty(rest) ? [:loss] : rest
+        end
+    elseif metrics === :all
+        plottable
+    elseif metrics isa Symbol
+        [metrics]
+    else
+        collect(Symbol, metrics)
+    end
+    for nm in names
+        nm in plottable && continue
+        i = findfirst(p -> first(p) == nm, _hidden(h))
+        i === nothing && error(
+            "ReactantNitro: `$nm` is not a metric in this history. It has: " *
+                join(("`$c`" for c in plottable), ", ") * "."
+        )
+        error(
+            "ReactantNitro: `$nm` is not a scalar metric ($(last(_hidden(h)[i]))); " *
+                "it has no curve to draw."
+        )
+    end
+    rows = _rows(h)
+    panels = map(names) do nm
+        xs, ys = Int[], Float64[]
+        for r in rows
+            v = get(r, nm, missing)
+            v === missing && continue
+            push!(xs, r[x])
+            push!(ys, Float64(v))
+        end
+        mark, subtitle = nothing, string(nm)
+        if best !== nothing && nm == best.metric
+            i = findfirst(r -> r.epoch == best.epoch, rows)
+            if i !== nothing && haskey(rows[i], nm)
+                mark = (rows[i][x], Float64(rows[i][nm]))
+                subtitle = "$nm ($(best.mode)), best at epoch $(best.epoch)"
+            end
+        end
+        return (; name = nm, x = xs, y = ys, best = mark, subtitle)
+    end
+    return (; title = "history of " * string(getfield(h, :experiment)), xlabel = string(x), panels)
 end

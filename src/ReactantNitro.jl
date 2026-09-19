@@ -39,6 +39,7 @@ import Random
 import Reactant
 import SHA
 import Statistics
+import Tables
 
 """
     ReactantNitro._unimplemented(what, detail)
