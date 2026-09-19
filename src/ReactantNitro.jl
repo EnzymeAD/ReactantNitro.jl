@@ -154,7 +154,7 @@ export Phase, Repl, Starting, Compiling, GradCompiling, OptCompiling, EvalCompil
 export Stepping, TrainStepping, EvalStepping, Checkpointing, Terminal, Done, Failed
 export register_phase_monitor!, unregister_phase_monitor!, progress_counter
 export request_stop!, run_dir, current_step, current_epoch, phase
-export experiment, parameters, states, binding_report, EarlyStopping, should_stop
+export experiment, parameters, states, EarlyStopping, should_stop
 # What the run produced, per epoch, as data that also displays as a table. A handle is not a
 # metrics store in the sense of a logger backend; it keeps the one series a person at a REPL asks
 # for after `train!` returns, and `history` is how they ask.

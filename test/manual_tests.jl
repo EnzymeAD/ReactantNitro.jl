@@ -312,7 +312,7 @@
             checkpointer = nothing, run_dir = mktempdir()
         )
         @test keys(n.schedules.opt) == (Symbol("gen.eta"),)
-        @test occursin("opt_state path gen", binding_report(n))
+        @test occursin("opt_state path gen", sprint(show, MIME"text/plain"(), n))
         gen0 = deepcopy(parameters(n).gen)
         disc0 = deepcopy(parameters(n).disc)
         train!(n)

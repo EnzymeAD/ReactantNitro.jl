@@ -566,7 +566,7 @@
             checkpointer = nothing, run_dir = mktempdir()
         )
         @test keys(n.schedules.opt) == (Symbol("backbone.eta"),)
-        @test occursin("group :backbone", binding_report(n))
+        @test occursin("group :backbone", sprint(show, MIME"text/plain"(), n))
         d0 = moved(n)[1]
         b0 = moved(n)[2]
         train!(n)

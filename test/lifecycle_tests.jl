@@ -529,7 +529,7 @@
         # What it withheld is said by the `weights` row and by the note naming `parameters`, so
         # the title is just the name; the assertions that no array reaches the output are above.
         @test occursin("Nitro for LifeMLP", long)
-        @test occursin("binding_report", long)             # and names the readers, where it is asked
+        @test occursin("`history`", long)                  # and names the readers, where it is asked
         # WHERE VALUES BOUND, in the same display: the report is no longer a second thing printed
         # beside the handle, and a reader who prints one handle sees both.
         @test occursin("gradient clip", long)

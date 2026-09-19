@@ -77,7 +77,7 @@
         @test !endswith(handle, "\n")
         @test occursin("│", handle)
         # The trailing note is printed under the box rather than swallowed with the newline.
-        @test occursin("binding_report", handle)
+        @test occursin("`history`", handle)
         @test endswith(handle, "`logger_info`")
     end
 
@@ -134,7 +134,7 @@
     # ── the palette ─────────────────────────────────────────────────────────────────────
     #
     # A role is a name in the core and a crayon here, and the split is what keeps an escape
-    # sequence out of `binding_report`'s string. These assertions pin both ends of it: that a role
+    # sequence out of the logged binding report's string. These assertions pin both ends of it: that a role
     # the core sets reaches a colour, and that a role this extension has never heard of leaves the
     # cell alone rather than taking the whole display down with a `KeyError`.
     @testset "roles map to the basic ANSI set, and an unknown role is inert" begin

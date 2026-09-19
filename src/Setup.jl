@@ -522,7 +522,7 @@ function _build_nitro(
 
     nitro = Nitro(
         e, model, ps, st, w0_tree, layout, opt_state, collection, routing, schema, mesh,
-        Dict{Any, Any}(), resolved, total, batch_size, logger, nothing, nothing, checksums, preset,
+        Dict{Any, Any}(), resolved, total, batch_size, logger, nothing, checksums, preset,
         source === nothing ? nothing : String(source),
         # The provenance half: the record is in scope here for the compatibility check above, so the
         # training run's identity costs nothing to keep and cannot be recovered later, since the
@@ -541,11 +541,11 @@ function _build_nitro(
         weights === nothing ? nothing : weights_origin(weights),
         NamedTuple[]
     )
-    # TWO BUILDS, and they are not the same artifact. The stored report is the machine-read one:
-    # it goes to `log_other!`, it is what `binding_report` returns, and its bytes must not depend
-    # on whether something else in the session loaded PrettyTables. The sections are what the
-    # handle DISPLAYS, appended to its own bands by `show`, so a reader sees one table instead of
-    # a summary and a report that each drew their own boxes.
+    # TWO BUILDS from one set of pieces. The text goes to `log_other!`, so the run's record says
+    # where every value bound whether or not anyone displayed the handle. The sections are what
+    # the handle DISPLAYS, appended to its own bands by `show`, so a reader sees one table instead
+    # of a summary and a report that each drew their own boxes. Nothing on the handle returns the
+    # text: a String of a framed table is unreadable at a REPL, and `show(nitro)` is the display.
     #
     # NOTHING IS PRINTED HERE, and the binding report used to be `@info`-ed at exactly this point.
     # It stopped being a separate artifact when it became part of `show(nitro)`: a constructor
@@ -553,9 +553,8 @@ function _build_nitro(
     # where most of these are built. A script that wants it asks, with `display(nitro)` or
     # `@info sprint(show, MIME"text/plain"(), nitro)`, and the run's record has it either way
     # through `log_other!` on the next line.
-    nitro.report = build_binding_report(nitro)
     nitro.sections = build_binding_sections(nitro)
-    log_other!(logger, "binding_report", nitro.report)
+    log_other!(logger, "binding_report", build_binding_report(nitro))
     run_ref === nothing || (run_ref[] = nitro)
     # The per-run monitor copy, taken HERE and not only at `train!`. `train!` calls it again,
     # which is safe because it is idempotent, and this call is what makes the eval constructions

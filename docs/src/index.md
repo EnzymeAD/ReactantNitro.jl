@@ -69,7 +69,7 @@ Lux has a training loop. A Reactant-first stack needs four things a training loo
 
 **Device memory freed per batch.** The host GC runs on host pressure and cannot see the accelerator filling, so a run that leaves batch buffers to the finalizer can die out of memory hours in while the host looks idle. The loop frees each batch's device buffers as soon as the loss readback confirms the step has finished, and the prefetch pipeline frees what it staged when a phase ends. See [Pitfalls](pitfalls.md).
 
-**Binding instead of wiring.** A hook declares the batch fields it wants as keywords, and the framework routes exactly those from whatever the loader yields. A schedule key names an optimizer rule field such as `eta` or a `Device` field on the experiment, and resolves to one of them. Ten run keywords default to an accessor of the same name, and most accessors fall back to a field of the same name. An `MLUtils.DataLoader` gets multi-threaded prefetching with nothing declared. The binding report prints where every value came from. See the [Tutorial](tutorial.md#Binding).
+**Binding instead of wiring.** A hook declares the batch fields it wants as keywords, and the framework routes exactly those from whatever the loader yields. A schedule key names an optimizer rule field such as `eta` or a `Device` field on the experiment, and resolves to one of them. Ten run keywords default to an accessor of the same name, and most accessors fall back to a field of the same name. An `MLUtils.DataLoader` gets multi-threaded prefetching with nothing declared. The binding report prints where every value came from. See the [Binding cheat sheet](binding.md).
 
 On top of those it is the loop Lux does not ship: gradient accumulation, phases, checkpoint and resume, early stopping, schedules, logging, and export to a servable bundle.
 
@@ -80,6 +80,7 @@ The package is meant to be driven from a REPL with Revise loaded. A `Nitro` is a
 ## Start here
 
 - [Tutorial](tutorial.md): MNIST from configuration to prediction, with each feature explained where it appears.
+- [Binding cheat sheet](binding.md): how everything connects by name, on one page.
 - [Pitfalls](pitfalls.md): what a Reactant-first stack gets wrong silently, and what the framework does about each.
 - [Experiments](experiments.md): the hook contract, the three markers, and the Revise workflow.
 - [Recompilation](recompilation.md): the compile cache, what is in the key, and the acceptance check.

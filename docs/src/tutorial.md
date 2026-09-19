@@ -20,6 +20,13 @@ This page trains the automatic way: the framework sequences every optimizer step
 that must sequence its own steps, a GAN with one optimizer per network, defines `train_step` and
 owns the step; see [Manual training](manual.md).
 
+!!! note "The one-page map: how everything connects"
+    Every connection this page walks through is drawn once on the
+    [Binding cheat sheet](binding.md): batch fields to hooks, `forward`'s outputs to `loss` and
+    `metrics`, the three markers to what traced code sees, schedule keys to their slots, run
+    keywords to accessors to fields, and what recompiles. Read it first if you want the shape
+    before the story, and go back to it whenever a name does not seem to reach where you expected.
+
 ## Configuration, data, and the model
 
 ```julia
@@ -421,6 +428,9 @@ read, and `run_ref` is a channel back to the caller, filled before the loop star
 
 Four things connect by name at setup, with nothing wired by hand. The binding report, appended to
 `show(nitro)` and handed to [`log_other!`](@ref), says where each one landed.
+
+!!! tip "Drawn out"
+    The [Binding cheat sheet](binding.md) has each of these as a diagram with the rule under it.
 
 | What | Binds to | By |
 | --- | --- | --- |

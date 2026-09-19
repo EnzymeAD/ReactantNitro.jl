@@ -56,6 +56,7 @@ makedocs(;
     pages = [
         "Home" => "index.md",
         "Tutorial" => "tutorial.md",
+        "Binding cheat sheet" => "binding.md",
         "Pitfalls" => "pitfalls.md",
         "Experiments" => "experiments.md",
         "Recompilation" => "recompilation.md",

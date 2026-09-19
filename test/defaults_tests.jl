@@ -221,8 +221,9 @@
             # taking one. A report naming a source that does not exist cannot be checked against the
             # source, and this line prints on every run of every experiment that leaves the clip alone.
             @test clip_source(BareMLP(), 0.0f0) === :default
-            @test occursin("[framework default]", binding_report(n))
-            @test !occursin("[field on e]", binding_report(n))
+            shown = sprint(show, MIME"text/plain"(), n)
+            @test occursin("[framework default]", shown)
+            @test !occursin("[field on e]", shown)
             # The other three routes still resolve, and the keyword is detected by value, since
             # defaulting a keyword to the experiment's accessor makes a passed keyword
             # indistinguishable from an omitted one by the time the body runs.

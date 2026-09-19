@@ -158,9 +158,8 @@ value came from, in one table. Setup prints nothing itself: the REPL already dis
 the constructor returns, and a constructor that also printed it would show you the same table
 twice. From a script, ask for it with `display(nitro)`.
 
-The plain text is handed to [`log_other!`](@ref) whether or not anything displayed it, so the
-run's record carries it and the terminal is never the only copy. [`binding_report`](@ref) returns
-that same text.
+The same text is handed to [`log_other!`](@ref) whether or not anything displayed it, so the
+run's record carries it and the terminal is never the only copy.
 
 Read it on the first run of any new config: it catches a group that came out empty, a ratio you
 did not intend, or a schedule that bound to the optimizer when you meant your experiment. It is a

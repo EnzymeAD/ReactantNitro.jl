@@ -45,7 +45,7 @@
             @test current_step(n) == 0
             @test current_epoch(n) == 0
             @test phase(n) isa Starting
-            @test binding_report(n) isa String
+            @test occursin("bindings", sprint(show, MIME"text/plain"(), n))
         end
 
         @testset "step 5 converted the Device and left everything else alone" begin
@@ -512,7 +512,7 @@
         # and the handle is where the run's own facts live.
         @test occursin("preset", sprint(show, MIME"text/plain"(), n))
         @test occursin("narrow", sprint(show, MIME"text/plain"(), n))
-        @test !occursin("preset", binding_report(n))
+        @test !occursin("preset", ReactantNitro.build_binding_report(n))
 
         # A Nitro keyword goes to Nitro, EVEN when it is also a field, which is what preserves the
         # three-way collision resolution on names like max_epochs.
@@ -539,7 +539,8 @@
         # A run that named no preset carries `nothing`, and the report stays silent about it.
         n3 = Nitro(MLP(); checkpointer = nothing, run_dir = mktempdir())
         @test n3.preset === nothing
-        @test !occursin("preset", binding_report(n3))
+        @test !occursin("preset", sprint(show, MIME"text/plain"(), n3))
+        @test !occursin("preset", ReactantNitro.build_binding_report(n3))
     end
 
 end

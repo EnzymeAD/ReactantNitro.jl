@@ -89,9 +89,10 @@
         :register_phase_monitor!, :unregister_phase_monitor!, :progress_counter,
         :request_stop!, :run_dir,
         :current_step, :current_epoch, :phase, :experiment, :parameters, :states,
-        :binding_report, :EarlyStopping, :should_stop,
+        :EarlyStopping, :should_stop,
         # The run's per-epoch series, as data that displays as a table: what a REPL asks a
-        # finished handle, so it is a public verb like `binding_report`.
+        # finished handle. Where each value bound is part of `show(nitro)`; there is no
+        # accessor returning that table as a String, since a framed String is unreadable.
         :history,
     ]
     const DISTRIBUTION = [:rank, :world_size]

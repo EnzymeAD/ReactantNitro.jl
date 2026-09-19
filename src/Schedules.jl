@@ -1,7 +1,7 @@
 # Schedules.jl
 #
 # Schedule resolution, the effective learning rate, and the text of the binding report. The
-# `binding_report(nitro)` accessor itself lives in Phases.jl with the rest of the `Nitro` accessors;
+# The sections are appended to `show(nitro)` in Phases.jl, and the text goes to the run's logger;
 # this file builds what it returns.
 
 """
@@ -909,7 +909,7 @@ end
 """
     ReactantNitro.build_binding_report(nitro) -> String
 
-The binding report's plain text, for [`binding_report`](@ref) and the logger.
+The binding report's text, for the run's logger.
 """
 build_binding_report(nitro) = binding_report_text(; binding_report_pieces(nitro)...)
 
@@ -1170,8 +1170,8 @@ end
 """
     ReactantNitro.binding_report_text(; kwargs...) -> String
 
-[`binding_report_sections`](@ref) rendered as text, which is the form stored on the handle,
-returned by [`binding_report`](@ref), and sent to `log_other!`.
+[`binding_report_sections`](@ref) rendered as text, which is the form sent to `log_other!` at
+setup so the run's record says where every value bound.
 
 Rendered through the installed table renderer into a plain `IOBuffer`, so the text carries the
 frame and none of the colour: an `IOBuffer` declares no `:color`, and every crayon the renderer

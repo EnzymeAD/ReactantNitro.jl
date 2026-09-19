@@ -139,7 +139,7 @@ nitro = Nitro(e; data = (; test = loader))        # supply data directly, skip b
 
 **Opaque, with accessors.** Users never construct or mutate one field by field; read it through
 [`experiment`](@ref), [`parameters`](@ref), [`states`](@ref), [`run_dir`](@ref),
-[`current_step`](@ref), [`current_epoch`](@ref), [`phase`](@ref), and [`binding_report`](@ref), and
+[`current_step`](@ref), [`current_epoch`](@ref), [`phase`](@ref), and [`history`](@ref), and
 write to it through [`request_stop!`](@ref).
 
 **On the name.** The object is a `Nitro`; a *run* is what happens when you `train!` one. That is why
@@ -174,8 +174,7 @@ mutable struct Nitro
     total::Any                # step 11, the schedule horizon; `nothing` with no train split
     batch_size::Any           # inferred from the first batch, never read from config
     logger::Any               # step 12
-    report::Any               # the schedule binding report, as text, for the log
-    sections::Any             # the same report as `TableSection`s, for `show`
+    sections::Any             # the binding report as `TableSection`s, appended to `show`
     anchor_checksum::Any      # the per-group decay-anchor checksum; `nothing` if unanchored
     preset::Any               # the named configuration this run claimed; `nothing` if none
     # WHERE THESE WEIGHTS CAME FROM: the resolved checkpoint the restore actually read, or `nothing`
@@ -340,24 +339,6 @@ function request_stop!(nitro::Nitro)
 end
 
 """
-    binding_report(nitro) -> String
-
-The binding report as plain text: where every configured value actually bound. It is a
-**diagnostic, not a check**; it computes nothing the run does not already compute and it never
-fails. Setup hands this same text to `log_other!(lgr, "binding_report", str)`, so the run's record
-carries it whether or not anything displayed it.
-
-**What you read is normally `show(nitro)`**, which appends the report's sections to the handle's
-own, so one table answers both what the run holds and where each value came from. This accessor is
-for the text: a log line, a file, a diff between two runs.
-
-It exists because the rules that resolve a learning rate, a schedule key, and a per-group
-accessor are individually simple and jointly hard to hold in your head, and because a wrong
-binding is otherwise invisible until a curve looks strange three hours in.
-"""
-binding_report(nitro::Nitro) = nitro.report
-
-"""
     logger_info(nitro) -> NamedTuple
 
 The run's logger's key identifying parameters, read straight off a running experiment:
@@ -452,7 +433,7 @@ Rows within a section may be short; a renderer reads missing cells as empty.
 
 **A role rather than a colour, and a lookup rather than an escape in the string.** Two things
 follow from it. The text stays plain, which matters because the same rows are rendered into
-`binding_report`'s string and handed to a logger, where an escape sequence is corruption rather
+the logged binding report's string and handed to a logger, where an escape sequence is corruption rather
 than styling. And which colour a role gets is the renderer's decision, so a destination that
 cannot colour ignores the map entirely rather than having to strip anything out of the cells.
 """
@@ -747,8 +728,7 @@ function Base.show(io::IO, ::MIME"text/plain", nitro::Nitro)
     # Named where the question is asked, exactly as the record's `show` names `checkpoint_info`:
     # whoever printed this handle wanted one of these and the summary is not it. It rides under
     # the frame, so it stays at the bottom.
-    note = "ask it for more with `experiment`, `parameters`, `states`, `binding_report`, " *
-        "`logger_info`"
+    note = "ask it for more with `history`, `experiment`, `parameters`, `states`, `logger_info`"
     # JUST THE NAME. The title used to carry "(the run handle; no weights are shown)", which was
     # a disclaimer for a display that has a `weights` row saying where they came from and a note
     # naming `parameters` as the way to get the arrays themselves. Saying it a third time in the
