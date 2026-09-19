@@ -1343,12 +1343,16 @@ end
 const _PLOG = Ref{Union{Nothing, _ProgressLog}}(nothing)
 const _PLOG_INTERVAL = 0.1
 
+# The record `@logprogress` emits, both halves: the `progress` keyword is the old API Pluto and
+# VS Code read, the `ProgressString` message is the new one TerminalLoggers reads.
 function _plog_emit!(st::_ProgressLog; done::Bool = false)
     fraction = st.total > 0 ? min(1.0, st.counter / st.total) : nothing
     name = isempty(st.phase) ? st.name : st.name * " [" * st.phase * "]"
-    Logging.@logmsg ProgressLogging.ProgressLevel ProgressLogging.Progress(
-        st.id, fraction; name, done
-    ) _id = st.id
+    msg = ProgressLogging.ProgressString(
+        ProgressLogging.Progress(st.id, fraction; name, done)
+    )
+    Logging.@logmsg ProgressLogging.ProgressLevel msg progress = (done ? "done" : fraction) _id =
+        st.id
     st.last_emit = time()
     return nothing
 end

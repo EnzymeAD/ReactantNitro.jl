@@ -829,8 +829,12 @@
         end
         recs = logger.logs
         @test all(r -> r.level == ProgressLevel, recs)
-        @test all(r -> r.message isa Progress, recs)
-        ps = [r.message for r in recs]
+        @test all(r -> r.message isa ProgressLogging.ProgressString, recs)
+        ps = [ProgressLogging.asprogress(r.level, r.message) for r in recs]
+        # The legacy keyword Pluto and VS Code read: the fraction, or "done".
+        @test all(r -> haskey(r.kwargs, :progress), recs)
+        @test recs[1].kwargs[:progress] == 0.0
+        @test recs[end].kwargs[:progress] == "done"
         @test allequal(p.id for p in ps)
         @test all(r -> r.id == r.message.id, recs)
         @test ps[1].fraction == 0.0
@@ -857,8 +861,9 @@
         end
         r1 = ref.logs[1]
         @test r1.level == recs[1].level
+        @test typeof(r1.message) == typeof(recs[1].message)
+        @test keys(r1.kwargs) == keys(recs[1].kwargs)
         @test ProgressLogging.asprogress(r1.level, r1.message) isa Progress
-        @test ProgressLogging.asprogress(recs[1].level, recs[1].message) isa Progress
         @test r1.id == ProgressLogging.asprogress(r1.level, r1.message).id
 
         # A stretch with no units carries no fraction: busy, not stuck at zero.
@@ -868,9 +873,11 @@
             ReactantNitro.progress_log_reporter(:step, "", 0, 0, 0)
             ReactantNitro.progress_log_reporter(:end, "", 0, 0, 0)
         end
-        @test [p.fraction for p in (r.message for r in logger.logs)] == [nothing, nothing]
-        @test logger.logs[1].message.name == "checkpoint epoch 1/5"
-        @test logger.logs[end].message.done
+        ps0 = [ProgressLogging.asprogress(r.level, r.message) for r in logger.logs]
+        @test [p.fraction for p in ps0] == [nothing, nothing]
+        @test ps0[1].name == "checkpoint epoch 1/5"
+        @test ps0[end].done
+        @test logger.logs[1].kwargs[:progress] === nothing
         # `:done` with nothing open is a no-op, and a `:begin` closes a stretch left open.
         logger = Test.TestLogger(; min_level = ProgressLevel)
         with_logger(logger) do
@@ -879,7 +886,10 @@
             ReactantNitro.progress_log_reporter(:begin, "b", 2, 1, 0)
             ReactantNitro.progress_log_reporter(:done, "", 0, 0, 0)
         end
-        names = [(r.message.name, r.message.done) for r in logger.logs]
+        names = [
+            (p.name, p.done) for
+                p in (ProgressLogging.asprogress(r.level, r.message) for r in logger.logs)
+        ]
         @test names == [("a", false), ("a", true), ("b", false), ("b", true)]
     end
 
@@ -899,11 +909,14 @@
                 @test !ReactantNitro._logging_progress()
                 train!(mk_life(; max_epochs = 1))
             end
-            @test isempty(filter(r -> r.message isa Progress, quiet.logs))
+            @test isempty(filter(r -> r.message isa ProgressLogging.ProgressString, quiet.logs))
         finally
             ReactantNitro.progress_reporter!(prev)
         end
-        ps = [r.message for r in logger.logs if r.message isa Progress]
+        ps = [
+            ProgressLogging.asprogress(r.level, r.message) for
+                r in logger.logs if r.message isa ProgressLogging.ProgressString
+        ]
         @test !isempty(ps)
         @test any(p -> p.name == "train epoch 1/1" && p.fraction == 0.0, ps)
         @test any(p -> p.name == "train epoch 1/1" && p.done, ps)
