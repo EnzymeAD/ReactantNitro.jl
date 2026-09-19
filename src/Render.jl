@@ -1,39 +1,10 @@
-# ReactantNitroPrettyTablesExt.jl
+# Render.jl
 #
-# The framed renderer for this package's long `show` methods, and the `history` table. Loading
-# PrettyTables anywhere in a session is the trigger, and `__init__` points
-# `ReactantNitro._TABLE_RENDERER` here.
-#
-# ── Why an extension and not a dependency ────────────────────────────────────────────
-#
-# A framework whose display pulls in a table library has made every deployment of it carry that
-# library, including a serving process that renders nothing. In practice Reactant depends on
-# PrettyTables, so every session that loads this package loads this extension too, and it is THE
-# renderer: the core keeps no second one to maintain beside it. Without this extension a long
-# `show` prints its title and a line saying so.
-#
-# ── How several sections become one frame ────────────────────────────────────────────
-#
-# `row_group_labels` is the feature this rests on: a full-width labelled band drawn between data
-# rows. Each of our sections becomes one of those, and a section's own column header is emitted as
-# an ordinary first row of its band, since a table has exactly one real column-label row and it
-# would have to sit above every section at once.
-#
-# NO VERTICAL RULES, and that is the choice that makes the whole thing work rather than a style
-# preference. A table has one column structure, so the widest cell anywhere in a column sets that
-# column for every section, and a two-column band inside a three-column table therefore ends in a
-# stretch of air. Unruled, that air is invisible and the band reads as a short line. Ruled, it
-# reads as a cell somebody forgot to fill in.
-#
-# ── The one thing to know if the display changes under you ───────────────────────────
-#
-# This activates on LOAD, so a session that pulls PrettyTables in indirectly (Reactant does)
-# gets the framed table without asking for it. `ReactantNitro.table_renderer!(nothing)` uninstalls
-# it for the rest of the process, and this extension never reclaims it.
-module ReactantNitroPrettyTablesExt
-
-import ReactantNitro
-import PrettyTables
+# The framed renderer every long `show` goes through, and the history table's two shows. PrettyTables
+# is an ordinary dependency: Reactant loads it into every process anyway, and a renderer installed
+# at definition needs no `__init__`, which matters for a tool that evaluates this package from
+# source and skips initialisers. Sections become `row_group_labels` bands of ONE frame, drawn
+# without vertical rules so a short band does not read as a row of empty cells.
 
 # ── The palette: six roles, and the eight-colour ANSI set ────────────────────────────
 #
@@ -71,18 +42,13 @@ const _ROLE_CRAYONS = Dict{Symbol, PrettyTables.Crayon}(
     :accent => PrettyTables.Crayon(foreground = :magenta),
 )
 
-# The renderer contract, as `ReactantNitro.table_renderer!` documents it: a title, the sections,
-# and a trailing note.
-#
-# NAMED AND TYPED SPECIFICALLY on purpose. It is reached through a `Ref{Any}`, so the call is
-# dynamic and nothing would check a looser signature; a bare `render` taking four untyped
-# arguments is the shape that reads as applicable to any four-argument call and turns a stack
-# trace from this display path into a puzzle.
+# The renderer contract, as `table_renderer!` documents it. Typed in full: it is reached through
+# a `Ref{Any}`, so nothing else checks the signature.
 function render_table(
-        io::IO, title::AbstractString, sections::Vector{ReactantNitro.TableSection},
+        io::IO, title::AbstractString, sections::Vector{TableSection},
         note::Union{AbstractString, Nothing}
     )
-    rows = ReactantNitro.TableRows()
+    rows = TableRows()
     labels = Pair{Int, String}[]
     headers = Set{Int}()
     # A section's styles are keyed by its OWN row numbers; the table's are keyed by the table's.
@@ -161,10 +127,10 @@ end
 # terminal, dropped the columns that did not, formatted the cells and wrote the note. This method
 # draws them, and it is the only `show` of a `MetricHistory` longer than one line, so a process
 # without PrettyTables sees the compact form.
-function Base.show(io::IO, ::MIME"text/plain", h::ReactantNitro.MetricHistory)
+function Base.show(io::IO, ::MIME"text/plain", h::MetricHistory)
     isempty(h) && return show(io, h)
     height, width = displaysize(io)
-    t = ReactantNitro.history_table(h, height, width)
+    t = history_table(h, height, width)
     buf = IOBuffer()
     PrettyTables.pretty_table(
         IOContext(buf, io), t.cells;
@@ -196,12 +162,12 @@ end
 # ── The history table, for a notebook ────────────────────────────────────────────────
 #
 # The same cells from `history_table`, unthinned and with every column, since a notebook scrolls.
-function Base.show(io::IO, ::MIME"text/html", h::ReactantNitro.MetricHistory)
+function Base.show(io::IO, ::MIME"text/html", h::MetricHistory)
     if isempty(h)
         print(io, "<p><code>", _html_escape(sprint(show, h)), "</code></p>")
         return nothing
     end
-    t = ReactantNitro.history_table(h, typemax(Int32), typemax(Int32))
+    t = history_table(h, typemax(Int32), typemax(Int32))
     PrettyTables.pretty_table(
         io, t.cells;
         backend = :html,
@@ -230,9 +196,5 @@ function _html_note(note::AbstractString)
     )
 end
 
-function __init__()
-    ReactantNitro.table_renderer!(render_table)
-    return nothing
-end
-
-end
+# The default, installed at definition. `table_renderer!` swaps it.
+_TABLE_RENDERER[] = render_table

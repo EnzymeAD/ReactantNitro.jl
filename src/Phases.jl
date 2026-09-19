@@ -394,16 +394,14 @@ logger_info(nitro::Nitro) = logger_info(nitro.logger)
 # reads as prose rather than seven columns; see `binding_report_sections`.
 #
 # A `Ref` rather than dispatch, because the renderer is a process-wide setting with no argument to
-# dispatch on, and because an extension setting it in `__init__` is one assignment that cannot
-# invalidate anything already compiled.
+# dispatch on. Render.jl installs the default once it is defined.
 const _TABLE_RENDERER = Ref{Any}(nothing)
 
 """
     ReactantNitro.TableRows
 
 The row type every renderer receives, `Vector{Vector{String}}`: one inner vector per row, already
-rendered to strings. Spelled as an alias so the core and an extension state the same type rather
-than two that happen to agree today.
+rendered to strings. Spelled as an alias so a renderer states the same type.
 """
 const TableRows = Vector{Vector{String}}
 
@@ -451,17 +449,13 @@ TableSection(title, header, rows) = TableSection(title, header, rows, CellStyles
 
 Set the renderer every long `show` in this package goes through, and return the previous one.
 `f` is called as `f(io::IO, title::AbstractString, sections::Vector{`[`TableSection`](@ref)`},
-note::Union{AbstractString, Nothing})`, and `nothing` restores the built-in aligned-column
-renderer. **Write those argument types out in the renderer**: it is reached through a `Ref{Any}`,
+note::Union{AbstractString, Nothing})`, and `nothing` switches the table off. **Write those argument types out in the renderer**: it is reached through a `Ref{Any}`,
 so nothing checks them for you, and four untyped arguments under a generic name is the signature
 that muddles a stack trace and looks applicable to calls that are not this one.
 
-The framed table is the only long display there is: `Reactant` depends on `PrettyTables`, so every
-session that loads this package loads it too and this package's extension installs the framed
-renderer in its `__init__`. There is no built-in fallback renderer to maintain beside it. With
+The framed PrettyTables renderer is installed at definition and is the only one shipped. With
 `nothing` installed, a long `show` prints the table's title, its trailing note, and one line saying
-the renderer is missing, which is what a process that loaded neither PrettyTables nor its extension
-sees.
+the display is off.
 
 **The contract takes sections rather than one header and one set of rows**, which it did until the
 handle summary and the binding report became one table. The old five-argument form
@@ -474,17 +468,9 @@ function table_renderer!(f)
     return prev
 end
 
-# CONCRETELY TYPED, all four arguments, and not because this is hot: it is called once per
-# display. A renderer is reached through a `Ref{Any}`, so the call is already dynamic, and a
-# generically named `render(io, title, sections, note)` with four untyped arguments is the shape
-# that makes a stack trace ambiguous and invites a method from somewhere else to look applicable.
-# The types are the contract `table_renderer!` documents; an extension writes the same ones.
-#
-# NO SECOND RENDERER. There was a plain aligned-column fallback here, and it was a second display
-# path to keep in step with the framed one for a process that never exists in practice, since
-# Reactant loads PrettyTables. With no renderer installed the display says so and prints what it
-# can without one: the title and the note, which between them name the handle and the accessors
-# that answer the same questions as data.
+# NO SECOND RENDERER: a plain fallback was a second display path to keep in step with the framed
+# one. With the table switched off the display prints the title and the note, which between them
+# name the handle and the accessors that answer the same questions as data.
 function _render_sections(
         io::IO, title::AbstractString, sections::Vector{TableSection};
         note::Union{AbstractString, Nothing} = nothing
@@ -492,7 +478,7 @@ function _render_sections(
     r = _TABLE_RENDERER[]
     r === nothing || return r(io, title, sections, note)
     print(io, title)
-    print(io, "\n  (no table renderer is installed: `using PrettyTables` renders this display)")
+    print(io, "\n  (table display is off; `ReactantNitro.table_renderer!` reinstalls one)")
     note === nothing || print(io, "\n  ", note)
     return nothing
 end

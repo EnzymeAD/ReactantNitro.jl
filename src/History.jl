@@ -2,8 +2,7 @@
 #
 # `history(nitro)`: the per-epoch series a handle's own `train!` calls produced, as data first and
 # as a table second. The data is a `MetricHistory`, which indexes by epoch, selects metrics by
-# name, and hands a column back as a vector; the table is its `show`, and lives in the
-# PrettyTables extension because that is the one renderer this package has.
+# name, and hands a column back as a vector; the table is its `show`, drawn in Render.jl.
 #
 # ── Why a handle keeps a series at all ─────────────────────────────────────────────
 #
@@ -19,8 +18,7 @@
 # Deciding WHICH rows and columns fit a terminal is arithmetic over the data, and it is the part
 # worth testing without a frame around it. Drawing the frame is PrettyTables' job. So
 # `history_table` produces the cells, the labels, the alignment and the footer note for a given
-# display size, and the extension's `show` does nothing but hand those to `pretty_table`. There
-# is deliberately no plain renderer beside it; see `_render_sections`.
+# display size, and the `show` in Render.jl does nothing but hand those to `pretty_table`.
 
 """
     ReactantNitro.MetricHistory
@@ -228,7 +226,7 @@ Base.getindex(h::MetricHistory, epochs::AbstractVector{<:Integer}, names::Symbol
 Base.getindex(h::MetricHistory, ::Colon, names::Symbol...) = h[names...]
 
 # The compact form, and the whole display when no renderer is loaded: the three-argument
-# `text/plain` method lives in the PrettyTables extension and falls back to this without it.
+# `text/plain` method lives in Render.jl.
 function Base.show(io::IO, h::MetricHistory)
     n = length(h)
     print(io, "history of ", getfield(h, :experiment), ": ", n, n == 1 ? " epoch" : " epochs")

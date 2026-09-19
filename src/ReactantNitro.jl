@@ -34,6 +34,7 @@ import Lux
 import Optimisers
 # Checkpoint filenames use `%.6g` for the metric value, the same format an earlier stack used,
 # so a score in a name is reproducible by anyone with `printf`.
+import PrettyTables
 import Printf
 import ProgressLogging
 import ProgressMeter
@@ -75,6 +76,7 @@ include("EarlyStop.jl")   # early stopping
 include("IORetry.jl")     # retrying I/O
 include("Checkpoint.jl")  # checkpointing and resume
 include("History.jl")     # the per-epoch metric history a handle keeps, and its table
+include("Render.jl")      # the framed table renderer, text and HTML
 # Visualization needs `predict` and the batch routers, so it follows `Train.jl`; it is placed here
 # rather than immediately after it because nothing between the two depends on it.
 include("Visualize.jl")   # rendering

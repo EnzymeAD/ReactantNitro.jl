@@ -1,13 +1,5 @@
-# The ReactantNitroPrettyTablesExt extension: the boxed renderer it installs for every long `show`
-# in this package.
-#
-# The extension only activates when PrettyTables is loaded alongside ReactantNitro, so the
-# `using PrettyTables` below is what triggers it. That also means this file CHANGES A PROCESS-WIDE
-# SETTING: `__init__` installs the renderer, and every testitem sharing this worker would render
-# through it afterwards. ReTestItems runs one testitem per worker process at a time, and the last
-# testset here puts the previous renderer back, so neither this file's own later assertions nor a
-# testitem that follows it sees a renderer it did not ask for.
-@testitem "prettytables_ext" begin
+# The framed renderer every long `show` in this package goes through, and its roles.
+@testitem "render" begin
     using Test
     using ReactantNitro
     using PrettyTables
@@ -43,11 +35,6 @@
         finally
             PrettyTables.Crayons.force_color(prev)
         end
-    end
-
-    @testset "loading PrettyTables installs the renderer" begin
-        @test Base.get_extension(ReactantNitro, :ReactantNitroPrettyTablesExt) !== nothing
-        @test ReactantNitro._TABLE_RENDERER[] !== nothing
     end
 
     @testset "the boxed form carries the same facts as the plain one" begin
@@ -138,7 +125,7 @@
     # the core sets reaches a colour, and that a role this extension has never heard of leaves the
     # cell alone rather than taking the whole display down with a `KeyError`.
     @testset "roles map to the basic ANSI set, and an unknown role is inert" begin
-        ext = Base.get_extension(ReactantNitro, :ReactantNitroPrettyTablesExt)
+        ext = ReactantNitro
         crayon(c) = sprint(print, c; context = :color => true)
 
         # THE BASIC EIGHT, which is what makes this legible on a theme nobody here chose: these
@@ -171,7 +158,7 @@
             )
         end
         @test occursin("\e[35m", rendered(ReactantNitro.CellStyles((1, 2) => :accent)))
-        # A role from a newer core than this extension: the cell renders, undecorated.
+        # An unknown role: the cell renders, undecorated.
         out = rendered(ReactantNitro.CellStyles((1, 2) => :not_a_role_yet))
         @test occursin("a", out) && occursin("b", out)
         @test !occursin("\e[3", out)
@@ -185,8 +172,8 @@
             bare = sprint(show, MIME"text/plain"(), PTExp())
             @test !occursin("│", bare)
             @test occursin("PTExp", bare)
-            @test occursin("no table renderer is installed", bare)
-            @test occursin("using PrettyTables", bare)
+            @test occursin("table display is off", bare)
+            @test occursin("table_renderer!", bare)
             @test !endswith(bare, "\n")
         finally
             ReactantNitro.table_renderer!(prev)

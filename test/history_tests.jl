@@ -75,7 +75,7 @@
         @test occursin("`mae`", err.msg)
 
         @test sprint(show, h) == "history of KitMLP: 3 epochs (1 to 3), 1 metric, $(n.run_dir)"
-        # The table, through the PrettyTables extension Reactant's dependency loads.
+        # The table, through PrettyTables.
         s = sprint(show, MIME"text/plain"(), h)
         @test occursin("history of KitMLP", s)
         @test occursin("mae", s)

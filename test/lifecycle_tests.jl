@@ -943,7 +943,7 @@
         @test ReactantNitro._PROGRESS_ROUTE[] === :none
     end
 
-    # ── the table renderer, which the PrettyTables extension swaps ───────────────────────
+    # ── the table renderer, which `table_renderer!` swaps ─────────────────────────────────
     @testset "a swapped table renderer receives the documented arguments" begin
         seen = Ref{Any}(nothing)
         prev = ReactantNitro.table_renderer!(
@@ -991,8 +991,7 @@
         finally
             ReactantNitro.table_renderer!(prev)
         end
-        # Restoring the previous renderer, which in every real session is the PrettyTables
-        # extension's, since Reactant loads PrettyTables.
+        # Restoring the previous renderer, the framed default in every real session.
         @test ReactantNitro._TABLE_RENDERER[] === prev
     end
 
