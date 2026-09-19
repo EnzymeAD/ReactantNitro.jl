@@ -5,30 +5,12 @@
     using ReactantNitro
     using ReactantNitro: MetricHistory, history_table, thin_rows
     using Lux, Random, Statistics
+    # The shared toy model from the test kit, whose precompile workload already trained it once,
+    # so this item starts with the framework's specializations for it warm. Its `metrics` emit one
+    # scalar (`mae`) and one summed matrix (`cm`), which is the pair the table has to handle.
+    using NitroTestKit
 
-    @experiment struct HistMLP
-        width::GraphConst{Int} = 6
-    end
-    hist_chain(w) = Lux.Chain(Lux.Dense(4 => w, tanh), Lux.Dense(w => 2))
-    ReactantNitro.build_model(e::HistMLP, rng) =
-        (m = hist_chain(e.width); (m, Lux.setup(rng, m)...))
-    ReactantNitro.forward(::HistMLP, model, ps, st; x) = Lux.apply(model, x, ps, st)
-    ReactantNitro.loss(::HistMLP, ŷ; y) = mean(abs2, ŷ .- y)
-    # One scalar metric and one that is not, so the table has something to tabulate and
-    # something to name instead.
-    ReactantNitro.metrics(::HistMLP, ŷ; y) =
-        (; mae = (sum(abs, ŷ .- y), size(y, 2)), cm = (ones(Int, 2, 2), nothing))
-    ReactantNitro.learning_rate(::HistMLP) = 1.0f-2
-
-    hist_batches(n; seed = 3) = (
-        rng = Random.MersenneTwister(seed);
-        [(; x = randn(rng, Float32, 4, 8), y = randn(rng, Float32, 2, 8)) for _ in 1:n]
-    )
-    const HIST_TRAIN = hist_batches(4)
-    const HIST_VAL = hist_batches(2; seed = 4)
-    ReactantNitro.build_data(::HistMLP, dist) = (; train = HIST_TRAIN, val = HIST_VAL)
-
-    mk(; kw...) = Nitro(HistMLP(); run_dir = mktempdir(), kw...)
+    mk(; kw...) = kit_nitro(; kw...)
 
     @testset "the series, as data" begin
         n = train!(
@@ -77,10 +59,10 @@
         @test err isa ErrorException
         @test occursin("`mae`", err.msg)
 
-        @test sprint(show, h) == "history of HistMLP: 3 epochs (1 to 3), 1 metric, $(n.run_dir)"
+        @test sprint(show, h) == "history of KitMLP: 3 epochs (1 to 3), 1 metric, $(n.run_dir)"
         # The table, through the PrettyTables extension Reactant's dependency loads.
         s = sprint(show, MIME"text/plain"(), h)
-        @test occursin("history of HistMLP", s)
+        @test occursin("history of KitMLP", s)
         @test occursin("mae", s)
         @test occursin("*", s)
         @test occursin("best mae (min)", s)
@@ -89,7 +71,7 @@
 
         # Training on extends the same series.
         n2 = Nitro(
-            HistMLP(); run_dir = n.run_dir, data = n.data, max_epochs = 5, resume = :auto,
+            KitMLP(); run_dir = n.run_dir, data = n.data, max_epochs = 5, resume = :auto,
             checkpointer = TopKCheckpointer(; metric = :mae, mode = :min)
         )
         train!(n2)

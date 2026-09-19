@@ -1,0 +1,24 @@
+name = "NitroTestKit"
+uuid = "11666062-642e-4e4e-88d5-605dd3df0415"
+version = "0.1.0"
+authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
+
+# The test suite's shared fixture and its precompile workload. Local to this repository, reached
+# through the root Project.toml's `[sources]`, and never registered: it exists so that the test
+# workers start with the framework's Julia specializations for the toy model already compiled,
+# without adding a second to a regular user's precompile.
+[deps]
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+ReactantNitro = "641982cc-88f5-4d80-bec4-e68c6a8af0a5"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[sources]
+ReactantNitro = {path = "../.."}
+
+[compat]
+Lux = "1"
+PrecompileTools = "1"
+ReactantNitro = "0.1"
+julia = "1.12"

@@ -55,10 +55,16 @@ julia = "1.12"
 KaimonGate = "5ee84a8c-75bd-412f-a7b8-4e6463aa635f"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 MLUtils = "f1d291b0-491e-4a28-83b9-f70985020b54"
+NitroTestKit = "11666062-642e-4e4e-88d5-605dd3df0415"
 PrettyTables = "08abe8d2-0d0c-5749-adfa-8a2ac140af0d"
 ReTestItems = "817f1d60-ba6b-4fd5-9520-3cf149f6a823"
 TensorBoardLogger = "899adc3e-224a-11e9-021f-63837185c80f"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["KaimonGate", "Logging", "MLUtils", "PrettyTables", "ReTestItems", "TensorBoardLogger", "Test"]
+test = ["KaimonGate", "Logging", "MLUtils", "NitroTestKit", "PrettyTables", "ReTestItems", "TensorBoardLogger", "Test"]
+
+# The test suite's shared fixture and precompile workload, a local package that is never
+# registered; see test/NitroTestKit/src/NitroTestKit.jl for why it is a package.
+[sources]
+NitroTestKit = {path = "test/NitroTestKit"}
