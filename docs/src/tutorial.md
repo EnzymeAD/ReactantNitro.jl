@@ -658,6 +658,17 @@ using CairoMakie
 save("history.png", plot(h))
 ```
 
+## Progress, in a terminal or a notebook
+
+`train!` reports each stretch of work, an epoch or an evaluation pass, through one reporter
+contract, and the default reporter picks the display per stretch. In an interactive terminal it
+draws a ProgressMeter bar. Where there is no terminal but the current logger accepts
+[ProgressLogging](https://github.com/JuliaLogging/ProgressLogging.jl) records, which is Pluto, VS
+Code, or a REPL running [TerminalLoggers](https://github.com/JuliaLogging/TerminalLoggers.jl), it
+emits those records and the environment draws them its own way. In a CI log or a captured
+transcript it emits nothing. `ReactantNitro.progress_reporter!` installs either built-in
+reporter directly, your own function of the same five arguments, or `nothing` to silence it.
+
 ## Predicting on new data
 
 [`predict`](@ref) is [`forward`](@ref) alone, in eval mode, on any `Nitro`. It takes a batch

@@ -1098,8 +1098,9 @@ const _PROGRESS_REPORTER = Ref{Any}(nothing)
     ReactantNitro.progress_reporter!(f) -> previous
 
 Set the progress reporter and return the previous one. `nothing` disables progress output
-entirely; the default is [`ReactantNitro.progress_bar_reporter`](@ref), which draws a
-ProgressMeter bar when a person is watching and nothing otherwise.
+entirely; the default is [`ReactantNitro.default_progress_reporter`](@ref), which draws a
+ProgressMeter bar when a terminal is watching, emits ProgressLogging records when the current
+logger accepts them, and does nothing otherwise.
 
 `f` is called as `f(verb::Symbol, label::String, total::Int, epoch::Int, max_epochs::Int)`, with
 `verb` one of:
@@ -1320,6 +1321,143 @@ function progress_bar_reporter(
         _BAR_DIRTY[] || return nothing
         _BAR_DIRTY[] = false
         println(stderr)
+    end
+    return nothing
+end
+
+# ── The log reporter, for a notebook ─────────────────────────────────────────────────
+#
+# A ProgressMeter bar is a cursor animation, and a notebook has no cursor: Pluto stacks each redraw
+# as a new line, IJulia appends unless told to clear the cell, and the reporter above draws
+# nothing in either because neither gives it a terminal. What a notebook does have is a logger.
+# ProgressLogging.jl defines ONE record shape for "this much of that is done", and the environment
+# renders it: Pluto as a bar in the cell, VS Code in its status bar, TerminalLoggers as a bar in a
+# plain REPL, and any other logger by ignoring it. This reporter emits that record and nothing
+# else, so the framework takes no position on what a notebook looks like.
+#
+# It is the same shape as the plotting decision: one data stream from the training loop, and the
+# environment chooses the renderer. ProgressLogging itself is an ordinary dependency for the same
+# reason ProgressMeter is: it depends on Logging and UUIDs, both already here.
+#
+# THROTTLED ON `:step`. A record goes through the logging machinery, a lock and a channel in a
+# notebook, and a training epoch can be ten thousand steps; the bar cannot show them apart and the
+# pane cannot draw them apart, so a frame every tenth of a second is every frame anyone can see.
+# The first and the last frame of a stretch are never throttled, so a stretch always opens at zero
+# and closes as done.
+
+mutable struct _ProgressLog
+    const id::UUIDs.UUID
+    const name::String
+    phase::String
+    const total::Int
+    counter::Int
+    last_emit::Float64
+end
+
+const _PLOG = Ref{Union{Nothing, _ProgressLog}}(nothing)
+const _PLOG_INTERVAL = 0.1
+
+function _plog_emit!(st::_ProgressLog; done::Bool = false)
+    fraction = st.total > 0 ? min(1.0, st.counter / st.total) : nothing
+    name = isempty(st.phase) ? st.name : st.name * " [" * st.phase * "]"
+    Logging.@logmsg ProgressLogging.ProgressLevel ProgressLogging.Progress(
+        st.id, fraction; name, done
+    ) _id = st.id
+    st.last_emit = time()
+    return nothing
+end
+
+function _plog_close!()
+    st = _PLOG[]
+    _PLOG[] = nothing
+    st === nothing || _plog_emit!(st; done = true)
+    return nothing
+end
+
+# Whether the logger in effect accepts a progress record at all. `ProgressLevel` sits just below
+# `Info`, so the stdlib `ConsoleLogger` a bare process runs with drops it unread, and a CI log gets
+# no progress lines it did not ask for; a notebook's logger and TerminalLoggers accept it. Read at
+# each `:begin`, like the terminal check, because `with_logger` changes the answer per call.
+_logging_progress() =
+    Logging.min_enabled_level(Logging.current_logger()) <= ProgressLogging.ProgressLevel
+
+"""
+    ReactantNitro.progress_log_reporter(verb, label, total, epoch, max_epochs) -> nothing
+
+The progress reporter for an environment that renders log records rather than a terminal: Pluto,
+VS Code, a REPL with TerminalLoggers, and any notebook whose logger accepts ProgressLogging's
+`ProgressLevel`. Implements the contract [`progress_reporter!`](@ref) documents by emitting one
+[`ProgressLogging.Progress`](https://github.com/JuliaLogging/ProgressLogging.jl) record per frame,
+under one id per stretch of work: a fraction of zero at `:begin`, the fraction done on `:step` at
+most every tenth of a second, the phase appended to the name on `:phase`, and `done = true` at
+`:end`. A stretch with `total = 0` carries no fraction, which the renderers draw as busy.
+
+Emits regardless of whether anything is listening; the logger drops what it does not accept. The
+default reporter, [`default_progress_reporter`](@ref), picks this one when no terminal is watching
+and the current logger accepts the level.
+"""
+function progress_log_reporter(
+        verb::Symbol, label::String, total::Int, epoch::Int, max_epochs::Int
+    )
+    if verb === :begin
+        _plog_close!()
+        name = max_epochs > 0 ? "$label epoch $epoch/$max_epochs" : label
+        st = _ProgressLog(UUIDs.uuid4(), name, "", total, 0, 0.0)
+        _PLOG[] = st
+        _plog_emit!(st)
+    elseif verb === :phase
+        st = _PLOG[]
+        st === nothing && return nothing
+        st.phase == label && return nothing
+        st.phase = label
+        _plog_emit!(st)
+    elseif verb === :step
+        st = _PLOG[]
+        # A unit-less stretch has no fraction to advance, so a stray step draws nothing.
+        (st === nothing || st.total <= 0) && return nothing
+        st.counter += 1
+        if st.counter >= st.total || time() - st.last_emit >= _PLOG_INTERVAL
+            _plog_emit!(st)
+        end
+    elseif verb === :end || verb === :done
+        _plog_close!()
+    end
+    return nothing
+end
+
+# ── The default: a terminal first, a logger second, silence otherwise ────────────────
+
+# Where the CURRENT stretch is being reported, chosen at its `:begin` and held to its `:end`, so
+# a stretch that starts on a terminal is not half-drawn and half-logged if the answer changes
+# under it.
+const _PROGRESS_ROUTE = Ref{Symbol}(:none)
+
+"""
+    ReactantNitro.default_progress_reporter(verb, label, total, epoch, max_epochs) -> nothing
+
+The progress reporter installed at load. At each stretch's `:begin` it picks, in order:
+[`progress_bar_reporter`](@ref) when the session is interactive and `stderr` is a terminal;
+[`progress_log_reporter`](@ref) when the current logger accepts ProgressLogging's level, which is
+a notebook or a REPL with TerminalLoggers; nothing otherwise, which is a CI log or a captured
+transcript. The choice holds for the stretch. Install either reporter directly with
+[`progress_reporter!`](@ref) to force one.
+"""
+function default_progress_reporter(
+        verb::Symbol, label::String, total::Int, epoch::Int, max_epochs::Int
+    )
+    if verb === :begin
+        _PROGRESS_ROUTE[] = _drawing_progress() ? :bar : _logging_progress() ? :log : :none
+    end
+    route = _PROGRESS_ROUTE[]
+    if verb === :done
+        # Both may hold state to close: the bar its line, the log an open stretch.
+        progress_bar_reporter(verb, label, total, epoch, max_epochs)
+        progress_log_reporter(verb, label, total, epoch, max_epochs)
+        _PROGRESS_ROUTE[] = :none
+    elseif route === :bar
+        progress_bar_reporter(verb, label, total, epoch, max_epochs)
+    elseif route === :log
+        progress_log_reporter(verb, label, total, epoch, max_epochs)
     end
     return nothing
 end

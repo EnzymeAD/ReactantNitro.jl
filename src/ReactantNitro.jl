@@ -29,17 +29,20 @@ import Functors
 import JLD2
 import JSON3
 import LinearAlgebra
+import Logging
 import Lux
 import Optimisers
 # Checkpoint filenames use `%.6g` for the metric value, the same format an earlier stack used,
 # so a score in a name is reproducible by anyone with `printf`.
 import Printf
+import ProgressLogging
 import ProgressMeter
 import Random
 import Reactant
 import SHA
 import Statistics
 import Tables
+import UUIDs
 
 """
     ReactantNitro._unimplemented(what, detail)
@@ -181,13 +184,13 @@ export visualize, save_figure, render
 # Distribution stubs
 export rank, world_size
 
-# The progress bar is installed HERE rather than at its definition, because a `Ref` filled during
-# precompilation is filled in the precompiling process and this one has to be filled in every
-# process that loads the package. Nothing is drawn as a result: `progress_bar_reporter` decides
-# per stretch of work whether anyone is watching, and outside an interactive terminal the answer
-# is no.
+# The progress reporter is installed HERE rather than at its definition, because a `Ref` filled
+# during precompilation is filled in the precompiling process and this one has to be filled in
+# every process that loads the package. Nothing is drawn as a result: `default_progress_reporter`
+# decides per stretch of work whether a terminal is watching or a logger is listening, and in a
+# process with neither it does nothing.
 function __init__()
-    progress_reporter!(progress_bar_reporter)
+    progress_reporter!(default_progress_reporter)
     return nothing
 end
 
