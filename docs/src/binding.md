@@ -50,15 +50,16 @@ metrics(e, outputs; label)           # the same
 
 ## The outputs: `forward` to everything downstream
 
-```julia
-outputs, st_new = forward(e, model, ps, st; img)  # st_new is threaded back into the layer state
-                                                  # and discarded in eval mode; `outputs` moves on
-                                                  # EXACTLY as returned, as one positional argument:
-loss(e, outputs; label)                 # a scalar, differentiated in the gradient program
-train_metrics(e, outputs; label)        # scalars per step, traced beside the loss
-metrics(e, outputs; label)              # (sum, count) per eval batch; padding already sliced off
-predict(nitro, batch)                   # the same outputs, returned as host arrays
-```
+`forward(e, model, ps, st; img)` returns `(outputs, st_new)`. The framework threads `st_new` back
+into the layer state, discarding it in eval mode, and hands `outputs` on **exactly as returned, as
+one positional argument**:
+
+| receives `outputs` | and produces |
+| --- | --- |
+| `loss(e, outputs; label)` | a scalar, differentiated in the gradient program |
+| `train_metrics(e, outputs; label)` | scalars per step, traced beside the loss |
+| `metrics(e, outputs; label)` | `(sum, count)` per eval batch, with the padding already sliced off |
+| `predict(nitro, batch)` | the same outputs, returned to you as host arrays |
 
 - Whatever `forward` puts in the first slot is what `loss` receives in its second. Nothing is
   splatted, unpacked, or renamed in between.

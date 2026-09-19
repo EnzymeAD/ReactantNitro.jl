@@ -398,6 +398,41 @@ html:root #documenter-settings hr {
 html:root #documenter-settings a {
     color: var(--brand-link, inherit);
 }
+/* The theme paints the card's footer and its head/foot borders in its own
+ * greys (#282f2f, #343c3d, #5e6d6f in documenter-dark), which read green
+ * against this palette; the select's chevron, hover and focus borders take
+ * the theme's link color. Give every one of those the brand's own values. */
+html:root .modal-card-foot {
+    background-color: var(--brand-navbar-bg, transparent);
+    border-top: 1px solid var(--brand-navbar-border, transparent);
+}
+html:root .modal-card-head,
+html:root .modal-card-foot {
+    border-color: var(--brand-navbar-border, transparent);
+}
+html:root #documenter-settings .select:not(.is-multiple):not(.is-loading)::after,
+html:root #documenter-settings .select:not(.is-multiple):not(.is-loading):hover::after {
+    border-color: var(--brand-link, currentColor);
+}
+html:root #documenter-settings .select select:hover,
+html:root #documenter-settings .select select:active {
+    border-color: var(--brand-link, currentColor);
+}
+html:root #documenter-settings .select select:focus {
+    border-color: var(--brand-link, currentColor);
+    box-shadow: 0 0 0 0.125em var(--brand-focus-ring, transparent);
+}
+html:root #documenter-settings .select select option {
+    background-color: var(--brand-search-bg, transparent);
+    color: var(--brand-text, inherit);
+}
+html:root #documenter-settings .delete {
+    background-color: var(--brand-muted, currentColor);
+}
+html:root #documenter-settings .delete:hover,
+html:root #documenter-settings .delete:focus {
+    background-color: var(--brand-link-hover, currentColor);
+}
 html:root ::selection {
     background-color: var(--brand-selection-bg, currentColor);
     color: var(--brand-selection-text, inherit);
