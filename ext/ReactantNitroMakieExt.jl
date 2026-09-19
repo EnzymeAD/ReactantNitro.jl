@@ -1,29 +1,10 @@
 # ReactantNitroMakieExt.jl
 #
-# `plot(history(nitro))` and `plot(nitro)`, for whichever Makie backend the session has loaded.
-#
-# ── Why the weak dependency is Makie and not a backend ───────────────────────────────
-#
-# Every backend loads Makie: CairoMakie for a file or a notebook image, GLMakie for a window,
-# WGLMakie for Pluto and Jupyter. An extension on Makie therefore activates with any of them and
-# takes no position on which, and a training environment that loads none of them carries no
-# plotting code at all. The same figure is what a REPL saves to PNG and what a notebook shows
-# inline with hover and zoom, which is the bridge to those environments: there is one object,
-# and the environment decides how it is displayed.
-#
-# ── What is decided here, and what is not ────────────────────────────────────────────
-#
-# Nothing about the data. `history_series` in the core chose the curves, the axis, and the marked
-# point, and is tested without this package. This file turns its panels into a `SpecApi` layout:
-# one `Axis` per curve, arranged in a grid, under a title. The `SpecApi` route rather than a
-# recipe because a recipe draws into ONE axis and the default here is one axis per metric, and
-# because a spec is what lets `plot(fig[2, 1], h)` place the whole grid inside a caller's figure.
-#
-# ── The one mark ─────────────────────────────────────────────────────────────────────
-#
-# The best epoch is drawn as a star and named in that panel's title. A shape and a word, not a
-# colour alone, so it reads in print, on a projector, and under any theme: colours here are
-# Makie's own, from whatever theme the session set, and this extension sets none.
+# `plot(history(nitro))` and `plot(nitro)`. The weak dependency is Makie, not a backend, so
+# CairoMakie, GLMakie and WGLMakie all activate it. `history_series` in the core decides what is
+# drawn; this file lays it out with SpecApi rather than a recipe, so the figure can be one axis
+# per curve and embed with `plot(fig[2, 1], h)`. Colours are the session's theme; the best epoch
+# is a star named in the title, not a colour.
 module ReactantNitroMakieExt
 
 import ReactantNitro
@@ -40,8 +21,7 @@ function Makie.convert_arguments(
     )
     s = history_series(h; x, metrics)
     n = length(s.panels)
-    # One curve is one axis. Up to four sit two abreast; more go three abreast, which keeps a
-    # panel wide enough that its title still fits on one line at Makie's default figure size.
+    # Up to four panels two abreast, more three abreast, so a title still fits its panel.
     ncols = n == 1 ? 1 : n <= 4 ? 2 : 3
     content = Pair{Tuple{Int, UnitRange{Int}}, Union{Makie.BlockSpec, Makie.GridLayoutSpec}}[]
     push!(
@@ -50,9 +30,7 @@ function Makie.convert_arguments(
             text = s.title, font = :bold, fontsize = 18, halign = :left, tellwidth = false
         ),
     )
-    # The theme's first series colour, taken explicitly: the line would get it by cycling, but a
-    # stroke does not cycle, and the star's stroke must be the line's colour so it reads as a
-    # point ON the curve rather than a second series.
+    # Explicit because a stroke does not cycle, and the star's stroke must match the line.
     colour = Makie.to_color(first(Makie.to_value(Makie.theme(:palette)[:color])))
     for (i, p) in enumerate(s.panels)
         r, c = fldmod1(i, ncols)
@@ -67,8 +45,7 @@ function Makie.convert_arguments(
                 ),
             )
         end
-        # The best epoch is the extreme of its curve, so on a marked panel the automatic limits
-        # get more air than Makie's default 5%, or a small panel clips half the star.
+        # The star sits at the curve's extreme; Makie's default 5% margin clips half of it.
         margin = p.best === nothing ? (0.05f0, 0.05f0) : (0.12f0, 0.12f0)
         push!(
             content,
@@ -81,7 +58,6 @@ function Makie.convert_arguments(
     return S.GridLayout(content)
 end
 
-# A handle plots as its history, so `plot(nitro)` after `train!` is the curve of the run.
 Makie.plot(n::Nitro; kw...) = Makie.plot(history(n); kw...)
 Makie.plot(fig::Union{Makie.Figure, Makie.GridPosition}, n::Nitro; kw...) =
     Makie.plot(fig, history(n); kw...)

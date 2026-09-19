@@ -195,11 +195,7 @@ end
 
 # ── The history table, for a notebook ────────────────────────────────────────────────
 #
-# Jupyter, VS Code and Pluto ask for `text/html` before `text/plain`, so without this method a
-# notebook shows the terminal table in a `<pre>`, thinned against the 24 lines a terminal-less
-# `IO` claims to have. This is the same table drawn by the HTML backend, with NO thinning and no
-# column dropped: a notebook scrolls, and the cell is the record. Decimals, column order, the
-# best-epoch mark and the footer notes are `history_table`'s, unchanged.
+# The same cells from `history_table`, unthinned and with every column, since a notebook scrolls.
 function Base.show(io::IO, ::MIME"text/html", h::ReactantNitro.MetricHistory)
     if isempty(h)
         print(io, "<p><code>", _html_escape(sprint(show, h)), "</code></p>")

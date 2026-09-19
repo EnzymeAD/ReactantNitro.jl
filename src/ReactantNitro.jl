@@ -184,11 +184,8 @@ export visualize, save_figure, render
 # Distribution stubs
 export rank, world_size
 
-# The progress reporter is installed HERE rather than at its definition, because a `Ref` filled
-# during precompilation is filled in the precompiling process and this one has to be filled in
-# every process that loads the package. Nothing is drawn as a result: `default_progress_reporter`
-# decides per stretch of work whether a terminal is watching or a logger is listening, and in a
-# process with neither it does nothing.
+# Installed here, not at the definition: a `Ref` filled during precompilation is filled in the
+# precompiling process only. Nothing is drawn by this; the reporter decides per stretch of work.
 function __init__()
     progress_reporter!(default_progress_reporter)
     return nothing

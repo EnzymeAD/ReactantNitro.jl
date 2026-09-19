@@ -1327,23 +1327,9 @@ end
 
 # ── The log reporter, for a notebook ─────────────────────────────────────────────────
 #
-# A ProgressMeter bar is a cursor animation, and a notebook has no cursor: Pluto stacks each redraw
-# as a new line, IJulia appends unless told to clear the cell, and the reporter above draws
-# nothing in either because neither gives it a terminal. What a notebook does have is a logger.
-# ProgressLogging.jl defines ONE record shape for "this much of that is done", and the environment
-# renders it: Pluto as a bar in the cell, VS Code in its status bar, TerminalLoggers as a bar in a
-# plain REPL, and any other logger by ignoring it. This reporter emits that record and nothing
-# else, so the framework takes no position on what a notebook looks like.
-#
-# It is the same shape as the plotting decision: one data stream from the training loop, and the
-# environment chooses the renderer. ProgressLogging itself is an ordinary dependency for the same
-# reason ProgressMeter is: it depends on Logging and UUIDs, both already here.
-#
-# THROTTLED ON `:step`. A record goes through the logging machinery, a lock and a channel in a
-# notebook, and a training epoch can be ten thousand steps; the bar cannot show them apart and the
-# pane cannot draw them apart, so a frame every tenth of a second is every frame anyone can see.
-# The first and the last frame of a stretch are never throttled, so a stretch always opens at zero
-# and closes as done.
+# A notebook has no cursor for a bar but does have a logger. This emits ProgressLogging records,
+# which Pluto, VS Code and TerminalLoggers render and other loggers drop. Steps are throttled to a
+# frame per tenth of a second; the first and last frame of a stretch always go out.
 
 mutable struct _ProgressLog
     const id::UUIDs.UUID
@@ -1374,10 +1360,8 @@ function _plog_close!()
     return nothing
 end
 
-# Whether the logger in effect accepts a progress record at all. `ProgressLevel` sits just below
-# `Info`, so the stdlib `ConsoleLogger` a bare process runs with drops it unread, and a CI log gets
-# no progress lines it did not ask for; a notebook's logger and TerminalLoggers accept it. Read at
-# each `:begin`, like the terminal check, because `with_logger` changes the answer per call.
+# `ProgressLevel` is below `Info`, so the stdlib `ConsoleLogger` drops the records and a CI log
+# stays clean. Read at each `:begin` because `with_logger` changes the answer per call.
 _logging_progress() =
     Logging.min_enabled_level(Logging.current_logger()) <= ProgressLogging.ProgressLevel
 
@@ -1427,9 +1411,7 @@ end
 
 # ── The default: a terminal first, a logger second, silence otherwise ────────────────
 
-# Where the CURRENT stretch is being reported, chosen at its `:begin` and held to its `:end`, so
-# a stretch that starts on a terminal is not half-drawn and half-logged if the answer changes
-# under it.
+# Chosen at `:begin` and held to `:end`, so one stretch is never half-drawn and half-logged.
 const _PROGRESS_ROUTE = Ref{Symbol}(:none)
 
 """

@@ -154,8 +154,7 @@ function Base.getproperty(h::MetricHistory, name::Symbol)
     return getfield(h, name)
 end
 
-# A column as a vector with the narrowest element type its values allow, `Union{Missing, T}`
-# when an epoch lacks the metric, so a consumer sees `Vector{Float64}` and not `Vector{Any}`.
+# The narrowest element type the values allow, `Union{Missing, T}` when an epoch lacks the metric.
 function _column(h::MetricHistory, name::Symbol)
     col = Any[get(r, name, missing) for r in _rows(h)]
     present = Any[v for v in col if !ismissing(v)]
@@ -166,11 +165,8 @@ end
 
 # ── Tables.jl ──────────────────────────────────────────────────────────────────────
 #
-# Column access ONLY, and that is a display decision as much as an interface one. Pluto shows any
-# table that reports ROW access in its own paginated grid of raw values, ahead of the `text/html`
-# method below; a column-access table falls through to ours. Every consumer this is for,
-# `DataFrame`, `CSV.write`, a plotting recipe, reads columns, and Tables.jl derives rows from
-# columns for the rest.
+# Column access only: Pluto replaces the `text/html` show of any table that reports row access
+# with its own grid of raw values. Tables.jl derives rows from columns for everything else.
 Tables.istable(::Type{MetricHistory}) = true
 Tables.columnaccess(::Type{MetricHistory}) = true
 Tables.columns(h::MetricHistory) =
@@ -379,8 +375,7 @@ function history_table(h::MetricHistory, height::Integer, width::Integer)
         notes, "* best $(best.metric) ($(best.mode)), the checkpointer's metric"
     )
     if shown < n
-        # A window of `budget` rows around the best epoch, or the end, is one that shows every
-        # row when selected; the whole range would only come back thinned the same way.
+        # A window of `budget` rows around the best epoch; the whole range would thin again.
         lo = clamp(something(ibest, n) - budget ÷ 2, 1, n - budget + 1)
         hi = lo + budget - 1
         push!(
@@ -423,9 +418,7 @@ end
 
 # ── The plot ───────────────────────────────────────────────────────────────────────
 #
-# Same split as the table: which curves a plot draws, against which axis, with which point marked,
-# is arithmetic over the data and is decided here; drawing them is the Makie extension's job, and
-# there is no plotting package in this environment to draw them with.
+# Same split as the table: what is drawn is decided here, the Makie extension draws it.
 
 """
     ReactantNitro.history_series(h; x = :epoch, metrics = nothing) -> NamedTuple
