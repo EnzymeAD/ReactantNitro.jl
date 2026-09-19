@@ -947,8 +947,8 @@
     @testset "a swapped table renderer receives the documented arguments" begin
         seen = Ref{Any}(nothing)
         prev = ReactantNitro.table_renderer!(
-            (io, title, sections, note) -> begin
-                seen[] = (; title, sections, note)
+            (io, mime, title, sections, note) -> begin
+                seen[] = (; mime, title, sections, note)
                 print(io, "RENDERED BY THE STUB")
             end
         )
@@ -956,6 +956,10 @@
             n = mk_life(; max_epochs = 1)
             out = sprint(show, MIME"text/plain"(), n)
             @test out == "RENDERED BY THE STUB"
+            @test seen[].mime == MIME"text/plain"()
+            # The same description reaches the renderer when a notebook asks for HTML.
+            @test sprint(show, MIME"text/html"(), n) == "RENDERED BY THE STUB"
+            @test seen[].mime == MIME"text/html"()
             got = seen[]
             @test occursin("Nitro for LifeMLP", got.title)
             @test got.sections isa Vector{ReactantNitro.TableSection}

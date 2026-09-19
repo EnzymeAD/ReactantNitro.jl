@@ -642,7 +642,9 @@ metric that is not a scalar, the confusion matrix above, is named in the footer 
 from and the footer says so.
 
 The history is also a Tables.jl table, so `DataFrame(h)` and `CSV.write("run.csv", h)` take it
-directly, and in a notebook it displays as the same table in HTML with every row. Slicing keeps
+directly, and in a notebook it displays as the same table in HTML with every row. The handle and
+the experiment display the same way: one description, drawn as a framed text table in a terminal
+and as an HTML table wherever `text/html` is asked for. Slicing keeps
 all of that: `h[10:20, :acc]` is a `MetricHistory` too, and shows, plots and converts the same way.
 
 With a Makie backend loaded, `plot(h)` or `plot(n)` draws the same history. The default is one

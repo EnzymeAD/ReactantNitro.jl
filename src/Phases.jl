@@ -448,8 +448,9 @@ TableSection(title, header, rows) = TableSection(title, header, rows, CellStyles
     ReactantNitro.table_renderer!(f) -> previous
 
 Set the renderer every long `show` in this package goes through, and return the previous one.
-`f` is called as `f(io::IO, title::AbstractString, sections::Vector{`[`TableSection`](@ref)`},
-note::Union{AbstractString, Nothing})`, and `nothing` switches the table off. **Write those argument types out in the renderer**: it is reached through a `Ref{Any}`,
+`f` is called as `f(io::IO, mime::MIME, title::AbstractString,
+sections::Vector{`[`TableSection`](@ref)`}, note::Union{AbstractString, Nothing})`, with `mime`
+either `MIME"text/plain"` or `MIME"text/html"`, and `nothing` switches the table off. **Write those argument types out in the renderer**: it is reached through a `Ref{Any}`,
 so nothing checks them for you, and four untyped arguments under a generic name is the signature
 that muddles a stack trace and looks applicable to calls that are not this one.
 
@@ -457,9 +458,9 @@ The framed PrettyTables renderer is installed at definition and is the only one 
 `nothing` installed, a long `show` prints the table's title, its trailing note, and one line saying
 the display is off.
 
-**The contract takes sections rather than one header and one set of rows**, which it did until the
-handle summary and the binding report became one table. The old five-argument form
-`f(io, title, header, rows, note)` is gone, and a renderer still written against it raises a
+**The contract takes the MIME type and sections.** Every long display defines both `show` methods
+from one description, so a notebook that asks for HTML and a terminal that asks for text draw the
+same facts. Older forms of the contract are gone, and a renderer written against one raises a
 `MethodError` on the first display rather than being quietly skipped.
 """
 function table_renderer!(f)
@@ -472,11 +473,11 @@ end
 # one. With the table switched off the display prints the title and the note, which between them
 # name the handle and the accessors that answer the same questions as data.
 function _render_sections(
-        io::IO, title::AbstractString, sections::Vector{TableSection};
+        io::IO, mime::MIME, title::AbstractString, sections::Vector{TableSection};
         note::Union{AbstractString, Nothing} = nothing
     )
     r = _TABLE_RENDERER[]
-    r === nothing || return r(io, title, sections, note)
+    r === nothing || return r(io, mime, title, sections, note)
     print(io, title)
     print(io, "\n  (table display is off; `ReactantNitro.table_renderer!` reinstalls one)")
     note === nothing || print(io, "\n  ", note)
@@ -486,9 +487,13 @@ end
 # The one-section call, which is what a display with nothing to divide up wants: the experiment
 # table, and a caller assembling a single band by hand.
 _render_table(
-    io::IO, title::AbstractString, header::Vector{String}, rows::TableRows;
+    io::IO, mime::MIME, title::AbstractString, header::Vector{String}, rows::TableRows;
     note::Union{AbstractString, Nothing} = nothing
-) = _render_sections(io, title, [TableSection("", header, rows)]; note)
+) = _render_sections(io, mime, title, [TableSection("", header, rows)]; note)
+
+# Every long display answers both MIME types: a terminal asks for text, a notebook for HTML and
+# falls back to text. ONE METHOD PER MIME, never a `Union`: `show(io, ::Union{...}, ::T)` is
+# ambiguous with Base's own `show(io, ::MIME"text/plain", x)`.
 
 # `nothing` rather than a guess for a handle whose layout is not a `FlatLayout`: a display reports
 # what it can read and invents nothing.
@@ -624,7 +629,10 @@ end
 # The rule that kept them apart is still enforced, and it is about CONTENT rather than layout: a
 # value appears in exactly one section. The state band holds what the handle carries, the binding
 # bands hold where each configured value came from, and neither repeats the other.
-function Base.show(io::IO, ::MIME"text/plain", nitro::Nitro)
+Base.show(io::IO, ::MIME"text/plain", nitro::Nitro) = _show_nitro(io, MIME"text/plain"(), nitro)
+Base.show(io::IO, ::MIME"text/html", nitro::Nitro) = _show_nitro(io, MIME"text/html"(), nitro)
+
+function _show_nitro(io::IO, mime::MIME, nitro::Nitro)
     pg = _nitro_params(nitro)
     devs = _nitro_devices(nitro)
     state = TableRows(
@@ -720,7 +728,7 @@ function Base.show(io::IO, ::MIME"text/plain", nitro::Nitro)
     # naming `parameters` as the way to get the arrays themselves. Saying it a third time in the
     # title told a reader nothing the table was not already telling them.
     title = "Nitro for " * string(nameof(typeof(nitro.e)))
-    _render_sections(io, title, sections; note)
+    _render_sections(io, mime, title, sections; note)
     return nothing
 end
 

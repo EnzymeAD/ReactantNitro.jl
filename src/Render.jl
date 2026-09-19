@@ -1,6 +1,7 @@
 # Render.jl
 #
-# The framed renderer every long `show` goes through, and the history table's two shows. PrettyTables
+# The framed renderer every long `show` goes through, as text and as HTML, and the history table's
+# two shows. PrettyTables
 # is an ordinary dependency: Reactant loads it into every process anyway, and a renderer installed
 # at definition needs no `__init__`, which matters for a tool that evaluates this package from
 # source and skips initialisers. Sections become `row_group_labels` bands of ONE frame, drawn
@@ -42,31 +43,20 @@ const _ROLE_CRAYONS = Dict{Symbol, PrettyTables.Crayon}(
     :accent => PrettyTables.Crayon(foreground = :magenta),
 )
 
-# The renderer contract, as `table_renderer!` documents it. Typed in full: it is reached through
-# a `Ref{Any}`, so nothing else checks the signature.
-function render_table(
-        io::IO, title::AbstractString, sections::Vector{TableSection},
-        note::Union{AbstractString, Nothing}
-    )
+# The sections flattened into one grid: the cells, the band labels by row, the header rows, and
+# the roles keyed by the table's own row numbers rather than each section's.
+function _table_layout(sections::Vector{TableSection})
     rows = TableRows()
     labels = Pair{Int, String}[]
     headers = Set{Int}()
-    # A section's styles are keyed by its OWN row numbers; the table's are keyed by the table's.
-    # This is where the two are reconciled, once, rather than at every lookup.
     roles = Dict{Tuple{Int, Int}, Symbol}()
     for sec in sections
-        # An empty section title draws no band label. The leading section uses it: the table's
-        # own title already names that band, and a label directly under the title is a heading
-        # printed twice. A label is placed at the row it precedes, so it is computed BEFORE the
-        # section's rows are appended.
+        # An empty section title draws no band label: the leading section is named by the
+        # table's title. A label sits at the row it precedes, so it is placed before the rows.
         isempty(sec.title) || push!(labels, (length(rows) + 1) => sec.title)
         if any(!isempty, sec.header)
             push!(rows, sec.header)
-            # Remembered so the highlighter below can BOLD it. A section's column header is an
-            # ordinary data row as far as the table is concerned, so nothing else distinguishes
-            # `group  settings  params` from the group rows underneath it, and a header that
-            # reads as data is worse than no header at all.
-            push!(headers, length(rows))
+            push!(headers, length(rows))    # an ordinary row to the table; bolded below
         end
         offset = length(rows)
         append!(rows, sec.rows)
@@ -74,50 +64,101 @@ function render_table(
             roles[(offset + r, c)] = role
         end
     end
-    isempty(rows) && return print(io, title)
+    isempty(rows) && return nothing
     cols = maximum(length, rows)
     data = [get(rows[r], c, "") for r in 1:length(rows), c in 1:cols]
+    return (; data, labels, headers, roles)
+end
 
+# The renderer contract, as `table_renderer!` documents it, once per MIME type. Typed in full: it
+# is reached through a `Ref{Any}`, so nothing else checks the signature.
+function render_table(
+        io::IO, ::MIME"text/plain", title::AbstractString, sections::Vector{TableSection},
+        note::Union{AbstractString, Nothing}
+    )
+    t = _table_layout(sections)
+    t === nothing && return print(io, title)
     # Rendered into a buffer for one reason: `pretty_table` ends its output with a newline and a
-    # `show` method must not, or every display carries a blank line under it. `IOContext(buf, io)`
-    # carries the caller's attributes across, `:color` above all, so the detour costs nothing else.
+    # `show` method must not. `IOContext(buf, io)` carries `:color` across.
     buf = IOBuffer()
     PrettyTables.pretty_table(
-        IOContext(buf, io), data;
+        IOContext(buf, io), t.data;
         alignment = :l, title, title_alignment = :l,
-        # The real column-label row is off: every section carries its own header as a data row,
-        # because one label row cannot describe five sections with different columns.
+        # Every section carries its own header as a data row; one label row cannot serve them.
         show_column_labels = false,
-        row_group_labels = isempty(labels) ? nothing : labels,
-        # ORDER IS THE PRECEDENCE: PrettyTables applies the FIRST highlighter that matches, so
-        # the header rule comes first and a section's column header stays bold even where a role
-        # was set on the same coordinates. Every crayon here is emitted solely when the
-        # destination declares color, so a `sprint` in a test or a redirect to a file still gets
-        # clean text.
+        row_group_labels = isempty(t.labels) ? nothing : t.labels,
+        # ORDER IS THE PRECEDENCE: the first matching highlighter wins, so a header stays bold
+        # where a role was set on the same cell. An unknown role leaves the cell alone.
         highlighters = [
-            PrettyTables.TextHighlighter((_, i, _) -> i in headers; bold = true),
-            # A ROLE THIS PALETTE DOES NOT KNOW LEAVES THE CELL ALONE, which is why the
-            # predicate looks the role up here rather than only checking that one was set. The
-            # roles are a contract between a `show` in the core and whatever renderer is
-            # installed, so a core that grows a seventh must not take a `KeyError` out of the
-            # display of every handle in a session that has not upgraded this extension with it.
+            PrettyTables.TextHighlighter((_, i, _) -> i in t.headers; bold = true),
             PrettyTables.TextHighlighter(
-                (_, i, j) -> haskey(_ROLE_CRAYONS, get(roles, (i, j), :none)),
-                (_, _, i, j) -> _ROLE_CRAYONS[roles[(i, j)]]
+                (_, i, j) -> haskey(_ROLE_CRAYONS, get(t.roles, (i, j), :none)),
+                (_, _, i, j) -> _ROLE_CRAYONS[t.roles[(i, j)]]
             ),
         ],
         table_format = PrettyTables.TextTableFormat(;
             vertical_lines_at_data_columns = :none,
             horizontal_line_after_column_labels = false,
         ),
-        # NO CROPPING. The default fits the table to the display and drops what does not fit, and
-        # what does not fit here is the right-hand column: the sources and the checkpoint path,
-        # which are the reason someone printed the handle. A wrapped long line beats an elided one.
+        # NO CROPPING: what would be dropped is the right-hand column, the sources and paths,
+        # which are the reason someone printed the handle.
         fit_table_in_display_horizontally = false,
         fit_table_in_display_vertically = false,
     )
     print(io, rstrip(String(take!(buf)), '\n'))
     note === nothing || print(io, "\n  ", note)
+    return nothing
+end
+
+# The same roles as CSS. Named colours, so a notebook theme's text colour still shows through
+# everywhere a role is not set, and `:bad` is bold as well as red, as in the terminal.
+const _ROLE_CSS = Dict{Symbol, Vector{Pair{String, String}}}(
+    :good => ["color" => "green"],
+    :busy => ["color" => "teal"],
+    :warn => ["color" => "darkorange"],
+    :bad => ["color" => "red", "font-weight" => "bold"],
+    :muted => ["color" => "gray"],
+    :accent => ["color" => "purple"],
+)
+
+const _HTML_STYLE = PrettyTables.HtmlTableStyle(;
+    title = ["font-weight" => "bold", "font-size" => "large", "text-align" => "left"],
+)
+
+function render_table(
+        io::IO, ::MIME"text/html", title::AbstractString, sections::Vector{TableSection},
+        note::Union{AbstractString, Nothing}
+    )
+    t = _table_layout(sections)
+    if t === nothing
+        print(io, "<p><b>", _html_escape(title), "</b></p>")
+    else
+        PrettyTables.pretty_table(
+            io, t.data;
+            backend = :html, alignment = :l, title,
+            show_column_labels = false,
+            row_group_labels = isempty(t.labels) ? nothing : t.labels,
+            highlighters = [
+                PrettyTables.HtmlHighlighter(
+                    (_, i, _) -> i in t.headers, ["font-weight" => "bold"]
+                ),
+                PrettyTables.HtmlHighlighter(
+                    (_, i, j) -> haskey(_ROLE_CSS, get(t.roles, (i, j), :none)),
+                    (_, _, i, j) -> _ROLE_CSS[t.roles[(i, j)]]
+                ),
+            ],
+            style = _HTML_STYLE,
+        )
+    end
+    note === nothing || _html_notes(io, note)
+    return nothing
+end
+
+# Footer notes, one paragraph per line, with backticked selections as `<code>`.
+function _html_notes(io::IO, note::AbstractString)
+    for line in split(note, "\n  "; keepempty = false)
+        print(io, "<p style=\"font-size: smaller; margin: 2px 0;\">", _html_note(line), "</p>")
+    end
     return nothing
 end
 
@@ -178,10 +219,9 @@ function Base.show(io::IO, ::MIME"text/html", h::MetricHistory)
                 (_, i, _) -> i == t.best_row, ["font-weight" => "bold"]
             ),
         ],
+        style = _HTML_STYLE,
     )
-    for note in split(t.note, "\n  "; keepempty = false)
-        print(io, "<p style=\"font-size: smaller; margin: 2px 0;\">", _html_note(note), "</p>")
-    end
+    isempty(t.note) || _html_notes(io, t.note)
     return nothing
 end
 

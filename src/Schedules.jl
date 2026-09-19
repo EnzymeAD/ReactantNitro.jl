@@ -1181,7 +1181,7 @@ Reactant loads PrettyTables, so the bytes are the same in every session.
 function binding_report_text(; name = "", kwargs...)
     io = IOBuffer()
     _render_sections(
-        io, "ReactantNitro: binding report for $name",
+        io, MIME"text/plain"(), "ReactantNitro: binding report for $name",
         binding_report_sections(; name, kwargs...); note = nothing
     )
     return String(take!(io))

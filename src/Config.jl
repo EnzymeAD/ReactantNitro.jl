@@ -425,7 +425,8 @@ Such a struct keeps Julia's default `show`, and opts in with the one line the ma
 
 ```julia
 Base.show(io::IO, e::MyExp) = ReactantNitro._show_experiment(io, e)
-Base.show(io::IO, ::MIME"text/plain", e::MyExp) = ReactantNitro._show_experiment(io, e; long = true)
+Base.show(io::IO, m::MIME"text/plain", e::MyExp) = ReactantNitro._show_experiment(io, m, e)
+Base.show(io::IO, m::MIME"text/html", e::MyExp) = ReactantNitro._show_experiment(io, m, e)
 ```
 """
 macro experiment(expr)
@@ -674,14 +675,19 @@ function _experiment(expr, source, mod = @__MODULE__)
     # wrote. A hand-written experiment (the macro is optional) keeps Julia's default `show` and can
     # opt in with the same one-liner these expand to.
     #
-    # `MIME{Symbol("text/plain")}` rather than the `MIME"text/plain"` string macro: the latter is a
-    # macrocall in macro output, and spelling the type directly is one less hygiene question.
+    # The long form answers both MIME types a display is asked for, so a notebook gets the table
+    # as HTML. One method per MIME: a `Union` would be ambiguous with Base's `text/plain` fallback.
+    # `MIME{Symbol("text/plain")}` rather than the string macro, which is a macrocall in macro
+    # output and one more hygiene question.
     show_def = :(Base.show(io::IO, e::$(esc(name))) = $(_qual(:_show_experiment))(io, e))
-    showl_def = :(
-        function Base.show(io::IO, ::MIME{Symbol("text/plain")}, e::$(esc(name)))
-            return $(_qual(:_show_experiment))(io, e; long = true)
+    showl_def = quote
+        function Base.show(io::IO, mime::MIME{Symbol("text/plain")}, e::$(esc(name)))
+            return $(_qual(:_show_experiment))(io, mime, e)
         end
-    )
+        function Base.show(io::IO, mime::MIME{Symbol("text/html")}, e::$(esc(name)))
+            return $(_qual(:_show_experiment))(io, mime, e)
+        end
+    end
 
     parts = Any[
         structdef, ctor, df_def, hf_def, cm_def, cv_def, show_def, showl_def, doc_def, esc(name),
@@ -705,18 +711,21 @@ end
 #
 # Values, not just names: an experiment is configuration, and a config table that withheld its
 # numbers would be useless in the case that is not a buffer, which is nearly all of them.
-function _show_experiment(io::IO, e; long::Bool = false)
+function _show_experiment(io::IO, e)
     T = typeof(e)
     fs = fieldnames(T)
-    if !long
-        print(io, nameof(T), "(")
-        print(io, join(("$f = " * _shown(getfield(e, f)) for f in fs), ", "))
-        print(io, ")")
-        return nothing
-    end
+    print(io, nameof(T), "(")
+    print(io, join(("$f = " * _shown(getfield(e, f)) for f in fs), ", "))
+    print(io, ")")
+    return nothing
+end
+
+function _show_experiment(io::IO, mime::MIME, e)
+    T = typeof(e)
+    fs = fieldnames(T)
     df, hf = device_fields(T), host_fields(T)
     title = string(nameof(T)) * "  (@experiment; no device buffer is shown)"
-    isempty(fs) && return print(io, title, "\n  (no fields)")
+    isempty(fs) && return _render_sections(io, mime, title, TableSection[]; note = "(no fields)")
     # The marker is the column that makes the table actionable: it is what a reader changes when a
     # field is in the wrong category, and it cannot be inferred from the value.
     rows = Vector{String}[
@@ -726,7 +735,7 @@ function _show_experiment(io::IO, e; long::Bool = false)
             _shown(getfield(e, f)),
         ] for f in fs
     ]
-    _render_table(io, title, ["field", "marker", "value"], rows)
+    _render_table(io, mime, title, ["field", "marker", "value"], rows)
     return nothing
 end
 

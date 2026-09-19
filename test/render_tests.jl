@@ -73,7 +73,7 @@
     @testset "long cells are not elided" begin
         long = "x"^200
         out = sprint() do io
-            ReactantNitro._render_table(io, "t", ["", ""], [["k", long]])
+            ReactantNitro._render_table(io, MIME"text/plain"(), "t", ["", ""], [["k", long]])
         end
         @test occursin(long, out)
         @test !occursin("⋯", out)
@@ -152,7 +152,7 @@
         rendered(styles) = with_color() do
             sprint(
                 io -> ext.render_table(
-                    IOContext(io, :color => true), "t",
+                    IOContext(io, :color => true), MIME"text/plain"(), "t",
                     [ReactantNitro.TableSection("", String[], rows, styles)], nothing
                 )
             )
@@ -162,6 +162,37 @@
         out = rendered(ReactantNitro.CellStyles((1, 2) => :not_a_role_yet))
         @test occursin("a", out) && occursin("b", out)
         @test !occursin("\e[3", out)
+    end
+
+    @testset "every long display renders as HTML from the same description" begin
+        n = Nitro(PTExp(); data = (;), checkpointer = nothing, run_dir = mktempdir())
+        for x in (n, PTExp())
+            @test showable(MIME"text/html"(), x)
+            html = sprint(show, MIME"text/html"(), x)
+            @test occursin("<table", html)
+            @test !occursin("│", html)
+        end
+        html = sprint(show, MIME"text/html"(), n)
+        @test occursin("Nitro for PTExp", html)
+        @test occursin("phase", html)
+        @test occursin("rowGroupLabel", html)                       # the bands of one table
+        @test occursin("history", html)                             # the footer note
+        @test occursin("<code>history</code>", html)
+        # Roles map to CSS, header rows are bold, and an unknown role is inert.
+        rows = ReactantNitro.TableRows([["k", "v"]])
+        sec(styles) = [ReactantNitro.TableSection("band", ["a", "b"], rows, styles)]
+        r(styles) = sprint(
+            io -> ReactantNitro.render_table(io, MIME"text/html"(), "t", sec(styles), "a note")
+        )
+        @test occursin("color: purple", r(ReactantNitro.CellStyles((1, 2) => :accent)))
+        @test occursin("color: red; font-weight: bold", r(ReactantNitro.CellStyles((1, 2) => :bad)))
+        out = r(ReactantNitro.CellStyles((1, 2) => :not_a_role))
+        @test occursin(">v</td>", out) && !occursin("color:", out)
+        @test occursin("font-weight: bold", out)                    # the header row
+        @test occursin("a note", out)
+        # The experiment table has the same three columns in both forms.
+        @test occursin(">marker</td>", sprint(show, MIME"text/html"(), PTExp()))
+        @test occursin("marker", sprint(show, MIME"text/plain"(), PTExp()))
     end
 
     @testset "with no renderer installed a long show says so instead of drawing" begin
