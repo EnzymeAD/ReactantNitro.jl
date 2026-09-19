@@ -1,8 +1,8 @@
 # The example environment, self contained. `ReactantNitro` comes from the repository root through
 # `[sources]` rather than from the registry, so the example runs against the tree it sits in.
 #
-#     julia --project=examples -e 'using Pkg; Pkg.instantiate()'
-#     julia --project=examples examples/mnist_tutorial.jl
+#     julia --project=examples/mnist -e 'using Pkg; Pkg.instantiate()'
+#     julia --project=examples/mnist examples/mnist/mnist_tutorial.jl
 #
 # None of MLDatasets, MLUtils or ParameterSchedulers is a ReactantNitro dependency, and that is the
 # point the tutorial makes about each of them: the framework ships no data loading, no batching and
@@ -17,4 +17,4 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 ReactantNitro = "641982cc-88f5-4d80-bec4-e68c6a8af0a5"
 
 [sources]
-ReactantNitro = {path = ".."}
+ReactantNitro = {path = "../.."}

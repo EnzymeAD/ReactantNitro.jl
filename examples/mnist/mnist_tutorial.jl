@@ -5,8 +5,8 @@
 # runs end to end. The two are meant to be read together, and the tutorial is where the reasoning
 # lives; the comments kept here are the ones that stop a reader mis-copying the code.
 #
-#     julia --project=examples -e 'using Pkg; Pkg.instantiate()'
-#     julia --project=examples examples/mnist_tutorial.jl
+#     julia --project=examples/mnist -e 'using Pkg; Pkg.instantiate()'
+#     julia --project=examples/mnist examples/mnist/mnist_tutorial.jl
 #
 # The full run is 5 epochs, on the same network, split, learning rate and epoch budget as the
 # README's quick start. Measured on CPU: acc 0.9584, macro_recall 0.9579, about 3 minutes.

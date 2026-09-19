@@ -6,11 +6,11 @@ over ten classes, with the same network, split, learning rate and epoch budget a
 quick start, so the two runs differ only in the features this page adds.
 
 !!! tip "The whole thing, runnable"
-    `examples/mnist_tutorial.jl` is this model as one self-contained file with its own environment:
+    `examples/mnist/mnist_tutorial.jl` is this model as one self-contained file with its own environment:
 
     ```
-    julia --project=examples -e 'using Pkg; Pkg.instantiate()'
-    julia --project=examples examples/mnist_tutorial.jl
+    julia --project=examples/mnist -e 'using Pkg; Pkg.instantiate()'
+    julia --project=examples/mnist examples/mnist/mnist_tutorial.jl
     ```
 
     `NITRO_EXAMPLE_EPOCHS=1` turns it into a smoke test, and `NITRO_EXAMPLE_BACKEND=cuda` puts it
