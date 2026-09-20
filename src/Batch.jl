@@ -127,21 +127,28 @@ stay uniform: a different field set is a different `NamedTuple` type, hence a di
 hence a recompile, and it invalidates the resolved routing. [`check_batch_schema`](@ref) enforces
 that on every later batch.
 """
-function resolve_routing(ev, batch::NamedTuple; model = Any, ps = Any, st = Any)
+function resolve_routing(ev, batch::NamedTuple; model = Any, ps = Any, st = Any, hooks = (;))
     E = ev isa Type ? ev : typeof(ev)
     bk = keys(batch)
     T(x) = x isa Type ? x : typeof(x)
+    # PROTOTYPE: the function resolved here is the MAP's when it supplies one, so routing reads the
+    # keywords of the function that will actually be called. Resolving the method and calling the
+    # closure would route by the wrong declaration and fail on the first batch.
     specs = (
-        (:forward, forward, Tuple{E, T(model), T(ps), T(st)}),
-        (:loss, loss, Tuple{E, Any}),
-        (:metrics, metrics, Tuple{E, Any}),
-        (:train_metrics, train_metrics, Tuple{E, Any}),
+        (:forward, hook_fn(hooks, :forward, forward), Tuple{E, T(model), T(ps), T(st)}),
+        (:loss, hook_fn(hooks, :loss, loss), Tuple{E, Any}),
+        (:metrics, hook_fn(hooks, :metrics, metrics), Tuple{E, Any}),
+        (:train_metrics, hook_fn(hooks, :train_metrics, train_metrics), Tuple{E, Any}),
     )
-    pairs = map(specs) do (hook, f, argtypes)
+    routers = map(specs) do (hook, f, argtypes)
         ks = route_keys(declared(f, argtypes), bk, hook)
-        hook => (ks === nothing ? nothing : Router{ks}())
+        return hook => (ks === nothing ? nothing : Router{ks}())
     end
-    return NamedTuple(pairs)
+    # `fns` rides ALONG the routers, into the programs, as part of one `Const` argument. Its type
+    # is therefore read by `map(typeof, args)` in `cache_key` with no change to the key, which is
+    # the whole reason a hook value must be a non-capturing singleton.
+    fns = NamedTuple(map(sp -> sp[1] => sp[2], specs))
+    return merge(NamedTuple(routers), (; fns))
 end
 
 """
@@ -277,7 +284,11 @@ validates. Everything else in the batch belongs to the user's loader alone.
 function routed_fields(routing::NamedTuple)
     ks = Symbol[]
     for r in routing
-        r === nothing && continue
+        # PROTOTYPE COST, stated where it bites: the hook map rides inside this NamedTuple, so the
+        # one place that iterates it has to know that not every entry is a `Router`. That is the
+        # leak from piggybacking rather than giving the map its own field, and this is the funnel
+        # every other iteration goes through, so it is the only place that pays.
+        r isa Router || continue
         for k in keys(r)
             k in ks || push!(ks, k)
         end

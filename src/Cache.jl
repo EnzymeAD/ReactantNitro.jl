@@ -651,6 +651,7 @@ _closure_target(f, args) = f === grad_program ?
             map(typeof, args[1:4])...,
             typeof(args[5]),
             typeof(args[9].forward),
+            typeof(hook_fn(hook_fns(args[9]), :forward, forward)),
         ),
     ) :
     (f, Core.apply_type(Tuple, map(typeof, args)...))

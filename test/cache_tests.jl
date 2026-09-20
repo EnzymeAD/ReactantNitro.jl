@@ -1246,7 +1246,13 @@
         fake = (Int(1), Float64(2.0), Char('x'), :sym, Vector{F4}([1.0]), 6, 7, 8, fake_router, 10, 11)
         cf, at = _closure_target(grad_program, fake)
         @test cf === fwd_program
-        @test at == Tuple{Int, Float64, Char, Symbol, Vector{F4}, ReactantNitro.Router{(:x,)}}
+        # The seventh element is the hook FUNCTION, which `fwd_program` now takes alongside its
+        # router so a hook supplied as a value (see Hooks.jl) is the one the closure is captured
+        # at. A `fake_router` carrying no map resolves it to the method, as here.
+        @test at == Tuple{
+            Int, Float64, Char, Symbol, Vector{F4}, ReactantNitro.Router{(:x,)},
+            typeof(ReactantNitro.forward),
+        }
         cf2, at2 = _closure_target(fwd_program, fake[1:5])
         @test cf2 === fwd_program
         @test at2 == Tuple{Int, Float64, Char, Symbol, Vector{F4}}

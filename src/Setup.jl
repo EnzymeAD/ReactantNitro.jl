@@ -144,8 +144,12 @@ function _build_nitro(
         # anchoring means for a run that starts from them. Keyword-only for the same reason as the
         # four above: both are facts about THIS construction.
         weights = nothing,
-        w0 = :build_model
+        w0 = :build_model,
+        # PROTOTYPE: hooks supplied as VALUES, shadowing the method for any name present. See
+        # Hooks.jl for why an entry may not capture and why that keeps the cache key sound.
+        hooks = (;)
     )
+    check_hooks(hooks)
     check_weights_kwargs(weights, w0; checkpoint, resume)
 
     # ── before step 2: locate a checkpoint (the resume path) ───────────────────────
@@ -239,7 +243,7 @@ function _build_nitro(
     rng = Random.default_rng()
 
     # ── 3. data. `build_data` sees the PRE-conversion experiment ───────────────────
-    collection = data === nothing ? build_data(e, nothing) : data
+    collection = data === nothing ? hook_fn(hooks, :build_data, build_data)(e, nothing) : data
     collection isa NamedTuple || error("ReactantNitro: `build_data` must return a NAMED collection, \
         `(; train, val)` or `(; train, val, test)`, and returned a `$(typeof(collection))`. Named and \
         extensible, so `evaluate` with no `test` supplied is a clear error rather than a positional \
@@ -282,7 +286,7 @@ function _build_nitro(
     ev = compile_view(e)
 
     # ── 6, 7. build the model, then capture w0 immediately ─────────────────────────
-    model, ps, st = build_model(e, rng)
+    model, ps, st = hook_fn(hooks, :build_model, build_model)(e, rng)
     # Replicated on a mesh, plain placement on one device. Parameters and layer state exist
     # identically on every device; only the batch is sharded.
     ps = place_replicated(ps, mesh)
@@ -341,7 +345,7 @@ function _build_nitro(
         # this is the same batch either way; going through the source says why it is the same batch
         # rather than relying on that.
         probe = first(prefetch_source(getproperty(collection, schema_split)))
-        routing = resolve_routing(ev, probe; model, ps, st)
+        routing = resolve_routing(ev, probe; model, ps, st, hooks)
         if training && manual
             # Manual mode builds its optimizer states HERE, before `batch_size_of`, because the
             # closure's router must be part of the routing the batch size is inferred from: a field

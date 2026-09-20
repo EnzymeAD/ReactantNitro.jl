@@ -235,14 +235,20 @@ captures, which is correct: they are genuinely trace-time constants and the cach
 covers them.
 """
 function objective_wrapper(ev, model, ps, st, batch, routers, ::Val{TM} = Val(:device)) where {TM}
-    outputs, st_new = call_hook(forward, :forward, routers.forward, batch, ev, model, ps, st)
-    l = call_hook(loss, :loss, routers.loss, batch, ev, outputs)
+    fns = hook_fns(routers)
+    outputs, st_new = call_hook(
+        hook_fn(fns, :forward, forward), :forward, routers.forward, batch, ev, model, ps, st
+    )
+    l = call_hook(hook_fn(fns, :loss, loss), :loss, routers.loss, batch, ev, outputs)
     # Under `:host` the hook is part of no program, so what leaves here is the PRIMAL, and
     # the driver calls `train_metrics` on it in ordinary Julia. `TM` is a type-level constant, so
     # this branch folds at trace time and neither arm's ops reach the other's graph.
     aux = TM === :host ? outputs :
         routers.train_metrics === nothing ? (;) :
-        call_hook(train_metrics, :train_metrics, routers.train_metrics, batch, ev, outputs)
+        call_hook(
+            hook_fn(fns, :train_metrics, train_metrics), :train_metrics,
+            routers.train_metrics, batch, ev, outputs
+        )
     # `ignore_derivatives` is LOAD-BEARING, not decorative: Reactant maps a `Duplicated` return to an
     # OUT result and seeds EVERY OUT with ones. For the scalar loss that is the correct dL/dL = 1;
     # for an unbarriered state output those ones flow into `dps` and corrupt the gradient with no
@@ -1648,7 +1654,9 @@ the schema is **not** checked against the training one here: only `forward`'s ow
 function predict_routing!(nitro::Nitro, batch::NamedTuple)
     if nitro.routing === nothing
         ev = compile_view(nitro.e)
-        routing = resolve_routing(ev, batch; nitro.model, nitro.ps, nitro.st)
+        routing = resolve_routing(
+            ev, batch; nitro.model, nitro.ps, nitro.st, hooks = hook_fns(nitro.routing)
+        )
         validate_batch(batch, routing)
         nitro.routing = routing
         nitro.schema = keys(batch)
@@ -1688,8 +1696,8 @@ whole routing and the whole batch. Both are in the compile-cache key by type, so
 carrying no labels would otherwise be a different key from a `validate` batch carrying them, and the
 sharing this program exists for would be lost to a difference `forward` cannot see.
 """
-function fwd_program(ev, model, ps, st, batch, fwd_router)
-    outputs, _ = call_hook(forward, :forward, fwd_router, batch, ev, model, ps, st)
+function fwd_program(ev, model, ps, st, batch, fwd_router, fwd_fn = forward)
+    outputs, _ = call_hook(fwd_fn, :forward, fwd_router, batch, ev, model, ps, st)
     return outputs
 end
 
@@ -1715,11 +1723,14 @@ it works on host arrays. It also reads `e`'s `Device` fields, which are device s
 onward. The residency choice is about the user's `metrics`, and an experiment that defines none has
 not made one.
 """
-function eval_metric_program(ev, outputs, batch, router, ::Val{NREAL}, ::Val{HOOK}) where {NREAL, HOOK}
+function eval_metric_program(
+        ev, outputs, batch, router, ::Val{NREAL}, ::Val{HOOK}, fns = (;)
+    ) where {NREAL, HOOK}
     o = slice_last(outputs, NREAL)
     b = slice_last(batch, NREAL)
-    return HOOK === :metrics ? call_hook(metrics, :metrics, router, b, ev, o) :
-        (; val_loss = (call_hook(loss, :loss, router, b, ev, o), 1))
+    return HOOK === :metrics ?
+        call_hook(hook_fn(fns, :metrics, metrics), :metrics, router, b, ev, o) :
+        (; val_loss = (call_hook(hook_fn(fns, :loss, loss), :loss, router, b, ev, o), 1))
 end
 
 """
@@ -1739,11 +1750,15 @@ function eval_forward(nitro::Nitro, ev, st, b, fwd_router)
     # `EvalCompiling`, which is honest. `gc_hash` is still read directly, since the frozen hash is
     # wanted here and `nitro` is what phases are keyed on.
     thunk = compile_cached(
-        fwd_program, ev, ev, nitro.model, nitro.ps, st, bf, fwd_router;
+        fwd_program, ev, ev, nitro.model, nitro.ps, st, bf, fwd_router,
+        hook_fn(hook_fns(nitro.routing), :forward, forward);
         phase = EvalCompiling(), worlds = nitro.frozen.worlds_eval,
         gc_hash = nitro.frozen.graphconst_hash, nitro
     )
-    return thunk(ev, nitro.model, nitro.ps, st, bf, fwd_router)
+    return thunk(
+        ev, nitro.model, nitro.ps, st, bf, fwd_router,
+        hook_fn(hook_fns(nitro.routing), :forward, forward)
+    )
 end
 
 """
@@ -1856,10 +1871,10 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
                 n_real == nitro.batch_size || check_output_batch_dim(outputs, nitro.batch_size)
                 thunk = compile_cached(
                     eval_metric_program, ev, ev, outputs, b, router,
-                    Val(n_real), Val(hook); phase = EvalCompiling(),
+                    Val(n_real), Val(hook), hook_fns(nitro.routing); phase = EvalCompiling(),
                     worlds = nitro.frozen.worlds_eval, nitro
                 )
-                thunk(ev, outputs, b, router, Val(n_real), Val(hook))
+                thunk(ev, outputs, b, router, Val(n_real), Val(hook), hook_fns(nitro.routing))
             else
                 # `metrics` NEVER sees padding: the outputs are sliced back to `n_real`, and the
                 # batch handed to it is the split's own host batch, which was never padded.

@@ -62,6 +62,7 @@ include("Config.jl")      # the experiment macro and the field categories
 include("Phases.jl")      # the phase system and the phase registry
 include("Runs.jl")        # the run registry's machine-readable face; methods live in the KaimonGate extension
 include("Interface.jl")   # the user hooks: signatures and defaults
+include("Hooks.jl")       # PROTOTYPE: hooks supplied as a map of values
 include("Batch.jl")       # batch routing
 include("Data.jl")        # the data contract and the dataloaders
 include("Decay.jl")       # weight decay

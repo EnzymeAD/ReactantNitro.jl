@@ -695,6 +695,242 @@ function _experiment(expr, source, mod = @__MODULE__)
     return Expr(:block, filter(!isnothing, parts)...)
 end
 
+# ── @nitrohook ──────────────────────────────────────────────────────────────────────
+#
+# Reactive-notebook support and nothing else: outside Pluto this macro defines one extra function
+# nobody calls, so the same file still runs as a plain script.
+#
+# Pluto builds its graph out of global variable NAMES, and a hook definition head is a QUALIFIED
+# name. `function ReactantNitro.loss(e::MyExp, logits; label)` is recorded as a definition of the
+# joined symbol `Symbol("ReactantNitro.loss")`, and nothing can reference that: the call that
+# reaches the hook happens inside this package, where Pluto cannot see it. A hook cell is
+# therefore a reactive DEAD END. Editing it re-runs that one cell, the cell holding the `Nitro`
+# never re-runs, and the notebook goes on training the code the handle was built with.
+# `stale_hooks` reports the drift, but only at the next entry point, and reaching one is exactly
+# what does not happen.
+#
+# The fix has to put a name a downstream cell CAN reference on the DEFINING side. A plain variable
+# per hook does that, and is what a user writes by hand, but it costs one DISTINCT name per hook:
+# Pluto compares `definitions` across cells, so two cells assigning one shared token name is a
+# `MultipleDefinitionsError`. A METHOD has no such problem. The conflict test compares
+# `funcdefs_with_signatures`, which is signature-level, while edge resolution compares
+# `funcdefs_without_signatures`, which is the bare name. Any number of cells may therefore define
+# methods of ONE function, and every one of them becomes an upstream edge of any cell that names
+# it. A single reference to `MyExp_hooks` covers a whole hook set, however many cells it is spread
+# across, and `Val{:loss}` keys the methods so the hooks stay disjoint from one another.
+#
+# Pluto expands a cell in the workspace and recomputes its reactive node from the EXPANSION, so a
+# macro-injected definition drives reactivity exactly like a hand-written one.
+#
+# This only makes the REBUILD fire. What a rebuild then picks up is `world_closure_staleness`'s
+# business and is unchanged by any of this.
+
+"""
+    ReactantNitro.@nitrohook <definition>
+
+Define one or more hooks and, alongside them, one method of `<Experiment>_hooks` per definition,
+so a reactive notebook can see that the hooks changed.
+
+Pluto's dependency graph is built from variable names, and a hook is defined on a qualified name
+(`ReactantNitro.loss`) that no cell references, because the call into it happens inside this
+package. A hook cell is invisible to the graph as a result: editing it re-runs that cell alone,
+and the `Nitro` is never rebuilt. This macro emits a token method beside the definition, giving a
+hook set one name a downstream cell can depend on.
+
+```julia
+@nitrohook function ReactantNitro.loss(e::MnistMLP, logits; label)
+    return -sum(label .* logsoftmax(logits; dims = 1)) / size(label, 2)
+end
+```
+
+Name that token once, wherever the handle is built, and every hook cell for `MnistMLP` becomes an
+upstream dependency of it:
+
+```julia
+n = begin
+    MnistMLP_hooks
+    Nitro(MnistMLP())
+end
+```
+
+The token is named for the type of the definition's first argument, so hook sets for different
+experiments stay independent. Several definitions may share one macro call, and each gets its own
+token method. Outside a reactive notebook the token is an unused function, and the definitions
+behave exactly as if the macro were not there.
+
+Most hooks dispatch on the experiment, and the token is named for the type of the definition's
+first argument, so hook sets for different experiments stay independent. A few extension points
+dispatch on something else (`batch_at` and `begin_epoch!` on a data source, `nonschedulable` on an
+optimizer rule, `default_no_decay` on neither); name the experiment explicitly for those, so their
+edge lands on the same token as the rest of the set:
+
+```julia
+@nitrohook MnistMLP ReactantNitro.batch_at(src::MyLoader, i::Integer) = ...
+```
+
+`@experiment` itself needs no macro. It defines `MnistMLP`, which every hook cell and the `Nitro`
+cell already name, so it is upstream of both on its own.
+
+Edit a hook where it is defined rather than appending a second definition in a later cell. Two
+versions of one hook cannot coexist: Julia has a single method table, so the later definition
+simply *is* the hook, and Pluto refuses both cells as a `MultipleDefinitionsError` before that
+matters. There is no "the hooks as of this cell" to depend on either, since cells form a graph and
+their order in the file is presentation only. Variants that must coexist need two dispatch
+targets, which is what the explicit form is for: two experiment types get two tokens and two
+independent subgraphs.
+
+Invalidation is all-or-nothing by design. Every hook cell for an experiment defines a method of
+the one token, so editing any of them rebuilds the handle. That is correct rather than coarse:
+dispatch resolves over the whole method table when the program is traced, so any method moving
+can change the program.
+
+Give `build_data` its own cell. Hooks bundled into one `begin` block are redefined together when
+any one of them changes, and a redefinition moves a method's world even when its text is
+unchanged, so editing the data hook beside `forward` poisons the compiled programs and takes the
+gradient with them, `grad_program` storing `fwd_program`'s closure rather than its own. Measured
+on a toy run: `build_data` edited alone costs 0 cache misses and poisons nothing, while
+redefining `forward` byte-identically poisons 2 entries and costs 4 misses. `build_data` is
+host-side, absent from `hook_worlds` and in no program's closure, so on its own it is free.
+
+Rebuilding remains what puts new code into effect: an existing `Nitro` keeps the programs it was
+built with, which is what [`ReactantNitro.stale_hooks`](@ref) reports. This macro only makes the
+rebuild happen.
+"""
+macro nitrohook(expr)
+    return _nitrohook_expansion(nothing, expr)
+end
+
+macro nitrohook(experiment, expr)
+    experiment isa Symbol || error(
+        "ReactantNitro.@nitrohook: the optional first argument names the experiment whose token \
+         to use, as in `@nitrohook MyExp ReactantNitro.batch_at(src::MyLoader, i) = ...`, and \
+         got `$experiment`."
+    )
+    return _nitrohook_expansion(experiment, expr)
+end
+
+function _nitrohook_expansion(experiment, expr)
+    tokens = _hook_tokens(expr, experiment)
+    parts = Any[esc(expr)]
+    for (tok, hook, key) in tokens
+        # `Base.Val` rather than `Val` so a notebook that shadows `Val` still expands. Only the
+        # token name is escaped: it is the one piece that must land in the caller's module.
+        push!(
+            parts,
+            :($(esc(tok))(::Base.Val{$(QuoteNode(hook))}, ::Base.Val{$key}) = $(QuoteNode(hook)))
+        )
+    end
+    # The token itself is the expansion's value, so a notebook shows "MyExp_hooks (generic
+    # function with N methods)" and the count doubles as a tally of the hooks wired up so far.
+    push!(parts, esc(first(last(tokens))))
+    return Expr(:block, parts...)
+end
+
+# Every `(token, hook)` pair a `@nitrohook` expression calls for, in source order. A `begin` block
+# is walked rather than rejected, since a notebook cell that already wraps its hook in one should
+# take the macro without being rewritten first.
+function _hook_tokens(expr, experiment = nothing)
+    out = Tuple{Symbol, Symbol, UInt}[]
+    _collect_hook_tokens!(out, expr, experiment)
+    isempty(out) && error(
+        "ReactantNitro.@nitrohook: expected a hook definition, as in \
+         `@nitrohook function ReactantNitro.loss(e::MyExp, logits; label) ... end`, and got \
+         `$expr`."
+    )
+    return out
+end
+
+function _collect_hook_tokens!(out, ex, experiment)
+    ex isa LineNumberNode && return out
+    if Meta.isexpr(ex, :block)
+        for a in ex.args
+            _collect_hook_tokens!(out, a, experiment)
+        end
+        return out
+    end
+    sig = _call_signature(ex)
+    sig === nothing || push!(out, _hook_token(sig, experiment))
+    return out
+end
+
+# The `:call` at the head of a definition, past any `where` clause and any return-type annotation,
+# or `nothing` when the expression is not a named function definition at all.
+function _call_signature(ex)
+    (Meta.isexpr(ex, :function) || Meta.isexpr(ex, :(=))) || return nothing
+    sig = ex.args[1]
+    while true
+        if Meta.isexpr(sig, :where)
+            sig = sig.args[1]
+        elseif Meta.isexpr(sig, :(::), 2) && Meta.isexpr(sig.args[1], :call)
+            sig = sig.args[1]
+        else
+            break
+        end
+    end
+    return Meta.isexpr(sig, :call) ? sig : nothing
+end
+
+# The token is named for the type the definition DISPATCHES on, which for a hook is the experiment
+# in the first positional argument. That is not universal: `batch_at` and `begin_epoch!` dispatch
+# on a data source, `nonschedulable` on an optimizer rule, and `default_no_decay` on nothing at
+# all. Those still reach a run, so they still want an edge, and the two-argument form names the
+# token for them rather than leaving them with a useless one or no expansion.
+function _hook_token(sig, experiment)
+    hook = _basename(sig.args[1])
+    hook === nothing && error(
+        "ReactantNitro.@nitrohook: could not read a hook name out of `$(sig.args[1])`. The \
+         definition head must be a plain or qualified name, as in `ReactantNitro.loss`."
+    )
+    experiment === nothing || return (Symbol(experiment, "_hooks"), hook, _sig_key(sig))
+    # The keywords parse into an `Expr(:parameters, ...)` that sorts BEFORE the positional
+    # arguments, so the dispatched-on argument is the first non-`:parameters` entry, not `args[2]`.
+    positional = filter(a -> !Meta.isexpr(a, :parameters), @view sig.args[2:end])
+    isempty(positional) && error(
+        "ReactantNitro.@nitrohook: `$hook` takes no positional argument, so there is no type to \
+         name its token after. Name one explicitly: `@nitrohook MyExp <definition>`."
+    )
+    arg = first(positional)
+    Meta.isexpr(arg, :(::)) || error(
+        "ReactantNitro.@nitrohook: the first argument of `$hook` is `$arg`, which carries no type \
+         annotation, so there is no type to name its token after. Write `e::MyExp`, or name the \
+         experiment explicitly: `@nitrohook MyExp <definition>`."
+    )
+    E = _basename(arg.args[end])
+    E === nothing && error(
+        "ReactantNitro.@nitrohook: could not read a type out of `$arg`. Name the experiment \
+         explicitly instead: `@nitrohook MyExp <definition>`."
+    )
+    return (Symbol(E, "_hooks"), hook, _sig_key(sig))
+end
+
+# The token's second `Val`, so that two DIFFERENT methods of one hook do not collide ON THE TOKEN.
+# Keyed on the hook name alone, `batch_at(src, i)` and `batch_at(src, i, plan)` in two cells, both
+# of which the interface documents, would land the same token signature and Pluto would refuse a
+# pair it otherwise allows: a conflict the macro invented rather than found.
+#
+# Only the dispatched-on shape goes in, the positional type annotations with `Any` for an
+# unannotated argument and the keyword names, so argument names and the body are out. That is the
+# same canonicalization Pluto applies to the hook definition itself, which means two cells that
+# really do define one method still collide THERE and are still reported, once, against the name
+# the user wrote. Conflict detection stays where it already worked; the token only carries edges.
+function _sig_key(sig)
+    kws, types = Symbol[], Any[]
+    for a in @view sig.args[2:end]
+        if Meta.isexpr(a, :parameters)
+            append!(kws, map(_kwname, a.args))
+        else
+            push!(types, _argtype(a))
+        end
+    end
+    return hash((Tuple(map(string, types)), Tuple(sort!(map(string, kws)))))
+end
+
+_argtype(a) =
+    Meta.isexpr(a, :(::)) ? a.args[end] :
+    Meta.isexpr(a, :kw) || Meta.isexpr(a, :...) ? _argtype(a.args[1]) : :Any
+
+_kwname(k) = k isa Symbol ? k : Meta.isexpr(k, (:kw, :(::), :...)) ? _kwname(k.args[1]) : :_
+
 # ── Showing an experiment NEVER shows a device buffer ───────────────────────────────
 #
 # The same hazard as `CheckpointRecord`'s and `Nitro`'s, arriving by a different door. A `Device`

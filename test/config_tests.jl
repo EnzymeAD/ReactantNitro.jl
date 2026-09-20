@@ -630,3 +630,183 @@
         @test _qual(:device_fields, N).args[1] === ReactantNitro
     end
 end
+
+# @nitrohook tests.
+#
+# The acceptance criterion: "a hook defined through the macro also defines a method of
+# `<Experiment>_hooks`, keyed so that hooks do not collide and experiments do not cross-link". The
+# reactive consequence of that is Pluto's and is not testable here; what IS testable is the shape
+# the expansion has to hand Pluto, so that is what this asserts.
+
+@testitem "nitrohook" begin
+    using Test
+    using ReactantNitro
+    using ReactantNitro: _hook_tokens, _call_signature, _basename, _sig_key
+
+    # The token NAME and hook, without the signature key, which has its own section below.
+    named(args...) = [(t[1], t[2]) for t in _hook_tokens(args...)]
+    # The hook each of a token's methods stands for, read back off its first `Val`.
+    tokhooks(f) = Set(m.sig.parameters[2].parameters[1] for m in methods(f))
+
+    # ── Token naming, straight off the expression ───────────────────────────────────
+    # Long form, keywords present: the keywords parse into an `Expr(:parameters, ...)` that sorts
+    # before the positional arguments, which is the trap this covers.
+    @test named(
+        :(
+            function ReactantNitro.loss(e::MyExp, logits; label)
+                return 0.0f0
+            end
+        )
+    ) == [(:MyExp_hooks, :loss)]
+
+    # Short form, unnamed first argument.
+    @test named(:(ReactantNitro.forward(::MyExp, model, ps, st; img) = nothing)) ==
+        [(:MyExp_hooks, :forward)]
+
+    # A `where` clause and a return-type annotation both sit between the definition head and the
+    # `:call`, and the parametric annotation must still reduce to the bare type name.
+    @test named(
+        :(
+            function ReactantNitro.loss(e::MyExp{T}, logits; label)::T where {T}
+                return zero(T)
+            end
+        )
+    ) == [(:MyExp_hooks, :loss)]
+
+    # A `begin` block is walked, not rejected: a notebook cell that already wraps its hook in one
+    # takes the macro without being rewritten first, and several hooks may share a call.
+    @test named(
+        :(
+            begin
+                ReactantNitro.metrics(::MyExp, logits; label) = nothing
+                ReactantNitro.finalize_metrics(::MyExp, m, c) = nothing
+            end
+        )
+    ) == [(:MyExp_hooks, :metrics), (:MyExp_hooks, :finalize_metrics)]
+
+    # An unqualified head is read the same way, so a hook reached through `import` still works.
+    @test named(:(loss(e::MyExp, logits) = 0.0f0)) == [(:MyExp_hooks, :loss)]
+
+    # Two experiments never share a token, which is what keeps one notebook's hook sets from
+    # invalidating each other.
+    @test named(:(ReactantNitro.loss(::Other, logits) = 0.0f0)) == [(:Other_hooks, :loss)]
+
+    # ── What is not a hook definition ───────────────────────────────────────────────
+    @test _call_signature(:(x = 1)) === nothing
+    @test _call_signature(
+        :(
+            f = function (x)
+                x
+            end
+        )
+    ) === nothing
+    @test_throws ErrorException _hook_tokens(:(1 + 1))
+    # No positional argument, so nothing to name the token after.
+    @test_throws ErrorException _hook_tokens(:(ReactantNitro.loss(; label) = 0.0f0))
+    # An untyped first argument cannot identify the experiment.
+    @test_throws ErrorException _hook_tokens(:(ReactantNitro.loss(e, logits) = 0.0f0))
+
+    # ── The expansion, evaluated ────────────────────────────────────────────────────
+    # A module of its own, so the generated token is observable and cannot leak into the suite.
+    M = Module()
+    Core.eval(M, :(using ReactantNitro))
+    Core.eval(
+        M, :(
+            @experiment struct HookExp
+                w::Device{Float32} = 1.0f0
+            end
+        )
+    )
+    Core.eval(
+        M, :(
+            ReactantNitro.@nitrohook function ReactantNitro.loss(e::HookExp, logits; label)
+                return sum(logits) * e.w
+            end
+        )
+    )
+    Core.eval(
+        M, :(
+            ReactantNitro.@nitrohook ReactantNitro.forward(::HookExp, model, ps, st; img) =
+                (img, st)
+        )
+    )
+
+    # The hooks themselves landed: the macro is transparent to the definition it wraps.
+    @test hasmethod(ReactantNitro.loss, Tuple{M.HookExp, Any})
+    @test which(ReactantNitro.loss, Tuple{M.HookExp, Any}).module === M
+
+    # And the token carries one method per hook, in the caller's module rather than a gensym.
+    @test isdefined(M, :HookExp_hooks)
+    @test length(methods(M.HookExp_hooks)) == 2
+    @test tokhooks(M.HookExp_hooks) == Set([:loss, :forward])
+    # Distinct signatures are the whole point: same bare name, no collision.
+    @test M.HookExp_hooks isa Function
+
+    # The macro's value is the token, so a notebook cell shows the tally of hooks wired up.
+    @test Core.eval(
+        M, :(
+            ReactantNitro.@nitrohook ReactantNitro.metrics(::HookExp, logits; label) = nothing
+        )
+    ) === M.HookExp_hooks
+    @test length(methods(M.HookExp_hooks)) == 3
+
+    # ── The explicit form, for the extension points that do not dispatch on the experiment ──
+    # `batch_at` dispatches on a data source, so inference names the token for the LOADER, which
+    # is correct but lands the edge on the wrong token for the run.
+    @test named(:(ReactantNitro.batch_at(src::MyLoader, i::Integer) = nothing)) ==
+        [(:MyLoader_hooks, :batch_at)]
+    # Naming the experiment puts it back on the run's own token.
+    @test named(
+        :(ReactantNitro.batch_at(src::MyLoader, i::Integer) = nothing), :MyExp
+    ) == [(:MyExp_hooks, :batch_at)]
+    # `default_no_decay` dispatches on nothing typed at all, which only the explicit form reaches.
+    @test_throws ErrorException _hook_tokens(:(ReactantNitro.default_no_decay(ks, x) = false))
+    @test named(:(ReactantNitro.default_no_decay(ks, x) = false), :MyExp) ==
+        [(:MyExp_hooks, :default_no_decay)]
+    # `nonschedulable` dispatches on a rule TYPE, where inference would read `Type` off the
+    # `Expr(:curly, ...)` and name a token after it.
+    @test named(:(ReactantNitro.nonschedulable(::Type{<:MyRule}) = (:beta,)), :MyExp) ==
+        [(:MyExp_hooks, :nonschedulable)]
+    # An explicit name is a bare type name, not an expression.
+    @test_throws LoadError Core.eval(
+        M, :(ReactantNitro.@nitrohook MyExp() ReactantNitro.loss(e::HookExp, l) = 0.0f0)
+    )
+
+    # Evaluated: the explicit form lands on the experiment's token, beside the inferred ones.
+    Core.eval(
+        M, :(
+            ReactantNitro.@nitrohook HookExp ReactantNitro.batch_at(src::Vector, i::Integer) =
+                src[i]
+        )
+    )
+    @test length(methods(M.HookExp_hooks)) == 4
+    @test :batch_at in tokhooks(M.HookExp_hooks)
+
+    # ── The signature key: the token must not invent a conflict Pluto would not have ──
+    key(ex) = only(_hook_tokens(ex))[3]
+    # `batch_at` is documented at two arities, and two cells may legitimately define both. Keyed
+    # on the hook name alone they would collide on the token; keyed on the signature they do not.
+    @test key(:(ReactantNitro.batch_at(s::MyLoader, i::Integer) = 1)) !=
+        key(:(ReactantNitro.batch_at(s::MyLoader, i::Integer, plan) = 2))
+    # Argument names and the body are NOT in the key, so a genuine redefinition still collides,
+    # and is reported once, against the hook the user wrote rather than the generated token.
+    @test key(:(ReactantNitro.loss(e::MyExp, out; label) = 1.0f0)) ==
+        key(:(ReactantNitro.loss(x::MyExp, pred; label) = 2.0f0))
+    # Keyword names are part of it: routing differs, so the methods differ.
+    @test key(:(ReactantNitro.loss(e::MyExp, out; label) = 1.0f0)) !=
+        key(:(ReactantNitro.loss(e::MyExp, out; target) = 1.0f0))
+    # An unannotated argument reads as `Any` rather than as its name.
+    @test key(:(ReactantNitro.loss(e::MyExp, out) = 1.0f0)) ==
+        key(:(ReactantNitro.loss(e::MyExp, other) = 1.0f0))
+    @test _sig_key(:(f(a::Int, b))) != _sig_key(:(f(a::Int, b::Int)))
+
+    # Two arities of one hook coexist on the token, as two methods rather than one collision.
+    Core.eval(
+        M, :(
+            ReactantNitro.@nitrohook HookExp ReactantNitro.batch_at(
+                src::Vector, i::Integer, plan
+            ) = src[i]
+        )
+    )
+    @test length(methods(M.HookExp_hooks)) == 5
+end
