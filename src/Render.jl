@@ -1,39 +1,20 @@
 # Render.jl
 #
 # The framed renderer every long `show` goes through, as text and as HTML, and the history table's
-# two shows. PrettyTables
-# is an ordinary dependency: Reactant loads it into every process anyway, and a renderer installed
-# at definition needs no `__init__`, which matters for a tool that evaluates this package from
-# source and skips initialisers. Sections become `row_group_labels` bands of ONE frame, drawn
-# without vertical rules so a short band does not read as a row of empty cells.
+# two shows. PrettyTables is an ordinary dependency, so the renderer is installed at definition
+# with no `__init__`. Sections become `row_group_labels` bands of one frame, drawn without vertical
+# rules so a short band does not read as a row of empty cells.
 
 # ── The palette: six roles, and the eight-colour ANSI set ────────────────────────────
 #
-# THE BASIC EIGHT, not 256-colour and not truecolor, and that is the whole reason this reads well
-# on somebody else's terminal. The basic eight are the ones a theme remaps, so `:green` is
-# whatever green that person chose and is legible against whatever background they chose with it.
-# A hex colour picked here would look considered on the machine it was picked on and would be the
-# one unreadable cell on a light theme.
+# The basic eight, which a theme remaps, so `:green` is legible against whatever background the
+# person chose; a hex colour would be the one unreadable cell on a light theme. `:dark_gray` is
+# Crayons' bright black, the theme's grey, dim on both polarities (`faint` is dropped by several
+# emulators). No backgrounds, since these tables get pasted into tickets.
 #
-# `:dark_gray` for `:muted` is the one entry to be careful with. It is Crayons' name for bright
-# black, which is the theme's grey and is dim on both polarities; `faint` would be the obvious
-# alternative and is a terminal attribute that several emulators drop entirely and one or two
-# render as invisible.
-#
-# Nothing here sets a background. A background colour survives a copy-paste into a ticket as a
-# block of highlight, and these tables get pasted.
-#
-# ── TWO GATES DECIDE WHETHER A CRAYON IS EMITTED, and they read different things ──────
-#
-# PrettyTables decides whether to STYLE from the `IOContext` it is handed. Crayons decides whether
-# to emit the ESCAPE from the buffer it is printing into, which is one PrettyTables made and which
-# does not carry that context, so it falls back to the process-global `Base.get_have_color()`.
-#
-# In a process with colour on, which is every REPL, both are satisfied and none of this is
-# visible. In one with colour off, a caller that wraps the `io` in `IOContext(:color => true)`
-# satisfies the first gate and not the second, and gets a table carrying `\e[0m` resets with no
-# colour before them. `Crayons.force_color(true)` is what satisfies the second, and a test
-# asserting on a crayon has to set both.
+# Two gates decide whether a crayon is emitted: PrettyTables styles from the `IOContext` it is
+# handed, and Crayons emits the escape based on the process-global `Base.get_have_color()`. A test
+# asserting on a crayon has to set both (`IOContext(:color => true)` and `Crayons.force_color`).
 const _ROLE_CRAYONS = Dict{Symbol, PrettyTables.Crayon}(
     :good => PrettyTables.Crayon(foreground = :green),
     :busy => PrettyTables.Crayon(foreground = :cyan),
@@ -51,8 +32,7 @@ function _table_layout(sections::Vector{TableSection})
     headers = Set{Int}()
     roles = Dict{Tuple{Int, Int}, Symbol}()
     for sec in sections
-        # An empty section title draws no band label: the leading section is named by the
-        # table's title. A label sits at the row it precedes, so it is placed before the rows.
+        # An empty title draws no band label; a label sits at the row it precedes.
         isempty(sec.title) || push!(labels, (length(rows) + 1) => sec.title)
         if any(!isempty, sec.header)
             push!(rows, sec.header)
@@ -78,8 +58,7 @@ function render_table(
     )
     t = _table_layout(sections)
     t === nothing && return print(io, title)
-    # Rendered into a buffer for one reason: `pretty_table` ends its output with a newline and a
-    # `show` method must not. `IOContext(buf, io)` carries `:color` across.
+    # Into a buffer because `pretty_table` ends with a newline and a `show` method must not.
     buf = IOBuffer()
     PrettyTables.pretty_table(
         IOContext(buf, io), t.data;
@@ -87,8 +66,7 @@ function render_table(
         # Every section carries its own header as a data row; one label row cannot serve them.
         show_column_labels = false,
         row_group_labels = isempty(t.labels) ? nothing : t.labels,
-        # ORDER IS THE PRECEDENCE: the first matching highlighter wins, so a header stays bold
-        # where a role was set on the same cell. An unknown role leaves the cell alone.
+        # The first matching highlighter wins, so a header stays bold where a role was set.
         highlighters = [
             PrettyTables.TextHighlighter((_, i, _) -> i in t.headers; bold = true),
             PrettyTables.TextHighlighter(
@@ -100,8 +78,7 @@ function render_table(
             vertical_lines_at_data_columns = :none,
             horizontal_line_after_column_labels = false,
         ),
-        # NO CROPPING: what would be dropped is the right-hand column, the sources and paths,
-        # which are the reason someone printed the handle.
+        # No cropping: what would be dropped is the right-hand column, the sources and paths.
         fit_table_in_display_horizontally = false,
         fit_table_in_display_vertically = false,
     )
@@ -164,10 +141,7 @@ end
 
 # ── The history table ────────────────────────────────────────────────────────────────
 #
-# Everything decided here was decided in the core: `history_table` picked the rows that fit the
-# terminal, dropped the columns that did not, formatted the cells and wrote the note. This method
-# draws them, and it is the only `show` of a `MetricHistory` longer than one line, so a process
-# without PrettyTables sees the compact form.
+# `history_table` picked the rows and columns that fit and formatted the cells; this draws them.
 function Base.show(io::IO, ::MIME"text/plain", h::MetricHistory)
     isempty(h) && return show(io, h)
     height, width = displaysize(io)
@@ -178,8 +152,7 @@ function Base.show(io::IO, ::MIME"text/plain", h::MetricHistory)
         column_labels = [t.labels], alignment = t.alignment,
         title = t.title, title_alignment = :l,
         highlighters = [
-            # The best epoch is the row a reader is looking for, so it is the one that earns
-            # colour; a gap row is filler and is muted so the eye skips it.
+            # The best epoch is the row a reader is looking for; a gap row is filler.
             PrettyTables.TextHighlighter(
                 (_, i, _) -> i == t.best_row, _ROLE_CRAYONS[:good]
             ),
@@ -190,8 +163,7 @@ function Base.show(io::IO, ::MIME"text/plain", h::MetricHistory)
         table_format = PrettyTables.TextTableFormat(;
             vertical_lines_at_data_columns = :none,
         ),
-        # The core already fitted the table to `displaysize(io)`; PrettyTables cropping on top of
-        # that would elide what the thinning deliberately kept.
+        # The core already fitted the table; cropping on top would elide what thinning kept.
         fit_table_in_display_horizontally = false,
         fit_table_in_display_vertically = false,
     )

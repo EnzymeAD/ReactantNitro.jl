@@ -1,36 +1,17 @@
 # ReactantNitroKaimonGateExt.jl
 #
-# The KaimonGate extension: registers `nitro_*` GateTools with the running Kaimon gate so an
-# agent can drive training, validation, evaluation, prediction, and export from the very session
-# where the model code is loaded. It is a dev tool, not a framework surface: nothing in `src/`
-# knows it exists, and the tools it registers are the agent's interface to entry points the
-# framework already ships (`train!`, `validate`, `evaluate`, `predict`, `export_model`).
+# The KaimonGate extension: registers `nitro_*` GateTools with the running Kaimon gate so an agent
+# can drive training, validation, evaluation, prediction and export from the session where the
+# model code is loaded. A dev tool over entry points the framework already ships; nothing in
+# `src/` knows it exists.
 #
-# ── Why runs are background tasks ────────────────────────────────────────────────────
-#
-# Kaimon's agent-side tool calls carry a HARD deadline (`_call_session_tool_async` in Kaimon's
-# gate client defaults to 5 minutes, and `tool_progress` messages do not extend it), and its eval
-# path fails after 10 minutes without output. A training run lasts hours, so no tool call may
-# block until the work finishes. Every tool here therefore does the same two things: start the
-# work on a background task and return a run id, and let the agent poll `nitro_status` or
-# `nitro_runs`, each a fast call, until the run completes.
-#
-# What the registry cannot survive is a session restart, and it does not pretend to: the
-# framework's own checkpoint machinery is the restart story (`resume = :auto`), and the docs page
-# says so. A restarted session simply has no in-flight runs, exactly as it has no in-flight evals.
-#
-# ── Registration ──────────────────────────────────────────────────────────────────────
-#
-# KaimonGate exposes one tool-registration verb, `serve(tools = [...])`, and a running gate's
-# tool list is REPLACED by that call; Kaimon's health checker re-imports the tools from the next
-# pong and sends `tools/list_changed`. The extension therefore registers on load, then keeps
-# retrying for a short window to cover the race with Kaimon's own `@async KaimonGate.serve(...)`
-# at session boot. `ReactantNitroKaimonGateExt.reinstall_kaimon_tools()` is the manual hammer: it registers
-# unconditionally, starting a gate if none is running, exactly as a bare `serve()` would.
-#
-# Outside a gate the extension is a quiet no-op: the automatic path probes the gate's running
-# flag and never starts a gate itself, and `serve()` skips non-interactive processes, so a test
-# process that loads the extension pays nothing.
+# Runs are background tasks because Kaimon's tool calls carry a hard deadline of minutes and a
+# training run lasts hours: every tool starts the work and returns a run id, and the agent polls
+# `nitro_status`. The registry does not survive a session restart; checkpoints are the restart
+# story. KaimonGate's `serve(tools = [...])` REPLACES a gate's tool list, so the extension
+# registers on load and retries for a short window to cover the race with the host's own `serve`
+# at session boot; `reinstall_kaimon_tools()` is the manual hammer. Outside a gate the extension
+# is a no-op.
 
 module ReactantNitroKaimonGateExt
 
@@ -41,11 +22,8 @@ using ReactantNitro: Nitro, ExportBackend, ReactantServerBundle
 
 # ── The run registry ──────────────────────────────────────────────────────────────────
 #
-# One entry per tool-launched unit of work. Process-local and lock-guarded, because the
-# training task writes it from one thread while the status tools read it from another. Finished
-# runs are trimmed oldest-first past a small cap so a long-lived session cannot accumulate them
-# forever; a RUNNING run is never trimmed, and neither is a failed run the agent has not yet
-# read, which is what the cap's "oldest finished first" ordering gives for free.
+# One entry per tool-launched unit of work, process-local and lock-guarded. Finished runs are
+# trimmed oldest-first past a small cap; a running run is never trimmed.
 
 mutable struct RunState
     id::String
@@ -108,14 +86,8 @@ end
 
 # ── The recording logger ──────────────────────────────────────────────────────────────
 #
-# The logging contract is duck-typed and `nothing` is the "no logging" value, but `nothing`
-# cannot hold state, and the status tools need the latest metrics. This tiny backend keeps them
-# in the run state and TEES to the experiment's own logger when the run has one, so a user's
-# hosted-tracker backend keeps receiving what it always received. `logger_state` returns
-# `nothing`, which keeps `reattach!` optional and the checkpoint record clean.
-#
-# All ten verbs get a method. The contract's "a MISSING METHOD IS A LOUD MethodError" rule is
-# per-verb on purpose, and a future driver call is not a reason to break a running tool.
+# The status tools need the latest metrics, so this backend keeps them in the run state and tees
+# to the experiment's own logger. All ten verbs get a method, since a missing one is a MethodError.
 
 struct RecordingLogger
     state::RunState
@@ -162,10 +134,8 @@ function ReactantNitro.finish!(lgr::RecordingLogger, reason)
 end
 
 ReactantNitro.logger_state(lgr::RecordingLogger) = nothing
-# Forwarded, not returned empty: the checkpoint record for a tool-launched run should carry the
-# real backend's trace-back ids, and the status tools should report them. `applicable` guards the
-# two informational accessors because they have no generic default (a ten-line file logger
-# defines neither), while `logger_info` needs no guard since its default is `(;)`.
+# Forwarded, so the checkpoint record and the status tools carry the real backend's ids.
+# `applicable` guards the two accessors with no generic default.
 ReactantNitro.run_id(lgr::RecordingLogger) =
     lgr.inner === nothing || !applicable(ReactantNitro.run_id, lgr.inner) ? nothing :
     ReactantNitro.run_id(lgr.inner)
@@ -176,8 +146,7 @@ ReactantNitro.logger_info(lgr::RecordingLogger) =
     lgr.inner === nothing ? (;) : ReactantNitro.logger_info(lgr.inner)
 ReactantNitro.reattach!(lgr::RecordingLogger, state) = nothing
 ReactantNitro.backend(lgr::RecordingLogger) = :recording
-# Setup's adoption step, forwarded: the tools may wrap the framework's own default `JSONLogger` (a
-# pathless one), and setup pins its path through this wrapper exactly as it pins an unwrapped one.
+# Setup's adoption step, forwarded, so a wrapped default `JSONLogger` still lands in the run dir.
 ReactantNitro._adopt_logger!(lgr::RecordingLogger, dir) =
     (lgr.inner === nothing || ReactantNitro._adopt_logger!(lgr.inner, dir); lgr)
 
@@ -187,10 +156,8 @@ _to_float(::Any) = NaN
 
 # ── Experiment resolution ─────────────────────────────────────────────────────────────
 #
-# The tools name an experiment as a module-qualified type string, e.g. `MyModels.MnistMLP`, or
-# as a bare type name the model package exported into Main. Resolution walks loaded bindings
-# only; the experiment code is already in this session, which is the whole point of running the
-# tools where the model is loaded rather than in a separate process.
+# A module-qualified type string (`MyModels.MnistMLP`) or a bare name exported into Main, resolved
+# against loaded bindings only.
 
 function _resolve_experiment(spec::AbstractString)
     parts = split(spec, '.')
@@ -233,12 +200,9 @@ end
 
 # ── The overrides parser ──────────────────────────────────────────────────────────────
 #
-# `overrides` carries experiment-FIELD values, which cannot be declared in the tool schema
-# because they are per-experiment. The format is a comma-separated `name=value` list where each
-# value is a Julia literal: `width=128`, `smoothing=0.05`, `labels=[1.0,2.0]`, `name="x"`. A
-# tiny hand-rolled parser keeps this dependency-free (JSON is no longer a stdlib) and validates
-# that every value is a literal, so a typo is a loud error rather than an `eval` of arbitrary
-# text. The same parser serves `nitro_predict`'s batch inputs.
+# `overrides` carries experiment-field values, which cannot be in the tool schema: a comma-separated
+# `name=value` list of Julia literals. A hand-rolled, dependency-free parser that accepts literals
+# only, so a typo is an error rather than an `eval` of arbitrary text. Also serves `nitro_predict`.
 
 function _split_top_level(s::AbstractString, c::Char)
     chars = collect(s)
@@ -313,13 +277,9 @@ function _unquote(s::AbstractString)
     return String(take!(out))
 end
 
-# A value must be a literal: numbers, strings, booleans, symbols, `nothing`, or a
-# vector/tuple/matrix of literals. Anything else (a call, a variable, an assignment) is
-# rejected, which is what makes the parser safe to hand arbitrary agent text.
-
-# Pure check, no eval, so a `:row` sub-expression (the space-separated rows of a matrix
-# literal) is examined but never evaluated outside its `:vcat`/`:hcat` parent, where it is
-# the only place `:row` is legal syntax.
+# A value must be a literal: numbers, strings, booleans, symbols, `nothing`, or a vector, tuple or
+# matrix of literals. A `:row` (a matrix literal's rows) is examined but only ever evaluated inside
+# its `:vcat`/`:hcat` parent.
 function _is_literal(ex)
     ex isa Union{Number, String, Bool, Char, Symbol, QuoteNode} && return true
     ex === nothing && return true
@@ -381,13 +341,9 @@ end
 
 # ── Nitro construction ────────────────────────────────────────────────────────────────
 #
-# The tools split their keywords into two worlds, mirroring the framework's own split. The typed
-# run knobs (max_epochs, run_dir, seed, n_devs, accum, gradient_clip_norm, preset, resume,
-# checkpoint) go to `Nitro`, where a keyword beats the experiment's own accessor
-# for one run. `overrides` carries experiment-FIELD values and goes to the constructor, exactly
-# like `from_preset`'s overrides, validated the same way: a key that is not a field is a loud
-# error, and a key passed both as a run knob and in `overrides` is an ambiguity error rather
-# than a silent winner.
+# The typed run knobs go to `Nitro`, where a keyword beats the experiment's accessor for one run;
+# `overrides` carries experiment-field values and goes to the constructor. A key in both places is
+# an ambiguity error.
 
 const TOOL_NITRO_KWARGS = (
     :max_epochs, :run_dir, :seed, :n_devs, :accum, :gradient_clip_norm, :preset, :resume,
@@ -430,31 +386,11 @@ end
 # checkpoint in run_dir), `false` (the default, start over), or a checkpoint path.
 _parse_resume(s::AbstractString) = s == "auto" ? :auto : s == "false" ? false : String(s)
 
-# `nitro_export`'s `data`, which is the one invocation keyword that lets an export SKIP a setup
-# step, and the last one this tool learned to express.
-#
-# `export_model`'s own docstring writes the export construction as
-# `Nitro(e; checkpoint = path, data = (;))` and says in as many words that `data = (;)` is not a
-# workaround: setup reads weights and traces a graph, and the training data is not part of either.
-# This tool built `Nitro(e; kwargs...)` with no `data` at all, so `build_data` always ran, and a
-# model whose exportable handle is a DIFFERENT BUILD from its trainable one could not be exported
-# through the tool in either direction. The worked case is a model with an `export_inference` flag:
-# with the flag set, `build_data` refuses the handle because an inference model cannot train; with
-# the flag clear, the first export hook refuses it because the program is teacher-forced and wants
-# ground truth on the wire. A pincer like that pushes exports off the tool and onto hand-written
-# `export_model` calls, including for the models that never had the problem, which is why the
-# keyword exists rather than being left to the caller.
-#
-# NOT BUILDING IS THE DEFAULT on the `experiment` path, which is the change of behavior here and is
-# deliberate. It is also what makes the export stop starting a data server it only has to tear down
-# again (`_finish_export_nitro!` exists for that). `data = "build"` is the escape hatch, for the one
-# case that needs it: `derive` is skipped on a `checkpoint =` construction (setup takes the
-# derived `Device` values from the record instead), but an export from an experiment with NO
-# checkpoint recomputes them, so a model that defines `derive` and reads its data has to build.
-#
-# The `run_id` path takes no answer at all. That handle exists already, with whatever data the run
-# built, and there is nothing left for this keyword to decide; accepting it there would be a knob
-# that reads as if it did something.
+# `nitro_export`'s `data`: `"none"` (the default) builds no data, since an export reads weights and
+# traces a graph, and is what lets a model whose exportable handle is a different build from its
+# trainable one be exported through the tool; `"build"` calls `build_data`, for a model whose
+# `derive` reads its data on an export with no checkpoint. The `run_id` path takes no answer, since
+# that handle is already built.
 function _push_export_data!(
         kwargs::Vector{Pair{Symbol, Any}}, data::Union{AbstractString, Nothing},
         run_id::Union{AbstractString, Nothing}, experiment::Union{AbstractString, Nothing}
@@ -514,20 +450,11 @@ function _attach_monitor!(state::RunState, nitro::Nitro)
     return nothing
 end
 
-# A run body executes at the LATEST WORLD, and that is a guarantee rather than belt-and-braces: a
-# method added after the task STARTED is invisible to it, and a run task raises the world counter
-# while it is already running. `_reactant_server_backend` is the case that found this. It loads
-# ReactantServerExport with `Base.require` when an export names that backend, the extension's
-# `site_provenance` and `write_export` methods only exist after that load, and the export dispatched
-# to the erroring generic instead: the FIRST `nitro_export` of a session failed on provenance while
-# an identical relaunch succeeded, because by then the session had the method.
-# The hazard belongs to every tool here and not only to export, since a session defines methods in
-# the REPL (`ex`, a Revise reload) and launches a run in the same turn.
-#
-# A task's world age is taken when it FIRST RUNS rather than when it is constructed, so ordering
-# alone very nearly hides this: a load landing before the task's first slice IS seen. That is what
-# makes it intermittent rather than a hard failure, and it is why the guarantee is here rather than
-# in the ordering of the caller. One dynamic call per RUN, against work measured in minutes.
+# The run body executes at the latest world: a method added after the task started (the
+# ReactantServerExport extension loaded on demand by `_reactant_server_backend`) is otherwise
+# invisible to it, and the first `nitro_export` of a session failed on provenance while an
+# identical relaunch succeeded. A task's world age is taken when it first runs, which is what made
+# it intermittent.
 function _launch_run!(f::Function, state::RunState)
     @async begin
         try
@@ -592,10 +519,8 @@ function _export_task(
         batch_sizes::Vector{Int}, provenance::Dict{String, Any},
         provenance_root::Union{AbstractString, Nothing}
     )
-    # Without the monitor, an export run's status never moves (the trace publishes no other
-    # phases) and `nitro_status` would show "starting" for the whole minutes-long compile. The
-    # framework now publishes `ExportCompiling` around `write_export`; attaching the same monitor
-    # the train and eval tasks attach is what reports it.
+    # Without the monitor an export run's status never moves; the framework publishes
+    # `ExportCompiling` around `write_export` and this is what reports it.
     _attach_monitor!(state, nitro)
     written = ReactantNitro.export_model(
         nitro, backend; dir = String(dir), name = String(name),
@@ -639,10 +564,8 @@ end
 
 # ── Batch inputs for predict ──────────────────────────────────────────────────────────
 #
-# The batch is the same `name=value` literal format as `overrides`, with each value an array.
-# Arrays are converted to Float32, the framework's storage standard, since a batch field
-# is host data crossing into a traced program; the batch axis is last, exactly as the framework
-# asserts everywhere else.
+# The same `name=value` literal format as `overrides`, each value an array converted to Float32,
+# batch axis last.
 
 function _parse_inputs(s::AbstractString)
     d = _parse_overrides(s)
@@ -678,14 +601,9 @@ end
 
 # ── The export backend registry ───────────────────────────────────────────────────────
 #
-# The tool names a backend with a string. `reactant_server` is the shipped one, resolved by
-# loading the ReactantServerExport weakdep on demand so the tool costs nothing until an export
-# actually happens. A small registry lets a test inject a recording backend instead of tracing a
-# real StableHLO bundle, which the CPU suite deliberately does not do.
-#
-# RESOLUTION HAPPENS IN THE CALLER, not in the run task: `nitro_export` calls this before it
-# launches. A factory that loads a package raises the world counter, and `_launch_run!` says what
-# that did to an export that resolved its backend from inside the task it was already running in.
+# `reactant_server` is the shipped backend, resolved by loading the ReactantServerExport weakdep on
+# demand; a small registry lets a test inject a recording backend. Resolution happens in the
+# caller, not the run task, since loading a package raises the world counter (see `_launch_run!`).
 
 const _BACKENDS = Dict{String, Function}()
 
@@ -720,10 +638,8 @@ end
 
 # ── Status rendering ──────────────────────────────────────────────────────────────────
 
-# One line naming the run's logger and its key parameters, read live off the handle. The
-# `RecordingLogger` the tools install wraps the real logger, so the summary unwraps to name the
-# backend the user actually chose and forwards `logger_info` for its identifying parameters
-# (the URL and experiment key of a hosted tracker, the file path of the shipped JSON default).
+# One line naming the run's logger and its key parameters, unwrapping the `RecordingLogger` to
+# name the backend the user chose.
 function _logger_summary(state::RunState)
     lgr = state.nitro.logger
     inner = lgr isa RecordingLogger ? lgr.inner : lgr
@@ -756,10 +672,8 @@ end
 
 # ── The tools ─────────────────────────────────────────────────────────────────────────
 #
-# Each handler is a module-level named function with a docstring; KaimonGate reflects the
-# signature into the MCP schema and the docstring into the tool description, so the agent sees
-# exactly the contract below. Handlers return immediately; the work runs on a background task
-# and the agent polls `nitro_status`.
+# Each handler is a named function with a docstring; KaimonGate reflects the signature into the MCP
+# schema and the docstring into the tool description. Handlers return immediately.
 
 """
     nitro_train(experiment; max_epochs, run_dir, seed, n_devs, accum, gradient_clip_norm,
@@ -767,23 +681,16 @@ end
 
 Start training an experiment in the background and return the run id immediately.
 
-`experiment` is a module-qualified type string for an `@experiment` struct already loaded in
-this session, e.g. `MyModels.MnistMLP`, or a bare name the model package exported into Main.
+`experiment` is a module-qualified type string for an `@experiment` struct loaded in this session,
+e.g. `MyModels.MnistMLP`. The typed keywords are run knobs passed to `Nitro`, beating the
+experiment's own accessor for this run: `max_epochs`, `run_dir`, `seed`, `n_devs`, `accum`,
+`gradient_clip_norm`, `preset` (a name from `presets(MyExp)`), `resume` (`"auto"`, `"false"`, or a
+checkpoint path), and `checkpoint`. `overrides` carries experiment-field values as a
+comma-separated `name=value` list of Julia literals, e.g. `overrides="width=128, labels=[1.0,2.0]"`;
+an unknown field or a key given in both places is an error.
 
-The typed keywords are run knobs passed to `Nitro` (a keyword beats the experiment's own
-accessor for this run): `max_epochs`, `run_dir`, `seed`, `n_devs`, `accum`,
-`gradient_clip_norm`, `preset` (a name from `presets(MyExp)`), `resume` (`"auto"`, `"false"`,
-or a checkpoint path), and `checkpoint` (a checkpoint path to load).
-
-`overrides` carries experiment-FIELD values that cannot be in the schema because they are
-per-experiment: a comma-separated `name=value` list of Julia literals, e.g.
-`overrides="width=128, smoothing=0.05, labels=[1.0,2.0]"`. A key that is not a field of the
-experiment is an error, and a key passed both as a run keyword and in `overrides` is an
-ambiguity error.
-
-The call returns before training starts. Poll `nitro_status(run_id=...)` until the run
-completes; `nitro_runs()` lists all runs. Training is graceful under `nitro_stop(run_id=...)`:
-the epoch finishes, validation runs, the checkpoint is written, and the run exits `Done`.
+Poll `nitro_status(run_id=...)` until the run completes; `nitro_runs()` lists all runs.
+`nitro_stop(run_id=...)` stops gracefully after the current epoch's validation and checkpoint.
 
 ```julia
 nitro_train(experiment="MyModels.MnistMLP", max_epochs=40, run_dir="runs/mnist_v1")
@@ -818,15 +725,11 @@ end
 """
     nitro_validate(; run_id, experiment, checkpoint, overrides, ...) -> String
 
-Run the `val` split over a `Nitro` in the background and return the run id immediately.
-
-Pass exactly one of `run_id` (a completed train run in this session; its trained `Nitro` is
-reused) or `experiment` (a type string; `checkpoint` loads trained weights, otherwise the
-weights are the freshly built ones). The remaining typed keywords are run knobs used only when
-constructing from `experiment`; `overrides` is experiment-field values, same format as
-`nitro_train`.
-
-Poll `nitro_status(run_id=...)` for the finalized metrics.
+Run the `val` split over a `Nitro` in the background and return the run id immediately. Pass
+exactly one of `run_id` (a completed train run in this session, whose trained `Nitro` is reused)
+or `experiment` (a type string; `checkpoint` loads trained weights). The remaining typed keywords
+are run knobs for the `experiment` construction; `overrides` has `nitro_train`'s format. Poll
+`nitro_status(run_id=...)` for the finalized metrics.
 """
 function nitro_validate(
         ;
@@ -943,46 +846,22 @@ end
 
 Export a trained model in the background and return the run id immediately.
 
-`dir` and `name` are required: the artifact lands in `dir/name` (the bundle format requires
-the directory basename to equal `name`). `backend` is `"reactant_server"` (the shipped
-StableHLO bundle backend, loaded on demand) or a backend registered for this session.
-`batch_sizes` is a vector literal of the batch sizes to compile, e.g. `"[1, 8]"`.
+`dir` and `name` are required; the artifact lands in `dir/name`. `backend` is
+`"reactant_server"` (the shipped StableHLO bundle backend, loaded on demand) or a backend
+registered for this session. `batch_sizes` is a vector literal, e.g. `"[1, 8]"`. Pass `run_id` (a
+completed train run) or `experiment` plus `checkpoint`; export asserts a single-device handle.
 
-**`provenance_root` is the repository root to collect repository state from**, and passing it
-is how a bundle exported through this tool gets a git commit, a tree hash and, on a dirty
-tree, the `working_tree.patch` that is the only thing tying the artifact to the code that
-produced it. The backend collects it, through its `site_provenance` method, so the patch never
-has to pass through this tool as text.
+`provenance_root` is the repository root to collect repository state from: the git commit, tree
+hash and, on a dirty tree, the `working_tree.patch` that ties the artifact to the code that produced
+it. Omitted, the export succeeds, every check passes, and the bundle cannot say which code built it;
+fine for a throwaway export and wrong for anything that gets registered. `provenance` is a
+`name=value` list merged last, for one-off scalars; a model's own facts belong in its
+`export_provenance_extra` hook.
 
-**WHAT YOU GET IF YOU OMIT IT**, stated because it is the failure worth designing against:
-the export succeeds, every check passes, and the manifest carries the framework's stamps (the
-flat config, the preset, the seed, the run directory, the framework version, and the
-checkpoint the weights were restored from) plus whatever the experiment's
-`export_provenance_extra` hook adds, and **no repository state at all**. The bundle looks
-complete and cannot answer which code built it. That is a legitimate choice for a throwaway
-export and the wrong one for anything that gets registered.
-
-`provenance` is an optional `name=value` list of Julia literals, merged LAST so it overrides
-every other layer. It is for one-off scalars and strings; a model's own facts belong in the
-`export_provenance_extra` hook, where neither this tool nor a hand-written `export_model`
-call can forget them. `export_model`'s own docstring gives the full precedence.
-
-Pass `run_id` (a completed train run; its trained `Nitro` is exported) or `experiment` plus
-`checkpoint` for trained weights. Export asserts a single-device handle, so a fresh
-construction uses `n_devs = 1`.
-
-**An `experiment` export does not build the training data**, because setup for an export reads
-weights and traces a graph and the data is part of neither; it is the same
-`Nitro(e; checkpoint = path, data = (;))` construction `export_model`'s own docstring
-prescribes. Two things follow. A model whose exportable handle is a DIFFERENT BUILD from its
-trainable one is exportable through this tool: put the flag in `overrides` and the handle is
-built with it, where a `build_data` that refuses an inference configuration never runs.
-And nothing starts a data server that the export then has to tear down.
-
-`data = "build"` calls `build_data` anyway. The one case that needs it: `derive` is skipped on
-a `checkpoint =` construction, but an export from an `experiment` with NO checkpoint
-recomputes the derived values, so a model whose `derive` reads its data has to build. With
-`run_id` the keyword is refused, since that handle is already built.
+An `experiment` export does not build the training data (the `Nitro(e; checkpoint, data = (;))`
+construction `export_model` prescribes), so a model whose exportable handle differs from its
+trainable one is exportable by putting the flag in `overrides`. `data = "build"` calls `build_data`
+anyway, for a model whose `derive` reads its data on an export with no checkpoint.
 
 ```julia
 nitro_export(run_id="a1b2c3d4", dir="export_out", name="mnist_v1",
@@ -1023,9 +902,7 @@ function nitro_export(
     kwargs = _collect_run_kwargs(;
         max_epochs, run_dir, seed, n_devs, accum, gradient_clip_norm, preset, resume,
     )
-    # Export is a CPU trace asserting one device: a fresh construction must not inherit
-    # a multi-device mesh from the run knobs. An explicit `n_devs = 1` is fine and is not pushed
-    # twice; anything else is refused.
+    # Export is a single-device CPU trace: a fresh construction must not inherit a mesh.
     if experiment !== nothing
         any(p -> first(p) === :n_devs && last(p) != 1, kwargs) && error(
             "ReactantNitro ReactantNitroKaimonGateExt: `nitro_export` from `experiment` requires \
@@ -1034,12 +911,8 @@ function nitro_export(
         all(p -> first(p) !== :n_devs, kwargs) && push!(kwargs, :n_devs => 1)
     end
     _push_export_data!(kwargs, data, run_id, experiment)
-    # Resolved HERE rather than inside the run body, for two reasons that are not the same reason.
-    # A name this session has no backend for is the caller's mistake and belongs in the caller's
-    # answer, not in a background run that has to be polled to discover it. And `reactant_server`
-    # loads a package to answer, which is work that has no business happening inside a run task:
-    # `_launch_run!` guarantees the latest world for the methods that arrive with it, and this
-    # keeps the load out of the traced stretch entirely.
+    # Resolved here rather than in the run body: an unknown backend is the caller's mistake, and
+    # loading a package has no business inside a run task (see `_launch_run!`).
     resolved = _resolve_backend(backend)
     label = something(experiment, run_id, "")
     state = _new_run(:export, label)
@@ -1047,16 +920,9 @@ function nitro_export(
         nitro = _target_nitro(state, run_id, experiment, checkpoint, overrides, kwargs, preset)
         bs = _parse_batch_sizes(batch_sizes)
         prov = _parse_provenance(provenance)
-        # A `Nitro` built for this export (the `experiment` path) has no run to end it, so nothing
-        # would ever publish its `Terminal`, and whatever `build_data` started (a data server, a
-        # client) outlives the export until a person notices. Publishing `Done` when the export is
-        # over, success or failure, is what lets the experiment's own Terminal monitors tear down.
-        # NOT for a run's `Nitro` (the `run_id` path): that one belongs to the run, which may still
-        # evaluate or export again, and ending it here would take the run's data server with it.
-        #
-        # Since `data` defaults to not building, the usual export now starts nothing for this to
-        # tear down. It stays because `data = "build"` still can, and because the teardown is what
-        # closes an open logger either way.
+        # A `Nitro` built for this export has no run to end it, so `Done` is published when the
+        # export is over to let the experiment's Terminal monitors tear down a data server or
+        # close a logger. Not for a run's `Nitro`, which the run may still evaluate or export.
         finish = experiment !== nothing
         try
             _export_task(state, nitro, resolved, dir, name, bs, prov, provenance_root)
@@ -1067,14 +933,11 @@ function nitro_export(
     return "started run $(state.id) (kind=export). Poll `nitro_status(run_id=\"$(state.id)\")`."
 end
 
-# Publish `Done` on a `Nitro` that exists only for an export, so its experiment's Terminal monitors
-# run (teardown of a data server, a client, an open logger). Never throws: the export's own result
-# is already decided by the time this runs, and a teardown that raised would replace it.
+# Publish `Done` on a `Nitro` that exists only for an export, so its Terminal monitors run. Never
+# throws: the export's result is already decided.
 function _finish_export_nitro!(nitro::Nitro)
     try
-        # Idempotent, and cheap: a monitor registered during `build_data` is adopted at the end of
-        # setup already, but a monitor registered later (a session that loaded a package mid-round)
-        # is not, and a teardown that runs no monitors tears nothing down.
+        # Idempotent; a monitor registered after setup would otherwise be missed.
         ReactantNitro.adopt_monitors!(nitro)
         ReactantNitro.publish_phase(nitro, ReactantNitro.Done())
     catch err
@@ -1235,19 +1098,11 @@ end
     nitro_setup(; backend, n_devs) -> String
 
 Configure this session's accelerator for every subsequent run, or report the current
-configuration with no arguments. **Thin tool form of `ReactantNitro.setup_devices!`**, the same
-function a REPL session calls, so a REPL workflow and a Kaimon workflow configure identically.
-
-`backend` selects the Reactant backend for the process: `"cpu"`, `"gpu"` (whichever of
-CUDA/ROCm is available), `"cuda"`, `"rocm"`, `"tpu"`. Omit it to leave Reactant's default (on a
-GPU machine that is the GPU; with none visible, CPU).
-
-`n_devs` pins how many VISIBLE devices subsequent runs shard the batch over. The default, when
-neither this call nor an experiment declares a count, is `length(Reactant.devices())`, meaning
-every visible device. On a GPU host, restrict the set with `CUDA_VISIBLE_DEVICES` at session start:
-one Julia process initializes XLA once, so device visibility is fixed for the process, and the
-pin can only select within what is visible. The pin wins over an experiment's declared
-`n_devs`; an explicit `n_devs` keyword on `nitro_train` still wins for that run.
+configuration with no arguments. The tool form of `ReactantNitro.setup_devices!`. `backend` is
+`"cpu"`, `"gpu"`, `"cuda"`, `"rocm"` or `"tpu"`; omit it for Reactant's default. `n_devs` pins how
+many visible devices runs shard over; visibility is fixed for the process, so restrict GPUs with
+`CUDA_VISIBLE_DEVICES` at session start. The pin beats an experiment's `n_devs`; an explicit
+keyword on `nitro_train` still wins for that run.
 
 ```julia
 nitro_setup(backend="cpu")            # run everything on CPU
@@ -1283,25 +1138,10 @@ function _build_tools()
     ]
 end
 
-# Is a Kaimon gate bound in this process right now?
-#
-# KaimonGate's signal for that is PRIVATE and has already moved once: this extension was written
-# against `_RUNNING::Ref{Bool}`, and since the GateSession refactor it is the accessor `_running()`
-# (`gate_session.jl`: `_running() = (s = _SESSION[]; s === nothing ? false : s.running)`). So probe
-# the known spellings in turn rather than naming one.
-#
-# WHEN NEITHER EXISTS, SAY SO ONCE AND LOUDLY. The previous version answered `false` for an
-# unrecognized gate and called that graceful degradation. It is not: it silently switches the whole
-# `nitro_*` tool surface OFF. Against KaimonGate 1.4 `_install_with_retry`'s loop asked "is a gate
-# running" thirty times, heard "no" every time from a LIVE gate, and registered nothing; no
-# exception was thrown, so `_install_tools`' own `@warn` never fired either, and an agent session
-# simply had no `nitro_train` with nothing in the log to say why (measured). A rename upstream
-# must cost a warning, never a feature.
-#
-# The real fix is upstream and is the same one the retry loop below asks for: a PUBLIC predicate
-# (and registration hook) in KaimonGate, so an extension depends on API instead of on the name of
-# a `Ref`. Until then, this is the compat shim, and `[compat] KaimonGate` cannot catch a private
-# rename inside an admitted version range.
+# Is a Kaimon gate bound in this process? KaimonGate's signal is private and has moved once
+# (`_RUNNING[]` to `_running()`), so both spellings are probed. When neither exists this warns once
+# rather than answering `false`: a silent `false` switched the whole `nitro_*` surface off against
+# a live gate with nothing in the log to say why. The real fix is a public predicate upstream.
 const _GATE_PROBE_WARNED = Ref(false)
 
 function _warn_gate_probe_once(what, err)
@@ -1333,10 +1173,8 @@ end
 
 function _install_tools()
     try
-        # `force = true` keeps registration working in non-interactive processes (the test suite
-        # runs headless), where `serve` would otherwise skip on the interactivity guard before
-        # reaching its replace-tools branch. Safe here because the automatic path calls this only
-        # when a gate is already running, and the manual hammer documents starting one.
+        # `force = true` keeps registration working in headless processes, where `serve` would
+        # otherwise skip on its interactivity guard.
         KaimonGate.serve(force = true, tools = _build_tools())
         return true
     catch e
@@ -1347,26 +1185,11 @@ end
 
 function _install_with_retry()
     _gate_running() && _install_tools() && return true
-    # No gate yet, which in a real session means one is about to arrive: the host's preamble runs
-    # `using KaimonGate`, then loads the model package (firing this `__init__`), and calls
-    # `KaimonGate.serve(...)` last. So the extension normally loads BEFORE the gate binds, and the
-    # loop below is the path that actually registers the tools. Retry for a bounded window rather
-    # than registering once and hoping.
-    #
-    # There is deliberately NO `isinteractive()` guard here. A gate host launches as
-    # `julia -t 16,1 --project=... --startup-file=no -e '<preamble>'`, where `isinteractive()` is
-    # false, so guarding on it disarmed this loop in exactly the case it exists for: a live gate
-    # registered nothing, silently, because no exception was thrown on the way out. Note that
-    # `_install_tools` was written for headless hosts (that is what its `force = true` is for),
-    # so the guard also contradicted its only caller. Cost of dropping it: a process that loads
-    # KaimonGate and never serves a gate pays one idle background task that wakes once a second
-    # for 30 seconds and then exits.
-    #
-    # This tolerates the ordering race rather than removing it. The real fix is upstream, an
-    # additive registration hook in KaimonGate so an extension can register before `serve` binds
-    # and have the tools picked up when it does. That would also stop two extensions'
-    # `serve(tools = ...)` calls from overwriting each other's tool list, which nothing on this
-    # side can.
+    # No gate yet normally means one is about to arrive: the host loads the model package (firing
+    # this `__init__`) before it calls `serve`, so this loop is the path that actually registers.
+    # No `isinteractive()` guard, since a gate host runs `julia -e '<preamble>'` where that is
+    # false; the cost is one idle task that wakes once a second for 30 s in a process that never
+    # serves a gate. The real fix is an additive registration hook upstream.
     @async begin
         for _ in 1:30
             sleep(1.0)
@@ -1380,23 +1203,17 @@ end
 """
     reinstall_kaimon_tools() -> Bool
 
-Register the `nitro_*` GateTools with the Kaimon gate. Called automatically when the extension
-loads; call it again after a manual `KaimonGate.stop()`/`serve()` cycle, or when another
-extension's `serve(tools=...)` replaced this session's tools. Unlike the automatic path this
-registers unconditionally: if no gate is running it starts one, exactly as `KaimonGate.serve()`
-would.
-
-Reach it from a session as `Base.get_extension(ReactantNitro, :ReactantNitroKaimonGateExt).reinstall_kaimon_tools()`.
-It lives in the extension module rather than in ReactantNitro because a precompiled module
-cannot create a new binding in another module, only add methods to existing ones.
+Register the `nitro_*` GateTools with the Kaimon gate, unconditionally, starting a gate if none is
+running. Called automatically on load; call it again after a manual `KaimonGate.stop()`/`serve()`
+cycle or when another extension's `serve(tools=...)` replaced this session's tools, as
+`Base.get_extension(ReactantNitro, :ReactantNitroKaimonGateExt).reinstall_kaimon_tools()`.
 """
 function reinstall_kaimon_tools()
     return _install_tools()
 end
 
-# The auto-registration lives in `__init__`, not at module top level: the extension body runs
-# once, at precompile time (where no gate exists and the call is a no-op), while `__init__`
-# runs on every runtime load, which is when the session's gate is (or is about to be) there.
+# In `__init__` rather than at top level: the module body runs once at precompile time, where no
+# gate exists.
 function __init__()
     _install_with_retry()
     return nothing

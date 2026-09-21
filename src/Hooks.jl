@@ -1,27 +1,15 @@
 # Hooks.jl
 #
-# PROTOTYPE. The hook map: hooks supplied as a NamedTuple of functions rather than as methods.
+# PROTOTYPE. Hooks supplied as a NamedTuple of functions rather than as methods, for reactive
+# notebooks: a method mutates a global method table no dependency graph can see, while a value is
+# named and downstream of what built it, and `merge` gives a second hook set that coexists with the
+# first.
 #
-# Why this exists at all is a reactive-notebook problem. A hook defined as a method mutates a
-# global, unversioned method table, which no value names and no dependency graph can see, so a
-# notebook cannot tell that a handle is downstream of it. A hook supplied as a VALUE is named, so
-# it is downstream of exactly what it is built from, and `merge` gives a second hook set that
-# coexists with the first instead of overwriting it.
-#
-# THE ONE RULE: a hook function may not capture. Non-capturing is not hygiene here, it is what
-# makes the existing compile-cache key sound WITHOUT modification. The map travels into the
-# programs the same way the `Router`s do, as a `Const` argument whose TYPE is read by
-# `map(typeof, args)` in `cache_key`. A non-capturing closure is a singleton type, so its identity
-# IS its type and the key separates two different hooks for free. A capturing closure is not: two
-# closures over different values share a type, `map(typeof, args)` cannot tell them apart, and the
-# cache would serve one program for two different computations. Cache.jl's invariant is "a hit
-# must be provably the same program; when in doubt, MISS", and an unhashable capture cannot meet
-# it, so the capture is refused at construction instead.
-#
-# It is not a restriction in practice: every hook already takes the experiment as its first
-# argument, so a value a hook needs belongs on `e`, where `Device`/`Host`/`GraphConst` state its
-# residency and `graphconst_field_hash` puts it in the key. That is the same discipline, reached
-# from the other side.
+# The one rule: a hook function may not capture. The map travels into the programs as a `Const`
+# argument whose type is read by `cache_key`; a non-capturing closure is a singleton type, so the
+# key separates two hooks for free, while two capturing closures over different values share a
+# type and the cache would serve one program for two computations. A value a hook needs belongs on
+# `e`, where its marker states its residency and hashes it into the key.
 
 """
     ReactantNitro.hook_fn(hooks, name, fallback) -> Function
@@ -34,12 +22,8 @@ hook_fn(hooks, name::Symbol, fallback) = get(hooks, name, fallback)
 """
     ReactantNitro.hook_fns(routing) -> NamedTuple
 
-The hook map carried by a routing, or `(;)` when there is none.
-
-Guarded rather than a bare `routing.fns`, because a routing is not always one this framework built:
-the eval path can carry `nothing`, and the suite hand-builds routing tuples to exercise the cache
-key directly. Both are legitimate, and both predate the map. Everything is type-level, so the
-lookup folds at trace time.
+The hook map carried by a routing, or `(;)` when there is none; guarded because the eval path can
+carry `nothing` and the suite hand-builds routing tuples.
 """
 hook_fns(routing::NamedTuple) = haskey(routing, :fns) ? routing.fns : (;)
 hook_fns(::Any) = (;)
@@ -47,11 +31,8 @@ hook_fns(::Any) = (;)
 """
     ReactantNitro.check_hooks(hooks) -> hooks
 
-Refuse a hook map that cannot be keyed: a non-function entry, or a closure that captures.
-
-The capture check is the load-bearing one; see this file's header for why a captured value is
-invisible to the compile-cache key and therefore a silent wrong-program hazard rather than a
-recompile.
+Refuse a hook map that cannot be keyed: a non-function entry, or a closure that captures, which
+would be invisible to the compile-cache key and therefore a silent wrong-program hazard.
 """
 function check_hooks(hooks)
     hooks isa NamedTuple || error(
@@ -62,14 +43,9 @@ function check_hooks(hooks)
         f isa Function || error(
             "ReactantNitro: hook `$name` is a `$(typeof(f))` rather than a function."
         )
-        # `Base.issingletontype`, NOT `isempty(fieldnames(...))`. A hook takes its batch fields as
-        # keywords, and Julia lowers a keyword method to a wrapper holding the inner body
-        # function, so every routed hook has exactly one field and the naive check refuses all of
-        # them. That field is CODE identity, not runtime data: the inner function is itself a
-        # singleton, the wrapper is still zero-size, and the type still determines the value. The
-        # predicate that separates the two is "has exactly one instance", which is precisely the
-        # property the cache key needs. `hook_predicate_available` is the assertion that it still
-        # means that.
+        # `Base.issingletontype`, not `isempty(fieldnames(...))`: Julia lowers a keyword method to a
+        # wrapper holding the body function, which is code identity rather than runtime data.
+        # `hook_predicate_available` asserts the predicate still means that.
         Base.issingletontype(typeof(f)) || error(
             "ReactantNitro: hook `$name` CAPTURES $(join(("`$t`" for t in _captured(f)), ", ")). \
              A captured value is invisible to the compile-cache key, which reads the hook's TYPE \
@@ -96,11 +72,8 @@ end
 """
     ReactantNitro.hook_predicate_available() -> Bool
 
-Whether `Base.issingletontype` still separates a keyword-lowered hook from a capturing one.
-
-[`check_hooks`](@ref) rests entirely on that predicate, and it is a Base internal, so it gets the
-same treatment as `primary_world_available`: a named check with a test asserting it still behaves
-as documented. A `false` here means the capture guard has silently stopped guarding.
+Whether `Base.issingletontype` still separates a keyword-lowered hook from a capturing one. A Base
+internal, so it gets a named check with a test, as `primary_world_available` does.
 """
 function hook_predicate_available()
     kw = let
@@ -130,30 +103,17 @@ tweaked = merge(base, @hooks begin
 end)
 ```
 
-Each definition becomes a value rather than a method: the body is wrapped in a `let`, so the name
-is local, nothing is added to any method table, and the result is a singleton function type. Two
-maps built from the same source are still two distinct types, so a handle built from `base` and
-one built from `tweaked` compile separately and neither invalidates the other.
-
-A group is the unit of invalidation, so [`check_hook_grouping`](@ref) refuses one that mixes a
-traced hook with a host hook: editing a free hook beside `forward` is not free. A group holding
-`metrics` or `train_metrics` gets a warning naming the residency the grouping assumes, since
-`metrics_residency` decides that at run time and the macro cannot see it.
-
-Definitions here are ordinary Julia, so referencing a value defined elsewhere is a plain global
-reference and behaves as it would in a method. What is refused is a CAPTURE, at
-[`check_hooks`](@ref).
+Each definition becomes a value rather than a method: the body is wrapped in a `let`, so nothing is
+added to any method table and the result is a singleton function type. A group is the unit of
+invalidation, so [`check_hook_grouping`](@ref) refuses one mixing a traced hook with a host hook,
+and warns about the residency a group assumes for `metrics` or `train_metrics`. A global reference
+from a definition is fine; a capture is refused at [`check_hooks`](@ref).
 """
 # ── The grouping rules ──────────────────────────────────────────────────────────────
 #
-# A group is the unit of invalidation: re-evaluating one mints a fresh type for EVERY hook in it,
-# so a group is only as cheap to edit as its most expensive member. That makes the layout a real
-# cost decision rather than a style preference, and the macro sees the names, so it is checked
-# here instead of documented and forgotten.
-#
-# Measured on a toy run: `build_data` edited in a host-only group costs 0 recompiles, and the same
-# edit with `build_data` grouped beside `forward` and `loss` costs 3, the gradient among them. The
-# rule exists for that number.
+# Re-evaluating a group mints a fresh type for every hook in it, so a group is only as cheap to
+# edit as its most expensive member: `build_data` edited beside `forward` costs the gradient
+# compile, and edited alone costs nothing.
 
 "Hooks that are ALWAYS part of a compiled program, so editing their group always recompiles."
 const TRACED_HOOKS = (:forward, :loss)
@@ -198,9 +158,8 @@ function check_hook_grouping(names)
     )
     resid = filter(n -> n in RESIDENCY_HOOKS, names)
     isempty(resid) && return nothing
-    # NOT an error: `metrics_residency` decides this at run time and the macro cannot see it. What
-    # the macro CAN do is say which residency the grouping is consistent with, so a mismatch is
-    # something the user was told about rather than something they measure later.
+    # Not an error: `metrics_residency` decides at run time; the macro can only say which residency
+    # the grouping is consistent with.
     if isempty(traced)
         @warn "ReactantNitro.@hooks: assuming HOST residency for \
             $(join(("`$n`" for n in resid), ", ")), since this group holds no traced hook. \

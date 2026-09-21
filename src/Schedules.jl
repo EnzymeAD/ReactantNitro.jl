@@ -1,48 +1,27 @@
 # Schedules.jl
 #
-# Schedule resolution, the effective learning rate, and the text of the binding report. The
-# The sections are appended to `show(nitro)` in Phases.jl, and the text goes to the run's logger;
-# this file builds what it returns.
+# Schedule resolution, the effective learning rate, and the binding report. The report's sections
+# are appended to `show(nitro)` in Phases.jl and its text goes to the run's logger.
 
 """
     ReactantNitro.resolve_schedules(e, given, total) -> resolved
 
-Schedule resolution, run once at setup.
+Schedule resolution, run once at setup. Every entry is a factory of the horizon, called once here
+with `total`, after which `sched(step)` runs once per optimizer step; a bare `Number` normalizes to
+`_ -> (_ -> value)`, so constants are setup-fixed by construction. `given` is the `Nitro` keyword
+if passed and [`schedules`](@ref)`(e)` otherwise, replacing wholesale rather than merging.
 
-**Every entry is a factory of the horizon**, called once here with `total`, after which
-`sched(step)` runs once per optimizer step. A bare `Number` normalizes to `_ -> (_ -> value)`,
-which is what makes constants setup-fixed by construction: only scheduled entries transfer per step.
+Keys resolve against two disjoint namespaces, `Device` field names and rule field names, reserved
+at the top level as `device` and `opt`. A scheduled rule field lands in the per-group `hp` carrier;
+a scheduled `Device` is written into the experiment by the per-step rebuild and reaches traced code
+as `e.aux_weight`. A key matching neither is an error naming the fix; one matching both is an
+ambiguity error showing the qualified form, since `lambda`, `eta` and `epsilon` collide routinely.
 
-`given` is the `Nitro` keyword if one was passed and [`schedules`](@ref)`(e)` otherwise; **the
-keyword replaces wholesale and does not merge**, because a silently retained schedule from the
-accessor is much harder to explain than an explicitly dropped one.
-
-**Key resolution is against two disjoint namespaces**, `Device` field names and rule field names,
-and they route to different places: a scheduled rule field lands in the per-group `hp` carrier and
-is applied to the chain, while a scheduled `Device` is written into the experiment by the per-step
-rebuild and reaches traced code as `e.aux_weight`. There is no third destination, which is what
-makes the resolution total.
-
-`device` and `opt` are **reserved** at the top level and name the two namespaces. A key matching
-neither is an error naming the fix; a key matching both is an ambiguity error naming both candidates
-and showing the qualified form **for the user's own key** rather than a generic example. Collisions
-are expected rather than exotic: `lambda` is the obvious name both for a decay coefficient and for a
-loss weight, and `eta`, `rho`, and `epsilon` are all plausible model hyperparameters, so the
-collision path is a two-line fix and **renaming the field is never required**.
-
-**`step` is the optimizer step, not the micro-batch**, and
-`total = max_epochs * div(steps_per_epoch, accum)` is an **exact** division, never `fld` or `cld`,
-because a batch count not divisible by `accum` is a setup error.
-
-**A nested `opt` key is a parameter-group path.** `opt = (; backbone = (; eta = ...))` flattens to
-the dotted key `opt.backbone.eta`, which binds the `:backbone` group's chain only. The value is the
-BASE curve for those groups and the per-group ratio is still applied,
-`η_g(t) = opt.backbone.eta(t) · (learning_rate(e, Val(:backbone)) / learning_rate(e))`, exactly like
-a bare key; a group with no path key falls back to the bare key, then to its base rate. Paths are
-ONE level (`group.field`), because the group table is flat, and qualified-only: an unqualified
-dotted key is a resolution error, since the `:auto` branch cannot know a top-level key is a group
-path. Manual mode is deliberately asymmetric: its path values are absolute, because manual mode has
-no base rate and no ratios.
+`step` is the optimizer step, and `total = max_epochs * div(steps_per_epoch, accum)` is exact. A
+nested `opt` key is a parameter-group path: `opt = (; backbone = (; eta = ...))` binds the
+`:backbone` group's chain only, as the base curve with the per-group ratio still applied; paths are
+one level, since the group table is flat. Manual mode's path values are absolute instead, since it
+has no base rate.
 """
 struct ResolvedSchedules{T <: NamedTuple, O <: NamedTuple}
     device::T                       # Device field name -> callable(step)
@@ -54,21 +33,17 @@ end
 
 Base.isempty(r::ResolvedSchedules) = isempty(r.device) && isempty(r.opt)
 
-# A bare `Number` normalizes to `_ -> (_ -> value)`. That is what makes constants setup-fixed BY
-# CONSTRUCTION rather than by a check: a constant is a `Number` and a schedule is a `Callable`, so
-# the per-step transfer count equals the number of quantities actually being varied.
+# A constant is a `Number` and a schedule is a `Callable`, so the per-step transfer count equals the
+# number of quantities actually being varied.
 _as_factory(x::Number) = _ -> (_ -> x)
 _as_factory(f) = f
 
 """
     ReactantNitro.HorizonGuard
 
-A schedule asked for a step PAST its horizon that THROWS there holds its final value and warns once,
-instead of ending the run. A schedule that answers past `total` (a step decay, a constant, a cycle) is
-left alone: the guard evaluates it as usual and only steps in on the exception, so nothing that does
-not depend on the horizon changes. The data contract is that `length(train)` is stable across
-epochs, so `total` counts every step the run will take. A source whose batch count drifts between
-epochs breaks that quietly.
+A schedule that throws when asked for a step past its horizon holds its final value and warns once,
+instead of ending the run. One that answers past `total` is left alone. The horizon is exact only
+while `length(train)` is stable across epochs, which the data contract requires.
 """
 mutable struct HorizonGuard{F}
     f::F
@@ -99,10 +74,9 @@ function (g::HorizonGuard)(step)
     end
 end
 
-# `device` and `opt` are reserved at the top level and name the two namespaces; every other
-# top-level key is unqualified and must resolve to exactly one of them. The `opt` table may nest
-# one level deeper: a NamedTuple VALUE is a parameter-group path, flattened here to a
-# dotted display key (`Symbol("backbone.eta")`) so the per-group binding survives resolution.
+# `device` and `opt` are reserved at the top level; every other key is unqualified and must resolve
+# to exactly one namespace. A NamedTuple value under `opt` is a parameter-group path, flattened to a
+# dotted display key (`Symbol("backbone.eta")`).
 function _flatten_schedules(nt::NamedTuple, what::AbstractString)
     out = Tuple{Symbol, Symbol, Any}[]
     for (k, v) in pairs(nt)
@@ -127,11 +101,9 @@ function _flatten_schedules(nt::NamedTuple, what::AbstractString)
     return out
 end
 
-# Flatten the `opt` table into `(ns, key, spec)` triples: a bare key is a rule field name and a
-# nested NamedTuple is a parameter-group PATH whose innermost keys are field names. The mirror of
-# manual mode's `_flatten_manual_opt!`, recursing over the user's table rather than an opt_state
-# tree; the dotted display key (`Symbol("backbone.eta")`) is the same shape either way, which is
-# what keeps the path parsing (`_schedule_target`) shared between the two modes.
+# Flatten the `opt` table into `(ns, key, spec)` triples: a bare key is a rule field, a nested
+# NamedTuple a parameter-group path. The dotted display key is the same shape as manual mode's, so
+# `_schedule_target` is shared.
 function _flatten_opt!(out, spec::NamedTuple, path::Tuple = ())
     for (k, v) in pairs(spec)
         if v isa NamedTuple
@@ -149,9 +121,7 @@ _display_key(ns, k) = ns === :auto ? k : Symbol(ns, ".", k)
     ReactantNitro.schedulable_fields(chains) -> Tuple{Vararg{Symbol}}
 
 The `opt` namespace: the union of every rule field in the composed chains, minus each rule's
-[`nonschedulable`](@ref) opt-out. The namespace is `opt` rather than `rule` deliberately, because
-`rule` is singular while a chain holds several and a key resolves against the union of their
-fields.
+[`nonschedulable`](@ref) opt-out.
 """
 function schedulable_fields(chains)
     ks = Symbol[]
@@ -221,9 +191,8 @@ function resolve_schedules(
                               $(nameof(typeof(e))). Its `Device` fields are \
                               $(isempty(df) ? "(none)" : df).")
         else
-            # A DOTTED `opt` key is a parameter-group path (`group.field`), one level because
-            # the group table is flat; it binds that group's chain only, and the field must be
-            # schedulable THERE, not merely somewhere. A bare key binds every group, unchanged.
+            # A dotted `opt` key is a one-level `group.field` path binding that group's chain only;
+            # the field must be schedulable there.
             path, field = _schedule_target(k)
             if isempty(path)
                 k in of || error(
@@ -289,14 +258,10 @@ end
 """
     ReactantNitro.check_lambda_conflict(e, groups, [key]) -> nothing
 
-**Scheduling `lambda` while also defining per-group `lambda` accessors is a setup error naming
-both**, since the schedule supplies the base. A BARE key (`opt.lambda`) applies the rule to every
-`groups` entry; a PATH key (`opt.<group>.lambda`) names its group and applies it to that group only,
-which is what lets one group's decay be scheduled while another's accessor keeps its own base.
-
-`eta` is deliberately exempt from the same rule, and that asymmetry is the whole point: per-group
-`learning_rate` accessors define **ratios** that compose with an `eta` schedule, whereas a scheduled
-`lambda` is uniform across groups and gets its per-group scaling from the `η_g(t)` factor instead.
+Scheduling `lambda` while also defining per-group `lambda` accessors is a setup error, since the
+schedule supplies the base. A bare key applies to every group; a path key to its group only. `eta`
+is exempt because per-group `learning_rate` accessors define ratios that compose with an `eta`
+schedule, while a scheduled `lambda` gets its per-group scaling from `η_g(t)`.
 """
 function check_lambda_conflict(e, groups, key::Symbol = :lambda)
     offenders = [g for g in groups if !is_framework_default(lambda, Tuple{typeof(e), Val{g}})]
@@ -319,10 +284,8 @@ end
 """
     ReactantNitro.is_framework_default(f, argtypes) -> Bool
 
-Whether the method that would be called is one of the framework's own defaults rather than a user
-method. Used where a configuration is an error only if the user actually defined something, which
-cannot be answered by calling the accessor: its default and a user method that happens to return
-the same value are indistinguishable by value.
+Whether the method that would be called is the framework's own default rather than a user method.
+Calling the accessor cannot answer this, since a user method may return the same value.
 """
 is_framework_default(f, argtypes) =
     hasmethod(f, argtypes) && which(f, argtypes).module === @__MODULE__
@@ -330,34 +293,21 @@ is_framework_default(f, argtypes) =
 """
     ReactantNitro.effective_lr(e, group, eta_t) -> scalar
 
-The definition of "effective learning rate" that the per-group `hp.eta` and `hp.lambda` refer to:
+The effective learning rate the per-group `hp.eta` and `hp.lambda` refer to:
 
     η_g(t) = eta_sched(t) * (learning_rate(e, Val(g)) / learning_rate(e))
 
-where `eta_sched(t)` is the `eta` schedule if one is configured and `learning_rate(e)` otherwise.
-**Per-group accessors define ratios; the schedule sets the absolute value of the default group**, so
-`η_default(t) == eta_sched(t)` exactly and a backbone at `1f-4` against a default of `1f-3` stays a
-tenth of it for the whole run. Both obvious alternatives are worse: a multiplier makes
-`OneCycle(total, 1f-3)` silently yield `1e-6`, and replacing all groups kills per-group ratios
-whenever a schedule exists.
+Per-group accessors define ratios and the schedule sets the default group's absolute value, so a
+backbone at `1f-4` against a default of `1f-3` stays a tenth of it for the whole run. `lambda`
+follows the same per-group scaling, with a uniform base from the schedule or a per-group one from
+the accessor:
 
-`lambda` follows `eta`'s per-group scaling and is the one other key with a per-group base:
+    λ_g(t) = η_g(t) * lambda_sched(t)      # `opt.lambda` scheduled
+    λ_g(t) = η_g(t) * lambda(e, Val(g))    # otherwise
 
-    λ_g(t) = η_g(t) * lambda_sched(t)      # `opt.lambda` scheduled: uniform base
-    λ_g(t) = η_g(t) * lambda(e, Val(g))    # otherwise: per-group base
-
-**The `η_g(t)` factor is what makes decay per-group, so the scheduled `lambda` itself stays uniform.**
-There is no ratio and no division, which matters because the default group's decay is legitimately
-`0` in most experiments. This is forced rather than chosen: decoupled decay is *defined* as scaled
-by the learning rate.
-
-**Every other scheduled key sets its value absolutely for every group**, and configuring both a
-schedule and a per-group accessor for the same quantity is a setup error naming both. Three rules,
-`eta`, `lambda`, and everything else, all stated, all loud. Per-group schedules are out of scope.
-
-The formula is complete without schedules: the schedule layer supplies `eta_t` from the resolved
-`eta` schedule and changes nothing here. `eta_t === nothing` is "no `eta` schedule configured",
-which means `eta_sched(t) = learning_rate(e)`.
+Decoupled decay is defined as scaled by the learning rate, so there is no ratio and no division,
+which matters because the default group's decay is legitimately `0`. Every other scheduled key is
+absolute for every group. `eta_t === nothing` means no `eta` schedule is configured.
 """
 function effective_lr(e, group::Symbol, eta_t = nothing)
     base = learning_rate(e)
@@ -376,28 +326,12 @@ end
 """
     ReactantNitro.step_aux(fields, scheds, step) -> NamedTuple
 
-The per-step rebuild of the scheduled `Device` fields, in **one pass** rather than `@set` per key:
-
-```julia
-step_aux(fields, scheds, step) =
-    merge(fields, NamedTuple{SCHED_KEYS}(map(k -> to_device(scheds[k](step)), SCHED_KEYS)))
-```
-
-Per-step cost is one small `NamedTuple` (mostly reference copies), one struct copy, and K device
-conversions. Per-group values count once per group, so a scheduled learning rate across G groups is
-G transfers; at G of two to four this is noise.
-
-**Verified:** rebuilding an optimizer rule each step with a fresh `ConcretePJRTNumber` `eta`
-re-enters the **same** compiled thunk, and the value is live: a flat eta sequence and a ramped one
-produce different parameters through one compiled program.
-
-**The scheduled value is coerced to the field's own type before conversion**, which is why this
-takes `fields` rather than only the schedules. A schedule written as `t -> 0.25 * min(1, t / 2000)`
-returns `Float64` for a `Device{Float32}` field, and the uncoerced value would produce a
-`ConcretePJRTNumber{Float64}`, moving `typeof(compile_view(e))`, which is `args[1]` at every trace
-site, and so **recompiling the gradient program on the first scheduled step**. That is a
-several-hundred-second cost for a missing `f0` suffix, and the framework can simply do the
-conversion.
+The per-step rebuild of the scheduled `Device` fields, in one pass: one small `NamedTuple`, one
+struct copy, and K device conversions. The scheduled value is coerced to the field's own type
+before conversion, which is why this takes `fields`: a schedule written as
+`t -> 0.25 * min(1, t / 2000)` returns `Float64` for a `Device{Float32}` field, and the uncoerced
+value would move `typeof(compile_view(e))` and recompile the gradient program on the first
+scheduled step.
 """
 function step_aux(fields::NamedTuple, scheds::NamedTuple, step::Integer; mesh = nothing)
     ks = keys(scheds)
@@ -411,12 +345,9 @@ end
 step_aux(fields::NamedTuple, r::ResolvedSchedules, step::Integer; mesh = nothing) =
     step_aux(fields, r.device, step; mesh)
 
-# Match the field's own type. The two cases need two different questions asked, and the trap is that
-# `eltype` answers only one of them: `eltype(ConcretePJRTArray{Float32,1,1})` is `Float32`, but
-# `eltype(ConcretePJRTNumber{Float32,1})` is `ConcretePJRTNumber{Float32,1}`, i.e. Base's
-# `eltype(::Type{T}) = T` fallback for a non-array. So the scalar case converts to `typeof(old)`,
-# which is right whether the field is already device-resident (setup has run, the run path) or still
-# a host `Number` (before conversion, and in unit tests), and `to_device` is idempotent over both.
+# `eltype(ConcretePJRTNumber{Float32,1})` is the type itself (Base's non-array fallback), so the
+# scalar case converts to `typeof(old)`, which is right whether the field is already on device or
+# still a host `Number`; `to_device` is idempotent over both.
 _coerce_scheduled(old, new::Number, ::Symbol) = convert(typeof(old), new)
 function _coerce_scheduled(old, new::AbstractArray, name::Symbol)
     size(new) == size(old) || error(
@@ -432,27 +363,12 @@ _coerce_scheduled(_, new, ::Symbol) = new
 """
     ReactantNitro.step_experiment(e, sched, step) -> e
 
-The per-step rebuild on the **experiment** side: the same rebuild `rebuild_rules` does for the
-optimizer's rules, applied to the scheduled [`Device`](@ref) fields of `e` itself. This is what makes
-`device = (; aux_weight = ...)` in `schedules` actually vary `e.aux_weight` inside `loss`, `forward`,
-and `metrics`.
-
-**Returns `e` itself, identically, when nothing device-side is scheduled**, which is the overwhelmingly
-common case and the reason the caller can invoke it unconditionally. Only a run that scheduled an
-experiment field pays for the struct copy.
-
-**The rebuild itself is [`step_aux`](@ref)**, which this wraps rather than reimplements: `step_aux`
-produces the new field values in one pass, and this puts them back into the struct. Two copies of the
-same merge would be two things to keep in agreement, and the one with the tests would not be the one
-that runs.
-
-`step` is the **upcoming** optimizer step, so callers pass `nitro.step + 1`, matching
-[`rebuild_rules`](@ref) exactly: the two halves of one rebuild must not disagree about which step they
-are building for.
-
-**The type assertion is the backstop.** `step_aux`'s coercion is meant to make it unreachable, and it
-is checked rather than trusted because the failure it prevents is a **silent recompile on every
-optimizer step**, which presents as "training got mysteriously slower" rather than as an error.
+The per-step rebuild on the experiment side, the counterpart of `rebuild_rules`: the scheduled
+[`Device`](@ref) fields of `e` are rebuilt through [`step_aux`](@ref), which is what makes
+`device = (; aux_weight = ...)` vary `e.aux_weight` inside `loss` and `forward`. Returns `e` itself
+when nothing device-side is scheduled. `step` is the upcoming optimizer step, `nitro.step + 1`,
+matching `rebuild_rules`. The type assertion is a backstop against a silent recompile on every
+step, which presents as training getting mysteriously slower.
 """
 function step_experiment(e, sched, step::Integer; mesh = nothing)
     (sched === nothing || isempty(sched.device)) && return e
@@ -477,34 +393,15 @@ end
 """
     ReactantNitro.to_device(x)
 
-The device conversion, and it is **not** the obvious incantation. Measured: bare `to_rarray(2.0f0)`
-passes the scalar through unchanged and the value **bakes**.
+The device conversion. Not the obvious incantation: bare `to_rarray(2.0f0)` passes a scalar
+through unchanged and the value bakes, so a `Number` needs `track_numbers = Number`. A device
+number is preferred over a 1-element array, whose `[1]` throws under trace. The identity methods
+keep it idempotent, since `to_device_rule` runs over rules already built with device scalars.
 
-```julia
-to_device(x::Number) = Reactant.to_rarray(x; track_numbers = Number)
-to_device(x::AbstractArray) = Reactant.to_rarray(x)
-```
-
-Prefer a device *number* over a 1-element array: an array requires `[1]` to read, which throws
-"Scalar indexing is disallowed" under trace.
-
-The two identity methods keep it idempotent, so a value already on device passes through rather than
-being handed back to `to_rarray` a second time. That matters because `to_device_rule` runs
-over rules the framework has already built with device hyperparameters.
-
-**A `Device` field may hold a CONTAINER of arrays, not only one value**, which is PyTorch's
-"buffers": tensors the graph reads and nothing differentiates, such as the frozen weights of a
-backbone a model calls through `Reactant.Ops.hlo_call` inside its `forward`. They belong on a
-`Device` field rather than in `ps` (nothing trains them) and rather than on a `GraphConst` (baking
-tens of millions of constants into the graph is a compile-time disaster). Because the experiment
-reaches Enzyme as `Const(ev)`, a buffer set placed there is constant to the gradient, so Enzyme
-differentiates only the head and keeps no tape for the backbone's forward.
-The container is mapped element-wise, so each leaf takes one of the methods above and the identity
-methods keep the whole thing idempotent.
-
-`Tuple` and `NamedTuple` only, deliberately: `AbstractVector{<:AbstractArray}` is already claimed
-by the `AbstractArray` method above, and adding it here would turn a wrong dispatch into a silent
-one rather than an error.
+A `Device` field may hold a `Tuple` or `NamedTuple` of arrays, PyTorch's "buffers": tensors the
+graph reads and nothing differentiates, such as a frozen backbone's weights. They belong on a
+`Device` field rather than in `ps` (nothing trains them) or a `GraphConst` (baking millions of
+constants into the graph). Reaching Enzyme as `Const(ev)`, they are constant to the gradient.
 """
 to_device(x::Number; mesh = nothing) =
     place_replicated(x, mesh; track_numbers = Number)
@@ -518,11 +415,10 @@ to_device(x::Union{Tuple, NamedTuple}; mesh = nothing) = map(v -> to_device(v; m
 """
     ReactantNitro.resolve_manual_schedules(e, given, total; opt_state, accessor) -> ResolvedSchedules
 
-Schedule resolution for a manual-mode experiment: the `device` keys resolve exactly as in the
-automatic loop (via [`resolve_schedules`](@ref), which this delegates to), and the `opt` keys
-resolve against the USER's `opt_state` structure instead of the framework's chains.
-
-**The `opt` table's keys are binding descriptors, and the structure IS the binding:**
+Schedule resolution for a manual-mode experiment: `device` keys resolve as in the automatic loop,
+and `opt` keys resolve against the user's `opt_state` structure. A bare key is a rule field name
+and binds every rule with that field, absolutely; a nested key is a path into `opt_state`, with
+the innermost keys field names. Paths and fields are validated at setup.
 
 ```julia
 schedules(e) = (;
@@ -532,17 +428,6 @@ schedules(e) = (;
         disc = (; eta = _ -> _ -> 2.0f-3),               # path: opt_state.disc's rules' eta
     ))
 ```
-
-A bare key is a rule FIELD name and binds to every rule in `opt_state` that has that field (the
-absolute value: manual mode has no base rate and no ratios). A nested key is a PATH into
-`opt_state`; the innermost keys are field names. A path is validated at setup against the
-`opt_state` tree, a field against the rules it reaches, and a `nonschedulable` field is refused,
-all with loud errors. This is what makes "we don't know what eta to bind to" impossible: the key
-says.
-
-Only the `opt` namespace carries paths; unqualified keys resolve exactly as in the automatic
-loop, against `Device` fields alone (manual mode has no chains for the opt side of the `:auto`
-resolution).
 """
 function resolve_manual_schedules(e, given::NamedTuple, total::Integer; opt_state, accessor = nothing)
     acc = accessor === nothing ? given : accessor
@@ -562,15 +447,9 @@ end
 """
     ReactantNitro.flatten_manual_opt(opt_table, opt_state, total, accessor_table) -> (flat, source, constant, varying)
 
-Manual mode's opt-table resolution: flatten the user's (possibly nested) `opt` table into
-display-keyed step functions, validating each binding against `opt_state`.
-
-* a bare key is a rule field name and binds to every rule in `opt_state` with that field;
-* a nested key is a path into `opt_state` and binds to the rules at that subtree.
-
-The display key of a path binding is the dotted path plus the field, `Symbol("gen.eta")`, which is
-what the per-step rebuild and the binding report read. `source`/`constant` mirror the automatic
-resolution's bookkeeping.
+Manual mode's opt-table resolution: flatten the possibly nested `opt` table into display-keyed step
+functions, validating each binding against `opt_state`. The display key of a path binding is the
+dotted path plus the field, `Symbol("gen.eta")`.
 """
 function flatten_manual_opt(opt_table::NamedTuple, opt_state, total::Integer, accessor_table = (;))
     out = Pair{Symbol, Any}[]
@@ -637,11 +516,8 @@ function _descend_opt_path(target, k::Symbol, path)
     return getproperty(target, k)
 end
 
-# The rules reachable from a target subtree, as a list of DISTINCT CORE rule types in
-# first-appearance order, and an error naming the reach if there are none. The core is the
-# innermost rule: `Optimisers.setup` wraps rules (with Reactant arrays) in a single-field
-# wrapper that delegates `apply!`, and a schedulable field lives on the wrapped rule, so the
-# check and the rebuild both look through wrappers.
+# The distinct core rule types reachable from a subtree. `Optimisers.setup` wraps rules in a
+# single-field wrapper that delegates `apply!`, and a schedulable field lives on the wrapped rule.
 function _manual_rules(x, seen = Type[], out = Type[])
     if x isa Optimisers.Leaf
         R = typeof(_rule_core(x.rule))
@@ -708,13 +584,9 @@ end
 """
     ReactantNitro.rebuild_scheduled_rules(nitro, step) -> opt_state
 
-The per-step host rebuild, the manual-mode counterpart of the automatic loop's `rebuild_rules`:
-evaluate every `opt` schedule at `step` and rebuild the rules it names in a fresh `opt_state` tree.
-
-Called by `_train_manual!` before each closure invocation, and the closure's program re-enters the
-same cache entry because the rebuild is TYPE-preserving: the scheduled value is coerced to the
-field's own element type (the `resolve_hp` rule, applied to a third place) and the rule's type is
-unchanged, so only the scalar VALUES move, exactly as the automatic loop's rebuilt rules.
+The per-step host rebuild, manual mode's counterpart of `rebuild_rules`: evaluate every `opt`
+schedule at `step` and rebuild the rules it names. Type-preserving, since the value is coerced to
+the field's own element type, so the closure's program re-enters the same cache entry.
 """
 function rebuild_scheduled_rules(nitro::Nitro, step::Integer)
     sched = nitro.schedules
@@ -761,15 +633,10 @@ map_leaves(f, x) = x
 """
     ReactantNitro.rebuild_leaf_rule(leaf, field, value) -> Leaf
 
-One rule's rebuild: set `field` to `value` in a NEW rule of the same type, keeping the state. The
-value is coerced to the field's own element type before device conversion, the `resolve_hp` rule
-applied in its third place: a Float64 schedule into a Float32 field would otherwise produce a
-`ConcretePJRTNumber{Float64}`, moving the rule's type, moving the closure program's argument types,
-and recompiling on the first scheduled step.
-
-Rules that do not have the field are untouched, and single-field rule wrappers (the
-`ReactantOptimiser` of Optimisers' Reactant extension) and `OptimiserChain`s are unwrapped and
-rewrapped, so a scheduled `eta` reaches the Adam inside either.
+One rule's rebuild: set `field` to `value` in a new rule of the same type, keeping the state, with
+the value coerced to the field's element type so the rule's type does not move. Chains and
+single-field rule wrappers are unwrapped and rewrapped, so a scheduled `eta` reaches the Adam
+inside either.
 """
 function rebuild_leaf_rule(leaf::Optimisers.Leaf, field::Symbol, value)
     newrule = rebuild_rule_field(leaf.rule, field, value)
@@ -777,9 +644,8 @@ function rebuild_leaf_rule(leaf::Optimisers.Leaf, field::Symbol, value)
     return Optimisers.Leaf(newrule, leaf.state, leaf.frozen)
 end
 
-# Set `field` to `value` in a new rule of the same type; recurse into chains and single-field
-# wrappers; leave every other rule untouched. The direct-field case coerces the value to the
-# field's own element type, then device-converts, exactly like the automatic loop's `resolve_hp`.
+# Set `field` in a new rule of the same type; recurse into chains and single-field wrappers; leave
+# every other rule untouched.
 function rebuild_rule_field(r, field::Symbol, value)
     T = typeof(r)
     if hasfield(T, field)
@@ -812,15 +678,10 @@ end
     ReactantNitro.binding_report_pieces(nitro) -> NamedTuple
 
 Everything the binding report says, read off a [`Nitro`](@ref) and handed to
-[`binding_report_sections`](@ref) or [`binding_report_text`](@ref) as keywords. **A diagnostic,
-not a check**: it computes nothing the run does not already compute and it never fails. It exists
-because the rules that resolve a learning rate, a schedule key, and a per-group accessor are
-individually simple and jointly hard to hold in your head.
-
-**One of three reports, and they do not overlap.** This one says where each configured value BOUND
-and from which source. What the handle currently holds, including the seed, the batch size, the
-split sizes and the preset, is the `state` band of `show(nitro)`, which these sections are
-appended to. What has been redefined since the handle froze it is [`fixed_config_report`](@ref).
+[`binding_report_sections`](@ref) or [`binding_report_text`](@ref). A diagnostic, not a check: it
+computes nothing the run does not already compute and never fails. It says where each configured
+value bound and from which source; what the handle holds is the `state` band of `show(nitro)`, and
+what has been redefined since is [`fixed_config_report`](@ref).
 
 ```
   data
@@ -845,19 +706,10 @@ appended to. What has been redefined since the handle froze it is [`fixed_config
              NOT present, the factory did not apply it    epsilon
 ```
 
-That last block is the point: the framework gives up **erroring** on an unapplied Level 2
-hyperparameter, because the identity check that would detect it also rejects a factory that
-legitimately transforms a value. As a report the same information costs nothing and rejects nothing.
-
-The `data` block is the home of the one thing the framework deliberately does not raise on: samples
-a drop-last training loader discarded are invisible to every check the framework can make. The
-parenthetical appears only when the source supports `MLUtils.numobs`, and is **omitted rather than
-guessed** otherwise. The `gradient_clip_norm` row's source label is the one place a reader sees
-whether the keyword, a method, or a field won, and it shares the `bindings` band with the
-schedules because it answers the same three questions they do.
-
-The sections are shown as bands of `show(nitro)`; the plain text goes to
-`log_other!(lgr, "binding_report", str)` so it lands in the run's record.
+The `level 2` block is where the framework reports rather than errors on an unapplied
+hyperparameter, since the identity check that would detect it also rejects a factory that
+legitimately transforms a value. The `data` block reports samples a drop-last loader discarded,
+which no check can raise on, and only when the source supports `MLUtils.numobs`.
 """
 function binding_report_pieces(nitro)
     lay = nitro.layout
@@ -871,10 +723,7 @@ function binding_report_pieces(nitro)
             for nm in keys(nitro.data)
     ]
     if get(nitro.frozen, :manual, false)
-        # In manual mode the optimizers are the USER's own, from `setup_optimizers`; the automatic
-        # per-group accessor resolution does not apply, and reporting it would claim a chain
-        # (the framework's RAdam default, say) the run does not have. One honest line instead;
-        # the rules themselves live in the user's `setup_optimizers`.
+        # Manual mode's optimizers are the user's own, so the per-group resolution does not apply.
         groups = [
             (;
                 name = :manual, base_eta = 0, ratio = 0, anchor = :user, lambda = 0,
@@ -924,20 +773,10 @@ build_binding_sections(nitro) = binding_report_sections(; binding_report_pieces(
 """
     ReactantNitro.clip_source(e, resolved) -> Symbol
 
-Which route supplied `gradient_clip_norm`: `:keyword` if the value this run resolved to is not the
-one the accessor chain would have produced, `:method` if the user defined an accessor, `:field` if
-the experiment declares a field of that name, and `:default` for the framework's own `0f0`. The
-binding report is the one place a reader sees whether the keyword, a method, or a field won.
-
-**The framework default is its own label.** Both branches of the accessor test used to
-answer `:field`, so a bare experiment declaring no such field was reported as taking one, which is
-the report naming a source that does not exist. A defaults audit is exactly where that surfaces:
-every run of a bare experiment prints this line.
-
-**The keyword is detected by comparing values rather than by a flag**, because `Nitro`'s keyword
-defaults to the accessor call, and a keyword that was passed is therefore indistinguishable from
-one that was not by the time the constructor body runs. A keyword equal to what the accessor would
-have returned reports the accessor, which is true of the value even though it understates the call.
+Which route supplied `gradient_clip_norm`: `:keyword` if the resolved value differs from what the
+accessor chain would produce, `:method` for a user accessor, `:field` for a declared field, and
+`:default` for the framework's own `0f0`. The keyword is detected by value, since a passed keyword
+is indistinguishable from the accessor default by the time the constructor body runs.
 """
 clip_source(e, resolved) =
     resolved != gradient_clip_norm(e) ? :keyword :
@@ -951,20 +790,11 @@ _g(x) = string(round(Float64(x); sigdigits = 3))
     ReactantNitro.prefetch_report_entry(name, split) -> (; device_batches, host_batches, workers, ordered, path)
 
 The per-split prefetch fact, resolved rather than requested (see `prefetch_config`).
-
-Every split reports its own resolved configuration now that the eval path streams too. It did not
-always: while `run_eval` iterated its split directly, an eval entry reported `path = :eval`, because a
-worker count for a path that never entered `batch_stream` would have been false.
 """
 prefetch_report_entry(::Symbol, split) = prefetch_config(split)
 
-# The rule for the data block: state what is known and omit what is not. `path` is the resolved
-# one, so `:single_no_trait` reads differently from `:single` on purpose: the first is a capability
-# the source does not have and the second is a number somebody chose.
-# The two buffer counts read as "on the device / on the host", which is what they are: one batch
-# staged past the transfer and `host_batches` allowed to exist before it. `ordered` appears only
-# when it is FALSE, because that is the setting that costs bitwise reproducibility and a line that
-# says so on every ordinary run would be noise rather than a warning.
+# The data block states what is known and omits what is not. `ordered` appears only when false,
+# since that is the setting that costs bitwise reproducibility.
 _prefetch_buffers(pf) =
     "$(pf.device_batches) on device, $(pf.host_batches) on host" *
     (pf.ordered ? "" : ", UNORDERED")
@@ -972,9 +802,8 @@ _prefetch_buffers(pf) =
 """
     ReactantNitro._batches_note(batches) -> String
 
-The data band's leading note. `batches` is a count, or the word [`_nitro_split`](@ref) reports for
-a loader that promises no length, and the two cannot share a phrasing: "streaming batches" claims
-a count the framework does not have.
+The data band's leading note: a count, or the word [`_nitro_split`](@ref) reports for a loader
+with no length.
 """
 _batches_note(b) = b in ("streaming", "?") ? String(b) : "$b batches"
 
@@ -995,37 +824,18 @@ _prefetch_note(pf) =
                                             schedules, groups, level2 = ()) -> Vector{TableSection}
 
 The binding report's [`TableSection`](@ref)s, built from explicit pieces so they are testable
-without a run. [`build_binding_report`](@ref) assembles these from a [`Nitro`](@ref), and
-`show(nitro)` appends them to the handle's own bands so a run is one table.
-
-**They report where values BOUND, and deliberately nothing else.** The seed, the accum, the
-schedule horizon, the batch size, the batch counts and the preset are all state the handle
-carries, so the `state` band above these is where they are read; a fact printed by two sections is
-a fact that can disagree between them. What is redefined since construction is a separate report,
-[`fixed_config_report`](@ref).
+without a run. They report where values bound and nothing else; the seed, accum, horizon, batch
+size and preset are the `state` band's, since a fact printed twice can disagree.
 
   * `splits`: one `(; name, batches, batch_size, samples, dropped, short_final[, prefetch])` per
-    split. Only what the data path RESOLVED is printed: `samples`, `dropped`, and `short_final`
-    may be `nothing` and are then **omitted rather than guessed**, per the rule for sources that
-    do not support `MLUtils.numobs`. The batch count is always resolvable, so it is what a split
-    with nothing else to report shows, and the band has no empty case. `batches` and `batch_size` are accepted and not printed,
-    since the handle carries both. `prefetch` is optional and read with `get`, so a caller
-    assembling the pieces by hand may leave it out; `build_binding_report` always supplies it,
-    from [`prefetch_report_entry`](@ref). `batch_size` is accepted and not printed, since it is
-    one number for the run and the `state` band carries it. `batches` leads the resolved notes
-    and may be a count or the word a non-countable loader reports; see [`_batches_note`](@ref).
-  * `clip_source`: `:keyword`, `:method`, `:field`, or `:default`. **This is the one place a
-    reader sees which of them won.** `:default` is the framework's own value and is what a bare
-    experiment reports; it is a separate label because "field on e" naming a field the experiment
-    does not declare is a report that cannot be checked against the source.
+    split. `samples`, `dropped` and `short_final` may be `nothing` and are then omitted rather than
+    guessed; `prefetch` is optional; `batch_size` is accepted and not printed.
+  * `clip_source`: `:keyword`, `:method`, `:field` or `:default`, the one place a reader sees which
+    won.
   * `groups`: one `(; name, base_eta, ratio, anchor, lambda, rule, params)` per parameter group.
-  * `level2`: one `(; group, present, absent)` per Level 2 chain. The framework gives up
-    **erroring** on an unapplied Level 2 hyperparameter, because the identity check that would
-    detect it also rejects a factory that legitimately transforms a value. As a report the same
-    information costs nothing and rejects nothing.
+  * `level2`: one `(; group, present, absent)` per Level 2 chain.
 
-`name` is accepted and not printed: the table's title already names the experiment, and these
-sections are bands inside it.
+`name` is accepted and not printed, since the table's title names the experiment.
 """
 function binding_report_sections(;
         name = "", splits = (), clip = 0,
@@ -1048,42 +858,23 @@ function binding_report_sections(;
             end
             sp.short_final === nothing ||
                 push!(notes, "final batch of $(sp.short_final) padded then sliced")
-            # `get` rather than `sp.prefetch`: this function is built to be callable from a test
-            # with explicit pieces, and the suites that do so construct their splits tuples by
-            # hand.
+            # `get`, so a test can build its splits tuples by hand.
             pf = get(sp, :prefetch, nothing)
             pf === nothing || push!(notes, _prefetch_note(pf))
-            # The batch count LEADS the resolved notes, and it moved here from the handle's own
-            # `data` row when the two displays became one table: it is the first thing anyone
-            # asks of a split, and a band headed `data` that did not say how many batches a split
-            # has would send the reader to a second display for it. The batch SIZE stays in the
-            # `state` band, since it is one number for the run rather than one per split.
-            #
-            # A note rather than a column of its own, because every section of this table shares
-            # its columns and a count is three characters wide: given a column, it would sit in
-            # one sized by `eta 0.001 (x1.0), lambda 0.0 toward zero, RAdam` and be separated
-            # from the rest of its own row by forty blanks.
+            # The batch count leads, as the first thing anyone asks of a split; a note rather than a
+            # column, since every section shares its columns and a count would sit in one sized by
+            # the settings text.
             pushfirst!(notes, _batches_note(sp.batches))
             push!(rows, [sp.name, join(notes, "; ")])
-            # UNORDERED is the one resolved data setting worth a colour. It costs bitwise
-            # reproducibility, `_prefetch_note` already refuses to mention ordering on the runs
-            # where it holds, and a split that quietly gave it up is exactly what a reader is
-            # scanning this band for.
+            # UNORDERED is the one resolved data setting worth a colour: it costs reproducibility.
             occursin("UNORDERED", last(rows)[2]) &&
                 (styles[(length(rows), 2)] = :warn)
         end
         push!(sections, TableSection("data", ["split", "resolved"], rows, styles))
     end
 
-    # ONE BAND FOR EVERYTHING THAT HAS A SOURCE, rather than a band per kind of value. The
-    # gradient clip had one of its own, which meant a labelled heading, a column header and two
-    # rules around a single row, and a section that size reads as a section only because the value
-    # needed somewhere to live. It answers the same three questions a schedule binding does, in
-    # the same order, so it belongs in the same table: what bound, what that means, and which
-    # route supplied it. Its source then lands in the column a reader is already scanning down.
-    #
-    # THE CLIP LEADS AND IS ALWAYS PRESENT, where a schedule may not be: it is the one value here
-    # that every run has, including a run that schedules nothing.
+    # One band for everything that has a source. The clip leads and is always present, where a
+    # schedule may not be, and it answers the same three questions a binding does.
     rows = TableRows()
     srcs = Symbol[clip_source]
     push!(
@@ -1104,27 +895,21 @@ function binding_report_sections(;
                     (manual ? _manual_opt_desc(k) : _auto_opt_desc(k)) :
                     "Device field   e.$k"
                 note = disp in schedules.constant ? "  (constant)" : ""
-                # The source keeps its brackets. It is the column a reader scans for, and "[train!
-                # keyword]" is the token that appears in every other report and in the docs.
+                # The source keeps its brackets; `[train! keyword]` is the token used everywhere.
                 src = get(schedules.source, disp, :accessor)
                 push!(rows, [string(disp), what * note, "[" * _source_label(src) * "]"])
                 push!(srcs, src)
             end
         end
     end
-    # A threshold of zero is the absence of a setting, so the clip's own cell is muted rather than
-    # stated: that row is there to be scanned past on the runs that do not clip, and to stand out
-    # on the ones that do.
+    # A threshold of zero is the absence of a setting, so its cell is muted.
     styles = _source_styles(srcs, 3)
     styles[(1, 2)] = clip > 0 ? :accent : :muted
     push!(sections, TableSection("bindings", ["binding", "what", "source"], rows, styles))
 
     if !isempty(groups)
-        # SEVEN FACTS IN THREE COLUMNS, and the flattening is forced rather than chosen. Every
-        # section of this table shares one column structure, so a band wanting seven columns would
-        # set seven widths for the whole report and leave the two-column bands stranded across
-        # them. What is lost is scanning `ratio` or `decay toward` down a column; what is kept is
-        # every group on one line, which is the thing that matters as G grows.
+        # Seven facts in three columns, since every section shares one column structure and a
+        # seven-column band would strand the two-column bands across it.
         rows = TableRows(
             [
                 [
@@ -1170,13 +955,8 @@ end
 """
     ReactantNitro.binding_report_text(; kwargs...) -> String
 
-[`binding_report_sections`](@ref) rendered as text, which is the form sent to `log_other!` at
-setup so the run's record says where every value bound.
-
-Rendered through the installed table renderer into a plain `IOBuffer`, so the text carries the
-frame and none of the colour: an `IOBuffer` declares no `:color`, and every crayon the renderer
-emits is gated on that. There is one renderer in this package, the PrettyTables extension's, and
-Reactant loads PrettyTables, so the bytes are the same in every session.
+[`binding_report_sections`](@ref) rendered as plain text for `log_other!`. An `IOBuffer` declares
+no `:color`, so the text carries the frame and none of the colour.
 """
 function binding_report_text(; name = "", kwargs...)
     io = IOBuffer()
@@ -1191,15 +971,9 @@ end
 """
     ReactantNitro._source_styles(sources, col) -> CellStyles
 
-The role for each row's source cell, in column `col`: `:accent` for a value a `train!` keyword set
-and `:muted` for the framework's own default.
-
-**This is the column a reader scans, and the two ends of it are the two questions they have.**
-`[train! keyword]` is what somebody changed for THIS run, which is the first thing to check when a
-run behaves unlike its neighbours; `[framework default]` is a value nobody chose, which is the
-first thing to check when a run behaves unlike its config implies. The accessor and method
-sources sit between them and stay plain, because a value that came from the experiment is the
-ordinary case and colouring the ordinary case spends the signal.
+The role for each row's source cell: `:accent` for a value a `train!` keyword set (what somebody
+changed for this run) and `:muted` for the framework's own default (a value nobody chose). The
+accessor and method sources stay plain, since a value from the experiment is the ordinary case.
 """
 _source_styles(sources, col::Int) = CellStyles(
     (i, col) => (src === :keyword ? :accent : :muted)
@@ -1212,9 +986,8 @@ _source_label(s::Symbol) = s === :keyword ? "train! keyword" :
     s === :field ? "field on e" :
     s === :default ? "framework default" : string(s)
 
-# Automatic-loop opt schedule keys: a bare key is a rule field name binding every group's
-# chain; a dotted key is `group.field`, binding that group's chain only, with the per-group ratio
-# still applied. The report says which a key is and which group a path binds.
+# Automatic-loop opt keys: a bare key binds every group's chain, a dotted `group.field` key binds
+# that group's only, with the per-group ratio still applied.
 function _auto_opt_desc(k::Symbol)
     parts = split(string(k), '.')
     field = Symbol(last(parts))

@@ -1,18 +1,14 @@
 # Checkpoint.jl
 #
 # Checkpointing: the record, the top-K checkpointer, the manifest, and the resume compatibility
-# checks.
-#
-# A "CHECKPOINT" IS FULL TRAINING STATE; "WEIGHTS" ARE PARAMETERS ALONE. An API that says checkpoint
-# and returns something unresumable has picked the wrong word, so `save_optimizer_state = true` by
-# default on EVERY checkpoint including top-K, not only a dedicated resume checkpoint. Whatever
-# produces parameters alone for export or serving is named for weights.
+# checks. A "checkpoint" is full training state and "weights" are parameters alone, so optimizer
+# state is saved on every checkpoint, including the top-K ones.
 
 """
     CheckpointRecord
 
-The single authority on what a checkpoint holds. The record on disk is the `snapshot` handed to
-[`save_checkpoint!`](@ref) plus the two framework-stamped fields at the top.
+The single authority on what a checkpoint holds: the `snapshot` handed to
+[`save_checkpoint!`](@ref) plus the two framework-stamped fields.
 
 | Field | Required | Why it is in the record |
 | --- | --- | --- |
@@ -20,7 +16,7 @@ The single authority on what a checkpoint holds. The record on disk is the `snap
 | `framework_version` | yes | Diagnosing a restore that misbehaves |
 | `ps` | yes | The parameters, as a tree |
 | `st` | yes | Layer state, including running statistics |
-| `opt_state` | yes | Opaque; carries moments **and** bias correction. **Stored as host values** |
+| `opt_state` | yes | Opaque; carries moments and bias correction. Stored as host values |
 | `flat_permutation` | yes | A different permutation scrambles `opt_state` against `ps` |
 | `step` | yes | Optimizer steps; restores schedules exactly |
 | `epoch` | yes | Loop position and reporting |
@@ -28,20 +24,13 @@ The single authority on what a checkpoint holds. The record on disk is the `snap
 | `config` | yes | Flattened, for the resume compatibility check |
 | `devices` | yes | Derived and adaptive `Device` values, so a change is visible after the fact |
 | `metrics` | yes | The epoch's validation metrics, for top-K bookkeeping |
-| `run_id`, `run_url` | optional | Informational; traces a checkpoint back to its experiment |
-| `logger_state` | optional | Machine-readable resumption state, opaque and backend-specific |
+| `run_id`, `run_url` | optional | Traces a checkpoint back to its experiment |
+| `logger_state` | optional | Opaque, backend-specific resumption state |
 | `logger_type` | optional | So resuming into a different backend refuses |
-| `anchor_checksum` | optional | Per anchored group; **the arrays themselves are not stored** |
+| `anchor_checksum` | optional | Per anchored group; the arrays themselves are not stored |
 | `stop_reason` | optional | `:completed`, `:early_stop`, or `:error` |
 
-**`opt_state` is stored as host values and re-normalized to device residency on restore.**
-Serializing `ConcretePJRTNumber` leaves would tie a checkpoint to a device configuration and JLD2
-has no reason to round-trip them faithfully, so the flow is uniform with exactly one normalization
-point per path: **write host, read host, normalize on the way in.** Skipping the restore-path
-normalization reacquires the frozen-step-counter bug in full, on the default path.
-
-A metric-comparison gate can read its curves out of this record's `metrics` field, which is why such
-a gate needs no logger and the framework ships none.
+Every value is a host value: write host, read host, normalize to device residency on the way in.
 """
 struct CheckpointRecord
     format_version::Int
@@ -65,36 +54,18 @@ struct CheckpointRecord
     preset::Any
 end
 
-# ── Showing a record NEVER shows the weights ─────────────────────────────────────────
+# ── Showing a record never shows the weights ─────────────────────────────────────────
 #
-# The default struct `show` prints every field recursively, and four of them (`ps`, `st`,
-# `opt_state`, `flat_permutation`) are the whole parameter tree. A 115 MB checkpoint therefore
-# `display`s as tens of millions of characters: a 64x64 toy weight alone prints 90,080. In a REPL
-# that is a wasted screen; in an agent session, where the REPL's output is the transcript, it is the
-# context window. Printing a record to find one small field is the way that cost gets paid by
-# accident: the parameter dump lands in the transcript and the field being looked for is buried in
-# it.
-#
-# So the summary is the show, and the arrays are named rather than printed. This is not politeness:
-# there is no way to ask for `epoch` without materializing the record, so the safe rendering has to
-# be the DEFAULT rendering, or the trap stays one keystroke away. `checkpoint_info` is the supported
-# way to ask, and the last line says so, because someone reading this output is mid-question.
-#
-# Nothing here can throw on a partly-migrated record: every field is read through `_shown`, which
-# falls back to the type name for anything it does not recognize.
-#
-# `_shown` IS ALSO THE EXPERIMENT RENDERER (`_show_experiment` in Config.jl), for the same reason
-# the weight list below is named once: an experiment carries device buffers under `Device{T}` where
-# `T` is a tuple or a NamedTuple, which is the same array-in-a-container shape a record's `ps` has.
-# Two renderers would drift, and the one that drifted would be the one that dumped a model.
+# Four fields are the whole parameter tree, so the default struct `show` prints tens of millions of
+# characters, which in an agent session is the context window. The summary is the show, the arrays
+# are named rather than printed, and `checkpoint_info` is the supported way to ask. `_shown` is also
+# the experiment renderer (Config.jl), since a `Device{Tuple}` of buffers has the same shape.
 _shown(x::Union{Nothing, Symbol, AbstractString, Real}) = repr(x)
-# A DEVICE scalar reads back as a host number. That is a four-byte transfer, and the value is the
-# entire reason such a field is in a table; the wrapper type is not.
+# A device scalar reads back as a host number: four bytes, and the value is the point.
 _shown(x::Reactant.RNumber) = repr(Reactant.to_number(x))
 _shown(x::NamedTuple) = isempty(x) ? "(;)" :
     "(" * join(("$k = " * _shown(v) for (k, v) in pairs(x)), ", ") * ")"
-# Tuples recurse for the buffer case: `Device{Tuple{Matrix, Matrix}}` renders as two shapes rather
-# than as `<Tuple>`, which would hide the one thing worth knowing about it.
+# Tuples recurse so a `Device{Tuple{Matrix, Matrix}}` renders as two shapes.
 _shown(x::Tuple) = isempty(x) ? "()" : "(" * join(map(_shown, x), ", ") * ")"
 _shown(x::AbstractArray) = "<" * string(eltype(x)) * " array, size " * join(size(x), "x") * ">"
 _shown(x) = "<" * string(nameof(typeof(x))) * ">"
@@ -129,37 +100,17 @@ end
 """
     TopKCheckpointer(; k = 3, metric = :val_loss, mode = :min, dir = nothing, name = nothing)
 
-The default checkpointer, writing into [`run_dir`](@ref).
+The default checkpointer, writing into [`run_dir`](@ref). Constructible for an arbitrary
+experiment because the default `metrics` guarantees `:val_loss`; a user `metrics` that does not
+emit the configured metric is a setup error.
 
-It is constructible for an arbitrary experiment **only because the default `metrics` guarantees
-`:val_loss` exists**; an earlier draft left `metric` with no default and therefore had a
-batteries-included default that could not be built. **If a user's own `metrics` does not emit the
-configured metric, that is a setup error naming the metric and the ones actually emitted**, checked
-before training rather than at the first checkpoint.
-
-**Retain a `latest` alongside top-K**, as a retention *rule* rather than a second file: never rotate
-out the newest, whatever it scored. On disk this is the union, K+1 files when the newest is not among
-the best and exactly K when it is. Resuming from the *best* checkpoint is not resuming from where you
-were.
-
-**Do not symlink `latest` into the top-K set.** Rotation deletes the target when a better checkpoint
-arrives, so the link dangles through entirely normal operation with no user action, and checkpoint
-directories get copied between paths where `tar`/`rsync`/`scp` handle symlinks inconsistently.
-
-Write a small manifest (file, epoch, metric, `stop_reason`) alongside; top-K bookkeeping needs it
-anyway and it lets resume find the newest without reading every file.
-
-**Passing `checkpointer = nothing` disables checkpointing** and is the documented opt-out, with its
-`::Nothing` no-op methods. TopK is the default rather than `nothing` because `resume = :auto` only
-works if something wrote a `latest`.
-
-"Every N epochs", "best only", and "write to object storage" are ten-line implementations. The
-serialization format stays concrete (JLD2); swapping it means replacing save and load together,
-which is the only safe granularity.
-
-**`name` is the checkpoint filename, and `nothing` means adopt the experiment's**
-[`checkpoint_filename`](@ref) at setup, exactly as `dir` adopts [`run_dir`](@ref). Passing one pins
-it and setup never overwrites it. It is called with keywords, `name(; epoch, step, metric, score)`.
+The retention rule is the top K by `metric` in union with the newest, whatever it scored: K+1
+files when the newest is not among the best, K when it is. `latest` is a rule, not a symlink,
+since a symlink into the top-K set dangles the moment rotation deletes its target. A small
+manifest (file, epoch, metric, `stop_reason`) is written alongside so resume finds the newest
+without reading every file. `checkpointer = nothing` disables checkpointing. `name` is the
+filename hook, `name(; epoch, step, metric, score)`; `nothing` adopts the experiment's
+[`checkpoint_filename`](@ref) at setup, as `dir` adopts `run_dir`.
 """
 mutable struct TopKCheckpointer
     k::Int
@@ -179,17 +130,11 @@ TopKCheckpointer(;
 """
     save_checkpoint!(ckpt, epoch, metrics, snapshot) -> nothing
 
-**The checkpointer decides internally whether an epoch warrants a write**, so policy and action
-collapse into one hook.
-
-Writes go through [`ReactantNitro.with_io_retry`](@ref), to a temporary path renamed into place
-atomically, and rotation deletes the displaced file only after the new one is durably in place.
-
-**Four arguments, and `e` is deliberately not among them.** The filename comes from the
-checkpointer's `name`, bound to the experiment's [`checkpoint_filename`](@ref) at setup, rather than
-from an experiment passed in here: the record's host-value discipline exists to keep device-resident
-leaves away from the function that serializes, and the experiment is the one object in a run that
-holds them by design.
+The checkpointer decides internally whether an epoch warrants a write. Writes go through
+[`with_io_retry`](@ref) to a temporary path renamed into place, and rotation deletes the displaced
+file only after the new one is durable. `e` is deliberately not an argument: the filename comes
+from the checkpointer's bound `name`, so the one object holding device leaves by design never
+reaches the function that serializes.
 """
 function save_checkpoint! end
 save_checkpoint!(::Nothing, epoch, metrics, snapshot) = nothing
@@ -229,32 +174,22 @@ function save_checkpoint!(ckpt::TopKCheckpointer, epoch, metrics, snapshot)
 
     entry = ManifestEntry((basename(path), Int(epoch), score, snapshot.stop_reason))
     prior = read_manifest(dir)
-    # ONE ENTRY PER EPOCH, AND ONE PER FILE. The first is what top-K bookkeeping ranks over. The
-    # second is because `file` is the only identity a checkpoint has, so an entry naming a file
-    # this write just overwrote describes bytes that are gone. Under the default name the two
-    # conditions coincide, since the name carries the epoch; they come apart for a `name` that does
-    # not, which is exactly the "best only" ten-line implementation, and without the second
-    # condition that one grows a manifest entry per epoch all naming the same file.
+    # One entry per epoch and one per file: `file` is a checkpoint's only identity, and a `name`
+    # that omits the epoch ("best only") would otherwise grow an entry per epoch naming one file.
     entries = ManifestEntry[
         e for e in prior
             if e.epoch != Int(epoch) && e.file != entry.file
     ]
     push!(entries, entry)
-    # REPLACING AN EPOCH DELETES THE FILE IT DISPLACED. The filter above drops the old same-epoch
-    # entry, so a write whose name differs from the previous write of that epoch leaves a file that
-    # is in no entry, which makes it invisible to the rotation below and to every later one:
-    # permanent, not merely untidy. The default name cannot reach this, since all four of its
-    # inputs are identical between the per-epoch write and the final rewrite at the end of a run,
-    # but `name` is a hook and Revise can change one mid-run.
+    # A write whose name differs from the previous write of that epoch would leave a file no entry
+    # names, invisible to every rotation; `name` is a hook and Revise can change it mid-run.
     displaced = String[
         e.file for e in prior
             if e.epoch == Int(epoch) && e.file != entry.file
     ]
     keep = retained(entries, ckpt)
-    # THE MANIFEST IS WRITTEN BEFORE THE ROTATION DELETES ANYTHING. A rotation that deletes
-    # first and then fails leaves a run with fewer checkpoints than its retention policy promises;
-    # writing the manifest first leaves at worst a file on disk that the manifest does not list,
-    # which the next rotation cleans up and which nothing reads.
+    # The manifest is written before the rotation deletes anything, so a failure leaves at worst
+    # an unlisted file rather than fewer checkpoints than the policy promises.
     write_manifest(dir, [e for e in entries if e.file in keep])
     for f in Iterators.flatten((displaced, (e.file for e in entries if !(e.file in keep))))
         p = joinpath(dir, f)
@@ -266,17 +201,9 @@ end
 """
     ReactantNitro.retained(entries, ckpt) -> Set{String}
 
-The retention rule: **the top K by the selection metric, in union with the newest, whatever it
-scored.** On disk that is K+1 files when the newest is not among the best and exactly K when it is.
-
-**`latest` is a rule, not a second file and not a symlink.** A symlink into the top-K set dangles
-the moment a better checkpoint rotates its target away, which is entirely normal operation, and
-checkpoint directories get copied between paths where `tar`, `rsync`, and `scp` handle symlinks
-inconsistently.
-
-An entry with no score, which is what a run with no `val` split produces, is never among the top K
-and is retained only by being the newest. That keeps a train-only run resumable without inventing an
-ordering over metrics it never computed.
+The retention rule: the top K by the selection metric, in union with the newest whatever it
+scored. An entry with no score (a run with no `val` split) is never among the top K and is retained
+only by being the newest, which keeps a train-only run resumable.
 """
 function retained(entries, ckpt::TopKCheckpointer)
     newest = entries[argmax([e.epoch for e in entries])]
@@ -301,16 +228,10 @@ function write_record(path::AbstractString, record::CheckpointRecord)
     return nothing
 end
 
-# The manifest: file, epoch, metric, and `stop_reason`, so top-K bookkeeping and `resume = :auto`
-# both work without reading every record. JLD2 for the same reason the records use it: the
-# framework fixes one serialization format, and swapping it means replacing save and load together.
-#
-# THE ENTRY TYPE IS EXPLICIT, and the two optional fields are `Union`s rather than whatever the first
-# entry happened to hold. A manifest built from bare NamedTuples types itself off its first row, so a
-# run whose first epoch had no `stop_reason` produced a `Vector` of entries with `stop_reason` typed
-# `Nothing`, and the final rewrite that carries the outcome could not be pushed into it. That failed
-# loudly here; on a file format it would be the kind of thing that fails on the tenth epoch of a
-# long run.
+# The manifest: file, epoch, metric and `stop_reason`, so top-K bookkeeping and `resume = :auto`
+# work without reading every record. The entry type is explicit, with `Union` fields: a manifest
+# built from bare NamedTuples typed itself off its first row, and the final rewrite carrying a
+# `stop_reason` could not be pushed into it.
 const ManifestEntry = @NamedTuple{
     file::String, epoch::Int, score::Union{Float64, Nothing},
     stop_reason::Union{Symbol, Nothing},
@@ -321,25 +242,17 @@ manifest_path(dir) = joinpath(dir, "manifest.jld2")
 """
     read_manifest(dir) -> Vector
 
-**Which checkpoints a run directory holds, without opening one of them.** Each entry
-carries `file` (a basename, not a path), `epoch`, `score` (the validation metric the retention rule
-ranked that checkpoint by, or `nothing` for a run with no `val` split) and `stop_reason` (`nothing`
-until a run records how it ended).
+Which checkpoints a run directory holds, without opening one. Each entry carries `file` (a
+basename), `epoch`, `score` (the retention metric, or `nothing` for a run with no `val` split) and
+`stop_reason` (`nothing` until the run records how it ended). This is the cheap question; go to a
+record with [`checkpoint_info`](@ref) only for what the manifest does not carry. Returns an empty
+vector for a directory no run has written to.
 
 ```julia
 for e in sort(read_manifest("runs/MyExp"); by = e -> e.epoch)
     println(e.epoch, "  ", e.score, "  ", e.file)
 end
 ```
-
-**This is the cheap question, and it is the one worth asking first.** The manifest is a single small
-file the checkpointer rewrites next to every record, so ranking a run's checkpoints, or finding the
-newest one to resume from, costs one read instead of deserializing a parameter tree per file in the
-directory. [`checkpoint_info`](@ref) is the other half of the pair: go to a record only for the
-fields the manifest does not carry, and not in a loop over a directory.
-
-Returns an empty vector when `dir` has no manifest. That is a directory no run has written to yet,
-which is an answer rather than an error, and it is what lets `resume = :auto` run in a fresh one.
 """
 function read_manifest(dir)
     p = manifest_path(dir)
@@ -366,33 +279,19 @@ end
 """
     checkpoint_info(path) -> NamedTuple
 
-**What a checkpoint says about itself, with none of its weights.** Which epoch, which step, which
-preset, which run, how it stopped, and the validation metrics that were current when it was written.
+What a checkpoint says about itself, with none of its weights: epoch, step, preset, run, how it
+stopped, and the validation metrics current when it was written.
 
 ```julia
 i = checkpoint_info("runs/MyExp/epoch-0012-step-116520-mae=0.0253034.jld2")
 i.epoch, i.step, i.preset, i.metrics.mae, i.run_id
 ```
 
-**This is the ONLY thing you should open a checkpoint with when you are asking a question about it**,
-and it exists because the alternative kept being reinvented, badly. A record is one JLD2 entry
-holding one object, four of whose fields are the whole parameter tree, so there is no way to read
-`epoch` without materializing all of it, and every session that tried built its own reader:
-`JLD2.Group` (does not exist), `JLD2.names` (not public, wrong method), `keys` on the record (no
-method), then `getfield` on a record read in a process without ReactantNitro loaded, where JLD2 hands
-back a `ReconstructedMutable` whose fields answer to `getproperty` and NOT to `getfield`. Then the
-one that actually costs something: `println` the record, and the parameter tree goes to stdout.
-[`CheckpointRecord`](@ref)'s `show` now refuses that, and this function means nobody has to get
-close to it.
-
-**Read it in a process that has ReactantNitro loaded.** That is not a nicety either: the workspace
-needs the type, or JLD2 reconstructs a look-alike and the field access rules change under you. This
-function is also where the two field-shape migrations live, so an older record answers the same
-questions as a new one.
-
-**For a whole run directory, do not call this in a loop.** [`read_manifest`](@ref) answers "which
-checkpoints are here, at which epochs, with which scores" from the run's own small manifest and opens
-no record at all; go to a record only for the fields the manifest does not carry.
+This is the one thing to open a checkpoint with when asking a question about it: a record is one
+JLD2 object four of whose fields are the parameter tree, so there is no cheaper way to read
+`epoch`, and hand-rolled readers have printed the whole tree by accident. Read it in a process with
+ReactantNitro loaded, or JLD2 reconstructs a look-alike type. For a whole directory use
+[`read_manifest`](@ref) rather than calling this in a loop.
 """
 function checkpoint_info(path::AbstractString)
     isfile(path) || error("ReactantNitro: there is no checkpoint at `$path`.")
@@ -415,45 +314,24 @@ end
 """
     checkpoint_filename(e; epoch, step, metric, score) -> String
 
-The checkpoint filename, and a user hook: define a method for your experiment type to name
-checkpoints differently.
+The checkpoint filename, and a user hook.
 
     epoch-0006-step-4500-val_loss=0.0416831.jld2
     epoch-0006-step-4500.jld2                          # a run with no `val` split
-    epoch-0043-step-32250-mae=-1.23457e-07.jld2
 
-Reading a run directory should answer "which checkpoint is good" without opening JLD2. The score is
-in the manifest and in every record too, but both need deserializing to rank three files.
-
-**The epoch stays first and stays zero-padded**, so lexicographic order is training order. The step
-is unpadded, because the epoch already supplies the ordering and a width would be a promise that
-breaks above its own digit count.
-
-**`score === nothing` omits the segment rather than filling it**, which is what a run with no `val`
-split produces; the retention rule keeps such a checkpoint by being newest. No metric segment
-means no metric was computed, and a token such as `no_score` would reserve a name a real metric
-could take.
-
-**The value needs no sanitizing, and that is a consequence rather than a convention.** The
-selection metric goes through [`check_control_readback`](@ref) before anything uses it, so `score`
-is either `nothing` or a FINITE `Float64`, and `%g` on a finite double is always within
-`[0-9.eE+-]`. A
-`NaN` score does not produce an odd filename; it stops the run. The metric NAME is sanitized,
-because it is a user-supplied `Symbol` and a filename is not.
-
-**A method must accept `kwargs...`** unless it wants a later keyword addition to be a `MethodError`:
+The epoch stays first and zero-padded so lexicographic order is training order; the step is
+unpadded. `score === nothing` omits the segment. The score needs no sanitizing because it went
+through [`check_control_readback`](@ref) and is a finite `Float64`; the metric name is a user
+`Symbol` and is sanitized. A method must accept `kwargs...` so a later keyword addition is not a
+`MethodError`:
 
 ```julia
 ReactantNitro.checkpoint_filename(e::MyExp; epoch, score, kwargs...) =
     "e\$(lpad(epoch, 4, '0'))_\$(round(something(score, 0.0); digits = 4)).jld2"
 ```
 
-The framework calls this through [`TopKCheckpointer`](@ref)'s `name`, which is bound to the
-experiment at setup, so `save_checkpoint!` keeps its four arguments and never sees `e`: the
-host-value discipline exists to keep device-resident leaves away from the function that serializes,
-and the experiment is the one object in a run that holds them by design. A consequence worth having:
-the binding dispatches at WRITE time, so a revised method takes effect on the next checkpoint of a
-live run, unlike a revised `checkpointer` accessor, which is called once at setup.
+The framework calls this through [`TopKCheckpointer`](@ref)'s `name`, bound at setup, so a revised
+method takes effect on the next checkpoint of a live run.
 """
 function checkpoint_filename end
 
@@ -469,11 +347,8 @@ end
 """
     ReactantNitro.sanitize_metric_name(metric) -> String
 
-A metric key is a user-supplied `Symbol` and a filename is not, so every character outside
-`[A-Za-z0-9_.]` becomes `_` and the result is truncated to 40. That covers glob metacharacters,
-Windows-hostile characters, and a path separator smuggled in through `Symbol("a/b")`, without
-needing to enumerate them. An empty result becomes `metric`, so a pathological `Symbol("")` still
-names a file.
+Every character outside `[A-Za-z0-9_.]` becomes `_`, truncated to 40, and an empty result becomes
+`metric`: a metric key is a user-supplied `Symbol` and a filename is not.
 """
 function sanitize_metric_name(metric)
     s = replace(String(metric), r"[^A-Za-z0-9_.]" => "_")
@@ -484,14 +359,9 @@ end
 """
     ReactantNitro.checkpoint_name(ckpt, epoch, step, score) -> String
 
-Resolve [`TopKCheckpointer`](@ref)'s `name` for one write, and CHECK WHAT IT RETURNED. A hook is a
-user method, so the return is validated at the one moment the failure is cheap rather than after a
-`joinpath` has quietly aimed the write somewhere else.
-
-The rules are the minimum that keeps the manifest the single identity a checkpoint has: a non-empty
-`.jld2` basename, no path separator, and no `..`. A name that omits the epoch is NOT refused, since
-that is a legitimate choice ("best only" writes one file), but it does collide across epochs, which
-is why the write deletes the file it displaced.
+Resolve [`TopKCheckpointer`](@ref)'s `name` for one write and check the result: a non-empty `.jld2`
+basename with no path separator and no `..`. A name that omits the epoch is allowed ("best only")
+and collides across epochs, which is why the write deletes the file it displaced.
 """
 function checkpoint_name(ckpt::TopKCheckpointer, epoch, step, score)
     ckpt.name === nothing && error("ReactantNitro: this `TopKCheckpointer` has no `name`. Setup \
@@ -551,17 +421,10 @@ is a ten-line implementation, cannot implement a path-dispatched loader at all.
 function load_checkpoint end
 load_checkpoint(::Nothing, path) = nothing
 
-# JLD2 warns "saved type CheckpointRecord is missing field <f> in workspace type; reconstructing"
-# whenever a record predates a field ADDITION, which means every checkpoint written before `preset`
-# existed. The warning is JLD2's, fires inside `load` before any of our code runs, and reads like
-# breakage: it says "reconstructing" at a user who is resuming a run that is about to work.
-#
-# The migration below is EXPLICIT and tested, so the warning reports a problem that is not happening,
-# and an old checkpoint is not a rare artifact: a long run's mid-training checkpoints are.
-# Suppressed NARROWLY, matching both the phrase and the type name, so any other JLD2 warning still
-# reaches the user. Same call as suppressing "Replacing docs" on a deliberate docstring merge: a
-# warning about an operation the framework performs on purpose is noise, and noise trains people to
-# ignore warnings.
+# JLD2 warns "saved type CheckpointRecord is missing field ... reconstructing" on every record that
+# predates a field addition, which is every mid-training checkpoint of a long run. The migration
+# below is explicit and tested, so the warning is suppressed narrowly, matching both the phrase and
+# the type name.
 struct _QuietReconstruct{L <: Base.CoreLogging.AbstractLogger} <: Base.CoreLogging.AbstractLogger
     parent::L
 end
@@ -588,22 +451,13 @@ _load_record_quietly(path) = Base.CoreLogging.with_logger(
     () -> JLD2.load(path, "record"), _QuietReconstruct(Base.CoreLogging.current_logger())
 )
 
-# Migration (the Tunable -> Device rename). Records written before the rename carry a
-# `tunables` field. JLD2 reconstructs a struct from the ON-DISK field names when they do not match
-# the workspace type, so an old record arrives as a ReconstructedMutable holding `tunables` rather
-# than as a `CheckpointRecord`, and the rename is done here, field by field. FORMAT_VERSION stays 1:
-# nothing about the semantics of the stored data changed, only the field's name.
-#
-# A FUNCTION rather than a block inside `load_checkpoint`, because `checkpoint_info` reads the same
-# records and two copies of a migration is how one of them gets a third migration and the other does
-# not. `path` is for the error only.
+# Field-shape migrations: the `tunables` to `devices` rename, and the addition of `preset`.
+# JLD2 reconstructs an old record as a ReconstructedMutable with the on-disk field names, and the
+# rename is done here. A function because `checkpoint_info` reads the same records. FORMAT_VERSION
+# stays 1, since the semantics did not change.
 function _migrate_record(raw, path = "<record>")
     raw isa CheckpointRecord && return raw
     if hasproperty(raw, :tunables) || !hasproperty(raw, :preset)
-        # TWO migrations now, both field-shape only, so FORMAT_VERSION stays 1: nothing about the
-        # semantics of the stored data changed. The `tunables` to `devices` rename, and the
-        # ADDITION of `preset`, which an older record does not have and which reads back as
-        # `nothing` rather than refusing.
         return CheckpointRecord(
             raw.format_version, raw.framework_version,
             raw.ps, raw.st, raw.opt_state, raw.flat_permutation,
@@ -638,42 +492,21 @@ end
 """
     ReactantNitro.check_resume_compatible(record, e, layout; kwargs...) -> nothing
 
-**`resume = :auto` is opt in**, and it is safe to reach for only because the compatibility check lives in
-the framework rather than in a harness.
+The compatibility check behind `resume = :auto` and `checkpoint = path`, one route from a record
+to usable state.
 
-  * **Config.** The flattened config is in the record, so on mismatch **refuse with a diff of the
-    offending fields**. Identical config continues, changed config errors, neither silently does the
-    wrong thing. `Host` fields are excluded, since changing `max_epochs` on resume is the normal
-    case.
-  * **Derived values are excluded from the config comparison, and the three cases differ.** A derived
-    **`Device`** may change freely: it is recomputed on resume by design, cannot affect the compiled
-    program, and the change is recorded in `devices` so it is visible after the fact. A derived
-    **`GraphConst`** field changing is an **error**, because it bakes as a trace-time constant and
-    changes the cache key, so continuing would silently train a different program than the one being
-    resumed.
-  * **`step` is stored, not derived.** Deriving it as `epoch * opt_steps_per_epoch` is silently wrong
-    whenever steps-per-epoch changed. Restoring `step` restores every stateless schedule exactly,
-    since those are pure functions of `(step, total)`. The optimizer's bias correction is **not**
-    restored from `step`; it lives in `opt_state`.
-  * **Validate shapes, not just parameter counts**, and validate the flat permutation.
-  * **Verify the decay anchor by checksum and refuse on mismatch.** Step 6 rebuilds the model under
-    the restored `seed` and step 7 captures `w0`; for each group whose `decay_anchor` is not `:zero`,
-    checksum the freshly captured anchor against the record. All match, proceed: the fresh capture is
-    provably the same tensor the original run anchored to. Any mismatch, **refuse**, naming the
-    group, both checksums, and the likely cause. Do not warn and continue: continuing means silently
-    regularizing toward a *different* point, which produces a plausible loss curve with no error. The
-    checksum is over the **host** value of each anchored group's flat slice, consistent with the
-    record storing host values throughout.
+  * Config: the `GraphConst` fields are compared and a mismatch refuses with a diff. `Host` fields
+    are excluded, since raising `max_epochs` on resume is normal; `Device` fields are excluded
+    because they cannot affect the compiled program, and a change is visible in `devices`.
+  * `step` is restored, not derived, so every stateless schedule resumes exactly.
+  * The flat permutation is compared leaf by leaf, shapes included.
+  * The decay anchor is verified by checksum: the model is rebuilt under the restored seed, `w0`
+    is captured, and each anchored group's checksum must match the record, or the run would
+    silently regularize toward a different point.
 
-The accepted limitations, all documented rather than hidden: **adaptive schedules do not resume
-exactly** (a schedule closing over training state restarts its adaptation; carry that state in a
-`Device` if it matters); **data order is the loader's** and the framework does not restore a
-sampler's RNG; and **an anchored run with a nondeterministic init cannot be resumed at all**, which
-is the deliberate trade for not storing the anchor arrays, since that would roughly double the record
-for a `:w0`-anchored backbone.
-
-The `checkpoint = path` construction reuses this same check, so there is one route from a checkpoint
-to usable state rather than two that can drift.
+Accepted limitations: an adaptive schedule restarts its adaptation, the loader's sampling order is
+not restored, and an anchored run with a nondeterministic init cannot be resumed at all, which is
+the trade for not storing the anchor arrays.
 """
 function check_resume_compatible(
         record, e, layout; anchors = nothing, logger = nothing,
@@ -689,20 +522,11 @@ end
 """
     ReactantNitro.check_config_compatible(record, e, path) -> nothing
 
-The config half of the resume check: **identical config continues, changed config errors, and
-neither silently does the wrong thing.**
-
-The comparison is over **`GraphConst` fields only**, which is the same set the compile cache is
-keyed on, and that is not a coincidence: a `GraphConst` field bakes as a trace-time constant, so a
-changed one means the resumed run would train a **different compiled program** than the one being
-resumed.
-
-`Device` fields are excluded because they are traced inputs that cannot affect the graph, and they
-are recorded separately in `devices` so a change stays visible after the fact. `Host` fields are
-excluded because raising `max_epochs` on resume is the normal case. A **derived** `GraphConst` field
-is in the comparison and a derived `Device` is not, which is exactly the three-case rule above and
-needs no special handling here: `derive` merges into the struct before this runs, so each derived
-value is already whichever kind it was declared as.
+The config half of the resume check, over `GraphConst` fields only, the same set the compile cache
+is keyed on: a changed one means the resumed run would train a different compiled program. `Device`
+fields are recorded separately in `devices`; `Host` fields are the normal thing to change on
+resume. `derive` has merged before this runs, so a derived field is compared as whichever kind it
+was declared.
 """
 function check_config_compatible(record, e, path)
     now = graphconst_fields(e)
@@ -769,13 +593,9 @@ end
 """
     ReactantNitro.check_permutation_compatible(record, layout, path) -> nothing
 
-The permutation half of the resume check, and its shape half in the same check. A different
-permutation scrambles `opt_state` against `ps`, so it is a refusal rather than a warning.
-
-**This validates shapes rather than only parameter counts**, which is a separate requirement: a
-[`LeafRow`](@ref) carries the leaf's `keypath`, `group`, `offset`, `len`, and `size`, so a model
-whose leaf count matches but whose shapes moved differs here. Storing keypaths is also what makes
-the error name the leaf that moved instead of reporting that two integer vectors differ.
+The permutation half of the resume check. A different permutation scrambles `opt_state` against
+`ps`, so it is a refusal. A [`LeafRow`](@ref) carries keypath, group, offset, length and size, so
+shapes are validated rather than only counts, and the error names the leaf that moved.
 """
 function check_permutation_compatible(record, layout::FlatLayout, path)
     was, now = record.flat_permutation, layout.permutation
@@ -804,13 +624,9 @@ end
 """
     ReactantNitro.anchor_checksums(anchors) -> NTuple or nothing
 
-The decay-anchor checksum, one per group, `nothing` for a group anchored at `:zero`.
-
-**SHA256 over the host bytes**, for two reasons. The checksum must be over the same bytes on both
-sides, and the record stores host values throughout, so the host value is the one both sides can
-agree on. And it outlives the process and the Julia version, which `Base.hash` does not promise: a
-checksum that drifted on a Julia upgrade would make resume refuse while blaming `build_model` for
-being nondeterministic, which is the least debuggable failure this check could produce.
+The decay-anchor checksum per group, `nothing` for a `:zero` group. SHA256 over the host bytes,
+which both sides agree on, and which outlives the process and the Julia version as `Base.hash`
+does not.
 """
 anchor_checksums(::Nothing) = nothing
 anchor_checksums(anchors::Tuple) = map(anchor_checksum, anchors)
@@ -824,19 +640,10 @@ end
 """
     ReactantNitro.check_anchors_compatible(record, layout, anchors, path) -> nothing
 
-The anchor half of the resume check, and the reason a checkpoint can store a **checksum** instead
-of the anchor arrays without that being a silent downgrade.
-
-Step 6 rebuilds the model under the **restored** seed and step 7 captures `w0`; for each group whose
-`decay_anchor` is not `:zero`, the freshly captured anchor is checksummed against the record. All
-match: proceed, because the fresh capture is provably the same tensor the original run anchored to,
-so nothing was lost by not storing it. Any mismatch: **refuse**, naming the group, both checksums,
-and the likely cause.
-
-**Do not warn and continue.** Continuing means silently regularizing toward a *different* point
-than the run being resumed, which is the whole hazard of anchored decay: a plausible loss curve and
-no error. The limitation this accepts is recorded above, that a run whose anchored parameters come
-from a nondeterministic source cannot be resumed at all, and the two escapes from it.
+The anchor half of the resume check, and what makes storing a checksum instead of the anchor
+arrays sound: the fresh `w0` capture is checksummed against the record, a match proves it is the
+same tensor, and a mismatch refuses, naming the group and both checksums. Continuing would
+silently regularize toward a different point with a plausible loss curve.
 """
 function check_anchors_compatible(record, layout::FlatLayout, anchors, path)
     fresh = anchor_checksums(anchors)
@@ -876,25 +683,10 @@ end
 """
     ReactantNitro.check_logger_compatible(record, logger, path; weights_only = false) -> nothing
 
-The logger type check. The record stores the logger's type name alongside its state, so resuming
-into a **different** backend refuses with both names rather than handing one backend's state to
-another's logger, which would either raise somewhere deep in that backend or, worse, quietly start a
-fresh experiment.
-
-A record with no `logger_state` reattaches nothing and therefore checks nothing: a ten-line file
-logger that defines neither hook keeps working across a resume, which is the whole point of making
-the pair self-describing.
-
-**`weights_only = true` permits no logger at all**, and the type check still applies to one that is
-passed. A weights-only restore continues no run: there is no history to extend, so declining the
-logger drops nothing, and `reattach!(::Nothing, state)` is already a no-op.
-
-That distinction is not a nicety. This check ran on both restore paths, so **every export of a
-checkpoint written with a logger was impossible**: `logger = nothing` was refused, and the alternative
-was to pass the real backend and have setup reattach and re-log the config into the finished TRAINING
-experiment, from an export, needing credentials a detached export may not have. The error's suggested
-escape, `resume = false`, is not consulted on the `checkpoint = path` branch, so there was none. Found
-by two independent model ports.
+Resuming into a different logger backend refuses with both type names rather than handing one
+backend's state to another. A record with no `logger_state` checks nothing. `weights_only = true`
+permits no logger at all: a weights-only restore continues no run, and without this every export
+of a checkpoint written with a logger was impossible.
 """
 function check_logger_compatible(record, logger, path; weights_only::Bool = false)
     record.logger_state === nothing && return nothing
@@ -920,13 +712,9 @@ end
 """
     ReactantNitro.restored_devices(record, e) -> NamedTuple
 
-The weights-only restore: the derived `Device` values **from the record**, rather than recomputed
-by `derive`. That difference is deliberate and is the one place the two restore paths diverge: an
-evaluation process may not have the training data `derive` reads at all, so recomputing is not an
-option there, while a resume recomputes.
-
-Only fields the experiment still declares as `Device` are taken, so a record written before a field
-was removed does not resurrect it as a merge error.
+The weights-only restore's derived `Device` values, from the record rather than recomputed, since
+an evaluation process may not have the training data `derive` reads. Only fields the experiment
+still declares as `Device` are taken.
 """
 function restored_devices(record, e)
     record.devices isa NamedTuple || return (;)
@@ -938,15 +726,10 @@ end
 """
     ReactantNitro.check_checkpointer(ckpt, collection, routing) -> nothing
 
-The checkpointer's setup-time checks, the same shape as the early-stopping ones and partial for the
-same reason: the metric key set is knowable before the run **only** when the experiment defines no
-`metrics` method, where the framework's substitution fixes it at `(:val_loss,)`. Otherwise the keys
-exist only once the hook has run, and [`save_checkpoint!`](@ref) raises at the first checkpoint
-naming what was actually emitted.
-
-`k`, `mode`, and the absence of a `val` split are checkable unconditionally. A checkpointer selecting
-on a metric in a run with no validation is not an error, though: the retention rule keeps the
-newest checkpoint whatever it scored, so a train-only run stays resumable and simply never ranks.
+The checkpointer's setup-time checks: `k`, `mode`, and, when the experiment defines no `metrics`
+(so the only key is `:val_loss`), the selection metric. Otherwise the keys exist only once the hook
+has run, and [`save_checkpoint!`](@ref) raises at the first checkpoint. Selecting on a metric in a
+run with no `val` split is not an error: the newest checkpoint is retained regardless.
 """
 check_checkpointer(::Nothing, collection, routing) = nothing
 
@@ -971,15 +754,9 @@ end
 """
     ReactantNitro.find_latest(ckpt, run_dir) -> path or nothing
 
-`resume = :auto`'s lookup: the **newest** record in `run_dir`, found through the manifest rather than
-by reading every file, which is one of the two jobs the manifest exists for.
-
-**Newest, not best.** The retention rule keeps the newest checkpoint whatever it scored, for
-exactly this: resuming from the *best* checkpoint is not resuming from where you were, and a run
-that resumed from its best epoch would silently discard every epoch after it.
-
-Returns `nothing` when there is nothing to resume from, without raising, or a first run in a fresh
-directory could not start under `resume = :auto`.
+`resume = :auto`'s lookup: the newest record in `run_dir`, through the manifest. Newest, not
+best, since resuming from the best epoch would discard every epoch after it. `nothing` when there
+is nothing to resume from.
 """
 find_latest(::Nothing, run_dir) = nothing
 
@@ -996,16 +773,9 @@ end
 """
     ReactantNitro.selected_checkpoint(ckpt, run_dir) -> NamedTuple or `nothing`
 
-**Which checkpoint the run would hand you**, as `(; path, epoch, metric, score)`: the BEST one by
-the checkpointer's own `metric` and `mode`, which is a different question from `find_latest`'s
-newest and is the one someone asks after a run finishes.
-
-Answered entirely from the manifest, so it costs one small read and opens no record. That is what
-lets a run call it at the end and a handle report it afterwards without going back to disk.
-
-`nothing` when there is no checkpointer, no directory, no scored entry (a train-only run scores
-nothing and is retained by being newest), or when the winning entry names a file that is no longer
-there. Ranking matches `retained`'s: ascending score, reversed for `mode = :max`.
+Which checkpoint the run would hand you, `(; path, epoch, metric, score)`: the best by the
+checkpointer's `metric` and `mode`, answered from the manifest alone. `nothing` with no
+checkpointer, no directory, no scored entry, or a winning file that is gone.
 """
 selected_checkpoint(::Nothing, run_dir) = nothing
 

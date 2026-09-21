@@ -1,36 +1,13 @@
 # ReactantNitroMLUtilsExt.jl
 #
-# The index-addressable trait for `MLUtils.DataLoader`, so the loader everyone already writes fans
-# out over every thread without the user doing anything.
-#
-# ── What this is, in one sentence ────────────────────────────────────────────────────
-#
-# It reads the loader's DECLARATION rather than iterating it: `DataLoader` is a description of a
-# dataset (the data, a batch size, whether to shuffle, an RNG), and this rebuilds the epoch's plan
-# from those fields with MLUtils' own `ObsView`, `shuffleobs` and `BatchView`. Nothing here
-# reimplements batching, shuffling or collation; it asks MLUtils for the same objects
-# `DataLoader.iterate` would have built, and then indexes them.
-#
-# ── Why it needs no state, and why that is the whole point ───────────────────────────
-#
-# `struct DataLoader` is immutable, so `begin_epoch!` has nowhere to stash an epoch's shuffled view.
-# That is exactly what the three-argument `batch_at` exists for: `begin_epoch!` RETURNS the plan,
-# the framework holds it for that one epoch and hands it to every worker, and this file stays two
-# pure methods with no side table, no wrapper type, and nothing to collide when two handles share
-# one loader (`Nitro(e; data = n.data)` is a documented pattern, and a side table would break it).
-#
-# It is also the right shape for a fan-out on its own terms: N workers read one immutable plan
-# rather than racing on a source's fields.
-#
-# ── Reconstructed from PUBLIC fields, deliberately ───────────────────────────────────
-#
-# `DataLoader` keeps its already-wrapped view in `_data`, and `_shuffledata` is MLUtils-internal.
-# Using either would tie this file to MLUtils' privates. `data`, `batchsize`, `partial`, `collate`,
-# `shuffle` and `rng` are all documented fields, and `ObsView`, `BatchView`, `shuffleobs`, `numobs`
-# and `getobs` are all exported, so the plan below is rebuilt entirely from the supported surface.
-# The one thing that must keep matching upstream is the ORDER of operations, shuffle the
-# observations and then batch them, which is what `_shuffledata` does and what makes a batch a
-# contiguous window of the permuted stream rather than a permutation of fixed batches.
+# The index-addressable trait for `MLUtils.DataLoader`, so the loader everyone writes fans out over
+# every thread. It reads the loader's declaration rather than iterating it, rebuilding the epoch's
+# plan from the documented fields (`data`, `batchsize`, `partial`, `collate`, `shuffle`, `rng`) with
+# MLUtils' own exported `ObsView`, `shuffleobs` and `BatchView`, then indexing them. `DataLoader`
+# is immutable, so `begin_epoch!` returns the plan rather than storing it, which is what the
+# three-argument `batch_at` exists for; the file is two pure methods with no side table to collide
+# when two handles share one loader. The one thing that must keep matching upstream is the order of
+# operations: shuffle the observations, then batch them.
 
 module ReactantNitroMLUtilsExt
 
@@ -42,16 +19,9 @@ using MLUtils: BatchView, DataLoader, ObsView, getobs, numobs, shuffleobs
 """
     ReactantNitro.begin_epoch!(dl::MLUtils.DataLoader) -> plan
 
-This epoch's plan: an `ObsView` permuted when `shuffle = true`, wrapped in a `BatchView` when the
-loader batches.
-
-**Returned rather than stored**, because `DataLoader` is immutable. The framework holds it for the
-epoch and hands it to [`ReactantNitro.batch_at`](@ref).
-
-`shuffle = true` draws a NEW permutation here, once per epoch, from the loader's own `rng`, which is
-the same thing `DataLoader`'s own `iterate` does at the top of each pass. That is the half of the
-trait a `batch_at` alone cannot supply: the fan-out never calls `iterate`, so without this every
-epoch after the first would train on the first epoch's permutation.
+This epoch's plan: an `ObsView`, permuted when `shuffle = true` from the loader's own `rng` as
+`DataLoader`'s `iterate` does at the top of each pass, wrapped in a `BatchView` when the loader
+batches. Returned rather than stored, since `DataLoader` is immutable.
 """
 function ReactantNitro.begin_epoch!(dl::DataLoader)
     obs = ObsView(dl.data, collect(1:numobs(dl.data)))
@@ -63,52 +33,27 @@ end
 """
     ReactantNitro.batch_at(dl::MLUtils.DataLoader, i::Integer, plan) -> batch
 
-Batch `i` of this epoch's plan, through MLUtils' own `getobs`, which is the same call
-`DataLoader`'s unbuffered serial path makes.
-
-`plan` is untyped on purpose: [`ReactantNitro.fanout_capable`](@ref) detects a three-argument method
-by asking whether one accepts any plan at all, so annotating it here would hide it and the loader
-would silently fall back to one producer.
+Batch `i` of this epoch's plan through MLUtils' own `getobs`. `plan` is untyped on purpose, since
+[`ReactantNitro.fanout_capable`](@ref) detects the three-argument method by asking whether it
+accepts any plan.
 """
 ReactantNitro.batch_at(dl::DataLoader, i::Integer, plan) = getobs(plan, i)
 
 """
     ReactantNitro.check_source_options(dl::MLUtils.DataLoader, name::Symbol, cfg) -> nothing
 
-`partial` on the training split, plus `buffer` and `parallel` judged against the path the split
-actually resolved to.
+`partial` on both kinds of split, plus `buffer` and `parallel` judged against the path the split
+resolved to. Both of those live inside `DataLoader`'s `iterate`, which the fan-out never calls, so
+on the fan-out path they are inert (and `buffer = true` is said to be); on the single-producer
+path they are live. `buffer = true` is refused there, since the framework reads ahead and the
+loader would refill its one batch while the previous is still queued for transfer, silently;
+`parallel = true` warns, since MLUtils documents that it breaks ordering.
 
-**Both options live inside `DataLoader`'s `Base.iterate`**, and that is the whole of it. `parallel`
-selects which `iterate` method runs; `buffer` matters because the buffered `iterate` fills one
-shared batch through `getobs!`. The trait in this file drives the loader by index instead, through
-`getobs`, so on the FAN-OUT path neither option runs and neither can hurt anything. On the
-single-producer path the framework iterates the source, so both are live. `workers = 1` is not
-exotic: plain `julia` with no `-t` has one default thread and lands there.
-
-**`buffer = true` is refused on the single-producer path**, because the framework reads ahead: the
-loader would fill its one batch again while the previous one is still queued for its device
-transfer, leaving the queued batch holding the wrong samples. Nothing raises and the loss curve
-still looks plausible. On the fan-out path it is merely ignored, and said so, since someone who set
-it to bound allocation should not be left believing it did something.
-
-**`parallel = true` warns on the single-producer path** and is silent on the fan-out path. There it
-is ignored and the user gets what they asked for anyway, from this framework's producers, in the
-source's order. On the single-producer path it does run, and MLUtils documents that it breaks
-ordering guarantees, so a fixed seed stops reproducing a run bitwise.
-
-**`partial = false` on an EVAL split warns**, which is the mirror image. The framework pads a short
-eval batch and slices the outputs back, so keeping it costs nothing and is the supported shape;
-dropping it silently shrinks the set the metric is computed over, and a test accuracy quoted over
-9,984 of 10,000 samples reads exactly like one over all of them. It stays legal because there are
-two good reasons for it, a deliberately truncated set and a model that mixes across the batch axis
-in test mode, for which dropping is how you avoid padding rather than tolerate it.
-
-**`partial = true` on the `train` split is refused, and refused HERE**, before anything compiles.
-The framework already rejects a short training batch, but it can only do so when one arrives, which
-is the last batch of the first epoch: a compile and a full epoch of training after the mistake was
-made. A `DataLoader` carries the answer in its fields, so the arithmetic is exact rather than a
-guess, and `partial = true` over an observation count that happens to divide evenly is left alone
-because no short batch will ever be produced.
+`partial = true` on the `train` split is refused here, before anything compiles, rather than at the
+last batch of the first epoch, and only when the observation count does not divide by the batch
+size. `partial = false` on an eval split warns: the framework pads and slices, so dropping silently
+shrinks the set a metric is computed over. It stays legal for a deliberately truncated set or a
+model that mixes across the batch axis in test mode.
 """
 function ReactantNitro.check_source_options(dl::DataLoader, name::Symbol, cfg)
     _check_partial(dl, name)
@@ -142,15 +87,13 @@ function ReactantNitro.check_source_options(dl::DataLoader, name::Symbol, cfg)
     return nothing
 end
 
-# Exact rather than heuristic: a short final batch exists only when the observation count does not
-# divide by the batch size, and both are fields on the loader. `batchsize <= 0` is MLUtils' iterate
-# individual observations mode, where every batch is one observation and none can be short.
+# Exact rather than heuristic: both numbers are fields on the loader. `batchsize <= 0` is MLUtils'
+# one-observation-per-batch mode, where none can be short.
 function _check_partial(dl::DataLoader, name::Symbol)
     dl.batchsize > 0 || return nothing
     n = numobs(dl.data)
     short = n % dl.batchsize
-    # Nothing to say either way when the count divides: no batch is ever short, so `partial` picks
-    # between two identical behaviours and the flag is inert.
+    # When the count divides, `partial` picks between two identical behaviours.
     short == 0 && return nothing
     if name === :train
         dl.partial || return nothing

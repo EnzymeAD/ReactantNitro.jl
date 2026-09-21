@@ -5,13 +5,9 @@
 """
     ReactantNitro.with_io_retry(f; attempts, backoff) -> f()
 
-Retry a filesystem operation that failed transiently. This exists because a checkpoint write is the
-one I/O path in the framework whose failure loses hours of compute.
-
-Checkpoint writes go through here, **write to a temporary path and `rename` into place atomically**,
-and **top-K rotation deletes the displaced file only after the new one is durably in place**. A
-rotation that deletes first and then fails to write leaves a run with fewer checkpoints than its
-retention policy promises.
+Retry a filesystem operation that failed transiently. A checkpoint write is the one I/O path whose
+failure loses hours of compute; writes go through here to a temporary path renamed into place, and
+rotation deletes the displaced file only after the new one is durable.
 """
 function with_io_retry(f; attempts::Int = 5, backoff::Real = 0.5)
     attempts >= 1 || error("ReactantNitro: `with_io_retry` needs at least one attempt, and got \
@@ -20,9 +16,7 @@ function with_io_retry(f; attempts::Int = 5, backoff::Real = 0.5)
         try
             return f()
         catch err
-            # ONLY TRANSIENT I/O IS RETRIED. A `MethodError` or a serialization failure is not going
-            # to succeed on the fourth try, and retrying it would turn an instant, legible failure
-            # into a slow one with the original cause four backoffs back in the log.
+            # Only transient I/O is retried; a `MethodError` will not succeed on the fourth try.
             (attempt == attempts || !is_transient_io(err)) && rethrow()
             @warn "ReactantNitro: a filesystem operation failed and will be retried \
                    ($attempt/$attempts). A checkpoint write is the one I/O path in the framework \
@@ -36,13 +30,7 @@ end
 """
     ReactantNitro.is_transient_io(err) -> Bool
 
-Whether an exception is the kind a retry can fix. `SystemError` and `Base.IOError` cover the cases
-this is about: a full or briefly unavailable filesystem, a network-filesystem hiccup, a stale
-handle. `EOFError` is included because a truncated read of a file another process is still writing
-is the same class of fault.
-
-Everything else is rethrown on the first attempt. Retrying a `MethodError`, a `JLD2` type error, or
-a `Base.InvalidStateException` cannot help, and it hides the cause behind several seconds of
-backoff.
+Whether a retry can fix the exception: `SystemError`, `Base.IOError`, and `EOFError` (a truncated
+read of a file another process is still writing). Everything else is rethrown on the first attempt.
 """
 is_transient_io(err) = err isa SystemError || err isa Base.IOError || err isa EOFError

@@ -9,24 +9,12 @@
 """
     Device{T}
 
-Declaration-time marker for an [`@experiment`](@ref) field, legal only in that position. It is
-never instantiated and never appears in the generated struct: the macro consumes it and records
-the field in [`device_fields`](@ref).
-
-A `Device` field is converted to device residency at setup and reaches the traced step as an
-**input**, so in-trace `e.aux_weight` is the device value and arithmetic works with no unwrapping.
-The one marker does three jobs:
-
-1. **Device placement.** Scalars become `ConcretePJRTNumber`, arrays `ConcretePJRTArray`.
-2. **Cache-key exclusion.** A traced input cannot affect the graph, so it is excluded from the
-   compile cache key by construction.
-3. **Schedulability.** Constant and scheduled are the same device slot; only the write cadence
-   differs, and switching between them does not recompile.
-
-**Marking is opt-in.** Forgetting to mark costs a spurious recompile, which is visible and
-harmless; marking a structural field `Device` would silently lose constant folding or fail at trace
-time. The cost of over-marking is the lost constant folding: a `Device` threshold of zero emits the
-ops a plain host `0f0` folds away. Mark what you intend to revise or schedule.
+Declaration-time marker for an [`@experiment`](@ref) field; the macro consumes it and records the
+field in [`device_fields`](@ref). A `Device` field is converted to device residency at setup and
+reaches the traced step as an input, so `e.aux_weight` in a hook is the device value. One marker,
+three jobs: device placement, exclusion from the compile cache key (a traced input cannot affect
+the graph), and schedulability (constant and scheduled are the same slot). Mark what you intend to
+revise or schedule; a `Device` threshold of zero emits ops a host `0f0` folds away.
 
 ```julia
 @experiment struct MyExp
@@ -35,63 +23,32 @@ ops a plain host `0f0` folds away. Mark what you intend to revise or schedule.
 end
 ```
 
-See also [`Host`](@ref), which is the default, and [`GraphConst`](@ref), which bakes, and
-[`@experiment`](@ref).
+See also [`Host`](@ref), the default, and [`GraphConst`](@ref), which bakes.
 """
 struct Device{T} end
 
 """
     Host{T}
 
-Declaration-time marker for an [`@experiment`](@ref) field, legal only in that position. It is
-never instantiated and never appears in the generated struct: the macro consumes it and records
-the field in [`host_fields`](@ref).
+Declaration-time marker for an [`@experiment`](@ref) field, and the default for an unmarked one:
+`max_epochs::Int = 40` means `max_epochs::Host{Int} = 40`. A `Host` field is never converted,
+never hashed into the compile cache key, and never visible to the tracer, which keeps driver knobs
+out of the key and dataset-sized state away from Reactant and Enzyme, which walk the whole
+`Const(e)` argument element-wise at every compile. [`compile_view`](@ref) replaces every `Host`
+field with a [`StrippedHost`](@ref) sentinel at every trace site.
 
-A `Host` field is **never converted, never hashed into the compile cache key, and never visible to
-the tracer**. It does two jobs:
-
-1. **Keeps driver knobs out of the cache key**, so changing `max_epochs` from 40 to 41 does not
-   force a full recompile.
-2. **Keeps dataset-sized state away from the tracer.** Reactant and Enzyme traverse the whole
-   `Const(e)` argument while tracing, so anything dataset-sized reachable from the experiment (a
-   sampler, an in-memory table, a materialized index) is walked element-wise, on one thread, every
-   time a program is compiled. The cost is O(n_train) and it does not change the emitted graph, so
-   nothing about the trained model looks wrong; it just gets slower the more data you have.
-
-**`Host` is the default: an unmarked field is Host.** In practice the vast majority of experiment
-fields are driver knobs or dataset-sized state, so the marker is optional and `max_epochs::Int = 40`
-means the same as `max_epochs::Host{Int} = 40`. Write the marker explicitly only where the field's
-host-ness would otherwise be surprising.
-
-The guard is [`compile_view`](@ref), which replaces every `Host` field with a
-[`StrippedHost`](@ref) sentinel. The framework passes that view to every trace site and uses the
-real `e` everywhere outside the trace.
-
-Typical `Host` fields: `max_epochs`, output paths, log cadence, checkpoint retention,
-early-stopping patience, and any materialized dataset an experiment chooses to carry.
-
-See also [`Device`](@ref) and [`GraphConst`](@ref) and [`@experiment`](@ref).
+See also [`Device`](@ref) and [`GraphConst`](@ref).
 """
 struct Host{T} end
 
 """
     GraphConst{T}
 
-Declaration-time marker for an [`@experiment`](@ref) field, legal only in that position. It is
-never instantiated and never appears in the generated struct: the macro consumes it and records
-the field, which the framework reaches as `setdiff(fieldnames, device_fields, host_fields)`.
-
-A `GraphConst` field **bakes as a trace-time constant and enters the compile cache key**. The
-tracer sees the real value, so `e.n_layers` is a Julia `Int` with ordinary control-flow semantics;
-changing it is a different program, which is exactly why it is hashed and why a changed value
-recompiles rather than silently running the old graph. This is the field category for **structure**:
-anything whose value changes the shape or meaning of the emitted graph, such as layer counts, widths,
-or a seed that is deliberately meant to be part of the program.
-
-**Marking is opt-in and the opposite of the default.** An unmarked field is [`Host`](@ref), so a
-field that would previously have been left plain must now be written `GraphConst` to keep baking. The
-cost of over-marking is a recompile per distinct value; the cost of under-marking is a loud
-`StrippedHost` error when traced code reads the field, never a silent wrong program.
+Declaration-time marker for an [`@experiment`](@ref) field. A `GraphConst` field bakes as a
+trace-time constant and enters the compile cache key: the tracer sees a real `Int` with ordinary
+control flow, and a changed value recompiles. The category for structure: layer counts, widths, a
+seed deliberately meant to be part of the program. Under-marking is a loud `StrippedHost` error
+when traced code reads the field, never a silent wrong program.
 
 ```julia
 @experiment struct MyExp
@@ -99,8 +56,6 @@ cost of over-marking is a recompile per distinct value; the cost of under-markin
     n_layers::GraphConst{Int} = 4
 end
 ```
-
-See also [`Device`](@ref) and [`Host`](@ref) and [`@experiment`](@ref).
 """
 struct GraphConst{T} end
 
@@ -108,34 +63,18 @@ struct GraphConst{T} end
     StrippedHost{name}
 
 The value [`compile_view`](@ref) substitutes for a [`Host`](@ref) field, carrying the field name as
-a **type parameter** so an error message can be built without the sentinel holding any data.
-
-**Using one raises, and the error says what to do about it.** The sentinel used to define no methods
-at all and rely on Base's fallbacks, which was loud but useless: you got
-`MethodError: no method matching *(::StrippedHost{:sz}, ::Float32)`, which names the field only by
-accident of the type parameter and offers no fix. Since `Host` became the **default**, reading an
-unmarked field from traced code is the common mistake rather than an exotic one, so the high-traffic
-operations now carry real methods and [`_stripped_error`](@ref) writes the message.
-
-Stated honestly, and unchanged by that: the sentinel is still accepted by any `::Any` signature,
-still compares with `===` and `==`, still hashes, still survives in a returned `NamedTuple`, and
-still returns `false` from `isnothing` without raising. Methods improve the **message** on every
-path that was already loud; they do not widen **detection**. A `Host` value that is merely stored,
-compared, or passed through still escapes, exactly as before.
+a type parameter. Using one raises through [`_stripped_error`](@ref), which names the field and the
+two fixes. The high-traffic operations carry real methods so the message is useful; detection is
+unchanged, and a `Host` value merely stored, compared or passed through still escapes.
 """
 struct StrippedHost{name} end
 
 """
     ReactantNitro._stripped_error(::StrippedHost{name}, op)
 
-The message a user gets when traced code reads an unmarked field. **The framework cannot know which
-fix was meant**, so it offers both with their consequences rather than guessing: a value that should
-bake into the graph wants [`GraphConst`](@ref) and a recompile per distinct value, and a value that
-should cross as a traced input wants [`Device`](@ref) and no recompile at all. Naming only one of
-them would be advice half the time.
-
-The third option is in there because it is the commonest real answer: most fields are read host-side
-and should stay unmarked.
+The message when traced code reads an unmarked field. The framework cannot know which fix was
+meant, so it offers `GraphConst` (bake, recompile per value) and `Device` (traced input, no
+recompile), plus the commonest answer: read it host-side.
 """
 @noinline function _stripped_error(::StrippedHost{name}, op) where {name}
     return error(
@@ -164,12 +103,8 @@ and should stay unmarked.
     )
 end
 
-# The high-traffic ways a value gets USED. Each delegates to one message, and each names the
-# operation so the report says how the field was reached rather than only that it was.
-#
-# This list is deliberately not exhaustive and cannot be: `StrippedHost` improves the message on
-# paths that already raised, so an operation missing from it falls back to Base and still errors,
-# just less helpfully. Add one when a real hook finds a gap.
+# The high-traffic ways a value gets used, each naming the operation. Not exhaustive: an operation
+# missing here falls back to Base and still errors, less helpfully.
 Base.getproperty(s::StrippedHost, f::Symbol) = _stripped_error(s, "getproperty(e.<field>, :$f)")
 Base.convert(::Type{T}, s::StrippedHost) where {T <: Number} = _stripped_error(s, "convert($T, _)")
 Base.getindex(s::StrippedHost, i...) = _stripped_error(s, "getindex")
@@ -195,21 +130,11 @@ const NO_DEFAULT = NoDefault()
 """
     ReactantNitro._merge_field_table!(mod, name, table) -> nothing
 
-Append [`@experiment`](@ref)'s generated marker table **beneath** any docstring the user wrote,
-rather than replacing it.
-
-`Base.@__doc__` on the generated struct is what lets `\"\"\"prose\"\"\" @experiment struct ...` parse at
-all; without it the macro's multi-expression block is rejected with "cannot document the following
-expression". But the macro then wants to document the same binding itself, and a second `@doc`
-**overwrites**, so marking alone would have turned a loud precompilation error into silently
-discarded documentation. Hence the merge: the user's prose is intent, the table records which fields
-bake into the graph, which cross as traced inputs, and which are invisible to the tracer, and that
-second half is the part a user cannot write for themselves.
-
-**This reaches into `Base.Docs`**, which is not a public API, so it is written to degrade rather than
-break: any failure to read or install leaves the generated table in place and the docstring merely
-unmerged. `test/config.jl` asserts the merged result, so a docsystem change shows up as a failing
-test rather than as silence.
+Append [`@experiment`](@ref)'s generated marker table beneath any docstring the user wrote.
+`Base.@__doc__` on the generated struct is what lets `\"\"\"prose\"\"\" @experiment struct ...` parse,
+and a second `@doc` would overwrite it, so the two are merged: the user's prose is intent, the table
+records which fields bake, cross, or are stripped. This reaches into `Base.Docs`, so it degrades
+rather than breaks, and `test/config.jl` asserts the merged result.
 """
 function _merge_field_table!(mod::Module, name::Symbol, table::AbstractString)
     prose = ""
@@ -227,20 +152,12 @@ function _merge_field_table!(mod::Module, name::Symbol, table::AbstractString)
     end
     text = isempty(strip(prose)) ? table : string(rstrip(prose), "\n\n", table)
     try
-        # `:module` is not optional: `REPL.parsedoc` reads it to render, so a `DocStr` without it
-        # installs cleanly and then throws a `KeyError` at `?MyExp`, which is the worst place to
-        # find out. `:path` and `:linenumber` are what the docsystem records for provenance.
+        # `:module` is required: `REPL.parsedoc` reads it, and a `DocStr` without it throws at
+        # `?MyExp`.
         data = Dict{Symbol, Any}(:module => mod, :path => "", :linenumber => 0)
         b = Base.Docs.Binding(mod, name)
-        # INSTALLED DIRECTLY RATHER THAN THROUGH `Base.Docs.doc!`, and the reason is the whole point
-        # of this function. `doc!` warns "Replacing docs for `X :: Union{}`" whenever the signature
-        # already has an entry, because for ordinary code a second docstring for one binding IS
-        # usually an accident. Here it is deliberate: `Base.@__doc__` has just put the user's
-        # prose there a moment ago and this deliberately appends the table beneath it. Going through
-        # `doc!` printed that warning on every precompile of every package with a documented
-        # experiment, telling the user their docstring had been thrown away at the exact moment it
-        # had been preserved. A warning that states the opposite of what happened is worse than the
-        # bug it was guarding against, so this does `doc!`'s bookkeeping without its guess.
+        # Installed directly rather than through `Base.Docs.doc!`, which warns "Replacing docs" on
+        # every precompile for exactly the append this performs on purpose.
         Base.Docs.initmeta(mod)
         md = get!(Base.Docs.meta(mod), b, Base.Docs.MultiDoc())
         haskey(md.docs, Union{}) || push!(md.order, Union{})
@@ -253,9 +170,7 @@ end
 
 # ── The generated interface, with total fallbacks ───────────────────────────────────
 #
-# All three are exported, because the macro is OPTIONAL: a user must be able to hand-write the
-# struct and define these themselves. The fallbacks make every one of them total, so framework
-# code may call them on any experiment, hand-written or generated.
+# The macro is optional, so all three are exported and every one is total for a hand-written struct.
 
 """
     device_fields(::Type{E}) -> NTuple{N,Symbol}
@@ -290,20 +205,10 @@ One entry per field of `E`, in declaration order:
                    doc = "Weight of the auxiliary ...", line = 3), ...)
 ```
 
-`kind` is one of `:device`, `:host`, `:graphconst`. `type` is the **declared** type, so a `Device`
-field reports the type inside the marker rather than the device type it holds after setup. `doc` is
-the field's docstring or `nothing`, and `line` is its declaration line, so a validation error can
-point at the source. `default` is `ReactantNitro.NO_DEFAULT` for a field declared without
-one.
-
-This is the source of the logged hyperparameter table, and the input any tool that renders an
-experiment's configuration reads.
-
-The fallback synthesizes a record for a hand-written experiment from `fieldnames`, `fieldtype`,
-[`device_fields`](@ref), and [`host_fields`](@ref), reporting `doc = nothing`, `line = 0`, and
-`default = NO_DEFAULT` throughout. It reports `fieldtype`, which for a hand-written `Device` field
-is the *device* type after setup rather than the declared one; a hand-written experiment that wants
-the declared types in its metadata defines this method itself.
+`kind` is `:device`, `:host` or `:graphconst`; `type` is the declared type; `doc` and `line` come
+from the declaration; `default` is `ReactantNitro.NO_DEFAULT` for a required field. The fallback
+synthesizes a record for a hand-written experiment from `fieldnames` and `fieldtype`, with
+`doc = nothing`, `line = 0` and no defaults.
 """
 function config_metadata(::Type{E}) where {E}
     fns = fieldnames(E)
@@ -319,26 +224,11 @@ end
 """
     compile_view(e) -> e_trace
 
-The stripped view of an experiment that every trace site sees: each [`Host`](@ref) field is
-replaced with a [`StrippedHost`](@ref) sentinel and everything else is passed through unchanged.
-Since an unmarked field is Host, this strips every field that is neither [`Device`](@ref) nor
-[`GraphConst`](@ref).
-
-The framework calls this at every trace site and passes the result as `Const`. The
-real `e` is used everywhere outside the trace: `build_data`, `derive`, metrics finalization,
-checkpointing, and every driver decision.
-
-[`@experiment`](@ref) generates a method per experiment type, so the reconstruction is type-stable
-and costs one struct copy. The generic fallback here covers a hand-written experiment that defines
-[`host_fields`](@ref) itself, and is an ordinary accessor, so an experiment whose layout the default
-does not suit overrides it directly.
-
-Note it strips `Host` and **leaves `Device` in place**, which is why the compile cache key is
-computed over this view's *GraphConst fields only* rather than over the view.
-
-Leaving `Device` in place is right for every trace the framework itself invokes and wrong for the
-one trace it hands away. See [`export_view`](@ref) for the frozen view export uses instead, and for
-why a `Device` field that reaches a serialized artifact makes it unservable.
+The view every trace site sees: each [`Host`](@ref) field replaced with a [`StrippedHost`](@ref)
+sentinel, everything else passed through, handed to the tracer as `Const`. The real `e` is used
+everywhere outside the trace. [`@experiment`](@ref) generates a type-stable method per experiment;
+the fallback here covers a hand-written one. It leaves `Device` fields in place, which is right for
+every trace the framework invokes and wrong for the one it hands away; see [`export_view`](@ref).
 """
 function compile_view(e)
     T = typeof(e)
@@ -353,15 +243,9 @@ end
 """
     ReactantNitro._field(e, name::Symbol, default)
 
-`getproperty(e, name)` when `e` has that field, `default` otherwise. This is what lets a Host field
-and a user method be interchangeable behind a defaulted accessor:
-
-```julia
-max_epochs(e) = _field(e, :max_epochs, 1)
-```
-
-These accessors run **host-side against the real `e`**, never against [`compile_view`](@ref)'s
-stripped view, which is exactly the split the `Host` marker exists to enforce.
+`getproperty(e, name)` when `e` has that field, `default` otherwise, which is what lets a `Host`
+field and a user method be interchangeable behind a defaulted accessor such as
+`max_epochs(e) = _field(e, :max_epochs, 1)`. Accessors run host-side against the real `e`.
 """
 @inline _field(e, name::Symbol, default) =
     hasfield(typeof(e), name) ? getproperty(e, name) : default
@@ -371,9 +255,10 @@ stripped view, which is exactly the split the `Host` marker exists to enforce.
 """
     @experiment struct MyExp ... end
 
-One declaration point, generating the struct, a `@kwdef`-style keyword constructor, the
-[`device_fields`](@ref) and [`host_fields`](@ref) traits, the [`config_metadata`](@ref) table, a
-[`compile_view`](@ref) method, two `Base.show` methods, and a `?MyExp` docstring.
+Declare an experiment type. One declaration point generates the struct, a `@kwdef`-style
+keyword constructor, the [`device_fields`](@ref) and [`host_fields`](@ref) traits, the
+[`config_metadata`](@ref) table, a [`compile_view`](@ref) method, the `Base.show` methods, and a
+`?MyExp` docstring.
 
 ```julia
 @experiment struct MyExp
@@ -388,46 +273,17 @@ One declaration point, generating the struct, a `@kwdef`-style keyword construct
 end
 ```
 
-The three markers are the three field categories the rest of the framework turns on. A
-[`Device`](@ref) field is a traced input. A [`GraphConst`](@ref) field bakes as a trace-time
-constant and enters the compile cache key. A [`Host`](@ref) field is invisible to the tracer
-entirely, and **it is the default**: an unmarked field is Host, which is the right category for the
-majority of real fields (driver knobs, dataset-sized state).
+A [`Device`](@ref) field is a traced input, a [`GraphConst`](@ref) field bakes into the graph and
+the cache key, and a [`Host`](@ref) field is invisible to the tracer and is the default. A macro is
+necessary because after setup a `Device` field holds a `ConcretePJRTNumber` and nothing at runtime
+says it was marked; every `Device` and `Host` field gets its own type parameter so what it holds
+can change, while `GraphConst` fields keep their declared type and the constructor `convert`s to
+it. Docstrings are bare strings above each field, since comments never reach a macro.
 
-**Why a macro is necessary rather than merely nice.** Each `Device` field's storage varies
-independently (scalar to `ConcretePJRTNumber`, array to `ConcretePJRTArray`), so N device fields
-need N type parameters; and after setup a field holds a `ConcretePJRTNumber` rather than a
-`Device`, so the framework cannot recover which fields were marked by inspecting types at runtime.
-The declaration-time knowledge has to be recorded as a trait.
-
-**Generated type parameters.** Every `Device` and `Host` field gets its own free type parameter,
-so a `Device` can hold a host value before setup and a device value after, and a `Host` can hold
-its real value in `e` and a [`StrippedHost`](@ref) in `compile_view(e)`. **GraphConst fields keep
-their declared concrete type**, and the generated keyword constructor `convert`s to it, so
-`n_layers::GraphConst{Int}` means what it says whether or not the experiment happens to declare a
-`Device` alongside it. Parameterized fields are **not** converted, since the point of the parameter
-is that what the field holds changes.
-
-**Docstrings** are written as bare strings above each field. Comments are stripped by the parser
-and are never visible to a macro, so `#` cannot carry a description. Per-field docs land in
-`config_metadata` and in the generated type docstring.
-
-**Display shows values and never a device buffer.** The generated `show` prints one line per
-field with its marker and its value, summarizing an array as its eltype and shape and recursing
-through tuples and NamedTuples to do it. That matters because `Device{T}` takes any `T`, and a
-read-only buffer for an `hlo_call` lives in a `Device{NamedTuple}` or `Device{Tuple}` of weights:
-under Julia's default struct `show`, printing such a config prints the arrays element by element.
-The generated output grows with the field count and never with the model.
-
-**The macro is optional.** A user may hand-write the struct and define `device_fields`,
-`host_fields`, and `config_metadata` themselves; those three are exported for exactly that reason.
-Such a struct keeps Julia's default `show`, and opts in with the one line the macro expands to:
-
-```julia
-Base.show(io::IO, e::MyExp) = ReactantNitro._show_experiment(io, e)
-Base.show(io::IO, m::MIME"text/plain", e::MyExp) = ReactantNitro._show_experiment(io, m, e)
-Base.show(io::IO, m::MIME"text/html", e::MyExp) = ReactantNitro._show_experiment(io, m, e)
-```
+The generated `show` prints values and never a device buffer, summarizing an array as its eltype
+and shape, because a `Device{NamedTuple}` of weights would otherwise print element by element. The
+macro is optional: a hand-written struct defines the three exported traits itself and may opt into
+the display with the `Base.show` one-liners the macro expands to (`_show_experiment`).
 """
 macro experiment(expr)
     return _experiment(expr, __source__, __module__)
@@ -439,20 +295,10 @@ end
     ReactantNitro._qual(name::Symbol, [caller::Module]) -> Expr
 
 Name one of this module's functions for a method definition emitted by [`@experiment`](@ref):
-through the symbol `ReactantNitro` when the caller has this module bound under that name, and
-through the module **object** otherwise.
-
-This is not cosmetic. Hygiene treats a short-form definition `f(x) = y` as introducing a binding, so
-an unescaped `device_fields(::Type{<:MyExp}) = ...` in macro output is renamed to a gensym and the
-method lands on a function nobody can call: the generated traits silently do nothing and every
-accessor falls through to the empty default. `esc` is not the fix either, since a name reaching the
-user's module through `using` cannot be extended there without an explicit `import`.
-
-The object form works wherever the macro is called, including after `using ReactantNitro:
-@experiment`, which binds no module name. The symbolic form is preferred when available because
-Pluto's expression explorer reads a definition head only as a chain of symbols: a module object
-there is dropped, the definition is read as an unqualified `device_fields`, and the cell conflicts
-with the one that imported the name.
+through the symbol `ReactantNitro` when the caller binds it, and through the module object
+otherwise. Hygiene would rename an unescaped short-form definition to a gensym, and `esc` cannot
+extend a name reached through `using`. The symbolic form is preferred because Pluto's expression
+explorer reads a definition head as a chain of symbols and drops a module object.
 """
 _qual(name::Symbol) = Expr(:., @__MODULE__, QuoteNode(name))
 function _qual(name::Symbol, caller::Module)
@@ -478,9 +324,8 @@ function _basename(ex)
     return nothing
 end
 
-# Recognize `Device{T}` / `Host{T}` / `GraphConst{T}`, including a qualified
-# `ReactantNitro.Device{T}`. A bare marker with no type parameter is an error rather than a plain
-# field of type `Device`, which is what it would otherwise silently become.
+# Recognize `Device{T}` / `Host{T}` / `GraphConst{T}`, qualified or not. A bare marker with no
+# parameter is an error rather than a plain field of type `Device`.
 function _marker(ex)
     name = _basename(ex)
     (name === :Device || name === :Host || name === :GraphConst) || return nothing
@@ -578,36 +423,20 @@ function _experiment(expr, source, mod = @__MODULE__)
     ]
     structsig = isempty(params) ? name : Expr(:curly, name, params...)
     super === nothing || (structsig = Expr(:<:, structsig, super))
-    # `Base.@__doc__` is what makes `"""docs""" @experiment struct ...` legal at all. Measured: ANY
-    # macro returning a multi-expression block fails with "cannot document the following
-    # expression", regardless of what the block contains or ends with, so this is a Julia docsystem
-    # rule rather than something this macro did wrong, and marking the one documentable expression
-    # is the sanctioned answer.
+    # `Base.@__doc__` is what makes `"""docs""" @experiment struct ...` legal: any macro returning a
+    # multi-expression block otherwise fails with "cannot document the following expression".
     structdef = Expr(
         :macrocall, GlobalRef(Base, Symbol("@__doc__")),
         source === nothing ? LineNumberNode(0) : source,
         esc(Expr(:struct, ismutable, structsig, Expr(:block, fdecls...)))
     )
 
-    # ── The @kwdef-style constructor. A field with no default is a required keyword, so omitting
-    # it raises UndefKeywordError naming it.
-    #
-    # A GRAPHCONST field is `convert`ed to its declared type here, and that line is load-bearing
-    # rather than tidy. Julia's own constructor for a parametric struct annotates a
-    # concretely-typed field with that type and does not convert, so `MyExp(; n_layers = 0x03)`
-    # would be a MethodError on an experiment that happens to declare a Device and would convert
-    # on one that does not. Whether `n_layers::GraphConst{Int}` accepts a `UInt8` should not depend
-    # on an unrelated field's marker. Device and Host fields are NOT converted: the whole point of
-    # their type parameter is that what they hold changes, from a host value to a device one and,
-    # for Host, to a StrippedHost.
-    #
-    # A FIELDLESS experiment gets NO generated constructor, and that guard is load-bearing rather
-    # than an edge case nobody reaches: with no fields the expression above is literally
-    # `MyExp(; ) = MyExp()`, which REPLACES Julia's own zero-argument constructor with one that
-    # calls itself, so `MyExp()` is a `StackOverflowError` at 80,000 frames naming only `MyExp()`.
-    # Julia already supplies exactly the constructor this would emit, so skipping it loses nothing.
-    # A fieldless experiment is not exotic: it is an experiment defining only the four required
-    # hooks and configuring nothing, which is the case every framework default exists to serve.
+    # The @kwdef-style constructor: a field with no default is a required keyword. A GraphConst
+    # field is `convert`ed to its declared type, since Julia's own constructor for a parametric
+    # struct does not convert and whether `n_layers` accepts a `UInt8` should not depend on an
+    # unrelated field's marker; Device and Host fields are not, since what they hold changes.
+    # A fieldless experiment gets no generated constructor: `MyExp(; ) = MyExp()` would replace
+    # Julia's zero-argument constructor with one that calls itself.
     kwargs = [f.default === NO_DEFAULT ? f.name : Expr(:kw, f.name, f.default) for f in fields]
     ctorargs = [
         f.kind === :graphconst ? Expr(:call, :convert, f.type, f.name) : f.name
@@ -621,9 +450,8 @@ function _experiment(expr, source, mod = @__MODULE__)
             )
         )
 
-    # ── Traits. Dispatch is on `Type{<:MyExp}` so both the UnionAll and every instantiation match,
-    # including the post-conversion type, which is what makes `config_metadata` report DECLARED
-    # types rather than device ones.
+    # Dispatch on `Type{<:MyExp}` so the post-conversion instantiation matches too, which is what
+    # lets `config_metadata` report declared types.
     dnames = Expr(:tuple, (QuoteNode(f.name) for f in fields if f.kind === :device)...)
     hnames = Expr(:tuple, (QuoteNode(f.name) for f in fields if f.kind === :host)...)
     df_def = :($(_qual(:device_fields, mod))(::Type{<:$(esc(name))}) = $dnames)
@@ -660,25 +488,13 @@ function _experiment(expr, source, mod = @__MODULE__)
     end
 
     docstr = _experiment_docstring(name, fields)
-    # MERGE rather than overwrite, a deliberate choice. `Base.@__doc__` above attaches the USER's
-    # docstring to the struct; this then appends the generated marker table beneath it, and
-    # installs the table alone when there is no user docstring, which is the previous
-    # behaviour. The table is the half a user cannot write, since it records which fields bake,
-    # which are traced inputs, and which are invisible to the tracer; the prose is intent and
-    # belongs above it. Neither is silently discarded.
+    # Merge rather than overwrite: `Base.@__doc__` attached the user's prose, and the table is the
+    # half a user cannot write.
     doc_def = :($(_qual(:_merge_field_table!))($mod, $(QuoteNode(name)), $docstr))
 
-    # ── The two `show` methods ──────────────────────────────────────────────────────────
-    #
-    # Emitted per type rather than defined once, because a generated experiment has no common
-    # supertype to dispatch on: the macro builds a bare struct, and `super` is whatever the user
-    # wrote. A hand-written experiment (the macro is optional) keeps Julia's default `show` and can
-    # opt in with the same one-liner these expand to.
-    #
-    # The long form answers both MIME types a display is asked for, so a notebook gets the table
-    # as HTML. One method per MIME: a `Union` would be ambiguous with Base's `text/plain` fallback.
-    # `MIME{Symbol("text/plain")}` rather than the string macro, which is a macrocall in macro
-    # output and one more hygiene question.
+    # The `show` methods, emitted per type since a generated experiment has no common supertype.
+    # One method per MIME (a `Union` would be ambiguous with Base's `text/plain` fallback), spelled
+    # `MIME{Symbol("text/plain")}` to avoid a string macro in macro output.
     show_def = :(Base.show(io::IO, e::$(esc(name))) = $(_qual(:_show_experiment))(io, e))
     showl_def = quote
         function Base.show(io::IO, mime::MIME{Symbol("text/plain")}, e::$(esc(name)))
@@ -697,104 +513,45 @@ end
 
 # ── @nitrohook ──────────────────────────────────────────────────────────────────────
 #
-# Reactive-notebook support and nothing else: outside Pluto this macro defines one extra function
-# nobody calls, so the same file still runs as a plain script.
-#
-# Pluto builds its graph out of global variable NAMES, and a hook definition head is a QUALIFIED
-# name. `function ReactantNitro.loss(e::MyExp, logits; label)` is recorded as a definition of the
-# joined symbol `Symbol("ReactantNitro.loss")`, and nothing can reference that: the call that
-# reaches the hook happens inside this package, where Pluto cannot see it. A hook cell is
-# therefore a reactive DEAD END. Editing it re-runs that one cell, the cell holding the `Nitro`
-# never re-runs, and the notebook goes on training the code the handle was built with.
-# `stale_hooks` reports the drift, but only at the next entry point, and reaching one is exactly
-# what does not happen.
-#
-# The fix has to put a name a downstream cell CAN reference on the DEFINING side. A plain variable
-# per hook does that, and is what a user writes by hand, but it costs one DISTINCT name per hook:
-# Pluto compares `definitions` across cells, so two cells assigning one shared token name is a
-# `MultipleDefinitionsError`. A METHOD has no such problem. The conflict test compares
-# `funcdefs_with_signatures`, which is signature-level, while edge resolution compares
-# `funcdefs_without_signatures`, which is the bare name. Any number of cells may therefore define
-# methods of ONE function, and every one of them becomes an upstream edge of any cell that names
-# it. A single reference to `MyExp_hooks` covers a whole hook set, however many cells it is spread
-# across, and `Val{:loss}` keys the methods so the hooks stay disjoint from one another.
-#
-# Pluto expands a cell in the workspace and recomputes its reactive node from the EXPANSION, so a
-# macro-injected definition drives reactivity exactly like a hand-written one.
-#
-# This only makes the REBUILD fire. What a rebuild then picks up is `world_closure_staleness`'s
-# business and is unchanged by any of this.
+# Reactive-notebook support only; outside Pluto the macro defines one extra function nobody calls.
+# Pluto builds its graph from global variable names, and a hook head is a qualified name
+# (`ReactantNitro.loss`) that no cell references, so a hook cell is a reactive dead end and the
+# `Nitro` cell never re-runs. The fix is a method of one token function per experiment on the
+# defining side: Pluto's conflict test is signature-level while its edge resolution is name-level,
+# so any number of cells may define methods of `MyExp_hooks` and every one becomes an upstream
+# edge of a cell that names it. This only makes the rebuild fire.
 
 """
     ReactantNitro.@nitrohook <definition>
 
 Define one or more hooks and, alongside them, one method of `<Experiment>_hooks` per definition,
-so a reactive notebook can see that the hooks changed.
-
-Pluto's dependency graph is built from variable names, and a hook is defined on a qualified name
-(`ReactantNitro.loss`) that no cell references, because the call into it happens inside this
-package. A hook cell is invisible to the graph as a result: editing it re-runs that cell alone,
-and the `Nitro` is never rebuilt. This macro emits a token method beside the definition, giving a
-hook set one name a downstream cell can depend on.
+so a reactive notebook can see that the hooks changed. Pluto's dependency graph is built from
+variable names, and a hook is defined on a qualified name no cell references, so editing a hook
+cell would otherwise re-run that cell alone and never rebuild the `Nitro`.
 
 ```julia
 @nitrohook function ReactantNitro.loss(e::MnistMLP, logits; label)
     return -sum(label .* logsoftmax(logits; dims = 1)) / size(label, 2)
 end
-```
 
-Name that token once, wherever the handle is built, and every hook cell for `MnistMLP` becomes an
-upstream dependency of it:
-
-```julia
 n = begin
-    MnistMLP_hooks
+    MnistMLP_hooks          # every hook cell for MnistMLP is now upstream of this one
     Nitro(MnistMLP())
 end
 ```
 
-The token is named for the type of the definition's first argument, so hook sets for different
-experiments stay independent. Several definitions may share one macro call, and each gets its own
-token method. Outside a reactive notebook the token is an unused function, and the definitions
-behave exactly as if the macro were not there.
+The token is named for the type of the definition's first argument. For an extension point that
+dispatches on something else (`batch_at` and `begin_epoch!` on a data source, `nonschedulable` on
+a rule, `default_no_decay` on nothing), name the experiment explicitly:
+`@nitrohook MnistMLP ReactantNitro.batch_at(src::MyLoader, i::Integer) = ...`. `@experiment`
+needs no macro, since every cell already names the type.
 
-Most hooks dispatch on the experiment, and the token is named for the type of the definition's
-first argument, so hook sets for different experiments stay independent. A few extension points
-dispatch on something else (`batch_at` and `begin_epoch!` on a data source, `nonschedulable` on an
-optimizer rule, `default_no_decay` on neither); name the experiment explicitly for those, so their
-edge lands on the same token as the rest of the set:
-
-```julia
-@nitrohook MnistMLP ReactantNitro.batch_at(src::MyLoader, i::Integer) = ...
-```
-
-`@experiment` itself needs no macro. It defines `MnistMLP`, which every hook cell and the `Nitro`
-cell already name, so it is upstream of both on its own.
-
-Edit a hook where it is defined rather than appending a second definition in a later cell. Two
-versions of one hook cannot coexist: Julia has a single method table, so the later definition
-simply *is* the hook, and Pluto refuses both cells as a `MultipleDefinitionsError` before that
-matters. There is no "the hooks as of this cell" to depend on either, since cells form a graph and
-their order in the file is presentation only. Variants that must coexist need two dispatch
-targets, which is what the explicit form is for: two experiment types get two tokens and two
-independent subgraphs.
-
-Invalidation is all-or-nothing by design. Every hook cell for an experiment defines a method of
-the one token, so editing any of them rebuilds the handle. That is correct rather than coarse:
-dispatch resolves over the whole method table when the program is traced, so any method moving
-can change the program.
-
-Give `build_data` its own cell. Hooks bundled into one `begin` block are redefined together when
-any one of them changes, and a redefinition moves a method's world even when its text is
-unchanged, so editing the data hook beside `forward` poisons the compiled programs and takes the
-gradient with them, `grad_program` storing `fwd_program`'s closure rather than its own. Measured
-on a toy run: `build_data` edited alone costs 0 cache misses and poisons nothing, while
-redefining `forward` byte-identically poisons 2 entries and costs 4 misses. `build_data` is
-host-side, absent from `hook_worlds` and in no program's closure, so on its own it is free.
-
-Rebuilding remains what puts new code into effect: an existing `Nitro` keeps the programs it was
-built with, which is what [`ReactantNitro.stale_hooks`](@ref) reports. This macro only makes the
-rebuild happen.
+Edit a hook where it is defined rather than appending a second definition; Julia has one method
+table and Pluto refuses both cells. Invalidation is all-or-nothing by design, since dispatch
+resolves over the whole table when the program is traced. Give `build_data` its own cell: hooks
+bundled in one `begin` block are redefined together, and redefining `forward` even byte-identically
+poisons the compiled programs, while `build_data` alone costs nothing. Rebuilding remains what puts
+new code into effect; [`ReactantNitro.stale_hooks`](@ref) reports the drift.
 """
 macro nitrohook(expr)
     return _nitrohook_expansion(nothing, expr)
@@ -826,9 +583,8 @@ function _nitrohook_expansion(experiment, expr)
     return Expr(:block, parts...)
 end
 
-# Every `(token, hook)` pair a `@nitrohook` expression calls for, in source order. A `begin` block
-# is walked rather than rejected, since a notebook cell that already wraps its hook in one should
-# take the macro without being rewritten first.
+# Every `(token, hook)` pair a `@nitrohook` expression calls for, in source order; a `begin` block
+# is walked rather than rejected.
 function _hook_tokens(expr, experiment = nothing)
     out = Tuple{Symbol, Symbol, UInt}[]
     _collect_hook_tokens!(out, expr, experiment)
@@ -870,11 +626,8 @@ function _call_signature(ex)
     return Meta.isexpr(sig, :call) ? sig : nothing
 end
 
-# The token is named for the type the definition DISPATCHES on, which for a hook is the experiment
-# in the first positional argument. That is not universal: `batch_at` and `begin_epoch!` dispatch
-# on a data source, `nonschedulable` on an optimizer rule, and `default_no_decay` on nothing at
-# all. Those still reach a run, so they still want an edge, and the two-argument form names the
-# token for them rather than leaving them with a useless one or no expansion.
+# The token is named for the type the definition dispatches on, the experiment in the first
+# positional argument; the two-argument form names it for hooks that dispatch on something else.
 function _hook_token(sig, experiment)
     hook = _basename(sig.args[1])
     hook === nothing && error(
@@ -903,16 +656,10 @@ function _hook_token(sig, experiment)
     return (Symbol(E, "_hooks"), hook, _sig_key(sig))
 end
 
-# The token's second `Val`, so that two DIFFERENT methods of one hook do not collide ON THE TOKEN.
-# Keyed on the hook name alone, `batch_at(src, i)` and `batch_at(src, i, plan)` in two cells, both
-# of which the interface documents, would land the same token signature and Pluto would refuse a
-# pair it otherwise allows: a conflict the macro invented rather than found.
-#
-# Only the dispatched-on shape goes in, the positional type annotations with `Any` for an
-# unannotated argument and the keyword names, so argument names and the body are out. That is the
-# same canonicalization Pluto applies to the hook definition itself, which means two cells that
-# really do define one method still collide THERE and are still reported, once, against the name
-# the user wrote. Conflict detection stays where it already worked; the token only carries edges.
+# The token's second `Val`, so two different methods of one hook (`batch_at(src, i)` and
+# `batch_at(src, i, plan)`) do not collide on the token. Only the dispatched-on shape goes in, the
+# same canonicalization Pluto applies to the definition itself, so a real conflict is still
+# reported there, once.
 function _sig_key(sig)
     kws, types = Symbol[], Any[]
     for a in @view sig.args[2:end]
@@ -931,22 +678,12 @@ _argtype(a) =
 
 _kwname(k) = k isa Symbol ? k : Meta.isexpr(k, (:kw, :(::), :...)) ? _kwname(k.args[1]) : :_
 
-# ── Showing an experiment NEVER shows a device buffer ───────────────────────────────
+# ── Showing an experiment never shows a device buffer ───────────────────────────────
 #
-# The same hazard as `CheckpointRecord`'s and `Nitro`'s, arriving by a different door. A `Device`
-# field is usually a scalar, and a table of scalars is exactly what an experiment should print. But
-# `Device{T}` takes any `T`, and the read-only buffer case puts WEIGHTS there: `Device{NamedTuple}`
-# or `Device{Tuple}` holding the arrays an `hlo_call` reads. Under Julia's default struct `show`
-# those print element by element, so displaying a config dumps a model. Measured on a toy
-# experiment carrying one 64x64 and two 16x16 buffers: 51,635 characters.
-#
-# The fix is the renderer `CheckpointRecord` already uses. `_shown` (Checkpoint.jl) summarizes an
-# array as its eltype and shape and RECURSES THROUGH tuples and NamedTuples, so a buffer field
-# renders as its shapes and a scalar field still renders as its value. The output's length grows
-# with the FIELD COUNT and never with the model, which is the property worth having.
-#
-# Values, not just names: an experiment is configuration, and a config table that withheld its
-# numbers would be useless in the case that is not a buffer, which is nearly all of them.
+# `Device{T}` takes any `T`, and the read-only buffer case puts weights there; under the default
+# struct `show` a toy experiment with three small buffers printed 51,635 characters. `_shown`
+# (Checkpoint.jl) summarizes an array as its eltype and shape, so the output grows with the field
+# count and never with the model. Values, not just names: an experiment is configuration.
 function _show_experiment(io::IO, e)
     T = typeof(e)
     fs = fieldnames(T)
@@ -975,8 +712,7 @@ function _show_experiment(io::IO, mime::MIME, e)
     return nothing
 end
 
-# Each note NAMES ITS MARKER, because the table's job is to be actionable: a reader deciding whether
-# a field is in the wrong category needs the word they would type, not only what it does.
+# Each note names its marker, the word a reader would type to move a field.
 const _KIND_NOTE = (
     device = "`Device`, traced input",
     host = "`Host`, driver only, stripped from the trace; the default",
@@ -1015,9 +751,9 @@ end
 """
     presets(::Type{E}) -> NamedTuple
 
-The table of named configurations for an experiment type. **The contents belong to the model; the
-mechanism belongs here.** Default is empty, so a type that declares none loses nothing and "an
-experiment defining only the four required hooks trains with nothing passed" is intact.
+The table of named configurations for an experiment type; the contents belong to the model, the
+mechanism here. Default is empty. Entries are partial, and everything else falls through to the
+struct's defaults; inheritance is `merge` on NamedTuples.
 
 ```julia
 ReactantNitro.presets(::Type{MyExp}) = (
@@ -1026,17 +762,9 @@ ReactantNitro.presets(::Type{MyExp}) = (
 )
 ```
 
-**Entries are PARTIAL**, and usually are: a recipe states what it changes and everything else falls
-through to the struct's defaults, exactly as the ad-hoc tables this replaces already do.
-
-**Why the framework has an opinion at all**, given three models each solved this privately in about
-ten lines: none of those tables is visible to the checkpoint record or the logger, so a **result**
-cannot say which recipe produced it. That, plus validating a key rather than letting a typo be a
-silent no-op, is what earns the surface. It is **not** a reproducibility mechanism; provenance
-already reproduces any run exactly from its git SHA.
-
-Inheritance is `merge` on NamedTuples and needs nothing from the framework:
-`wide_v2 = merge(wide_v1, (; max_epochs = 80))`.
+The framework has an opinion so that the checkpoint record and the logger can say which recipe
+produced a result, and so a typo in a key is an error rather than a silent no-op. It is not a
+reproducibility mechanism; provenance is.
 """
 function presets end
 presets(::Type) = (;)
@@ -1045,24 +773,13 @@ presets(::Type) = (;)
     from_preset(E::Type, name::Symbol; overrides...) -> e
 
 Build an experiment from [`presets`](@ref)`(E)[name]`, with `overrides` winning over the preset.
+Every preset key is validated against `fieldnames(E)`. A preset is field values, so the marker
+semantics are untouched: switching presets recompiles exactly when a `GraphConst` field differs.
+This does not record the name; use [`Nitro`](@ref)`(E, name; ...)` for that.
 
 ```julia
-e = from_preset(MyExp, :current)
 e = from_preset(MyExp, :current; max_epochs = 40)
 ```
-
-**Every preset key is validated against `fieldnames(E)`**, and it is the only correctness argument
-for presets: today a typo in a splatted `NamedTuple` is a silent no-op, and a recipe that quietly
-failed to set the field it names is worse than one that refuses to load.
-
-**A preset is field values, so the marker semantics are untouched.** `GraphConst` fields enter the
-compile cache key as usual, which means switching presets recompiles **exactly when the emitted
-graph really differs**: two recipes differing only in `Host` fields share both compiled programs,
-and one that changes a class count correctly does not. A preset may set a `Device` field too;
-`derive` wins for anything it computes, which is already true of a hand-set value.
-
-This does **not** record the name, because it returns a bare experiment and the framework has nowhere
-to put it. Use [`Nitro`](@ref)`(E, name; ...)` for that.
 """
 function from_preset(E::Type, name::Symbol; overrides...)
     table = presets(E)

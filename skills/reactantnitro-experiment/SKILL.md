@@ -255,18 +255,14 @@ and your sampling is not something to rewrite for the sake of a batching helper.
 the loader's item to a `NamedTuple` and forwards `length` is the whole adapter.
 
 **Prefetch is a framework default, and it changes nothing about the contract.** Setup wraps every
-split, the eval ones included, in a `PrefetchIterator` at `workers = Threads.nthreads(:default)`,
-`device_batches = 1` (batches staged on the device), `host_batches = 2 * workers` (batches allowed to
-exist on the host at once) and ordered delivery, unless the source is already a `PrefetchIterator` or
-a `NoPrefetch`. The wrapper is a declaration carrying a source and those settings; it forwards
-`length` and its `iterate` is a passthrough, so the three requirements above are the whole contract
-either way. `NoPrefetch` is the supported way to decline, and `ordered = false` is the one other knob
-worth knowing: it trades a bitwise-reproducible epoch order for immunity to a straggling batch. A
-source that wants real concurrency past the generic path implements the two-method trait
-`batch_at(source, i)`, to fetch batch `i` directly, plus `begin_epoch!(source)`, which the framework
-calls once per epoch before the first batch. The binding report, part of the handle's display, shows
-each split's resolved `workers`, `device_batches`, `host_batches` and path, which is where you read
-what a run actually resolved to.
+split, eval included, in a `PrefetchIterator` at `workers = Threads.nthreads(:default)`,
+`device_batches = 1` (staged on the device), `host_batches = 2 * workers` (existing on the host) and
+ordered delivery, unless the source is already a `PrefetchIterator` or a `NoPrefetch`. The wrapper
+forwards `length` and its `iterate` is a passthrough, so the three requirements above are the whole
+contract. `NoPrefetch` declines; `ordered = false` trades a bitwise-reproducible epoch order for
+immunity to a straggling batch. Real concurrency needs the two-method trait, `batch_at(source, i)`
+and `begin_epoch!(source)`. The handle's display shows each split's resolved `workers`,
+`device_batches`, `host_batches` and path.
 
 **Runs leave the interactive thread, and ^C is a graceful stop.** Every entry point
 (`train!`, `validate`, `evaluate`, `predict`, `export_model`) runs its body on a default-pool

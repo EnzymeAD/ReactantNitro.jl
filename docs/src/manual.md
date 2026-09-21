@@ -37,7 +37,8 @@ XLA program per run; nothing recompiles after step 1.
 
 ## The very simple GAN
 
-A complete, minimal least-squares GAN, the same recipe the `train_step` docstring carries:
+A complete, minimal least-squares GAN, the worked example the [`train_step`](@ref) docstring
+points at:
 
 ```julia
 using Statistics: mean   # or `using Statistics` at the top of the file

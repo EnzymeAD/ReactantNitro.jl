@@ -3,19 +3,10 @@
 # The optimizer layer: device-resident optimizer state, the traced-rule allowlist, the flat
 # per-group parameter layout, the three configuration levels, and framework-owned clipping.
 #
-# ── The governing fact of the whole design ──────────────────────────────────────────
-#
-# Stock `Optimisers.jl` rules trace correctly and match the host path BITWISE, but only if the
-# framework normalizes the optimizer state to device residency first, INCLUDING its integer step
-# counters. Left alone, `Optimisers.setup` produces state with host `Int` fields; those bake as
-# trace-time constants, the counter freezes, and the run silently trains with the wrong bias
-# correction.
-#
-# Re-measured here (Optimisers 0.4.8, Reactant 0.2.270, Julia 1.12.6, CPU), 64-element
-# flat buffer, 3 steps, RAdam: with the counter device-resident the result is bitwise identical to
-# the host path and the state is a type fixed point. With `track_numbers = AbstractFloat`, leaving
-# `t` host, `t` freezes at 2 where the host reaches 4 and the parameters drift 1.3e-3. NO ERROR IS
-# RAISED AT ANY POINT. The optimizer tests carry the control that asserts the second half.
+# The governing fact: stock `Optimisers.jl` rules trace correctly and match the host path bitwise,
+# but only if the optimizer state is normalized to device residency first, INCLUDING its integer
+# step counters. Left host, a counter bakes as a trace-time constant and freezes, and the run
+# silently trains with the wrong bias correction. The optimizer tests carry the control.
 
 # ── Framework-owned state initialization ────────────────────────────────────────────
 
@@ -31,12 +22,8 @@ is_host_number(x) = x isa Number && !(x isa Reactant.RNumber)
 """
     ReactantNitro.host_numbers(x) -> Vector{String}
 
-Every host `Number` reachable from `x`, as `path::Type` strings. The paths are what makes the
-assertion's failure legible: "which leaf is still on the host" is the only useful thing to say.
-
-`Optimisers.Leaf.frozen` is skipped: it is declared `::Bool` and is not a type parameter, so it
-**cannot** be promoted, which is the same fact that forces the rule and the state to convert
-separately.
+Every host `Number` reachable from `x`, as `path::Type` strings, so the assertion can say which leaf
+is still on the host. `Optimisers.Leaf.frozen` is skipped: declared `::Bool`, it cannot be promoted.
 """
 function host_numbers(x, path = "", out = String[])
     if x isa Reactant.RNumber || x isa AbstractArray || x isa AbstractString || x isa Symbol
@@ -61,13 +48,9 @@ end
 """
     ReactantNitro.assert_device_state(state; context) -> nothing
 
-The no-host-`Number` assertion over an optimizer **state** tree, run both at setup and after a
-restore. **This is the only thing standing between a user and the silent failure this file opens
-with**, which is why it is a runtime check and not only a test.
-
-It applies to the state, not to the rule. A rule legitimately keeps host fields, namely every field
-in [`nonschedulable`](@ref); that side is governed by [`to_device_rule`](@ref) and is asserted
-separately.
+The no-host-`Number` assertion over an optimizer STATE tree, at setup and after a restore, and the
+only thing standing between a user and the silent frozen-counter failure. A rule legitimately keeps
+host fields ([`nonschedulable`](@ref)) and is governed by [`to_device_rule`](@ref) instead.
 """
 function assert_device_state(state; context::AbstractString = "optimizer state")
     leaked = host_numbers(state)
@@ -86,14 +69,8 @@ end
 """
     ReactantNitro.assert_opt_state_device(opt_state; context) -> nothing
 
-The no-host-`Number` assertion over a USER-SUPPLIED optimizer state tree, the manual training
-mode, for [`setup_optimizers`](@ref)'s result and its restored form: walk every `Optimisers.Leaf`
-reachable from the tree and assert the leaf's STATE.
-
-The automatic path asserts each group's `state` alone, because `build_opt_state` built the leaves.
-A user tree carries the leaves' RULES too, and a rule legitimately keeps host fields, namely every
-field in [`nonschedulable`](@ref), so the walk asserts states only, never rules: that is the same
-boundary `to_device_leaf` preserves. `host_numbers` already skips `Leaf.frozen` explicitly.
+The same assertion over a user-supplied optimizer state tree (manual mode): every `Optimisers.Leaf`
+reachable from it has its STATE asserted, never its rule.
 """
 function assert_opt_state_device(
         x, context::AbstractString = "optimizer state from `setup_optimizers`"
@@ -117,22 +94,11 @@ end
 """
     ReactantNitro.to_device_leaf(l::Optimisers.Leaf) -> Optimisers.Leaf
 
-    Optimisers.Leaf(to_device_rule(l.rule),
-                    Reactant.to_rarray(l.state; track_numbers = Number),
-                    l.frozen)
-
-**The rule and the state convert separately.** A single `to_rarray(leaf; track_numbers = Number)`
-fails with `Reactant.NoFieldMatchError` (measured), because `Optimisers.Leaf.frozen` is declared
-`::Bool` and is not a type parameter, so promoting it to `TracedRNumber{Bool}` cannot be
-reconstructed.
-
-The state uses a blanket `track_numbers = Number`, because it **must** promote integers, which is
-the whole point of the fact this file opens with, and carries no `Bool`.
-
-The same normalization runs on the **resume** path, over the restored `opt_state`. The record
-stores **host** values, so the flow is uniform and has exactly one normalization point per path:
-write host, read host, normalize on the way in. Skipping it on resume reacquires the frozen-counter
-bug in full.
+Normalize a leaf to device residency: the rule through [`to_device_rule`](@ref) and the state
+through `to_rarray(...; track_numbers = Number)`, separately, because `Leaf.frozen` is declared
+`::Bool` and a single `to_rarray` over the leaf cannot reconstruct it. `track_numbers = Number`
+because the state must promote integers. The same normalization runs on the resume path over the
+restored `opt_state`: write host, read host, normalize on the way in.
 """
 function to_device_leaf(l::Optimisers.Leaf; mesh = nothing)
     return Optimisers.Leaf(
@@ -147,30 +113,12 @@ to_device_leaf(t::Union{Tuple, NamedTuple}; mesh = nothing) =
 """
     ReactantNitro.to_device_rule(r) -> rule
 
-Promote exactly the schedulable fields; leave structural ones host.
-
-**The rule promotes per field, not by type**, and that is not a stylistic choice: **a type-based
-policy cannot tell a schedulable hyperparameter from a structural one**, since they are often the
-same type. `ClipNorm` is the worked case. Measured here: its fields are *declared* `Any, Any, Bool`
-and a default `ClipNorm()` is `ClipNorm{Float64,Float64}(10.0, 2.0, true)`, so the schedulable
-`omega` and the structural `p` are **the same type** and no type-based policy can separate them even
-in principle. Any policy admitting `omega` also promotes `p`, which then fails `_norm`'s `::Real`
-dispatch constraint. That failure is what once made this project record "ClipNorm cannot trace at
-all", which was wrong in both halves.
-
-**The set to promote is exactly `fieldnames(T)` minus [`nonschedulable`](@ref)`(T)`**, which is the
-trait the schedule layer already declares. One declaration drives both, and it must: a field that
-cannot be promoted cannot be scheduled, and a field that is scheduled must be promoted.
-
-A parameter-sized field such as [`Decay`](@ref)'s `anchor` and `no_decay_mask` is in that opt-out
-and is therefore passed through untouched. That is correct rather than a gap: the framework
-constructs `Decay` with those already on device, from the per-group `hp` table, and
-"non-schedulable" means "not pushed afresh every step", which is exactly what a parameter-sized
-buffer must not be.
-
-**The name is `to_device_rule`, not `promote_rule`.** `promote_rule` is exported from `Base`, and
-defining it unqualified at module level does not error but makes `Base.promote_rule` unreachable by
-that name inside the module.
+Promote exactly the schedulable fields of a rule and leave the structural ones host. Per field, not
+by type: `ClipNorm`'s schedulable `omega` and structural `p` are both `Float64`, and promoting `p`
+breaks `_norm`'s `::Real` dispatch. The set is `fieldnames(T)` minus [`nonschedulable`](@ref)`(T)`,
+so one declaration drives scheduling and promotion. Parameter-sized fields such as [`Decay`](@ref)'s
+`anchor` are in that opt-out and pass through, already on device. Named `to_device_rule` because
+defining `promote_rule` unqualified would shadow `Base.promote_rule`.
 """
 function to_device_rule(r; mesh = nothing)
     T = typeof(r)
@@ -190,12 +138,9 @@ to_device_rule(c::Optimisers.OptimiserChain; mesh = nothing) =
 """
     ReactantNitro.ADMITTED_RULES
 
-The traced-optimizer allowlist. Membership criterion, three parts, all mechanically checkable: the
-rule **traces** with device-resident state and hyperparameters; its state is a **type fixed point**
-across the traced boundary; and three steps are **bitwise identical** to the stock host path.
-
-Re-measured under the per-field normalization above, 64-element flat buffer, 3 steps,
-every rule constructed at the buffer's element type:
+The traced-optimizer allowlist. A rule is admitted once it traces with device-resident state and
+hyperparameters, its state is a type fixed point across the traced boundary, and three steps match
+the stock host path bitwise (64-element buffer, every rule at the buffer's element type):
 
 | Rule | Traces | Fixed point | maxdiff vs host |
 | --- | --- | --- | --- |
@@ -207,26 +152,11 @@ every rule constructed at the buffer's element type:
 | `OptimiserChain(RAdam, WeightDecay)` | yes | yes | 0.0 |
 | `OptimiserChain(ClipNorm, Adam)` | yes | yes | 0.0 |
 
-**`Descent` is 1 ulp where every other admitted rule is exact.** Measured and diagnosed rather than
-tolerated: `Descent`'s update is `x - eta * g`, a multiply immediately consumed by a subtract, which
-XLA is free to contract into a **fused multiply-add**. FMA rounds once where the host rounds twice.
-Three predictions were checked and all hold: with `eta` an exact power of two the multiply is exact
-and the result is bitwise; the difference is one ulp and does not accumulate over steps; and the
-compiled result equals host `fma.(-eta, g, x)` **exactly**. Every other admitted rule has a division
-or a sqrt between the multiply and the subtract, which blocks contraction, which is why they are
-bitwise.
-
-So the optimizer tests assert bitwise equality against the **FMA-contracted** host reference for
-`Descent` and against the plain host path for everything else. That keeps an exact assertion rather
-than a tolerance, so the test still fails loudly if XLA's behavior changes, which is the whole
-reason for asserting bitwise rather than to a tolerance.
-
-**`AccumGrad` is deliberately absent**, and it is the one entry that traces and is *wrong*: see
-`Train.jl` for the accumulation the framework does instead.
-
-**Elementwise rules only.** Layer-adaptive rules (LARS, LAMB) would compute one trust ratio per group
-rather than per layer, a behavioral difference that surfaces as a bad curve rather than an error, so
-they are rejected even though nothing about them fails to trace.
+`Descent`'s update `x - eta * g` is a multiply feeding a subtract, which XLA contracts into a fused
+multiply-add that rounds once; the compiled result equals host `fma.(-eta, g, x)` exactly, and the
+tests assert against that. Every other rule has a division or sqrt in between. `AccumGrad` is
+absent because it traces and is wrong (Train.jl). Layer-adaptive rules (LARS, LAMB) are rejected
+because they would compute one trust ratio per group rather than per layer.
 """
 const ADMITTED_RULES = (
     Optimisers.Descent, Optimisers.Momentum, Optimisers.Nesterov,
@@ -238,13 +168,9 @@ const ADMITTED_RULES = (
 """
     ReactantNitro.check_allowlist(rule) -> nothing
 
-The admission check, enforced at setup. Its error names the admitted rules and points at the
-upstream contribution path, because that error is the only runtime signal a user gets.
-
-`ClipNorm` with the default `throw = true` is rejected **naming the flag**. It reaches
-`if o.throw && !isfinite(nrm)`, a host branch on a traced value, and fails with
-`TypeError: non-boolean (Reactant.TracedRNumber{Bool}) used in boolean context`, which names nothing
-a user could act on. Measured, so the rejection is not precautionary.
+The admission check, at setup. `ClipNorm` with the default `throw = true` is rejected naming the
+flag: it reaches `if o.throw && !isfinite(nrm)`, a host branch on a traced value, and fails with a
+`TypeError` that names nothing a user could act on.
 """
 function check_allowlist(c::Optimisers.OptimiserChain)
     foreach(check_allowlist, c.opts)
@@ -286,13 +212,9 @@ end
 """
     ReactantNitro.LeafRow
 
-One row of the flat permutation, which is a per-leaf table and **not** a `Vector{Int}` over
-elements. `offset` is 0-based **within that leaf's group buffer**, since the framework materializes
-G disjoint per-group arrays rather than one buffer with a mask.
-
-Storing keypaths rather than raw offsets is what lets the resume check produce a **useful** diff:
-it can say which leaf moved, rather than that two integer vectors differ. It is also small, one row
-per parameter array rather than per element.
+One row of the flat permutation, a per-leaf table rather than a `Vector{Int}` over elements.
+`offset` is 0-based within the leaf's group buffer. Storing keypaths is what lets the resume check
+say which leaf moved.
 """
 const LeafRow = @NamedTuple{keypath::Tuple, group::Symbol, offset::Int, len::Int, size::Dims}
 
@@ -311,12 +233,9 @@ struct FlatLayout{G}
     groups::NTuple{G, Symbol}
     lengths::NTuple{G, Int}
     index::Dict{Tuple, Int}                     # keypath -> row number in `permutation`
-    # Row numbers per group, in flat order, as TUPLES rather than Vectors. That is not a
-    # micro-optimization: `map` over a host `Vector` INSIDE a traced function is intercepted by
-    # Reactant's overlay and vectorized into `elem_apply_via_while_loop`, which promotes the row
-    # indices to `TracedRNumber{Int64}` and then fails with `getindex for Vector{Any} with types
-    # Tuple{TracedRNumber{Int64}} is not supported`. `map` over a Tuple is Base's own and stays
-    # host, which is what keeps the operand order host-known at trace time.
+    # Tuples rather than Vectors: `map` over a host `Vector` inside a traced function is intercepted
+    # by Reactant and vectorized, promoting the row indices to traced numbers; `map` over a Tuple
+    # stays host, so the operand order is known at trace time.
     group_rows::NTuple{G, Tuple{Vararg{Int}}}
     row_group::Vector{Int}                     # row number -> group number
 end
@@ -326,20 +245,11 @@ n_groups(::FlatLayout{G}) where {G} = G
 """
     ReactantNitro.LayoutRef{ID}
 
-A zero-field handle carrying a [`FlatLayout`](@ref) at the **type** level, the same technique
-[`Router`](@ref) uses for its key set, and for the same reason plus one more.
-
-**The layout cannot ride into a traced program as a value.** Measured: Reactant traverses
-a struct argument and promotes the `Int`s inside it, so `layout.index[keypath]` comes back a
-`TracedRNumber{Int64}` and indexing the leaf vector fails with `getindex for Vector{Any} with types
-Tuple{Reactant.TracedRNumber{Int64}} is not supported`. The layout is **host bookkeeping**: both
-directions of the map are closed over as host-side constants for the run, and a promoted offset is
-neither host nor a constant.
-
-Carrying it at the type level also puts it in the compile cache's key for free, through the
-argument types,
-which is what a `FlatLayout{G}` value argument would **not** have done: two different layouts with the
-same `G` share a type, so they would have collided on a key that was otherwise identical.
+A zero-field handle carrying a [`FlatLayout`](@ref) at the type level, as [`Router`](@ref) does its
+key set. The layout cannot ride into a traced program as a value: Reactant promotes the `Int`s
+inside a struct argument, and a promoted offset can index nothing. Carrying it at the type level
+also puts it in the compile cache key, which a `FlatLayout{G}` value would not, since two layouts
+with the same `G` share a type.
 """
 struct LayoutRef{ID} end
 
@@ -382,14 +292,10 @@ end
 """
     ReactantNitro.build_layout(e, ps) -> FlatLayout
 
-Setup's layout step, **unconditional**, including for an evaluation `Nitro`: it is host-side
-bookkeeping rather than device memory, and the checkpoint path validates the restored permutation
-against the one computed here, which a `Nitro` that skipped this step could not do.
-
-**The layout is a stable sort of the traversal-order leaves by group index.** Stability is what makes
-it deterministic: within a group, leaves keep traversal order. `:default` is group 1 and the
-remaining groups follow first-appearance order, which is stable for a fixed model and bakes into the
-compiled program.
+Setup's layout step, unconditional, including for an evaluation `Nitro`: host-side bookkeeping the
+checkpoint path validates against. A stable sort of the traversal-order leaves by group index, so
+within a group leaves keep traversal order; `:default` is group 1 and the rest follow
+first-appearance order.
 """
 function build_layout(e, ps)
     kps = leaf_keypaths(ps)
@@ -429,13 +335,8 @@ end
 """
     ReactantNitro.flatten(tree, layout) -> NTuple{G}
 
-Tree to G group buffers. **A concatenate**, which is a real copy of the parameter set rather than a
-fold into a consumer, so calling it free would be wrong.
-
-What it is *not* is a runtime permuted gather: because the permutation is one row per leaf rather
-than one entry per element, the operand order is host-known at trace time, so grouping by leaf costs
-nothing beyond the copy. That is also why this runs inside the traced program without emitting
-control flow.
+Tree to G group buffers, a concatenate (a real copy). Because the permutation is one row per leaf,
+the operand order is host-known at trace time, so grouping emits no control flow.
 """
 function flatten(tree, layout::FlatLayout{G}, mesh = nothing) where {G}
     leaves = Vector{Any}(undef, length(layout.permutation))
@@ -452,26 +353,11 @@ function flatten(tree, layout::FlatLayout{G}, mesh = nothing) where {G}
     return ntuple(gi -> _concat_group(leaves, layout.group_rows[gi], mesh), Val(G))
 end
 
-# CONCRETE DEVICE ARRAYS GO THROUGH THE HOST, and this is not an optimization, it is the only way
-# this function works on a GPU at all.
-#
-# `vec` of a `ConcretePJRTArray` is a `Base.ReshapedArray` wrapping the device buffer, which is not a
-# Reactant array type, so `vcat` of those misses Reactant's methods and lands in Base's generic
-# `typed_vcat`. That allocates the destination and fills it with `setindex!`, elementwise. On host
-# arrays it is legal and merely slow; on a GPU Reactant refuses:
-#
-#     ERROR: Scalar indexing is disallowed.
-#     Invocation of getindex(::ConcretePJRTArray, ::Vararg{Int,N})
-#
-# Found by the first real GPU run, at `flat = flatten(ps, layout)` during `Nitro`
-# construction, before step 1. THE FLAT PARAMETER LAYOUT COULD NOT BE BUILT ON A GPU, so nothing in
-# this framework had ever run on one. 1243 green CPU tests could not have caught it: the same code
-# passes on CPU while doing something pathological, so the suite was green and wrong.
-#
-# The host round trip is affordable because THIS PATH IS SETUP-ONLY. `flatten` sees concrete device
-# arrays exactly twice per run, at `flat = flatten(ps, layout)` and in `decay_anchors`, both once
-# during construction. Inside the traced programs the leaves are `TracedRArray`s, which are not
-# `AbstractConcreteArray`, so they take the branch below unchanged and the hot path is untouched.
+# Concrete device arrays go through the host, which is the only way this works on a GPU: `vec` of
+# a `ConcretePJRTArray` is a `ReshapedArray`, so `vcat` lands in Base's elementwise `typed_vcat`,
+# which is legal on CPU and "Scalar indexing is disallowed" on a GPU (found by the first real GPU
+# run, at `Nitro` construction). Affordable because this path is setup-only: inside the traced
+# programs the leaves are `TracedRArray`s and take the other branch.
 function _concat_group(leaves, rows::Tuple, mesh = nothing)
     xs = ntuple(i -> leaves[rows[i]], length(rows))
     if any(x -> x isa Reactant.AbstractConcreteArray, xs)
@@ -484,27 +370,17 @@ end
 """
     ReactantNitro.unflatten(flat::NTuple{G}, template, layout) -> tree
 
-G group buffers back to a tree, shaped like `template`. **A `reshape` over a contiguous slice**, per
-leaf: `reshape(flat[offset .+ (1:len)], size)`.
-
-Under trace both the slice and the reshape are ordinary XLA operations that fold into the consuming
-op, so the reconstruction is free rather than a copy. **These are not host views**, which is why
-the export caveat about `copy()`ing view-shaped outputs does not apply to parameters: nothing here
-produces a Julia `SubArray`.
+G group buffers back to a tree shaped like `template`, a `reshape` over a contiguous slice per leaf.
+Under trace the slice and reshape fold into the consuming op, so this is free.
 """
 function unflatten(flat::NTuple{G, Any}, template, layout::FlatLayout{G}) where {G}
     return Functors.fmap_with_path(template) do kp, x
         x isa AbstractArray || return x
         r = layout.index[Tuple(kp)]
         row = layout.permutation[r]
-        # `copy` is load-bearing, not defensive. Without it the reconstruction comes back as a
-        # `Base.ReshapedArray` wrapping the flat buffer, so `typeof(ps)` CHANGES after the first
-        # optimizer step and every subsequent step misses the compile cache and recompiles. The
-        # export caveat about view-shaped outputs is often waved off for parameters on the grounds
-        # that nothing here produces a Julia `SubArray`, which is true of `SubArray` and false of
-        # the substance: a
-        # `ReshapedArray` is just as much a view, and it is what a materialized program output
-        # actually carries. Under trace the copy is an XLA op that folds away.
+        # `copy` is load-bearing: without it the leaf is a `ReshapedArray` over the flat buffer, so
+        # `typeof(ps)` changes after the first step and every step recompiles. Under trace the copy
+        # folds away.
         return copy(reshape(flat[layout.row_group[r]][row.offset .+ (1:row.len)], row.size))
     end
 end
@@ -516,20 +392,10 @@ unflatten(flat::Tuple, template, layout::FlatLayout) =
 """
     ReactantNitro.no_decay_masks(e, ps, layout; elt = Float32) -> NTuple{G}
 
-The per-parameter decay exclusion, as one 0/1 flat buffer per group: **1 means decayed**, 0 means
-excluded. **This is the one piece of per-parameter behavior not expressed through groups**, and the
-reason it is not is that biases and norm affines occur inside every group, so routing their
-exclusion through [`param_group`](@ref) would force a group split that also splits the
-learning-rate ratio.
-
-The rule is [`no_decay`](@ref)`(e, keypath, leaf)`, which defaults to
-[`default_no_decay`](@ref), `ndims(leaf) == 1`. That default is exactly what this function hardcoded
-before the hook existed, so no run's numerics move by adding it.
-
-Built **once, at construction**, and stored on the [`Nitro`](@ref). It used to be rebuilt at every
-`train!` entry as well, which was harmless only because it was a pure function of frozen state; with
-a user hook feeding it, recomputing would let a revised rule take effect on an existing handle and
-contradict the rule that a handle's programs and numerics are fixed at construction.
+The per-parameter decay exclusion, as one 0/1 flat buffer per group (1 decayed, 0 excluded), from
+[`no_decay`](@ref)`(e, keypath, leaf)`. The one piece of per-parameter behavior not expressed
+through groups, since biases occur inside every group. Built once at construction and stored on the
+[`Nitro`](@ref), so a revised rule takes effect on the next handle.
 """
 function no_decay_masks(e, ps, layout::FlatLayout{G}; elt::Type = Float32) where {G}
     keep = Dict{Tuple, Bool}()
@@ -552,60 +418,20 @@ end
 """
     ReactantNitro.resolve_hp(e, layout, gi; eta_t = nothing, anchors = nothing, masks = nothing)
 
-The per-group hyperparameter carrier, resolved per group per step. Keys `eta`, `lambda`, `anchor`,
-and `no_decay_mask` are always present, and the schedule layer adds one key per scheduled rule
-field.
+The per-group hyperparameter carrier, resolved per group per step: `eta`, `lambda`, `anchor` and
+`no_decay_mask`, plus one key per scheduled rule field. `eta` and `lambda` follow
+[`effective_lr`](@ref); `eta_t` is the `eta` schedule's value or `nothing` when none is configured.
 
-`eta` and `lambda` follow the effective-learning-rate definition, with [`effective_lr`](@ref) doing
-the arithmetic:
+Both scalars are converted to the flat buffer's element type before device conversion:
+`Optimisers.RAdam()` defaults `eta` to `Float64`, and a `Float32` buffer would come back `Float64`
+from `apply!` and fail the thunk guard on step 2.
 
-    η_g(t) = eta_sched(t) * (learning_rate(e, Val(g)) / learning_rate(e))
-    λ_g(t) = η_g(t) * lambda(e, Val(g))
-
-`eta_t` is the `eta` schedule's value at this step, or `nothing` at setup and whenever no `eta`
-schedule is configured, in which case `learning_rate(e)` is used.
-
-**Both scalars are converted to the flat buffer's element type before device conversion**, and that
-is load-bearing rather than tidy. Measured: `Optimisers.RAdam()` defaults `eta` to `Float64`, so a
-`Float32` parameter buffer comes back out of `apply!` as `Float64`, the thunk guard rejects the
-second call, and the run dies on step 2 with a message about argument types rather than about
-precision. The element type is carried through the flat buffer, the optimizer state, the masks,
-and the scheduled-scalar carrier; this is that carrier.
-
-**`memo` is what keeps the constant case from re-uploading**, and the donation question it was
-blocked on is now measured rather than open. Without a memo, `to_device` runs unconditionally, so
-`eta` and a non-zero `lambda` are uploaded fresh on every optimizer step, per group, whether or not
-anything is scheduled: with no `eta` schedule, `effective_lr` returns the constant base rate and it
-is still converted from a host `Float32` each time. The parameter-sized entries were always right,
-since `anchor` and `no_decay_mask` are passed through from values built at setup and never
-re-uploaded, which is what the non-schedulable opt-out exists to protect. See
-[`memo_to_device`](@ref) for the reuse rule.
-
-**Measured on CUDA.** The blocker was whether the optimizer program DONATES the buffers
-these scalars live in, because a cached scalar reused after donation is the freed-buffer hazard
-wearing a different hat and presents as a WRONG LEARNING RATE rather than as a crash. Compiling an
-optimizer-shaped program over an `Adam` leaf gave `donated_args_mask == Bool[0, 1, 1, 0, 0, 0, 0]`:
-the two donated arguments are the moments, and `eta` is not donated. That follows from the program's
-own shape rather than from luck. `apply_group` returns `Leaf(leaf.rule, ...)`, so the rule, and the
-`eta` inside it, is returned as a pass-through block argument, which makes it a PRESERVED argument
-under Reactant's `:auto` policy and preserved arguments are exactly the ones donation skips.
-Reuse then held: 500 steps against one cached scalar, readback correct at every checkpoint, and the
-parameters bit-identical to the fresh-upload path.
-
-**The CPU backend cannot see any of this**, which is the CPU/device boundary showing up in the one
-place it would have been easiest to trust. The same probe on CPU returns an all-false mask for
-every argument
-including pure consumption, so donation is simply not exercised there, and a green CPU suite is
-evidence about the memo's bookkeeping only, never about whether reuse is safe.
-
-**What the memo actually buys, with its scope attached**, because the unqualified number is
-misleading. An isolated scalar upload measured 40.8 us on an empty queue and 61.3 us at queue depth
-16. `resolve_hp` issues one upload per group per optimizer step at the default zero `lambda`, so a
-275-step epoch over two groups is roughly 550 uploads, on the order of 20 ms per epoch of transfer.
-An optimizer-step microbenchmark with no forward or backward pass in it showed 20.3% (100k
-parameters) to 36.6% (10M) of step wall time recovered, but that denominator is the optimizer step
-alone; against a real model measured at roughly 40 s of stepping per epoch the saving is **well under
-one percent of training wall time**. Take this for being exact and nearly free, not for being fast.
+`memo` is a [`ScalarMemo`](@ref) that skips the upload while the host value is unchanged, so a
+constant `eta` crosses once per run. Reuse is safe because the optimizer program does not donate
+the rule's scalars (measured on CUDA: `apply_group` returns the rule as a pass-through argument, so
+it is preserved; 500 steps of reuse were bit-identical to fresh uploads). The CPU backend never
+exercises donation, so a green CPU suite says nothing about this. The saving is well under one
+percent of training wall time; take it for being exact rather than fast.
 """
 function resolve_hp(
         e, layout::FlatLayout, gi::Int; eta_t = nothing, anchors = nothing,
@@ -627,18 +453,9 @@ end
 """
     ReactantNitro.ScalarMemo() -> ScalarMemo
 
-One slot per `(group, key)`, holding the host value last uploaded and the device scalar it produced,
-so [`resolve_hp`](@ref) can skip the transfer while the host value is unchanged.
-
-**One slot, not a growing table**, and that is the whole of the eviction policy. A scheduled `eta`
-produces a different value on most steps, so a keyed cache would grow without bound and never hit;
-replacing the slot on a miss makes the scheduled case cost exactly what it costs today and the
-constant case cost one upload per run.
-
-**Scoped to a `train!` call**, which is what keeps `mesh` out of the key. `nitro.mesh` is fixed for
-the run, so every scalar a given memo holds was placed on the same mesh by construction. A
-module-level memo could not say that, and a scalar placed with a device count of 1 against moments
-replicated across a mesh is the exact failure `rebuild_rules` records from the first 4-device run.
+One slot per `(group, key)`, holding the host value last uploaded and the device scalar it
+produced. One slot, not a table, since a scheduled `eta` differs on most steps and a keyed cache
+would grow without hitting. Scoped to a `train!` call, so `mesh` is an invariant rather than a key.
 """
 struct ScalarMemo
     slots::Dict{Tuple{Int, Symbol}, Tuple{Any, Any}}
@@ -648,27 +465,12 @@ ScalarMemo() = ScalarMemo(Dict{Tuple{Int, Symbol}, Tuple{Any, Any}}())
 """
     ReactantNitro.memo_to_device(memo, key, x; mesh = nothing) -> device scalar
 
-[`to_device`](@ref) with a one-slot memo in front of it. `memo === nothing` is the unmemoized path
-and is exactly the old behaviour, which is what `setup` and the unit tests take.
-
-Two conditions gate reuse, and both are refusals rather than permissions:
-
-  * **the host value must be `===` the one that produced the cached scalar.** `===` on a `Float32`
-    is bitwise, so it never conflates `0.0` with `-0.0`, never claims a `Float32` and a `Float64`
-    spelling of one number are the same, and needs no separate element-type key. `resolve_hp`
-    converts to `elt` BEFORE calling here, so the value compared is the one that would be uploaded.
-  * **the cached scalar must not be marked donated.** Reactant sets `donated` when it hands a
-    buffer's storage to a program, and reusing one after that is the freed-buffer hazard, which
-    presents as a wrong learning rate rather than a crash. A value with no `donated` field to read
-    is refused too, so an IFRT or future concrete type this was never measured against falls back to
-    uploading rather than guessing.
-
-**The guard is not independent of its subject and should not be read as if it were.** `donated` is
-Reactant's own record of what it told XLA, not an outside check on it, so it cannot catch a buffer
-XLA consumed without Reactant marking it. The per-step upload hid that class of bug by never reusing
-anything; this does not. What stands behind it is the measurement in [`resolve_hp`](@ref)'s
-docstring, 500 steps of reuse on CUDA with the parameters bit-identical to the fresh path, and that
-measurement has to be re-run on a Reactant bump rather than assumed to carry forward.
+[`to_device`](@ref) with a one-slot memo in front; `memo === nothing` is the unmemoized path. Reuse
+requires the host value to be `===` the one that produced the cached scalar (bitwise on a
+`Float32`, so `-0.0` and a `Float64` spelling never conflate) and the cached scalar not to be marked
+donated; a type with no `donated` field is refused too. `donated` is Reactant's own record, not an
+outside check, so the CUDA measurement in [`resolve_hp`](@ref) is what stands behind this and has to
+be re-run on a Reactant bump.
 """
 memo_to_device(::Nothing, key, x; mesh = nothing) = to_device(x; mesh)
 
@@ -690,27 +492,11 @@ reuse_refused(x) = !hasfield(typeof(x), :donated) || getfield(x, :donated)
 """
     ReactantNitro.build_chain(e, group::Symbol, hp) -> Optimisers.AbstractRule
 
-The three configuration levels resolved into one chain per group, plus the setup checks below.
-
-**Levels 0 and 1: the framework constructs.** [`optimizer`](@ref) returns a rule *type*, so the
-framework builds it by splatting the resolved values into its constructor, keyed by field name.
-Every configured hyperparameter is therefore applied by construction, and a rule the
-framework has never heard of works with no framework change.
-
-**Level 2: the user's factory constructs** and the framework only supplies `hp`. It performs one
-**name** check, which catches the typo and the wrong-rule case, and deliberately does **not** check
-that the factory read what it was given; see [`optimizer`](@ref).
-
-Three setup errors, all naming the offenders:
-
-  * **A base rule declaring a `lambda` field at Level 1** (`AdamW`), since that rule plus the
-    framework-composed [`Decay`](@ref) tail would decay twice, silently, at whatever the two
-    coefficients sum to, and `opt.lambda` would then resolve against two rules in one chain.
-  * **Two rules in one chain declaring the same schedulable field name**, without which a single
-    schedule key would silently write two rules. This is the intra-chain sibling of the schedule
-    layer's cross-namespace ambiguity error.
-  * **`Decay` anywhere but last in a chain**, since anything after it would feed the decay term
-    through moment estimation, producing coupled L2, which the framework does not support.
+The three configuration levels resolved into one chain per group. At Levels 0 and 1 the framework
+constructs the rule from its type by field name; at Level 2 the user's factory constructs and the
+framework checks names only. Three setup errors: a base rule declaring its own `lambda` at Level 1
+(it would decay twice), two rules in one chain declaring the same schedulable field (one key would
+write both), and `Decay` anywhere but last (anything after it would produce coupled L2).
 """
 function build_chain(e, group::Symbol, hp)
     chain = optimizer(e, group, hp)
@@ -723,12 +509,8 @@ end
 """
     ReactantNitro.level1_chain(e, group, hp) -> Optimisers.AbstractRule
 
-The default method behind `optimizer(e, group, hp)`: the Level 1 composition of
-[`optimizer`](@ref)`(e, Val(group))` with the framework's own [`Decay`](@ref) tail. Level 1 is the
-default method of Level 2, so there is one concept with a shorthand.
-
-The `Decay` tail is omitted entirely when the group's `lambda` is zero, which is the default, so a
-bare experiment's chain is the base rule alone and emits no decay ops.
+The default method behind `optimizer(e, group, hp)`: [`optimizer`](@ref)`(e, Val(group))` composed
+with the [`Decay`](@ref) tail, which is omitted when the group's `lambda` is zero.
 """
 function level1_chain(e, group::Symbol, hp)
     R = optimizer(e, Val(group))
@@ -831,24 +613,11 @@ end
 """
     ReactantNitro.build_opt_state(e, flat::NTuple{G}, layout; kwargs...) -> NTuple{G}
 
-Setup's optimizer-state step, **training only**. Build the per-group chain, `Optimisers.setup` it
-against that group's flat buffer, normalize through [`to_device_leaf`](@ref), and assert the
-no-host-`Number` property on the result. Skipped by a `Nitro` built for evaluation, which would
-otherwise allocate the moments
-for nothing, which for Adam-family rules is twice the parameter memory on device.
-
-**Call `Optimisers.apply!` per group.** `apply!` is array-level rather than tree-level, so handing it
-a flat group slice skips the tree walk entirely, and per-group calls also solve the scalar-`eta`
-limitation that blocks a single flat leaf.
-
-**The collection is an `NTuple{G}`, never a `Vector`.** With two groups carrying different rules, a
-`Vector` infers as `Vector{Optimisers.Leaf}`, which is abstractly typed, and the thunk guard then
-rejects the second call.
-
-`opt_state` remains **opaque to the user and to the checkpointer**: store and return whatever the
-optimizer produced. It is not opaque to the framework, which owns its construction and normalization.
-**Bias correction lives here**, since `βt` and `t` are state fields of the stock rules, so resume
-restores it by restoring the state; the separately stored `step` exists for schedules.
+Setup's optimizer-state step, training only: build each group's chain, `Optimisers.setup` it
+against the group's flat buffer, normalize through [`to_device_leaf`](@ref), and assert no host
+`Number` survives. `apply!` is array-level, so a flat group slice skips the tree walk. The
+collection is an `NTuple{G}`, never a `Vector`, which would infer abstractly and fail the thunk
+guard. Bias correction lives in the state, so resume restores it with the state.
 """
 function build_opt_state(e, flat::NTuple{G, Any}, layout::FlatLayout{G}; kwargs...) where {G}
     state = ntuple(Val(G)) do gi
@@ -884,21 +653,13 @@ end
     step_optimizer(opt_state, ps, grads) -> (states, ps_new)
 
 One tree-level optimizer step for use inside a [`train_step`](@ref) closure: `Optimisers.update`
-under trace, returning the new parameter tree and the new optimizer **states**.
-
-**The rules are stripped from the return, and the driver re-attaches the rules it handed in.**
-A measured rule of sharding: a replicated scalar, which is what a rule's device hyperparameters
-are, cannot leave a compiled program as an output on a mesh, though arrays can, and that is the
-same rule that makes the automatic `opt_program` return states. `opt_state` must be
-device-normalized, which
-[`setup_optimizers`](@ref) does; call this once per network or group, passing that subtree:
+under trace, returning the new parameter tree and the new optimizer STATES. The rules are stripped
+because a replicated scalar cannot leave a compiled program on a mesh; the driver re-attaches them.
+Call it once per network or group, passing that subtree:
 
 ```julia
 st_g, ps_g = ReactantNitro.step_optimizer(opt_state.gen, ps.gen, g_g)
 ```
-
-The subtraction mirrors `apply_group` in preserving `eltype(x)`, so the parameter tree is a type
-fixed point across the step, which is what keeps the closure's program on one cache entry.
 """
 function step_optimizer(opt_state, ps, grads)
     opt_state_new, ps_new = Optimisers.update(opt_state, ps, grads)
@@ -908,11 +669,9 @@ end
 """
     ReactantNitro.strip_rules(opt_state) -> states
 
-Replace every `Optimisers.Leaf` reachable from a user's optimizer state tree with its
-STATE, preserving structure. The mirror of [`merge_rules`](@ref), and the half of the
-"rules in, states out" contract that runs inside the traced closure: a `Leaf` cannot leave a
-compiled program on a mesh because its rule carries replicated scalars, so the closure returns
-states and the driver re-attaches the rules.
+Replace every `Optimisers.Leaf` in a user's optimizer state tree with its STATE, preserving
+structure; the traced half of the "rules in, states out" contract. The mirror of
+[`merge_rules`](@ref).
 """
 function strip_rules(x)
     if x isa Optimisers.Leaf
@@ -935,11 +694,9 @@ end
 """
     ReactantNitro.merge_rules(combined, states) -> opt_state
 
-The mirror of [`strip_rules`](@ref), run by the driver between closure calls: re-attach the rules
-of the `opt_state` it handed in to the states the closure returned, rebuilding each
-`Optimisers.Leaf` as `Leaf(input.rule, returned_state, input.frozen)`. The two trees must
-have the same structure; a mismatch is a framework bug rather than a user error, and surfaces as a
-method error here, at the merge, rather than inside a trace.
+Re-attach the rules of the `opt_state` handed in to the states the closure returned, rebuilding
+each `Leaf(input.rule, returned_state, input.frozen)`. A structure mismatch is a framework bug and
+surfaces here rather than inside a trace.
 """
 function merge_rules(combined, states)
     if combined isa Optimisers.Leaf
@@ -976,19 +733,11 @@ global_grad_norm(g_accum::Tuple) = sqrt(sum(gi -> sum(abs2, gi), g_accum))
 """
     ReactantNitro.clip_by_global_norm(g_accum::NTuple{G}, threshold) -> NTuple{G}
 
-The framework's own clip, applied at the top of the **optimizer** program on the fully accumulated
-gradient, before any `apply!`. Never a chain member: a chain member clips **per group**, which is a
-different algorithm producing different updates.
-
-**The threshold is a trace-time host constant**, so `threshold <= 0` returns the accumulator
-untouched and the compiled program is identical to one from a run that never configured clipping.
-A device-resident threshold could not keep that: `0` would scale the gradient to zero norm, and on an
-all-zero gradient `0/0` yields `NaN` silently. "Off" would have to be spelled `Inf`.
-
-The scale is `threshold / max(norm, threshold)`, which is exactly `1` when the norm is under the
-threshold and `threshold / norm` when over, and which cannot divide by zero because `threshold > 0`
-on this branch. A gradient over the threshold therefore comes out at norm exactly the threshold,
-which the accumulation tests assert.
+The framework's clip, at the top of the optimizer program on the fully accumulated gradient. The
+threshold is a trace-time host constant, so `threshold <= 0` returns the accumulator untouched and
+emits nothing; a device-resident `0` would scale the gradient to `NaN`. The scale is
+`threshold / max(norm, threshold)`, so a gradient over the threshold comes out at exactly the
+threshold.
 """
 function clip_by_global_norm(g_accum::Tuple, threshold::Real)
     threshold > 0 || return g_accum          # HOST branch: emits no ops at all

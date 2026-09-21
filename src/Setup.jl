@@ -1,122 +1,69 @@
 # Setup.jl
 #
-# The setup sequence, the `Nitro` constructor, and the accelerator and distribution surface.
-#
-# THE SETUP SEQUENCE IS THE SINGLE AUTHORITY ON ORDERING. Every edge has a reason, and the reason is
-# why the order cannot be permuted. The sequence is written out in `Nitro`'s implementation below
-# rather than paraphrased somewhere else, because a description kept apart from the code it orders
-# drifts from it.
+# The setup sequence, the `Nitro` constructor, and the accelerator and distribution surface. The
+# sequence is written out in `_build_nitro` itself, since a description kept apart from the code
+# it orders drifts from it.
 
 """
     Nitro(e; seed, resume, run_dir, data, n_devs, checkpoint, accum, max_epochs, schedules,
              gradient_clip_norm, logger, checkpointer, early_stop, run_ref, weights, w0) -> Nitro
 
-Run the setup sequence and return the resulting handle. **No training.**
+Run the setup sequence and return the handle. No training.
 
-**The signature below is the single authority for these defaults and this docstring deliberately
-does not restate them**, because `train!(nitro)` takes no keywords and `train!(e; kwargs...)`
-forwards here, so a second list is a second authority with nothing keeping the two equal. It had
-already drifted once: this docstring carried a stale table giving `seed`, `logger`, `checkpointer`,
-and five more as literal values and saying **three** keywords default to an accessor, while the
-signature below it defaults **ten** to one. The values live in the signature; the shape of the rule
-lives here.
-
-**Ten keywords default to an accessor of the same name**, which is how the "defaulted accessor" and
-"value passed to `train!`" mechanisms compose: the keyword replaces the accessor's
-value for one run, and omitting it falls through to the experiment's own. **Four stay keyword-only**,
-`data`, `checkpoint`, `resume`, and `run_ref`, each naming a fact about this invocation rather than a
-property of the experiment. The per-group accessors are outside the mechanism entirely, having no
-sensible keyword form.
-
-**`early_stop` defaults to `nothing`, so a bare experiment does not early-stop.** A framework that
-truncates your run by default is surprising, and any patience value would be a guess.
-**`max_epochs` defaults to `1`**, since a bare experiment has no such field; stated because a first
-run finishing after one epoch reads as a bug otherwise.
+Ten keywords default to an accessor of the same name (the signature of `_build_nitro` is the
+authority for the defaults), so the keyword replaces the accessor's value for one run and omitting
+it falls through to the experiment's own. `data`, `checkpoint`, `resume` and `run_ref` are
+keyword-only, each naming a fact about this invocation. `early_stop` defaults to `nothing` and
+`max_epochs` to `1`.
 
 ## The fresh sequence
 
 | # | Step | Why here |
 | --- | --- | --- |
-| 1 | Validate config: markers, optimizer allowlist membership, mutually exclusive decay settings | Cheapest failures first, before any allocation |
-| 2 | Seed the global rng from `seed` | Must precede anything that draws, i.e. steps 3 and 6 |
-| 3 | `build_data(e, dist)` | `derive` needs data; the cache is created after it |
-| 4 | `derive(e, data)`, merge into `e` | Needs data; must precede conversion, since it returns host values, and must precede `build_model`, since a derived structural value changes the architecture |
-| 4.5 | `setup_devices` | Must precede step 5, because conversion places values on the mesh |
-| 5 | Convert `Device` fields to device, rebuild `e`; **`e`'s type changes here** | Must follow every hook that produces config, must precede every hook that is traced |
-| 6 | `build_model(e, rng)` | Sees the post-conversion `e`. Pretrained loading happens inside it |
-| 7 | Capture `w0`, the parameters exactly as `build_model` returned them | Must be immediately after, before any restore or step |
-| 8 | Param groups, the flat permutation, the per-group ranges | Needs `ps`. **Unconditional**, including for an evaluation `Nitro`: it is host-side bookkeeping, and the resume path validates the restored permutation against it |
-| 9 | **Training only.** Flatten `ps`; build optimizer state and **normalize it to device residency** | Needs the layout; normalization is what makes tracing correct |
-| 10 | Create the compile cache; resolve batch routing, **always against `typeof(compile_view(e))`** | Needs the batch schema and the hooks. The stripped type is what the trace site actually calls with |
-| 11 | **Training only.** Check `length(train) % accum == 0`; resolve the horizon `total = max_epochs * div(steps_per_epoch, accum)` and call each schedule factory once with it | Needs `length(train)`, `accum`, and `max_epochs`. The check precedes the horizon because an exact `div` depends on it |
+| 1 | Validate config: markers, optimizer allowlist, decay settings | Cheapest failures first |
+| 2 | Seed the global rng | Before anything that draws (3 and 6) |
+| 3 | `build_data(e, dist)` | `derive` needs data |
+| 4 | `derive(e, data)`, merged into `e` | Returns host values, so before conversion; may change the architecture, so before `build_model` |
+| 4.5 | `setup_devices` | Conversion places values on the mesh |
+| 5 | Convert `Device` fields to device; **`e`'s type changes here** | After every hook that produces config, before every hook that is traced |
+| 6 | `build_model(e, rng)` | Sees the post-conversion `e` |
+| 7 | Capture `w0` | Immediately after, before any restore or step |
+| 8 | Param groups, the flat permutation, the per-group ranges | Needs `ps`; unconditional, since the resume path validates against it |
+| 9 | **Training only.** Flatten `ps`, build optimizer state, normalize it to device residency | Needs the layout |
+| 10 | Create the compile cache; resolve routing against `typeof(compile_view(e))` | Needs the batch schema and the hooks |
+| 11 | **Training only.** Check `length(train) % accum == 0`; resolve the horizon and call each schedule factory once | Needs `length(train)`, `accum`, `max_epochs` |
 | 12 | Construct the logger, log parameters and the seed | Before the first compile, which can crash |
-| 13 | First trace and compile, against `compile_view(e)` | Everything above is a prerequisite. **The tracer must never see the full `e`** |
+| 13 | First trace and compile, against `compile_view(e)` | The tracer never sees the full `e` |
 
-**Which experiment do hooks see?** `build_data` and `derive` see the **pre-conversion** experiment,
-where `Device` fields hold plain host values. Every other hook, including `build_model`, `forward`,
-`loss`, `metrics`, `optimizer`, and every accessor, sees the **post-conversion** one. Two hooks, one
-boundary.
+`build_data` and `derive` see the pre-conversion experiment, where `Device` fields hold host values;
+every other hook sees the post-conversion one.
 
-## Resume inserts three steps and changes nothing else
+**Resume** adds three steps: between 1 and 2, locate the checkpoint (`:auto` finds `latest` in
+`run_dir`), check config compatibility, and restore `seed` from the record with a warning if it
+differs (a silent override turns a seed sweep that forgot to vary `run_dir` into N identical runs);
+after 7, restore `ps`, `st`, `opt_state`, `step` and `epoch`, with `w0` the fresh capture verified
+against the record's `anchor_checksum`; after 8, refuse a flat permutation that differs; after 9,
+re-normalize the restored `opt_state` to device residency, without which a resumed run trains at
+the wrong point of its optimizer's bias correction with no error.
 
-  * **Between 1 and 2:** locate the checkpoint (`:auto` finds `latest` in `run_dir`), read its
-    record, run the config compatibility check, and **restore `seed` from the record, overriding
-    any `seed = ...` and warning when they differ**. A silent override turns a seed sweep that forgot
-    to vary `run_dir` into N identical runs. Restoring is what makes `w0` reproducible, so the
-    override is right and only its silence was wrong.
-  * **After 7:** restore `ps`, `st`, `opt_state`, `step`, and `epoch`. **`w0` is the value freshly
-    captured at step 7, verified against the record's `anchor_checksum`**, which is why step 6's
-    rebuild happens before the restore in spite of being thrown away.
-  * **After 8:** verify the restored flat permutation matches the one just computed, and refuse with
-    a diff if not. A silently different permutation scrambles `opt_state` against `ps`.
-  * **After 9: re-normalize the restored `opt_state` and re-run the no-host-`Number` assertion.**
-    Step 9's normalization applies to state the framework *constructed*; a restore does not
-    construct, so without this the resumed run reacquires the frozen-step-counter bug in full.
-    **That is the single most dangerous omission this framework could have**, because the symptom is
-    a plausible loss curve and no error.
+**A warm start**, `weights = other::Nitro`, takes `ps` and `st` from a handle in this process
+after step 7, through host memory, and otherwise runs the fresh sequence. The trees must match leaf
+for leaf. `w0` says what `decay_anchor = :w0` anchors to: `:build_model` (the default), `:weights`
+(L2-SP fine-tuning), or a parameter tree.
 
-## A warm start inserts one step
-
-`weights = other::Nitro` takes `ps` and `st` from a handle in this process and otherwise runs the
-fresh sequence: `derive` runs against THIS run's data, the optimizer state is fresh, and `step` and
-`epoch` are zero. It is the in-memory sibling of `checkpoint = path`, for the REPL case where the
-trained handle is right there. The transfer happens **after 7**, through host memory, so the source
-may sit on a different mesh; the trees must match leaf for leaf in keypath and size, and a mismatch
-is refused with a diff. `weights` together with `checkpoint` or `resume` is an error: two sources
-for one thing.
-
-`w0` says what `decay_anchor = :w0` anchors to for such a run. `:build_model`, the default, keeps
-today's meaning, the freshly initialized parameters. `:weights` anchors to the transferred ones,
-which is the L2-SP fine-tuning setup: initialize from A, anchor to A. A parameter tree anchors to
-that tree: initialize from A, anchor to B. `:weights` without `weights` is an error.
-
-## The no-train variant
-
-A `Nitro` built without a `train` split **skips steps 9 and 11**, since both are training-only and
-`total` is undefined with no training split. **Step 8 still runs.** Batch routing and `batch_size`
-fall back to the first batch of whichever split exists; with no split at all, routing is **deferred
-to the first `predict` call**, which supplies a batch, and `batch_size` is the width of that batch,
-with no padding needed because the caller supplied it whole. That is the one case where the
-ordering above does not fully apply, and it is why routing is described as resolved once per run
-rather than once at setup.
+**Without a `train` split** steps 9 and 11 are skipped. Routing falls back to the first batch of
+whichever split exists; with no split at all it is deferred to the first `predict` call.
 """
-# `Starting` BEFORE the build, through the module-level monitors, because the handle this would
-# publish through is what the build is for. `build_data` is inside `_build_nitro`, and on this stack
-# it can start and compile a data server, so this is the longest undeclared stretch there was.
+# `Starting` is published before the build, through the module-level monitors, because `build_data`
+# can start and compile a data server and this was the longest undeclared stretch there was.
 Nitro(e; kwargs...) = _off_interactive() do
     publish_phase(Starting())
     return _build_nitro(e; kwargs...)
 end
 
-# The body of `Nitro(e)`, split out so the public constructor can move it off the interactive
-# thread. Construction blocks its calling thread for 45 to 95 s (device init, `build_model`, the
-# device conversion), and when the caller is the main task under `julia -t N,1` that thread is the
-# interactive one, which starves every `:interactive` task in the process: an external supervisor's
-# session heartbeat among them, so the supervisor reclaimed the session and killed the run before
-# its first step. `_off_interactive` (Phases.jl) carries the measurement and applies `with_repl`'s
-# spawn policy, so single-threaded sessions and worker-thread callers run this inline exactly as
-# before. The keyword defaults stay HERE, on the function that reads `e`, so `Nitro(e; kwargs...)`
-# forwards only what the caller passed and the accessor defaults keep a single home.
+# Split out so the public constructor can move it off the interactive thread: construction blocks
+# for a minute or more, and on the interactive thread that starves an external supervisor's
+# heartbeat. The keyword defaults live here, on the function that reads `e`.
 function _build_nitro(
         e;
         # Ten keywords default to an accessor of the same name, so an experiment
@@ -131,8 +78,7 @@ function _build_nitro(
         logger = ReactantNitro.logger(e),
         checkpointer = ReactantNitro.checkpointer(e),
         early_stop = ReactantNitro.early_stop(e),
-        # Not an accessor: a preset name is a fact about how THIS handle was built, so there
-        # is nothing on `e` to read it from. `Nitro(E, :name)` below sets it for you.
+        # A preset name is a fact about how this handle was built; `Nitro(E, :name)` sets it.
         preset::Union{Symbol, Nothing} = nothing,
         # Four stay keyword-only, because each names a fact about THIS INVOCATION rather than
         # a property of the experiment. `data`'s accessor exists and is called `build_data`.
@@ -140,13 +86,10 @@ function _build_nitro(
         data = nothing,
         checkpoint = nothing,
         run_ref = nothing,
-        # A warm start: the initial weights from another handle in this process, and what `:w0`
-        # anchoring means for a run that starts from them. Keyword-only for the same reason as the
-        # four above: both are facts about THIS construction.
+        # A warm start from another handle, and what `:w0` anchoring means for it.
         weights = nothing,
         w0 = :build_model,
-        # PROTOTYPE: hooks supplied as VALUES, shadowing the method for any name present. See
-        # Hooks.jl for why an entry may not capture and why that keeps the cache key sound.
+        # PROTOTYPE: hooks supplied as values shadow the method of the same name (Hooks.jl).
         hooks = (;)
     )
     check_hooks(hooks)
@@ -157,35 +100,20 @@ function _build_nitro(
     # explicit `dir` adopts it here. An explicit `dir` pins it and is never overwritten.
     checkpointer isa TopKCheckpointer && checkpointer.dir === nothing &&
         (checkpointer.dir = String(run_dir))
-    # The checkpoint filename, adopted under the same rule and in the same place: a checkpointer
-    # with no `name` binds the experiment's `checkpoint_filename` hook, and an explicit `name` pins
-    # it.
-    #
-    # BOUND HERE RATHER THAN PASSED TO `save_checkpoint!`, which never receives `e`. Widening that
-    # four-argument contract would hand the object full of DEVICE-resident leaves to the function
-    # whose job is serialization, which is the failure the record's host discipline and
-    # `assert_host_record` exist to prevent; the assertion walks the snapshot and cannot walk `e`.
-    #
-    # The closure calls the GENERIC FUNCTION, so dispatch happens at write time and a revised
-    # `checkpoint_filename` takes effect on the next checkpoint of a live run. That is deliberately
-    # unlike a revised `checkpointer` accessor, which `_PROBED` below records as undetected because
-    # an accessor that CONSTRUCTS is called once, here.
+    # The filename hook is bound here too, as a closure calling the generic function, so
+    # `save_checkpoint!` never receives `e` (an object full of device leaves handed to the
+    # serializer) and a revised `checkpoint_filename` takes effect on the next write.
     checkpointer isa TopKCheckpointer && checkpointer.name === nothing &&
         (checkpointer.name = (; kwargs...) -> ReactantNitro.checkpoint_filename(e; kwargs...))
-    # The default logger adopts the run's resolved directory exactly like the checkpointer
-    # above, and through the same channel: `_adopt_logger!` is the logger-side half, so a wrapper
-    # around the default (the gate extension's RecordingLogger) can forward the pin and the
-    # wrapped default still lands in the run's directory. A user's own logger is untouched by it.
+    # The default logger adopts the run directory the same way; a wrapper around it (the gate
+    # extension's RecordingLogger) forwards the pin, and a user's own logger is untouched.
     logger = _adopt_logger!(logger, run_dir)
 
     record, source = nothing, nothing
     if checkpoint !== nothing
-        # `load_checkpoint` dispatches on the CHECKPOINTER rather than on the path, so a
-        # non-file backend can implement it at all. The corollary is that `checkpointer = nothing`
-        # has no loader, and its `::Nothing` method returns `nothing` rather than raising. An
-        # explicit `checkpoint = path` therefore has to be checked: without this, a serving
-        # construction that quite reasonably disables checkpoint WRITING would load nothing, train
-        # nothing, and answer with freshly initialized weights that look plausible.
+        # `load_checkpoint` dispatches on the checkpointer, so `checkpointer = nothing` has no
+        # loader and an explicit `checkpoint = path` would otherwise load nothing and answer with
+        # fresh weights.
         checkpointer === nothing && error(
             """
             ReactantNitro: `checkpoint = $(repr(checkpoint))` asks for a checkpoint to be loaded and
@@ -203,19 +131,15 @@ function _build_nitro(
     elseif resume !== false
         record, source = load_checkpoint(checkpointer, resume), resume
     end
-    # There are TWO restores with one compatibility check, and they differ in exactly one place:
-    # `checkpoint = path` restores the weights and the derived `Device` values FROM the record,
-    # because an evaluation process may not have the training data to recompute them from, while
-    # `resume` recomputes derived values through `derive` and continues the trajectory.
+    # Two restores, one compatibility check: `checkpoint = path` takes the derived `Device` values
+    # from the record (an evaluation process may lack the training data), `resume` recomputes them.
     weights_only = record !== nothing && checkpoint !== nothing
 
     # ── 1. validate config, cheapest failures first ────────────────────────────────
     validate_config(e; accum, gradient_clip_norm)
 
-    # Manual mode, selected by the presence of a `train_step` method for this experiment type (or
-    # the `manual_training(e) = false` override declining it). Resolved ONCE, here, and frozen into
-    # the handle: the driver a `Nitro` uses is fixed at construction, so flipping this on an
-    # existing handle is inert and reported by `fixed_config_report` rather than applied silently.
+    # Manual mode is selected by a `train_step` method and frozen into the handle; flipping it on
+    # an existing handle is reported by `fixed_config_report` rather than applied.
     manual = manual_training(e)
     if manual && accum > 1
         error(
@@ -229,10 +153,8 @@ function _build_nitro(
     end
 
     # ── 2. seed, before anything that draws ────────────────────────────────────────
-    # The seed is RESTORED from the record, overriding any `seed = ...`, and the override is
-    # announced. A silent one turns a seed sweep that forgot to vary `run_dir` into N identical
-    # runs. Restoring is what makes `w0` reproducible, which
-    # the anchor checksum then depends on, so the override is right and only silence was wrong.
+    # The seed is restored from the record, with a warning: restoring is what makes `w0`
+    # reproducible, and a silent override would make a seed sweep N identical runs.
     if record !== nothing && record.seed != seed
         @warn "ReactantNitro: restoring `seed = $(record.seed)` from the checkpoint, overriding the \
                requested `seed = $seed`. A rebuild must reproduce the same initialization: the \
@@ -249,33 +171,24 @@ function _build_nitro(
         extensible, so `evaluate` with no `test` supplied is a clear error rather than a positional \
         mistake.")
     for name in keys(collection)
-        # Through the wrapper: a `PrefetchIterator` is a declaration carrying a source and a
-        # depth, so the contract belongs to what it wraps. It forwards `length` anyway, and checking
-        # the source is what makes the error name the loader the user actually wrote.
+        # Through the wrapper, so the error names the loader the user wrote.
         check_data_source(prefetch_source(getproperty(collection, name)), name)
     end
     training = haskey(collection, :train)
 
     # ── 4. derive, still pre-conversion, so it returns host values ─────────────────
-    # The one place the two restores differ: a `checkpoint = path` construction takes the derived
-    # `Device` values from the record instead of recomputing them, because an evaluation process may
-    # have no training data to derive from. A resume recomputes them, and the config comparison
-    # excludes derived values for exactly that reason.
+    # `checkpoint = path` takes the derived values from the record; `resume` recomputes them, and
+    # the config comparison excludes derived values for that reason.
     e = weights_only ? merge_derived(e, restored_devices(record, e)) :
         merge_derived(e, derive(e, collection))
 
-    # Every `GraphConst` value must hash and compare by CONTENT, checked BEFORE the comparison
-    # below rather than after. `check_config_compatible` compares with `isequal`, so a field that
-    # answers by identity fails it every time and prints a diff whose two sides are identical; that
-    # is the confusing symptom, not the cause. Asserting first turns it into an error that names the
-    # field and the fix. Here for the same reason the config check is here: `derive` has merged, so
-    # a derived GraphConst field is finally in the struct to check.
+    # `GraphConst` values must hash and compare by content. Asserted before the comparison below,
+    # which would otherwise print a diff whose two sides look identical. Here because `derive` has
+    # merged, so derived fields are finally in the struct.
     assert_graphconst_hashable(e)
 
-    # The resume config check, run HERE rather than between steps 1 and 2 where the sequence above
-    # puts it, because the field set is not final until `derive` has merged: a derived GraphConst
-    # field changing is one of the cases that check makes an error, and before step 4 it is not yet
-    # in the struct to compare.
+    # Here rather than between steps 1 and 2 because the field set is not final until `derive`
+    # has merged.
     record === nothing || check_config_compatible(record, e, source)
 
     # ── 4.5 devices, before conversion places values on the mesh ───────────────────
@@ -287,29 +200,22 @@ function _build_nitro(
 
     # ── 6, 7. build the model, then capture w0 immediately ─────────────────────────
     model, ps, st = hook_fn(hooks, :build_model, build_model)(e, rng)
-    # Replicated on a mesh, plain placement on one device. Parameters and layer state exist
-    # identically on every device; only the batch is sharded.
+    # Parameters and layer state are replicated on a mesh; only the batch is sharded.
     ps = place_replicated(ps, mesh)
     st = place_replicated(st, mesh)
     w0_tree = deepcopy(ps)            # step 7: before any restore or step
 
-    # ── after 7: restore the weights. `w0` above is the FRESH capture, deliberately ─
-    # Step 6's rebuild happens before the restore in spite of being thrown away, because the anchor
-    # checksum is verified against a freshly captured `w0`. That is what makes storing a checksum
-    # instead of the anchor arrays sound.
+    # Step 6's rebuild happens before the restore, in spite of being thrown away, because the
+    # anchor checksum is verified against a fresh `w0`.
     if record !== nothing
-        # `from_host` FIRST, then place. A record may hold a surrogate for a value whose
-        # type forbids host contents, `HostRNG` for `Reactant.ReactantRNG` being the worked case, and
-        # `to_rarray` has no way to know what that surrogate stood for.
+        # `from_host` first: a record may hold a surrogate (`HostRNG`) that `to_rarray` cannot
+        # recognise.
         ps = place_replicated(from_host(to_host(record.ps)), mesh)
         st = place_replicated(from_host(to_host(record.st)), mesh)
     end
 
-    # ── after 7: a warm start from another handle ──────────────────────────────────
-    # Through host memory, exactly as the record path above: the source may live on another mesh,
-    # and `to_host` is the one walker that knows every device leaf. The structural check runs
-    # against the FRESH layout, because that is the model this experiment builds; the transferred
-    # tree has to fit it, not the other way round.
+    # Through host memory, so the source may live on another mesh. Checked against the fresh
+    # layout: the transferred tree has to fit this model.
     if weights !== nothing
         check_weights_compatible(weights, build_layout(e, ps))
         ps = place_replicated(from_host(to_host(weights.ps)), mesh)
@@ -326,41 +232,29 @@ function _build_nitro(
     if record !== nothing
         check_permutation_compatible(record, layout, source)
         check_anchors_compatible(record, layout, anchors, source)
-        # `weights_only` continues no run, so declining the logger drops no history. Without
-        # this, an export or an offline evaluation of any logger-written checkpoint had no legal way
-        # to avoid writing to the training run's experiment.
+        # `weights_only` continues no run, so declining the logger drops no history.
         check_logger_compatible(record, logger, source; weights_only)
     end
 
     # ── 10. routing, resolved against typeof(compile_view(e)) ──────────────────────
-    # The fallback table: the first batch of `train`, else of whichever split exists, else NOTHING,
-    # and routing defers to the first `predict` call, which supplies a batch. The three products
-    # stay `nothing` in that last case and `predict_routing!` fills them. `opt_state` is declared
-    # here for manual mode, which builds it in this block (see below).
+    # The first batch of `train`, else of whichever split exists, else nothing, in which case
+    # routing defers to the first `predict` call. `opt_state` is declared here for manual mode.
     routing, batch_size, schema = (nothing, nothing, nothing)
     opt_state = nothing
     if !isempty(keys(collection))
         schema_split = training ? :train : first(keys(collection))
-        # `prefetch_source` before `first`. The wrapper's own `iterate` is a passthrough, so
-        # this is the same batch either way; going through the source says why it is the same batch
-        # rather than relying on that.
+        # Through the source; the wrapper's `iterate` is a passthrough so it is the same batch.
         probe = first(prefetch_source(getproperty(collection, schema_split)))
         routing = resolve_routing(ev, probe; model, ps, st, hooks)
         if training && manual
-            # Manual mode builds its optimizer states HERE, before `batch_size_of`, because the
-            # closure's router must be part of the routing the batch size is inferred from: a field
-            # only the closure reads (the GAN's noise, say) declares nothing to the other hooks, so
-            # without this the batch size would be uninferable. `setup_optimizers` is the step 9
-            # replacement; the framework normalizes the result to device residency through the
-            # `to_device_leaf` walk and asserts the no-host-`Number` property on every leaf's STATE
-            # (not its rule: nonschedulable rule fields legitimately stay host).
+            # Manual mode builds its optimizer state here, before `batch_size_of`, because the
+            # closure's router must be part of the routing the batch size is inferred from. The
+            # result is normalized to device residency and asserted on every leaf's STATE.
             opt_state = setup_optimizers(e, model, ps, st, mesh)
             opt_state = to_device_leaf(opt_state; mesh)
             assert_opt_state_device(opt_state)
-            # Restore re-normalization, exactly as the automatic path does at step 9: a restore
-            # constructs nothing, so without this the resumed run reacquires the frozen-step-counter
-            # bug in full. Weights-only constructions deliberately keep a fresh optimizer, matching
-            # the automatic path.
+            # A restore constructs nothing, so it is re-normalized as the automatic path does at
+            # step 9. Weights-only constructions keep a fresh optimizer.
             if record !== nothing && !weights_only
                 opt_state = to_device_leaf(record.opt_state; mesh)
                 assert_opt_state_device(opt_state)
@@ -374,92 +268,57 @@ function _build_nitro(
         validate_batch(probe, routing)
         batch_size = batch_size_of(probe, routing)
         schema = keys(probe)
-        # The batch is sharded on the `:data` axis, so it has to divide across the mesh.
-        # Checked here rather than at the first transfer because here it is a legible setup error
-        # and there it is an XLA shape complaint that names neither number.
+        # A legible setup error here rather than an XLA shape complaint at the first transfer.
         check_shardable_batch(batch_size, n_devs)
     end
 
     # ── after 10. prefetch, applied by the framework rather than requested ──────────
     #
-    # HERE, and not at step 3, deliberately. Everything above that inspects the collection
-    # STRUCTURALLY has now run against exactly what `build_data` returned: `check_data_source` names
-    # the user's own loader, `derive(e, collection)` sees the splits it built, and the schema probe
-    # draws its batch through `prefetch_source`. Wrapping earlier would put a framework wrapper in
-    # front of a `derive` that reaches into a split, which is a break nothing in the contract forbids.
-    #
-    # EVERY split is wrapped, the eval ones included. It was `train` alone while `run_eval` iterated
-    # its split directly, when a wrapped eval split would have reported a worker count nothing used;
-    # `eval_stream` is what made the eval splits stream too.
+    # Wrapped here, after every structural check has seen the collection exactly as `build_data`
+    # returned it. Every split is wrapped, eval ones included (they stream through `eval_stream`).
     collection = auto_prefetch(collection)
-    # AFTER the wrap, because the question is about the resolved pipeline and not about the source:
-    # a split the user declined with `NoPrefetch` runs its data path inline, consuming each batch
-    # before the next is built, so a loader option that a producer running ahead would break is
-    # perfectly safe there.
-    # EVERY split, including the ones that declined prefetch. Some of what a source type can get
-    # wrong depends on the resolved path and some does not: a training loader that keeps its partial
-    # final batch is wrong whether or not anything reads ahead, and `cfg` is passed so the hook can
-    # tell the two kinds apart rather than the caller guessing for it.
+    # Source-option checks run on the resolved pipeline, for every split: some options are only
+    # wrong when a producer runs ahead, others (a training loader keeping its partial final batch)
+    # are wrong regardless, and `cfg` lets the hook tell the two apart.
     for nm in keys(collection)
         split = getproperty(collection, nm)
         check_source_options(prefetch_source(split), nm, prefetch_config(split))
     end
     training && warn_no_concurrency(collection.train)
 
-    # The early-stopping setup checks, here because they need both the split collection and the
-    # resolved routing: a policy with no `val` split to read, or naming a metric an
-    # experiment defining no `metrics` cannot emit, is a configuration error the run would otherwise
-    # discover an epoch in, or never.
+    # Here because both need the split collection and the resolved routing: a policy with no `val`
+    # split, or naming a metric the experiment cannot emit, is a configuration error.
     check_early_stop(early_stop, collection, routing)
     check_checkpointer(checkpointer, collection, routing)
 
     # ── 9, 11. training only ───────────────────────────────────────────────────────
-    # Manual mode flattens nothing. `flat` feeds `build_opt_state`, `masks` feed
-    # `rebuild_rules`, and `g_accum` feeds the automatic gradient program; the closure owns all of
-    # those, so `()` / `nothing` is correct rather than a placeholder. `opt_state` was already
-    # built for manual mode in the step-10 block (the closure's router needed its type); it is
-    # declared `nothing` here for the automatic path.
+    # Manual mode flattens nothing: the closure owns the optimizer state, the masks and the
+    # accumulator, so `()` / `nothing` is correct rather than a placeholder.
     flat = manual ? () : flatten(ps, layout, mesh)
     resolved, total = nothing, nothing
-    # Hoisted out of the `if` so the freeze below can see it. `()` for a no-train `Nitro` is
-    # correct rather than a placeholder: with no optimizer program to compile there is no rule whose
-    # `apply!` could go stale. Manual mode keeps `()` too: the closure's own rules are the user's,
-    # and their `apply!` worlds enter the compile key through `worlds_manual` instead.
+    # Hoisted so the freeze below can see it. `()` for a no-train `Nitro` and for manual mode,
+    # whose rules enter the compile key through `worlds_manual` instead.
     chains = ()
-    # The per-leaf decay exclusion, resolved ONCE here rather than at every `train!` entry.
-    # `no_decay` is a user hook now, so recomputing it later would let a revision take effect on an
-    # existing handle and contradict the handle's fixed point. Training-only, because
-    # `rebuild_rules` is the only consumer and a serving `Nitro` should not pay G parameter-sized
-    # device buffers for something it will never read. Skipped in manual mode, whose rules are the
-    # user's own.
+    # Resolved once, here: `no_decay` is a user hook, and recomputing it at `train!` would let a
+    # revision take effect on a frozen handle. Training-only and skipped in manual mode.
     masks = training && !manual ? map(m -> place_replicated(m, mesh), no_decay_masks(e, ps, layout)) : nothing
     if training
         n_batches = length(collection.train)
         check_train_divisibility(n_batches, accum)
         total = max_epochs * div(n_batches, accum)
         if manual
-            # `opt` schedules are PATH-BOUND into the user's `opt_state` (a bare key binds
-            # to every rule with that field; a nested key is a path into the tree). Resolved and
-            # validated here against the opt_state step 9 built, applied by the driver's per-step
-            # rebuild (`rebuild_scheduled_rules`) between closure calls. Device-keyed schedules
-            # resolve exactly as in the automatic loop.
+            # `opt` schedules are path-bound into the user's `opt_state` and applied by the driver's
+            # per-step rebuild; device-keyed schedules resolve as in the automatic loop.
             resolved = resolve_manual_schedules(
                 e, schedules, total;
                 opt_state, accessor = ReactantNitro.schedules(e)
             )
         else
             opt_state = build_opt_state(e, flat, layout; anchors, masks, mesh)
-            # ── after 9: RE-NORMALIZE THE RESTORED `opt_state`. ────────────────────────
-            # Omitting this is the single most dangerous omission this framework could have. Step
-            # 9's normalization applies to state the framework CONSTRUCTED; a restore constructs
-            # nothing, so without this the resumed run reacquires the frozen-step-counter bug in
-            # full, on `resume = :auto`. The symptom is a plausible loss
-            # curve and no error: RAdam's `t` stays host, never advances under trace, and the run
-            # silently trains at the wrong point of its own bias correction.
-            #
-            # A weights-only construction deliberately does NOT restore the moments: it means
-            # "trained weights, no training this process", and a fresh optimizer is what a new run
-            # starting from those weights wants.
+            # Re-normalize a RESTORED `opt_state`. Step 9's normalization applies to state the
+            # framework constructed; a restore constructs nothing, and without this RAdam's `t`
+            # stays host, never advances under trace, and the run silently trains at the wrong
+            # point of its bias correction. A weights-only construction keeps a fresh optimizer.
             if record !== nothing && !weights_only
                 opt_state = to_device_leaf(record.opt_state; mesh)
                 for gi in 1:n_groups(layout)
@@ -474,9 +333,8 @@ function _build_nitro(
                 gi -> build_chain(e, layout.groups[gi], resolve_hp(e, layout, gi)),
                 ntuple(identity, n_groups(layout))
             )
-            # NOTE for the freeze below: `rebuild_rules` reconstructs these every optimizer step with
-            # fresh device scalars, but only the VALUES move; the rule TYPES, and therefore the `apply!`
-            # methods, are these. So resolving the rule worlds here covers every step of the run.
+            # `rebuild_rules` moves only the VALUES each step; the rule types, and so the `apply!`
+            # methods, are these, so resolving the rule worlds here covers the whole run.
             resolved = resolve_schedules(
                 e, schedules, total;
                 chains, accessor = ReactantNitro.schedules(e),
@@ -486,18 +344,13 @@ function _build_nitro(
     end
 
     # ── 12. the logger, BEFORE the first compile, which can crash ──────────────────
-    # Reattachment happens before the run starts and before any metric is logged, so a
-    # backend that supports it continues ONE history rather than opening a second experiment. The
-    # state is opaque, which is what keeps backend-specific code out of the framework.
+    # Reattachment before any metric is logged, so a backend continues one history rather than
+    # opening a second experiment.
     record === nothing || record.logger_state === nothing ||
         reattach!(logger, record.logger_state)
-    # The preset name is logged alongside the config it produced, so a result can be grouped by
-    # which named recipe it claimed. `nothing` for a run that named none, and omitted rather than
-    # logged as "nothing", since a backend showing `preset = nothing` on every ordinary run is noise.
-    # The resolved prefetch settings are hyperparameters here, not system details: `workers`
-    # derives from `Threads.nthreads(:default)`, so two runs of byte-identical code at different `-t`
-    # get a different partition of each epoch into accumulation groups. A reader comparing two runs
-    # needs the number, and the process's thread count is already logged separately by the backend.
+    # The preset name is logged with the config it produced, omitted when none. The resolved
+    # prefetch settings are hyperparameters: `workers` derives from `-t`, and two runs of identical
+    # code at different `-t` get a different partition of each epoch into accumulation groups.
     pf = training ? prefetch_config(collection.train) :
         (; device_batches = 0, host_batches = 0, workers = 0, ordered = true)
     cfg = config_params(
@@ -507,16 +360,11 @@ function _build_nitro(
     )
     log_params!(logger, preset === nothing ? cfg : merge(cfg, (; preset)))
 
-    # `step` is RESTORED, never derived. Deriving it as `epoch * opt_steps_per_epoch` is
-    # silently wrong whenever steps-per-epoch changed, and restoring it puts every stateless
-    # schedule back exactly, since those are pure functions of `(step, total)`.
+    # `step` is restored, never derived: deriving it from `epoch` is wrong whenever steps per epoch
+    # changed, and restoring it puts every stateless schedule back exactly.
     step0, epoch0 = (record === nothing || weights_only) ? (0, 0) : (record.step, record.epoch)
 
-    # With the stop reason stored, a resume into a finished run SAYS SO instead of exiting silently.
-    # A run that early-stopped and is resumed with `:auto` would immediately re-satisfy its own
-    # condition, and one that completed has nothing left to do; either way the surprising thing is a
-    # `train!` that returns instantly, so the framework names the cause rather than leaving it to be
-    # inferred.
+    # A resume into a finished run says so rather than returning instantly.
     if !weights_only && record !== nothing && record.stop_reason !== nothing &&
             (record.stop_reason !== :error && epoch0 >= max_epochs)
         @warn "ReactantNitro: the checkpoint being resumed ended at epoch $epoch0 with \
@@ -529,9 +377,7 @@ function _build_nitro(
         e, model, ps, st, w0_tree, layout, opt_state, collection, routing, schema, mesh,
         Dict{Any, Any}(), resolved, total, batch_size, logger, nothing, checksums, preset,
         source === nothing ? nothing : String(source),
-        # The provenance half: the record is in scope here for the compatibility check above, so the
-        # training run's identity costs nothing to keep and cannot be recovered later, since the
-        # weights-only restore discards the record on the next line's worth of scope.
+        # The training run's identity, kept because it cannot be recovered later.
         record === nothing ? nothing : record.run_id,
         record === nothing ? nothing : record.run_url,
         String(run_dir), Int(seed), Int(accum), Int(max_epochs), gradient_clip_norm,
@@ -540,42 +386,24 @@ function _build_nitro(
         (; masks, anchors),
         map(zero, flat), RegisteredMonitor[], Int(step0), Int(epoch0), Starting(),
         false, nothing,
-        # No metrics and no elapsed time yet: a fresh handle has run nothing, including one
-        # restored from a checkpoint, whose recorded metrics belong to the process that wrote it.
+        # No metrics and no elapsed time yet, even for a restored handle.
         (;), nothing, nothing,
         weights === nothing ? nothing : weights_origin(weights),
         NamedTuple[]
     )
-    # TWO BUILDS from one set of pieces. The text goes to `log_other!`, so the run's record says
-    # where every value bound whether or not anyone displayed the handle. The sections are what
-    # the handle DISPLAYS, appended to its own bands by `show`, so a reader sees one table instead
-    # of a summary and a report that each drew their own boxes. Nothing on the handle returns the
-    # text: a String of a framed table is unreadable at a REPL, and `show(nitro)` is the display.
-    #
-    # NOTHING IS PRINTED HERE, and the binding report used to be `@info`-ed at exactly this point.
-    # It stopped being a separate artifact when it became part of `show(nitro)`: a constructor
-    # that also printed its own return value would display the handle twice in the REPL, which is
-    # where most of these are built. A script that wants it asks, with `display(nitro)` or
-    # `@info sprint(show, MIME"text/plain"(), nitro)`, and the run's record has it either way
-    # through `log_other!` on the next line.
+    # Two builds from one set of pieces: the text goes to `log_other!` so the record says where
+    # every value bound, and the sections are what `show(nitro)` appends to the handle's display.
+    # Nothing is printed here; a constructor that printed its return value would display the
+    # handle twice in the REPL.
     nitro.sections = build_binding_sections(nitro)
     log_other!(logger, "binding_report", build_binding_report(nitro))
     run_ref === nothing || (run_ref[] = nitro)
-    # The per-run monitor copy, taken HERE and not only at `train!`. `train!` calls it again,
-    # which is safe because it is idempotent, and this call is what makes the eval constructions
-    # work: a
-    # handle that is validated, predicted from, or rendered never reaches `train!`, so without this
-    # its module-level monitors are never adopted and NONE of its transitions are published --
-    # including the eval compile, which is the longest thing such a handle does and the one a
-    # watchdog most needs to be told about.
+    # Adopted here as well as at `train!` (idempotent), because a handle that is only validated,
+    # predicted from or rendered never reaches `train!`, and its eval compile is what a watchdog
+    # most needs to hear about.
     adopt_monitors!(nitro)
-    # NO `Repl` here, deliberately: a constructor that reported itself idle would hand the card back
-    # between the build and the first verb. `Starting` IS declared, at the top of `Nitro` above and
-    # through the module-level monitors, because the handle these lines are still assembling is the
-    # thing a handle-based publish would need. What this comment used to say, that the window is
-    # "covered by whatever the monitor beat when the process started", was true only while the
-    # ambient driver re-declared an idle budget every ten seconds. Under a supervisor that declares
-    # idle once and lets it decay, an undeclared window is charged against whatever is LEFT of it.
+    # No `Repl` here: a constructor that reported itself idle would hand the card back between the
+    # build and the first verb. `Starting` was declared at the top of `Nitro`.
     return nitro
 end
 
@@ -611,9 +439,8 @@ function check_weights_kwargs(weights, w0; checkpoint, resume)
     return nothing
 end
 
-# What `show` and the export provenance say about a warm start: the handle it came from, by the
-# facts a reader can chase. Taken at construction, because the source handle may train on
-# afterwards and this run's weights are the ones it had THEN.
+# What `show` and the export provenance say about a warm start. Taken at construction, since the
+# source handle may train on afterwards.
 weights_origin(src::Nitro) = (;
     experiment = nameof(typeof(src.e)), epoch = src.epoch, step = src.step,
     run_dir = src.run_dir,
@@ -678,25 +505,12 @@ end
 """
     ReactantNitro.warn_no_concurrency(train_split) -> nothing
 
-One `@warn` at setup when the **training** split ends up with no host-side concurrency, naming what to
-implement.
+One `@warn` at setup when the training split resolved to no host-side concurrency, naming what to
+implement. It exists because a model once trained 4x slow for weeks with nothing saying so.
 
-**This is the change that addresses the footgun rather than the symptom.** The regression this whole
-mechanism exists for was not a wrong number, it was the absence of one: a model package's comment
-asserted the framework handled prefetching, nothing contradicted it, and the run's first ten lines said
-nothing either way for weeks while it trained 4.2x slow. A run that has no concurrency is now told so
-before it compiles anything.
-
-A **warning rather than an error**, in all three cases. A single producer trains correctly, some
-sources genuinely cannot be indexed, and `NoPrefetch` is a legitimate choice; erroring would refuse to
-run a correct configuration on a performance opinion. The binding report carries the same fact
-without the severity, for the runs where it is expected.
-
-**Three of the six resolved paths say nothing here, and their silence is deliberate.** `:fanout` and
-`:fanout_unordered` are the good cases. `:materialized` is a `Vector` whose batches `build_data`
-already built: producing one is a pointer load, so there is no host work for N producers to spread,
-and warning about a several-fold slowdown that cannot occur would be the false positive that teaches
-people to ignore the real one.
+A warning, not an error: a single producer trains correctly, some sources cannot be indexed, and
+`NoPrefetch` is a legitimate choice. `:fanout`, `:fanout_unordered` and `:materialized` (a `Vector`
+of already-built batches, so no host work to spread) say nothing.
 """
 function warn_no_concurrency(train_split)
     cfg = prefetch_config(train_split)
@@ -705,23 +519,18 @@ function warn_no_concurrency(train_split)
         @warn """
         ReactantNitro: the `train` split runs ONE producer task and leaves \
         $(prefetch_workers(train_split)) workers idle, because `$(typeof(src))` implements \
-        neither half of the index-addressable trait.
-        Staging is lookahead, not concurrency: a producer slower per batch than the device is per \
-        step starves it at any `device_batches`. Watch `data_wait_frac` in the per-epoch metrics.
-        Implement BOTH `ReactantNitro.batch_at(src, i)`, where `i` is a BATCH index, and \
-        `ReactantNitro.begin_epoch!(src)`. With only `batch_at`, every epoch after the first \
-        replays the first epoch's plan."""
+        neither half of the index-addressable trait. Buffering is lookahead, not concurrency: a \
+        slow producer starves the device at any `device_batches`; watch `data_wait_frac`. \
+        Implement BOTH `ReactantNitro.batch_at(src, i)` (`i` is a BATCH index) and \
+        `ReactantNitro.begin_epoch!(src)`."""
     elseif cfg.path === :inline
         @warn """
-        ReactantNitro: the `train` split is wrapped in `NoPrefetch`, so its entire host data path
-        runs INLINE on the training task and overlaps nothing. That is what this
-        marker means and it is presumably deliberate; watch `data_wait_frac` in the per-epoch
-        metrics to see what it costs."""
+        ReactantNitro: the `train` split is `NoPrefetch`, so its host data path runs inline on the \
+        training task and overlaps nothing; watch `data_wait_frac` to see what it costs."""
     elseif cfg.path === :single
         @warn """
-        ReactantNitro: the `train` split runs its host data path in ONE producer task, because
-        `workers = 1` was requested explicitly. Staging is lookahead, not
-        concurrency; watch `data_wait_frac` in the per-epoch metrics."""
+        ReactantNitro: the `train` split runs ONE producer task because `workers = 1` was \
+        requested; watch `data_wait_frac`."""
     end
     return nothing
 end
@@ -729,19 +538,11 @@ end
 """
     ReactantNitro.check_driver_fields(e) -> nothing
 
-A driver-only value declared as a **`GraphConst`** field is a setup error naming the fix.
-
-The run accessors read a field of their own name through `_field`, which is what lets an experiment
-set its own defaults instead of a caller retyping them. That invites declaring `seed` or
-`max_epochs` as an ordinary field, and a `GraphConst` field **bakes as a trace-time constant and
-enters the compile cache key**. For `seed` that is exactly what the seeding rule forbids, and the
-cost is not abstract: a seed sweep is supposed to share one compiled program, and with a
-`GraphConst` `seed` field every seed recompiles.
-
-Unmarked is already right: a field that is neither `Device` nor `GraphConst` is [`Host`](@ref) by
-default, which is exactly what a driver knob wants. The error says so. `accum` and
-`gradient_clip_norm` are deliberately absent from this check: both genuinely bake, so a `GraphConst`
-field is correct for them.
+A driver-only value (`seed`, `max_epochs`, `run_dir`, ...) declared as a `GraphConst` field is a
+setup error. A `GraphConst` bakes as a trace-time constant and enters the compile cache key, so a
+`GraphConst` `seed` recompiles per seed and defeats the sweep the seeding rule exists for. Unmarked
+is right: an unmarked field is [`Host`](@ref). `accum` and `gradient_clip_norm` genuinely bake and
+are not checked.
 """
 const DRIVER_ONLY_FIELDS = (
     :seed, :max_epochs, :run_dir, :n_devs, :logger, :checkpointer,
@@ -776,27 +577,13 @@ end
 """
     ReactantNitro.config_params(e; kwargs...) -> NamedTuple
 
-The flat hyperparameter table setup step 12 logs, built from the experiment's **actual configured
-values** plus the run keywords that are hyperparameters in their own right.
+The flat hyperparameter table setup step 12 logs: the experiment's actual configured values plus
+the run keywords that are hyperparameters in their own right. Values, not declaration metadata,
+since logging the defaults would report the same `width` for every run of a sweep.
 
-**It logs values, not declaration metadata.** `config_metadata` is the source of the logged
-hyperparameter table in the sense that it supplies the field list and the kinds; logging the record
-itself would put each field's *declared default* in the table, so a sweep
-varying `width` would report the same `width` for every run. That is silent and plausible-looking,
-which is the failure mode this framework spends most of its effort on.
-
-Three rules, each with a reason:
-
-  * **`Device` fields are read back to host values.** By step 12 they are device scalars, and a
-    logger backend should receive a number rather than a `ConcretePJRTNumber`.
-  * **Anything that is not scalar-ish is logged as a descriptor**, not by value. A derived
-    `class_weights` vector is a legitimate `Device`, and splatting it into a flat table would
-    defeat the logging contract's "keep flat parameter key style".
-  * **`Host` fields are included only when scalar-ish.** A `Host` field's whole second job is
-    letting an experiment carry a materialized dataset, and a dataset has no business in a
-    hyperparameter table.
-
-`seed` is here rather than in `log_other!` because the seed is a hyperparameter.
+`Device` fields are read back to host numbers; anything not scalar-ish is logged as a descriptor
+rather than splatted into the flat table; `Host` fields are included only when scalar-ish, because
+a `Host` field may be a materialized dataset. `seed` is here because it is a hyperparameter.
 """
 function config_params(e; kwargs...)
     T = typeof(e)
@@ -829,12 +616,9 @@ default_run_dir(e) = joinpath("runs", string(nameof(typeof(e))))
 """
     ReactantNitro.decay_anchors(e, w0, layout) -> NTuple{G} or nothing
 
-The per-group decay anchor, resolved to a flat device slice per group, or `nothing` for a group
-decaying toward zero. `nothing` is a TYPE-level distinction, so a `:zero` group's chain emits no
-subtraction ops and carries no parameter-sized zero buffer.
-
-`w0` is the parameters exactly as `build_model` returned them at setup step 7, which is why `:w0`
-anchoring is a consequence of initialization rather than an independent knob.
+The per-group decay anchor as a flat device slice, or `nothing` for a group decaying toward zero.
+`nothing` is type-level, so a `:zero` group's chain emits no subtraction and carries no buffer.
+`w0` is the parameters as `build_model` returned them at step 7.
 """
 function decay_anchors(e, w0, layout::FlatLayout{G}, mesh = nothing) where {G}
     any(g -> decay_anchor(e, Val(g)) !== :zero, layout.groups) || return nothing
@@ -869,9 +653,7 @@ function validate_config(e; accum = 1, gradient_clip_norm = 0.0f0)
     gradient_clip_norm isa Real || error("ReactantNitro: `gradient_clip_norm` must be a real host \
         number and is a `$(typeof(gradient_clip_norm))`. It is a TRACE-TIME HOST CONSTANT, not a \
         `Device` and not schedulable.")
-    # Both residency hooks, at setup rather than at the first metric call, because a typo would
-    # otherwise silently select the default and move where the metric runs. This is the cheapest
-    # possible failure and step 1 is where those belong.
+    # Both residency hooks here: a typo would otherwise silently select the default.
     check_residency(e, :metrics)
     check_residency(e, :train_metrics)
     return nothing
@@ -880,46 +662,21 @@ end
 """
     Nitro(E::Type, preset::Symbol; kwargs...) -> Nitro
 
-The recorded preset form: build the experiment from [`from_preset`](@ref)`(E, preset)` and **record
-which named recipe this run claimed**, so the name reaches the checkpoint record and `log_params!`.
-
-```julia
-n = Nitro(MyExp, :baseline; run_dir = "runs/baseline")
-```
-
-**Keywords are split by which set they belong to**, in one rule: **a `Nitro` keyword goes to
-`Nitro`; anything else must be a field of `E` and goes to the recipe.** Anything in neither is an
-error naming both valid sets.
+Build the experiment from [`from_preset`](@ref)`(E, preset)` and record which named recipe the run
+claimed, so the name reaches the checkpoint record and `log_params!`.
 
 ```julia
 n = Nitro(MyExp, :baseline; max_epochs = 40, aug_rotate_deg = 9.0)
 #                              ^ run keyword    ^ field, so it overrides the recipe
 ```
 
-**A name that is both keeps going to `Nitro`**, which preserves the collision resolution exactly:
-`max_epochs`, `seed`, `run_dir`, `accum`, `n_devs`, and `gradient_clip_norm` are struct fields,
-legal preset keys, AND run keywords, and here they are unambiguously the **run** keyword because
-this is a `Nitro` call. The preset acts at construction and the run keyword acts at run level, which
-is the layering. Nothing that resolved to the run level before this split moves.
+Keywords are split by one rule: a `Nitro` keyword goes to `Nitro`; anything else must be a field
+of `E` and goes to the recipe; a name that is both (`max_epochs`, `seed`, `run_dir`, `accum`,
+`n_devs`, `gradient_clip_norm`) is the run keyword. Anything in neither set is an error naming
+both. The keyword set is derived from the constructor's declaration, so it cannot go stale.
 
-**The keyword set is derived from this constructor's own declaration**, so it cannot go stale as
-keywords are added.
-
-Overriding a field used to require going through `from_preset` and naming the preset a second time:
-
-```julia
-n = Nitro(from_preset(MyExp, :baseline; aug_rotate_deg = 9.0); preset = :baseline)
-```
-
-**Prefer the form at the top.** That one still works and is what this is shorthand for, but it names
-the preset twice and **nothing checks the two agree**, so passing `preset = :variant` there records
-a name the experiment was never built from, silently, and the recorded name is the whole point of
-recording one. Reported from the first real use, where every override the model needed was a field
-rather than a keyword, which made the two-name form the common path instead of the escape hatch.
-
-**Recording a name for a modified experiment is still accepted**, deliberately: a preset's values are
-struct fields by the time anything sees them, so per-value provenance would be a claim the type
-system cannot back. What the split removes is having to say the name twice to get it.
+The longer spelling, `Nitro(from_preset(MyExp, :baseline; ...); preset = :baseline)`, still works
+and is what this is shorthand for, but it names the preset twice and nothing checks the two agree.
 """
 function Nitro(E::Type, preset::Symbol; kwargs...)
     nitro_kw, field_kw = _split_preset_kwargs(E, preset, kwargs)
@@ -943,9 +700,8 @@ function _split_preset_kwargs(E::Type, preset::Symbol, kwargs)
              again as a keyword would be two answers to one question."
         )
         if k === :data
-            # Deferred to AFTER the loop, deliberately: the error suggests a `from_preset` call and
-            # that suggestion is only correct once every FIELD override has been classified. Erroring
-            # here would print a fix that silently drops them.
+            # Deferred past the loop so the error's suggested `from_preset` call carries every
+            # field override.
             saw_data = true
         elseif k in nkw
             push!(nitro_kw, k => v)          # a run keyword, even when it is also a field
@@ -964,22 +720,11 @@ function _split_preset_kwargs(E::Type, preset::Symbol, kwargs)
     return nitro_kw, field_kw
 end
 
-# REFUSED because it silently trains on the wrong thing. `data` is the one invocation keyword that
-# SKIPS a setup step: step 3 runs `build_data(e, ...)` only when no collection was supplied. In
-# this form the framework builds `e` itself, so the caller's collection came from a DIFFERENT
-# instance, and anything `build_data` populates on the experiment it is handed stays empty on the one
-# actually being constructed. `derive` then reads that empty state and returns something shaped like
-# an answer. Measured on the first real preset table: a 10-class weighted loss over a zero-length
-# class-weight vector, with no error.
-#
-# `checkpoint`, `resume`, and `run_ref` are NOT refused: they feed the record lookup and the caller's
-# output channel, and skip nothing.
-#
-# THE SUGGESTION CARRIES THE FIELD OVERRIDES, which is the whole reason this is a separate function.
-# Anyone reaching the recorded form is disproportionately likely to HAVE field overrides, since
-# keyword splitting is the main reason to use it, so a suggestion that dropped them would be
-# copy-pasteable and wrong: a dropped `backbone_kind = :stub` builds the real backbone instead, which
-# is a multi-minute compile of the wrong model rather than an obvious failure.
+# Refused because it silently trains on the wrong thing: `data` skips `build_data`, but this form
+# builds `e` itself, so the caller's collection came from a different instance and anything
+# `build_data` populates on the experiment stays empty for `derive` to read. (`checkpoint`,
+# `resume` and `run_ref` skip nothing and are not refused.) The suggestion carries the field
+# overrides, since a copy-pasteable fix that dropped them would build the wrong model.
 @noinline function _refuse_data(E::Type, preset::Symbol, field_kw)
     ov = isempty(field_kw) ? "" :
         "; " * join(("$k = $(_short_repr(v))" for (k, v) in field_kw), ", ")
@@ -1000,27 +745,13 @@ end
     )
 end
 
-# Field overrides are hyperparameters in the ordinary case, but nothing stops one being an array, and
-# a suggestion is useless if it is a screenful.
+# A field override may be an array, and a suggestion is useless as a screenful.
 _short_repr(v) = (s = repr(v); length(s) <= 40 ? s : "<$(nameof(typeof(v)))>")
 
-# DERIVED from the constructor's own declaration, never hardcoded. A literal list would be a second
-# place to keep in agreement with the signature above, and going stale silently is the shape of
-# defect this framework has paid for repeatedly. `Base.kwarg_decl` is the same mechanism batch
-# routing uses to route hooks by their declared keywords.
-#
-# READ OFF `_build_nitro`, NOT `Nitro`. The public `Nitro(e; kwargs...)` is a thin wrapper that moves
-# the build off the interactive thread, so its OWN declaration is a bare sink and `Base.kwarg_decl`
-# reports exactly `[KWARG_SINK]` for it. The keyword defaults deliberately live on `_build_nitro`,
-# the function that reads `e`, so the accessor defaults keep a single home; that makes
-# `_build_nitro` the only place the run keywords are actually named. While this pointed at `Nitro`
-# the set was empty of real names, so `_split_preset_kwargs` classified EVERY keyword as unknown and
-# the whole of the preset routing failed: `Nitro(E, :name; run_dir = ...)` reported `run_dir` as
-# neither a `Nitro` keyword nor a field of `E`.
-#
-# The sink check is the guard the paragraph above only promised. Deriving the list stops it going
-# stale as keywords are ADDED, but it cannot notice the build body being split out from under it a
-# second time; this can, and says so at the first `Nitro(E, name)` call rather than misrouting.
+# Derived from the constructor's own declaration rather than a literal list that could go stale.
+# Read off `_build_nitro`, not `Nitro`: the public wrapper's declaration is a bare keyword sink,
+# and while this pointed at it every preset keyword was classified as unknown. The sink check is
+# what catches the body being split out from under this a second time.
 function _nitro_keywords()
     kw = Base.kwarg_decl(which(_build_nitro, Tuple{Any}))
     has_sink(kw) && error(
@@ -1034,26 +765,14 @@ end
 """
     ReactantNitro.setup_devices(n_devs) -> mesh
 
-Setup step 4.5. Build a `Reactant.Sharding.Mesh` over the requested local devices, sharding the
-batch on the `:data` axis and replicating parameters, optimizer state, and layer state.
-**`n_devs == 1` skips the mesh entirely.**
+Setup step 4.5: a 1-D `Reactant.Sharding.Mesh` with a single `:data` axis over the requested local
+devices, sharding the batch along it and replicating everything else (see
+[`place_replicated`](@ref) and [`place_batch`](@ref)). `n_devs == 1` skips the mesh entirely, since
+a one-device mesh is a no-op Reactant warns about.
 
-Single node, one or more devices, one process, is the whole of the distribution scope here.
-Multi-node and multi-process are out, and the distribution stubs at the bottom of this file are how
-the interfaces stay non-breaking if that changes.
-**There is no MPI and no NCCL here**: XLA distributes by partitioning one compiled program over a
-mesh, which is a different mechanism from traditional data-parallel collectives and does not compose
-with them.
-
-**`n_devs == 1` skips the mesh entirely**, and that is not merely an optimization: a one-device
-`Sharding.Mesh` is a no-op that Reactant warns about ("single device mesh is not well supported").
-
-**The mesh is 1-D with a single `:data` axis**, because the whole of the parallelism here is data
-parallel. The batch is sharded along it and everything else is replicated (see
-[`place_replicated`](@ref) and [`place_batch`](@ref)).
-
-**`n_devs` counts VISIBLE devices**, so `CUDA_VISIBLE_DEVICES` is the supported way to restrict a
-run, and asking for more than are visible is a setup error rather than a silent truncation.
+The scope is single node, one process, one or more devices; XLA partitions one compiled program
+over the mesh, which does not compose with MPI or NCCL. `n_devs` counts VISIBLE devices, so
+`CUDA_VISIBLE_DEVICES` is the supported way to restrict a run, and asking for more is an error.
 """
 function setup_devices(n_devs::Integer)
     n_devs >= 1 || error("ReactantNitro: `n_devs` must be at least 1, and is $n_devs.")
@@ -1071,43 +790,25 @@ end
 
 # ── Process-level accelerator configuration ────────────────────────────────────────────
 #
-# The one code path for "choose the accelerator for this session". A REPL session calls
-# `setup_devices!` directly; the Kaimon tool `nitro_setup` is a thin wrapper over the same
-# function, so the two workflows cannot drift apart. The state it writes is the `_PINNED_N_DEVS`
-# pin in Interface.jl, read by the `n_devs` accessor.
+# One code path for choosing the session's accelerator: a REPL calls `setup_devices!`, the Kaimon
+# tool `nitro_setup` wraps the same function. It writes `_PINNED_N_DEVS` (Interface.jl).
 
 """
     ReactantNitro.setup_devices!(; backend = nothing, n_devs = nothing) -> NamedTuple
 
-Configure this process's accelerator for every subsequent run and report what is now in effect,
-as `(; backend, visible, n_devs, pinned)`. **The Kaimon tool `nitro_setup` is exactly this
-function**, so a REPL session and a Kaimon-hosted session configure identically.
+Configure this process's accelerator for every subsequent run and report what is in effect, as
+`(; backend, visible, n_devs, pinned)`. The Kaimon tool `nitro_setup` is exactly this function.
 
-Calling it is **optional**. A session that never calls it runs on Reactant's default backend with
-`n_devs` = every visible device, `length(Reactant.devices())`, which is what a CPU machine (one
-visible device) gets automatically. This function exists to be explicit and to fail fast.
+Optional: a session that never calls it runs on Reactant's default backend with `n_devs` equal to
+every visible device. `backend` passes through to `Reactant.set_default_backend` (`"cpu"`,
+`"gpu"`, `"cuda"`, `"rocm"`, `"tpu"`). `n_devs` pins the device count for the process, validated
+against the visible devices; the pin beats an experiment's declared `n_devs`, and an explicit
+`n_devs` keyword on `Nitro` still wins for that one run.
 
-`backend` passes through to `Reactant.set_default_backend` and names a Reactant backend:
-`"cpu"`, `"gpu"` (whichever of CUDA/ROCm is available), `"cuda"`, `"rocm"`, `"tpu"`. Omit it to
-leave Reactant's default: the highest-priority working backend, chosen once per process at the
-first device access (GPU where one is visible, else CPU).
-
-`n_devs` pins the device count for this process, validated eagerly against the VISIBLE devices
-through the same check a `Nitro` construction runs, one session earlier. **The pin replaces
-the default and beats an experiment's declared `n_devs` field**; an explicit `n_devs` keyword on
-`Nitro`/`train!` still wins for that one run.
-
-**One process, one XLA.** A Julia process initializes its XLA/PJRT client once; `n_devs` never
-creates clients or processes. It slices the already-visible device set to build the mesh, so to
-restrict which GPUs a session sees, set `CUDA_VISIBLE_DEVICES` **before starting the process**:
-visibility is fixed at the first client access. Asking for more devices than are visible is an
-error, and the error names `CUDA_VISIBLE_DEVICES`.
-
-The batch size is GLOBAL and gets split across the mesh, so adding devices buys throughput and
-does not change the effective batch.
-
-Calling with no arguments changes nothing and reports the current configuration: the backend in
-use, how many devices are visible, and the `n_devs` the next run will use.
+One process, one XLA: the client is initialized once and `n_devs` only slices the visible device
+set, so to restrict which GPUs a session sees, set `CUDA_VISIBLE_DEVICES` before starting the
+process. The batch size is global and is split across the mesh, so adding devices buys throughput
+without changing the effective batch. Called with no arguments, this only reports.
 
 ```julia
 ReactantNitro.setup_devices!()                      # report
@@ -1116,8 +817,7 @@ ReactantNitro.setup_devices!(backend = "cuda", n_devs = 2)  # two of the visible
 ```
 """
 function setup_devices!(; backend = nothing, n_devs = nothing)
-    # 1. Backend: pass through to Reactant's process-global default, with a friendlier error
-    #    than the KeyError an unknown name would otherwise surface.
+    # A friendlier error than the KeyError an unknown backend name would surface.
     if backend !== nothing
         backend isa AbstractString || throw(
             ArgumentError(
@@ -1137,8 +837,7 @@ function setup_devices!(; backend = nothing, n_devs = nothing)
             )
         end
     end
-    # 2. Device count: validate through `setup_devices`, so the n_devs contract has a single
-    #    authority (≥ 1, ≤ visible, and an error that names CUDA_VISIBLE_DEVICES), then pin.
+    # Validated through `setup_devices`, so the `n_devs` contract has one authority.
     if n_devs !== nothing
         setup_devices(n_devs)
         _PINNED_N_DEVS[] = n_devs
@@ -1158,22 +857,13 @@ end
     ReactantNitro.place_replicated(x, mesh) -> x_device
     ReactantNitro.place_batch(x, mesh) -> x_device
 
-The two placements. **Everything is replicated except the batch**, which is sharded on its last
-dimension along the mesh's `:data` axis.
+The two placements: everything is replicated except the batch, which is sharded on its last
+dimension along the `:data` axis. The sample axis is last by the batch contract, which is why
+routing transfers only the fields a hook declares. `mesh === nothing` is the single-device path
+and both fall through to `to_rarray`.
 
-`mesh === nothing` is the single-device path and both fall through to a bare `to_rarray`, so every
-call site reads the same on one device and on several.
-
-**Why the last dimension.** The batch contract puts the sample axis last, which is also Lux's
-convention, so the batch dimension is `ndims(x)` for every routed field. A field whose sample axis
-is somewhere else cannot be sharded correctly by this rule, which is one more reason routing
-transfers only the fields a hook actually declares.
-
-**What replication buys.** Parameters, optimizer state, layer state, the decay masks and anchors, the
-accumulator, and the scalar carriers all exist identically on every device, so the compiled program
-partitions cleanly over the batch axis alone. That is the whole of data parallelism: the GPU count is
-**throughput, not a batch multiplier**. A run at `batch_size = 32` on four devices puts 8 samples on
-each, and its numerics are those of a 32-sample batch, not a 128-sample one.
+The device count is throughput, not a batch multiplier: `batch_size = 32` on four devices puts 8
+samples on each, with the numerics of a 32-sample batch.
 """
 place_replicated(x, ::Nothing; kwargs...) = Reactant.to_rarray(x; kwargs...)
 place_replicated(x, mesh; kwargs...) =
@@ -1191,11 +881,8 @@ place_batch(x, mesh) = Reactant.to_rarray(
 """
     ReactantNitro.check_shardable_batch(batch_size, n_devs) -> nothing
 
-The sharding divisibility requirement, checked at setup where it is cheap.
-
-A batch sharded on the `:data` axis has to divide evenly across the mesh. XLA will pad or refuse
-otherwise, and neither failure names the batch size, so the framework checks first and says which
-two numbers disagree. This is the multi-device sibling of the `length(train) % accum == 0` check.
+A batch sharded on the `:data` axis must divide evenly across the mesh. XLA would pad or refuse
+without naming the batch size, so the framework checks first.
 """
 function check_shardable_batch(batch_size::Integer, n_devs::Integer)
     n_devs == 1 && return nothing
@@ -1214,16 +901,10 @@ end
 """
     ReactantNitro.to_device_config(e) -> e_converted
 
-Setup step 5: walk the experiment, convert every [`Device`](@ref) leaf through
-[`to_device`](@ref), and rebuild. **This changes the experiment's type**, which is fine because it
-precedes any compile.
-
-Device conversion happens in exactly three places and only one of them recurs: here at setup,
-per optimizer step for the **scheduled** entries only, and nowhere else. **Nothing converts
-inside the traced step.** A setup-fixed entry, scalar or 10,000-element vector, is converted once and
-reused by reference; because a constant is a `Number` rather than a `Callable`, constants are
-setup-fixed by construction, so the per-step transfer count equals the number of quantities actually
-being varied.
+Setup step 5: convert every [`Device`](@ref) leaf through [`to_device`](@ref) and rebuild the
+experiment, which changes its type. Conversion happens here and, per optimizer step, for the
+scheduled entries only; nothing converts inside the traced step, so a setup-fixed entry of any size
+is converted once and reused by reference.
 """
 function to_device_config(e, mesh = nothing)
     T = typeof(e)
@@ -1240,13 +921,9 @@ end
 """
     device_value(nitro, name) -> value
 
-The **host** value of a [`Device`](@ref) field of the live experiment. `nitro.e` holds device
-values after setup step 5, so reading a field directly hands back a `ConcretePJRTNumber` or
-`ConcretePJRTArray`; this transfers it back. The counterpart to [`set_device!`](@ref), and the
-supported way for host-side code to read a value it is also writing.
-
-Errors on a field that is not `Device`, because a [`Host`](@ref) or [`GraphConst`](@ref) field is
-already a host value and `getfield` is the right way to read it.
+The host value of a [`Device`](@ref) field of the live experiment, which holds device values after
+setup step 5. The counterpart to [`set_device!`](@ref). Errors on a field that is not `Device`,
+since a `Host` or `GraphConst` field is already a host value.
 """
 function device_value(nitro::Nitro, name::Symbol)
     e = nitro.e
@@ -1258,33 +935,15 @@ end
     set_device!(nitro, name, value) -> nitro
     set_device!(nitro; name = value, ...) -> nitro
 
-Write a new value into a [`Device`](@ref) field of a live handle. **Provably does not recompile**,
-which is the whole point: it is how a device sweep or a changed inference threshold reuses the
-programs already in the compile cache instead of rebuilding a `Nitro`.
+Write a new value into a [`Device`](@ref) field of a live handle without recompiling: this is how a
+device sweep or a changed inference threshold reuses the programs already in the compile cache.
 
-The guarantee is structural rather than hopeful. The cache key skips `device_fields` when hashing,
-and [`graphconst_field_hash`](@ref) seeds on `Base.typename(T)` rather than `hash(T)` precisely so
-that re-parameterizing an experiment for device residency does not move the hash, so a new device
-value in a `Device` slot leaves every key component untouched. This function asserts that before it
-commits,
-and the assertion is not decoration: `typeof(compile_view(e))` is `args[1]`'s type at every trace
-site, so a value whose device type differs by even an element type would move the key and buy a
-recompile silently.
-
-Two things are refused, both because they would break that guarantee rather than out of caution:
-
-  * **A field that is not `Device`.** A [`GraphConst`](@ref) field bakes as a trace-time constant and
-    is hashed, so changing it genuinely is a different program; a `Host` field reaches no trace at
-    all. The error names which case it is and points at the rebuild, which is cheap because the
-    cache is module-level and a fresh `Nitro` hits every entry the change does not invalidate.
-  * **A different type or size.** Element type would move `typeof(ev)` and therefore the key. Size
-    would not, since `_shape` of a struct is `nothing`, which is worse: the key would still match
-    and the shape mismatch would surface inside XLA at call time, exactly the gap the key lists
-    shapes for.
-
-**A scheduled field is also refused**, because the per-optimizer-step rebuild rewrites the
-scheduled entries from the schedule, so a value written here would survive until the next optimizer
-step and no longer. Silently losing a write one step later is worse than refusing it.
+The guarantee is structural. The cache key skips `device_fields` when hashing and seeds on the
+type name rather than the parameterized type, so a new device value leaves every key component
+untouched; the function asserts both before committing. Refused: a field that is not `Device` (a
+`GraphConst` is genuinely a different program, a `Host` field reaches no trace), a value of a
+different element type or size (the type would move the key; the size would not and would fail
+inside XLA instead), and a scheduled field (the per-step rebuild would overwrite the write).
 
 ```julia
 n = Nitro(e; checkpoint = "runs/MyExp/best.jld2")   # weights-only, skips `derive`
@@ -1293,18 +952,13 @@ for thr in (0.3f0, 0.5f0, 0.7f0)
     out = predict(n, batch)                         # no compile, any iteration
 end
 ```
-
-See also [`device_value`](@ref) to read one back, and [`Device`](@ref) for what the marker means.
 """
 function set_device!(nitro::Nitro, name::Symbol, value)
     e = nitro.e
     T = typeof(e)
     _check_device(e, name, "set_device!")
 
-    # Refused because the schedule OWNS the field: `step_experiment` rebuilds it at the top of every
-    # optimizer step, so a write here would survive exactly until the next step and
-    # then vanish, which is worse than a refusal because the value visibly took and then silently
-    # did not.
+    # The schedule owns a scheduled field: a write here would vanish at the next optimizer step.
     sched = nitro.schedules
     if sched !== nothing && haskey(sched.device, name)
         error("ReactantNitro: `$name` is scheduled, so the per-step rebuild owns \
@@ -1339,9 +993,7 @@ function set_device!(nitro::Nitro, name::Symbol, value)
         )...
     )
     ev_after = compile_view(e_new)
-    # The cache key's promise, checked rather than trusted. Both halves have failed in review: the
-    # type through a widened element type, the hash through a `Device` that was not declared in
-    # `device_fields`.
+    # The cache key's promise, checked rather than trusted; both halves have failed in review.
     typeof(ev_after) === typeof(ev_before) || error("ReactantNitro internal: `set_device!($name)` \
         moved `typeof(compile_view(e))` from $(typeof(ev_before)) to $(typeof(ev_after)), which is \
         `args[1]`'s type at every trace site and therefore part of the compile key. Refusing \
@@ -1387,11 +1039,8 @@ end
     ReactantNitro.CONFIG_REPORT
 
 Whether the entry points print [`fixed_config_report`](@ref). `true` by default;
-`ReactantNitro.set_config_report!(false)` silences it for a driver that calls `validate` in a loop and
-does not want the banner each time.
-
-Not a `Nitro` keyword and not an `@experiment` field, because it is a property of the session's
-console rather than of the run, and because `train!(nitro)` deliberately takes no keywords.
+`set_config_report!(false)` silences it for a driver calling `validate` in a loop. A property of the
+session's console rather than of the run, so not a `Nitro` keyword.
 """
 const CONFIG_REPORT = Ref(true)
 
@@ -1402,99 +1051,52 @@ function set_config_report!(on::Bool)
     return prev
 end
 
-# The scalar run knobs whose accessors are PURE and therefore safe to re-probe for the divergence
-# check. `logger`, `checkpointer`, `early_stop`, and `schedules` are deliberately absent: their
-# accessors are CONSTRUCTORS, and README's logger section states the framework "calls this exactly
-# ONCE, at setup, which is what makes it safe for an accessor to have a side effect: opening a file
-# here, or registering a run with a hosted tracker". Probing one would fire that side effect on every
-# entry-point call, and comparing the result would false-positive anyway, since `EarlyStopping` and
-# `TopKCheckpointer` are mutable and compare by identity. Consequence, documented rather than fixed:
-# a revised `early_stop`/`checkpointer`/`logger` CONSTRUCTOR is not detected here.
+# The run knobs whose accessors are pure and safe to re-probe. `logger`, `checkpointer`,
+# `early_stop` and `schedules` are constructors called exactly once at setup, so probing them would
+# fire their side effects and compare by identity anyway; a revised one is not detected here.
 const _PROBED = (:seed, :accum, :max_epochs, :gradient_clip_norm, :run_dir)
 
 """
     ReactantNitro.frozen_dispatch(ev, model, ps, st, routing, chains) -> NamedTuple
 
-Every component of the compile-cache key that comes from **live method dispatch**, resolved once,
-here.
-
-Before this, `hook_worlds` and both `metrics_residency` reads ran at each entry-point call, so an
-existing handle could observe a redefinition and silently recompile between two `train!` calls. An
-earlier change removed the two entries that could only fire spuriously; these are the ones that
-could fire *correctly*, and freezing them is the other half of the same argument. With them stored,
-every component of the key derives from stored state, and **the programs a `Nitro` uses are
-determined at construction**. What replaces the recompile is [`fixed_config_report`](@ref)'s hook
-section, which says the handle is stale and names the rebuild.
-
-**Three world tuples rather than one, because the programs have different dependency sets.**
+Every component of the compile-cache key that comes from live method dispatch, resolved once at
+construction, so the programs a `Nitro` uses are determined when it is built and a redefinition
+cannot make an existing handle silently recompile between two `train!` calls.
+[`fixed_config_report`](@ref) is what tells the user the handle is stale instead.
 
 | Entry | Covers | Consumed by |
 | --- | --- | --- |
-| `worlds_train` | the hooks, resolved against a **train-mode** `st` | `grad_program` |
+| `worlds_train` | the hooks, resolved against a train-mode `st` | `grad_program` |
 | `worlds_opt` | the same, plus every rule's `apply!` | `opt_program` |
-| `worlds_eval` | the hooks, resolved against an **eval-mode** `st` | `fwd_program`, `eval_metric_program` |
+| `worlds_eval` | the hooks, resolved against an eval-mode `st` | `fwd_program`, `eval_metric_program` |
 | `graphconst_hash` | the experiment-derived key component | every `compile_cached`, as `gc_hash` |
 
-**The split is what lets the rules in at all.** `chains` was a parameter of [`hook_worlds`](@ref)
-that no call site ever passed, so `_rules_of`'s loop never ran and a revised custom
-`Optimisers.apply!` silently reused the old optimizer program, which the cache contract and that
-docstring both claimed was covered. Wiring it needs a single correct chain set, and construction is
-the only place one exists: `rebuild_rules` reconstructs chains per step, so there is nothing to hand
-a per-call resolution. Putting the rules in `worlds_opt` **only** keeps a rule edit off the 495.6 s
-gradient program, since `opt_program` traces no user hook and a hook edit cannot change it either.
-Sharing one tuple would re-buy exactly the spurious expensive recompile that was removed earlier.
-
-**The two `st` modes are not pedantry.** `forward`'s world is resolved against `typeof(st)`, and
-`train!` used to resolve it against the un-moded `nitro.st` while compiling with
-`Lux.trainmode(st)`. For a model whose train and eval state types differ and which dispatches
-`forward` on them, that resolved the wrong signature. Freezing forces both modes to be named.
+The rules go in `worlds_opt` only, so a rule edit stays off the expensive gradient program. The two
+`st` modes matter for a model whose train and eval state types differ and which dispatches
+`forward` on them.
 """
 function frozen_dispatch(e, model, ps, st, routing, chains; manual = false, opt_state = nothing)
-    # `ev` for the worlds, because that is what every trace site passes and what `hook_worlds`
-    # requires; the FULL `e` for the residencies, because that is what the call sites this replaces
-    # passed. The two agree for any experiment declaring `metrics_residency` on its own type, since
-    # `compile_view` rebuilds the same struct with different parameters, but reproducing each read
-    # exactly is how this stays a pure relocation rather than a behavior change smuggled in with one.
+    # `ev` for the worlds, since that is what every trace site passes; the full `e` for the
+    # residencies, since that is what the call sites this replaced passed.
     ev = compile_view(e)
     st_train, st_eval = Lux.trainmode(st), Lux.testmode(st)
     return (;
         worlds_train = hook_worlds(ev; model, ps, st = st_train),
         worlds_opt = hook_worlds(ev; model, ps, st = st_train, chains),
         worlds_eval = hook_worlds(ev; model, ps, st = st_eval),
-        # The two metric residencies, read once for the same reason. An experiment with no
-        # `train_metrics` method stays on the `:device` program whatever the accessor says,
-        # since there is nothing to move to the host when the hook does not exist.
+        # An experiment with no `train_metrics` stays on the `:device` program whatever the
+        # accessor says.
         tm_residency = routing === nothing || routing.train_metrics === nothing ? :device :
             check_residency(e, :train_metrics),
         metrics_residency = check_residency(e, :metrics),
-        # The experiment-derived key component, resolved ONCE here, which is what `cache_key`'s
-        # docstring has always claimed and what the implementation did not do: it recomputed the
-        # hash on every `compile_cached`, and that runs per micro-batch.
-        #
-        # Safe for a whole run, and the invariant is already enforced rather than newly assumed.
-        # `ev` is not constant across `train!`: the adaptive path rebuilds it when a `Device`
-        # field updates. But `set_device!` ERRORS if that rebuild moves `graphconst_field_hash`, so
-        # "the config hash cannot change within a run" is a property this framework already
-        # guarantees, and hoisting the value is reading that guarantee rather than trusting it.
-        #
-        # ONLY the experiment half is hoisted. Argument types and SHAPES are still computed on every
-        # call, and must be: Reactant's `@generated` guard covers types but not shapes, which is
-        # exactly why a ragged batch passes the guard and then fails inside XLA. Caching past the
-        # shape check would reintroduce that.
-        #
-        # Measured: this is worth about 0.04 ms per epoch at 550 lookups and is NOT a
-        # performance change. It earns its place by making the code match its own contract, and by
-        # bounding a real footgun: a `GraphConst` holding a 1e6-element array hashes in 624 us, so
-        # rehashing it per micro-batch costs about 343 ms per epoch, and now it is hashed once.
+        # Hoisted once: `set_device!` errors if a rebuild moves this hash, so it cannot change
+        # within a run. Argument types and shapes are still computed on every call, since
+        # Reactant's guard covers types but not shapes. Worth little per lookup, but a large
+        # `GraphConst` array hashed per micro-batch was hundreds of ms per epoch.
         graphconst_hash = graphconst_field_hash(ev),
-        # Manual mode's frozen-dispatch entries. `manual` is the resolved mode itself, so
-        # flipping `manual_training(e)` on an existing handle is reported by `stale_hooks` rather
-        # than applied. `worlds_manual` is the closure program's key component: the hooks (a manual
-        # closure may call them) plus the closure's OWN method world, so editing `train_step`
-        # invalidates the cache on a new `Nitro`. `worlds_setup` is staleness-only: `setup_optimizers`
-        # is not traced by the closure, so its world does NOT belong in the compile key (a
-        # redefinition would otherwise re-buy the closure compile for a byte-identical program), but
-        # redefining it on an existing handle should still be reported rather than silently inert.
+        # Manual mode: `worlds_manual` is the closure program's key component (the hooks plus the
+        # closure's own method world). `worlds_setup` is staleness-only, since `setup_optimizers`
+        # is not traced by the closure and does not belong in the compile key.
         manual = manual,
         worlds_manual = manual ? (
                 hook_worlds(ev; model, ps, st = st_train)...,
@@ -1507,18 +1109,10 @@ end
 """
     ReactantNitro.stale_hooks(nitro) -> Vector{Symbol}
 
-Which frozen world tuples no longer match live dispatch, as the names
-[`fixed_config_report`](@ref) prints. Empty is the normal case.
-
-This is the **whole** safety story for freezing the dispatch state, and it is why freezing is not
-simply a regression. Method worlds went into the key because "editing `forward` and calling
-`train!` again would hit the cache and silently run the old program", and the word carrying the
-weight is *silently*. Freezing brings the stale program back and this removes the silence: the
-handle reports that its hooks were redefined and names the rebuild, at the cost of a few `which`
-calls per entry-point call, against a step that costs orders of magnitude more.
-
-A **new** `Nitro` is unaffected and always resolves current dispatch, which is what keeps the cache
-doing its actual job: letting a fresh, genuinely compatible handle skip the compile.
+Which frozen world tuples no longer match live dispatch, as [`fixed_config_report`](@ref) prints
+them. Empty is the normal case. This is the whole safety story for freezing dispatch: the handle
+keeps its programs, and this removes the silence about it, at the cost of a few `which` calls per
+entry-point call. A new `Nitro` always resolves current dispatch.
 """
 function stale_hooks(nitro::Nitro)
     f = nitro.frozen
@@ -1531,11 +1125,8 @@ function stale_hooks(nitro::Nitro)
     return Symbol[k for k in keys(f) if getproperty(live, k) != getproperty(f, k)]
 end
 
-# The chains whose `apply!` worlds went into `worlds_opt`. Rebuilt rather than stored, since only
-# their TYPES matter here and `rebuild_rules` preserves those; storing the construction-time chains
-# would pin their device scalars alive for the run's whole life for no benefit.
-# Manual mode has no framework chains: the user's rules are never rebuilt by the framework, so
-# `()` is correct, and walking the user's opt_state tree for leaves would fail on its nesting.
+# Rebuilt rather than stored, since only the rule TYPES matter and storing the construction-time
+# chains would pin their device scalars alive. Manual mode has no framework chains.
 frozen_chains(nitro::Nitro) =
     get(nitro.frozen, :manual, false) ? () :
     nitro.opt_state === nothing ? () : map(l -> l.rule, nitro.opt_state)
@@ -1561,41 +1152,22 @@ probe_accessors(e) = NamedTuple{_PROBED}(
 """
     ReactantNitro.fixed_config_report(nitro; entry = :train) -> String
 
-**What has been redefined since this handle froze it**, and therefore is not in effect. Empty when
-nothing has, which is the usual case and is why the entry points are silent about it.
+What has been redefined since this handle froze it, and is therefore not in effect. Empty when
+nothing has, which is why the entry points are silent about it. It does not list the handle's
+values; `show(nitro)` does that.
 
-It does NOT list the handle's values. `show(nitro)` is the view of what a handle holds, and the
-binding report is the view of where each configured value came from; this is the third question,
-and the only one whose answer nothing else can supply. Overlapping the three was how the top of
-every `train!` came to repeat the seed and the run directory twice before the run started.
-
-Setup resolves the ten accessor-defaulted keywords once, into the `Nitro`'s own fields, and every
-read after that goes to the field. So revising `accum(::MyExp)` or `max_epochs(::MyExp)` and calling
-`train!` on an existing handle changes nothing, and it once also triggered a full recompile through
-[`hook_worlds`](@ref), which made the wasted compile read as confirmation that the edit had landed.
-Removing that entry fixed the cost and made the silence total, so this report is what tells the user
-instead.
-
-**The handle always wins.** This never applies a divergence, because `accum` and `max_epochs` are
-entangled with the schedule horizon `total = max_epochs * div(n_batches, accum)` and with
-`check_train_divisibility`, so applying one in isolation would leave the schedules resolved against
-a horizon that no longer exists. The fix is a rebuild, which is cheap: the cache is module-level, so
-`Nitro(e; data = nitro.data, max_epochs = 60)` reuses every compiled program.
-
+Setup resolves the accessor-defaulted keywords once into the handle's fields, so revising
+`accum(::MyExp)` and calling `train!` on an existing handle changes nothing, and this report is what
+says so. The handle always wins: `accum` and `max_epochs` are entangled with the schedule horizon,
+so applying one in isolation would leave the schedules resolved against a horizon that no longer
+exists. The fix is a rebuild, which reuses every compiled program the change does not invalidate.
 `entry` selects the relevant set, since `validate` and `predict` read neither `accum` nor the clip.
-Only pure scalar accessors are probed; see `_PROBED` for which and why.
 """
 function fixed_config_report(nitro::Nitro; entry::Symbol = :train)
     e = nitro.e
     io = IOBuffer()
-    # DRIFT ONLY. This used to open with a table of the handle's fixed values, which is now what
-    # `show(nitro)` is for: seed, accum, max_epochs, total, clip and run_dir were all in both, and
-    # printing them again at the top of every `train!`, `validate` and `predict` was noise a reader
-    # learned to scroll past. What is left is the half nothing else can tell you: which accessors
-    # and hooks were redefined AFTER this handle froze them, and are therefore not in effect.
-    #
-    # Empty when nothing drifted, which is the common case, and `report_fixed_config` prints
-    # nothing at all then. Silence is the correct output for "everything is as you left it".
+    # Drift only. The handle's fixed values are `show(nitro)`'s job; printing them at the top of
+    # every entry point was noise. Empty when nothing drifted, and then nothing is printed.
     then = nitro.accessors_at_setup
     for f in _PROBED
         entry === :train || f in (:seed, :run_dir) || continue
@@ -1606,20 +1178,15 @@ function fixed_config_report(nitro::Nitro; entry::Symbol = :train)
         catch
             continue          # an accessor that throws is the user's business, not this report's
         end
-        # accessor-THEN vs accessor-NOW. Comparing against the STORED field instead would flag every
-        # keyword override, since a keyword is indistinguishable from its accessor default by the time
-        # the constructor body runs (see `clip_source`, and `accessors_at_setup`'s comment).
+        # Accessor-THEN against accessor-NOW; the stored field would flag every keyword override.
         now == was && continue
-        # One string, deliberately: a `\` continuation keeps the next line's indentation, which is
-        # tolerable in an error message and looks broken in a formatted report.
+        # One string: a `\` continuation keeps the next line's indentation.
         println(
             io, "  ! `$f(e)` was redefined: it returned $was at construction and returns $now ",
             "now. This handle still uses $(getfield(nitro, f)); rebuild to pick up $now."
         )
     end
-    # The other half of the same job. The accessor lines above cover CONFIGURATION that this handle
-    # fixed; this covers CODE. Both exist because the handle is frozen and neither the stale value
-    # nor the stale program may be silent.
+    # The accessor lines cover configuration; this covers code.
     stale = stale_hooks(nitro)
     isempty(stale) || println(
         io, "  ! hooks were redefined after this `Nitro` was built ",
@@ -1628,11 +1195,8 @@ function fixed_config_report(nitro::Nitro; entry::Symbol = :train)
         "cache is module-level, so a rebuild recompiles only what actually ",
         "changed."
     )
-    # The third half: the world-closure guard poisons module entries so NEW handles
-    # recompile, and this handle is told when its OWN programs were among them. `programs` is the
-    # handle-local thunk store (the frozen contract made literal), so its keys ARE this handle's
-    # programs, and an intersection with the poisoned set is precise: only a handle that actually
-    # holds a now-poisoned program hears about it.
+    # The world-closure guard poisons module entries so new handles recompile; this tells the
+    # handle when its own programs were among them.
     staleness = LAST_WORLD_STALENESS[]
     mine = isempty(staleness.poisoned) ? nothing :
         findfirst(p -> haskey(nitro.programs, p), staleness.poisoned)
@@ -1644,19 +1208,15 @@ function fixed_config_report(nitro::Nitro; entry::Symbol = :train)
     )
     body = String(take!(io))
     isempty(body) && return ""
-    # The title is built here rather than up front so that "nothing drifted" can be the empty
-    # string: a header with no findings under it reads as a finding nobody wrote down.
+    # Built last so "nothing drifted" can be the empty string.
     title = "ReactantNitro: $(nameof(typeof(e))) has values fixed at construction that have \
              since been redefined. This handle keeps what it froze; rebuild the `Nitro` to pick \
              up the new ones, and see `show(nitro)` for what it is currently holding."
     return title * "\n" * body
 end
 
-# Printed rather than `@info`-ed: it is a report, not a diagnostic, and `@info`'s gutter would put
-# a `|` down the left of every line of it. And printed only when there is something to say, which
-# is why this is not simply `print`. Unlike the binding report, this one has no display of its own
-# to ride on: `show(nitro)` states what the handle IS HOLDING, and a value redefined since it
-# froze is by definition not that.
+# Printed rather than `@info`-ed (a report, not a diagnostic), and only when there is something to
+# say.
 function report_fixed_config(nitro::Nitro, entry::Symbol)
     CONFIG_REPORT[] || return nothing
     txt = fixed_config_report(nitro; entry)
@@ -1668,12 +1228,9 @@ end
     ReactantNitro.merge_derived(e, derived) -> e
 
 Setup step 4: merge [`derive`](@ref)'s result into the experiment. A derived [`Device`](@ref)
-becomes a device value excluded from the cache key; a derived `GraphConst` field becomes a baked
-constant included in it, and the hook does not need to know the difference.
-
-**A large derived value should be `Device`, not `GraphConst`**, because a `GraphConst` array field is
-both baked as a trace-time constant and walked by the tracer, while a `Device` is converted once
-and walked as one buffer.
+becomes a device value excluded from the cache key; a derived `GraphConst` becomes a baked constant
+included in it. A large derived value should be `Device`, since a `GraphConst` array is walked by
+the tracer.
 """
 function merge_derived(e, derived::NamedTuple)
     isempty(derived) && return e
@@ -1689,14 +1246,9 @@ end
 
 # ── Distribution stubs, kept non-breaking ───────────────────────────────────────────
 #
-# Interfaces that would eventually need a distribution handle keep the parameter now, untyped and
-# documented as unused. Nothing dispatches on it, so there is no type to own or version, and adding a
-# real handle later does not break consumers who wrote `dist` untyped.
-#
-# Do NOT extend this to the logger. Rank gating is the driver's job; putting rank in the logger
-# contract would force every backend to reimplement the same guard, and one that forgets duplicates
-# every metric per rank. Rank reaches phase monitors as `info.is_rank0`, documented as always
-# `true` today so nobody writes an untested rank-conditional branch.
+# Interfaces that would need a distribution handle keep the parameter now, untyped and unused, so a
+# real handle later breaks nobody. Rank gating is the driver's job, never the logger's; it reaches
+# phase monitors as `info.is_rank0`, always `true` today.
 
 """
     rank(dist) -> Int

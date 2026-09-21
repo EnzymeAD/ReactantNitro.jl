@@ -1,34 +1,18 @@
 # History.jl
 #
-# `history(nitro)`: the per-epoch series a handle's own `train!` calls produced, as data first and
-# as a table second. The data is a `MetricHistory`, which indexes by epoch, selects metrics by
-# name, and hands a column back as a vector; the table is its `show`, drawn in Render.jl.
-#
-# ── Why a handle keeps a series at all ─────────────────────────────────────────────
-#
-# `last_metrics` answers "how did the last epoch do". The question a person asks after a run is
-# "how did it GO", which is the shape of the curve, and before this the only place that shape
-# existed was a logger backend: a file to open, or a hosted tracker to log into. A REPL that has
-# the handle in hand should be able to ask the handle. What it keeps is small, one `NamedTuple` of
-# host scalars per validated epoch, and it is fresh per handle: a resumed run's earlier epochs
-# belong to the process that trained them and are not reconstructed here.
-#
-# ── Why the display logic is here and the rendering is not ─────────────────────────
-#
-# Deciding WHICH rows and columns fit a terminal is arithmetic over the data, and it is the part
-# worth testing without a frame around it. Drawing the frame is PrettyTables' job. So
-# `history_table` produces the cells, the labels, the alignment and the footer note for a given
-# display size, and the `show` in Render.jl does nothing but hand those to `pretty_table`.
+# `history(nitro)`: the per-epoch series a handle's own `train!` calls produced, as data first (a
+# `MetricHistory`, indexed by epoch and by metric name) and as a table second (its `show`, drawn in
+# Render.jl). Deciding which rows and columns fit a terminal is arithmetic over the data and is
+# done here; drawing the frame is PrettyTables' job.
 
 """
     ReactantNitro.MetricHistory
 
-What [`history`](@ref)`(nitro)` returns: one row per validated epoch, `(; epoch, step, loss,
+The per-epoch metric series a handle keeps. What [`history`](@ref)`(nitro)` returns: one row per
+validated epoch, `(; epoch, step, loss,
 metrics...)`, with `loss` the epoch's mean train loss and the rest that epoch's finalized
-validation metrics as host values. Its display is the table; the object is the data.
-
-Indexing selects, by **epoch** for rows and by **name** for columns; `epoch` and `step` always
-stay:
+validation metrics as host values. Indexing selects by epoch for rows and by name for columns;
+`epoch` and `step` always stay:
 
 ```julia
 h = history(nitro)
@@ -38,25 +22,16 @@ h[10:20]                     # epochs 10 to 20, still a MetricHistory
 h[:acc, :macro_recall]       # two metrics, every epoch
 h[10:20, :acc]               # both
 h[step = 5_000:20_000]       # the epochs whose closing step is in that range
-h[:acc, step = 5_000:20_000] # both
 h.acc                        # the column as a Vector, for a plot or a threshold
 h.epoch, h.step, h.loss      # the axes and the train loss
 ```
 
-A row's `step` is the global step at the END of its epoch, so `step = a:b` selects the epochs that
-closed within it. With a Makie backend loaded, `plot(h)` draws it; see [`history_series`](@ref)
-for what the plot shows by default.
-
-It is a Tables.jl table with column access, so `DataFrame(h)`, `CSV.write(path, h)` and anything
-else that consumes one take it directly. The table view has the scalar columns in the order above;
-a column with a gap, an epoch that did not report the metric, has `missing` there and a
-`Union{Missing, T}` element type. A non-scalar metric is not a column of the table view. In a
-notebook the display is the same table as HTML, every row, since a notebook scrolls.
-
-The column order is fixed: `epoch`, `step`, `loss`, the checkpointer's selection metric when the
-handle has one, then the remaining scalar metrics in the order they first appeared. A metric that
-is not a scalar, a confusion matrix say, is not tabulated; `propertynames(h)` still lists it and
-`h.confusion` returns it per epoch.
+It is a Tables.jl table with column access, so `DataFrame(h)` and `CSV.write(path, h)` take it
+directly; with a Makie backend loaded, `plot(h)` draws it (see [`history_series`](@ref)). Columns
+are `epoch`, `step`, `loss`, the checkpointer's selection metric when the handle has one, then the
+remaining scalar metrics in first-appearance order; an epoch lacking a metric has `missing`. A
+non-scalar metric (a confusion matrix) is not a column of the table view, but `propertynames(h)`
+lists it and `h.confusion` returns it per epoch.
 """
 struct MetricHistory
     experiment::Symbol
@@ -65,15 +40,12 @@ struct MetricHistory
     columns::Vector{Symbol}
     hidden::Vector{Pair{Symbol, String}}     # non-scalar metrics, with a shape note
     best::Union{Nothing, NamedTuple}         # (; metric, mode, epoch), from the checkpointer
-    # The epoch the HANDLE's history starts at, kept through every selection so that `h[18:28]`
-    # is not mistaken for a resumed run: only a history that itself began past epoch 1 has
-    # earlier epochs in another process.
+    # The epoch the handle's history starts at, kept through every selection, so only a history
+    # that itself began past epoch 1 reports earlier epochs in another process.
     first_epoch::Int
 end
 
-# The row appended once per validated epoch, from both training loops. `loss` is `NaN` for an epoch
-# that ran no micro-batch, which cannot happen in a completed epoch and is the honest value if it
-# ever does.
+# The row appended once per validated epoch. `loss` is `NaN` for an epoch that ran no micro-batch.
 history_row(nitro, loss_sum, loss_n, metrics_out) = merge(
     (; epoch = nitro.epoch, step = nitro.step, loss = loss_n == 0 ? NaN : loss_sum / loss_n),
     metrics_out,
@@ -82,13 +54,9 @@ history_row(nitro, loss_sum, loss_n, metrics_out) = merge(
 """
     history(nitro) -> MetricHistory
 
-The per-epoch series this handle's `train!` calls produced: `(; epoch, step, loss, metrics...)`
-per validated epoch, as a [`MetricHistory`](@ref) that indexes by epoch and by metric name and
-displays as a table sized to the terminal.
-
-Fresh per handle. A handle built with `resume = :auto` starts its history at the epoch it resumed
-from, and the table says so; the earlier epochs are in the logger's record. Nothing is read from
-disk here, which is what lets it work with any logger backend, or none.
+The per-epoch series this handle's `train!` calls produced, as a [`MetricHistory`](@ref). Fresh per
+handle: a resumed handle starts at the epoch it resumed from, and the table says so. Nothing is read
+from disk, so it works with any logger backend or none.
 """
 function history(nitro::Nitro)
     rows = nitro.history
@@ -163,8 +131,8 @@ end
 
 # ── Tables.jl ──────────────────────────────────────────────────────────────────────
 #
-# Column access only: Pluto replaces the `text/html` show of any table that reports row access
-# with its own grid of raw values. Tables.jl derives rows from columns for everything else.
+# Column access only: Pluto replaces the `text/html` show of a table reporting row access with its
+# own grid.
 Tables.istable(::Type{MetricHistory}) = true
 Tables.columnaccess(::Type{MetricHistory}) = true
 Tables.columns(h::MetricHistory) =
@@ -241,13 +209,9 @@ end
 """
     ReactantNitro.thin_rows(n, best, budget) -> Vector{Int}
 
-Which of `n` rows to show when only `budget` lines are available: windows around the first, the
-`best` (or `nothing`) and the last row, each grown one row at a time in turn until the budget is
-spent, with `0` marking a gap between windows. A gap costs one line, so the result's length is at
-most `budget`, and every row is shown when `n <= budget`.
-
-The windows grow round-robin, the best one in both directions, so the best epoch gets roughly twice
-the context of the ends. Windows that meet merge, which frees the gap's line for another row.
+Which of `n` rows to show in `budget` lines: windows around the first, the `best` (or `nothing`)
+and the last row, grown one row at a time round-robin until the budget is spent, with `0` marking
+a gap. The best window grows in both directions, so it gets twice the context of the ends.
 """
 function thin_rows(n::Int, best::Union{Nothing, Int}, budget::Int)
     n <= budget && return collect(1:n)
@@ -279,10 +243,8 @@ function _gaps(keep::Set{Int})
     return count(i -> s[i + 1] > s[i] + 1, 1:(length(s) - 1))
 end
 
-# One cell, given the column's decimal count. An integer is itself; a non-finite value prints as
-# such, because a `NaN` in the table is a finding and a blank would hide it; a float prints with
-# the column's decimals so the points line up down the column, or in `%g` form for a column that
-# `_column_decimals` decided has no sensible fixed count.
+# One cell, given the column's decimal count. A non-finite value prints as such, since a `NaN` in
+# the table is a finding; a float prints with the column's decimals so the points line up.
 _history_cell(::Missing, decimals) = ""
 _history_cell(x::Bool, decimals) = string(x)
 _history_cell(x::Integer, decimals) = string(x)
@@ -294,10 +256,7 @@ function _history_cell(x::AbstractFloat, decimals)
 end
 
 # The decimals a column prints with: enough that its smallest shown magnitude keeps four
-# significant digits, so `0.7` and `0.02531` in one column print as `0.70000` and `0.02531` and
-# the points align. Capped at six; a column with a value past that, or past a million, has no
-# fixed count that reads and prints in `%g` form instead (`nothing`). A column with no finite float
-# is left alone.
+# significant digits, capped at six; a column past that or past a million prints in `%g` form.
 function _column_decimals(rows, picks, c)
     smallest, largest = Inf, 0.0
     for p in picks
@@ -318,21 +277,17 @@ end
 """
     ReactantNitro.history_table(h, height, width) -> NamedTuple
 
-Everything a renderer needs to draw `h` in a `height` x `width` terminal, computed without one:
-`title`, `labels`, `cells::Matrix{String}`, `alignment`, `best_row` (or `nothing`), `gap_rows`, and
-`note`. Rows are thinned with [`thin_rows`](@ref) to the lines left after the frame; columns past
-the fixed four are dropped from the right until the widths fit, and the note names what was left
-out and how to select it. Each float column prints with one decimal count, chosen so its smallest
-shown value keeps four significant digits, so the points align down the column.
+Everything a renderer needs to draw `h` in a `height` x `width` terminal: `title`, `labels`,
+`cells::Matrix{String}`, `alignment`, `best_row`, `gap_rows` and `note`. Rows are thinned with
+[`thin_rows`](@ref); columns past the fixed four are dropped from the right until the widths fit,
+and the note says what was left out and how to select it.
 """
 function history_table(h::MetricHistory, height::Integer, width::Integer)
     rows, cols = _rows(h), _columns(h)
     best = _best(h)
     n = length(rows)
     ibest = best === nothing ? nothing : findfirst(r -> r.epoch == best.epoch, rows)
-    # Title, column labels, header rule, top and bottom rules, the note, and a line of air: nine
-    # lines the table spends before a row of data. Never fewer than five data lines, which is the
-    # three anchors and two gaps.
+    # Nine lines of frame before a row of data; never fewer than five data lines.
     budget = max(5, Int(height) - 9)
     picks = thin_rows(n, ibest, budget)
     shown = count(!=(0), picks)
@@ -392,14 +347,11 @@ function history_table(h::MetricHistory, height::Integer, width::Integer)
     )
     fe = getfield(h, :first_epoch)
     fe > 1 && push!(notes, "epochs before $fe were trained in another process")
-    # One note per line: a footer that wraps mid-sentence under a table is harder to read than
-    # a frame that is one line taller.
+    # One note per line.
     return (; title, labels, cells, alignment, best_row, gap_rows, note = join(notes, "\n  "))
 end
 
-# The frame's width for these columns: every cell padded to its column, two blanks of padding per
-# column, and the outer rules. An estimate of PrettyTables' layout rather than a call into it,
-# close enough to decide a drop and cheap enough to run per column.
+# An estimate of PrettyTables' layout, close enough to decide a drop.
 function _table_width(rows, picks, keep)
     w = 0
     for c in keep
@@ -422,20 +374,11 @@ end
     ReactantNitro.history_series(h; x = :epoch, metrics = nothing) -> NamedTuple
 
 Everything a plot of `h` draws, computed without a plotting package: `title`, `xlabel`, and
-`panels`, one per curve, each `(; name, x, y, best, subtitle)`.
-
-`x` is `:epoch` or `:step`, the axis. `metrics` picks the curves:
-
-- `nothing`, the default: the checkpointer's metric when the history has it as a column, which is
-  the one curve the run was selecting on; otherwise every metric column; otherwise `loss`
-- `:all`: every column, `loss` included
-- one name, or a collection of names, in the history's column order
-
-`best` is the `(x, y)` of the checkpointer's chosen epoch on that metric's panel when the selection
-still holds that epoch, and `nothing` on every other panel. A row that lacks a metric is skipped; a
-non-finite value is kept, so the drawn line breaks where the run did. The Makie extension turns
-this into `plot(h)`, so `plot(h[10:20, :acc])` and `plot(h; x = :step, metrics = :all)` are both
-how to ask for a different figure.
+`panels`, one per curve, each `(; name, x, y, best, subtitle)`. `x` is `:epoch` or `:step`.
+`metrics` is `nothing` (the checkpointer's metric when the history has it, else every metric
+column, else `loss`), `:all`, one name, or a collection. `best` marks the checkpointer's chosen
+epoch on that metric's panel. A row lacking a metric is skipped; a non-finite value is kept, so the
+line breaks where the run did. The Makie extension turns this into `plot(h)`.
 """
 function history_series(h::MetricHistory; x::Symbol = :epoch, metrics = nothing)
     x in (:epoch, :step) || error("ReactantNitro: `x` must be `:epoch` or `:step`, got `$x`.")

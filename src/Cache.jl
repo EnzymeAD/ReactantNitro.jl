@@ -1,25 +1,16 @@
 # Cache.jl
 #
 # The module-level compile cache: its key, its world guards, and the rule that decides a hit.
-#
-# Requirement: repeated `train!`, `validate`, `predict` in the same session must not recompile for
-# the same input. A module-level cache satisfies this with zero API surface: no handle to thread and
-# no ownership question, which also defers the `CompiledModel` question until real use answers what a
-# handle would add.
-#
-# THE INVARIANT: a hit must be provably the same program; when in doubt, MISS. An over-specific key
-# costs a recompile; an under-specific key runs the wrong program.
-#
-# No cross-session persistence, no eviction, and no verification mode.
+# Repeated `train!`, `validate` and `predict` in one session must not recompile for the same input.
+# The invariant: a hit must be provably the same program, and when in doubt, miss. No cross-session
+# persistence, no eviction.
 
 """
     ReactantNitro.CACHE
 
-The module-level compile cache and its lock. The cache and the module-level phase registry are the
-two process-global pieces of bookkeeping, and both are lock-guarded so concurrent `train!` calls
-cannot corrupt each other. **Nothing else about concurrent runs in one process is designed for**,
-and the device memory of two simultaneous runs is the user's problem: one run per process is the
-supported configuration.
+The module-level compile cache and its lock. It and the phase registry are the two process-global
+structures, both lock-guarded so concurrent runs cannot corrupt each other's bookkeeping; one run
+per process is the supported configuration.
 """
 const CACHE = Dict{Any, Any}()
 const CACHE_LOCK = ReentrantLock()
@@ -27,23 +18,13 @@ const CACHE_LOCK = ReentrantLock()
 """
     ReactantNitro.CACHE_CLOSURES
 
-The world-closure guard: each cache entry's dependency closure, captured at compile time and
-keyed by the same key as [`CACHE`](@ref). [`world_closure_staleness`](@ref) re-resolves it against
-live dispatch at the entry points and poisons any entry whose methods moved, so a downstream
-redefinition that the hook worlds cannot see (a helper `forward` calls, a dependency method)
-becomes a cache miss for a NEW `Nitro` instead of a silent stale hit. An existing `Nitro` keeps
-its compiled programs, now stale, and is told so in the report: the handle-local thunk store makes
-the frozen contract literal (see [`compile_cached`](@ref) and `fixed_config_report`).
-
-The gradient program stores [`fwd_program`](@ref)'s closure, not its own: the backward pass runs
-inside Enzyme's interpreter, which plain inference cannot descend into, so `grad_program`'s own
-closure captures nothing but glue (measured: 143 methods, missing `forward` and `loss` entirely). Its
-behavior is `forward`'s behavior, so `fwd_program`'s closure is the guard that makes a downstream
-edit miss for the expensive program too.
-
-`LAST_WORLD_CHECKED` is the memo behind [`world_closure_staleness`](@ref)'s world check: a drift is
-only possible when the world counter moved since the last scan, so an unchanged counter skips the
-whole re-resolution.
+The world-closure guard: each entry's dependency closure, captured at compile time under the same
+key as [`CACHE`](@ref). [`world_closure_staleness`](@ref) re-resolves it against live dispatch at
+the entry points and poisons any entry whose methods moved, so a redefinition below the hooks (a
+helper `forward` calls) becomes a miss for a new `Nitro`; an existing one keeps its programs and is
+told so. The gradient program stores [`fwd_program`](@ref)'s closure, since the backward pass runs
+inside Enzyme's interpreter, which inference cannot descend into. `LAST_WORLD_CHECKED` memoizes the
+scan on the world counter.
 """
 const CACHE_CLOSURES = Dict{Any, Any}()
 const LAST_WORLD_CHECKED = Ref{UInt}(0)
@@ -55,112 +36,49 @@ const LAST_WORLD_STALENESS = Ref((; poisoned = Any[], drifted = Symbol[]))
 """
     ReactantNitro.cache_key(f, ev, args, baked) -> key
 
-The compile cache key. Its experiment-derived components are computed **once per `Nitro`**, into
-`nitro.frozen.graphconst_hash`, and passed in as `gc_hash`; its argument types and shapes are read
-per compiled-program invocation.
-
-**That split is a requirement, not an optimization, in one direction and the reverse in the other.**
-The argument half MUST be recomputed every call: Reactant's `@generated` guard covers types but not
-shapes, which is precisely why a ragged batch passes the guard and then fails inside XLA, so a cache
-that skipped the shape check would reintroduce that. The experiment half CANNOT change within a run,
-and that is guaranteed rather than assumed: the per-step rebuild reconstructs `ev` mid-run, and
-`set_device!` errors if the rebuild moves `graphconst_field_hash`.
-
-An earlier implementation recomputed the experiment half on every `compile_cached`, which runs per
-micro-batch, while this docstring already claimed it was computed once. Measured, that cost about
-0.04 ms per epoch and was never worth fixing for speed; it was fixed because the contract said one
-thing and the code did another, and because it bounds a real footgun. A `GraphConst`
-holding a 1e6-element array hashes in 624 us, so rehashing per micro-batch is about 343 ms per
-epoch. Now it is hashed once per handle.
+The compile cache key. The experiment-derived component is computed once per `Nitro`
+(`nitro.frozen.graphconst_hash`); the argument types and shapes are read on every call, because
+Reactant's `@generated` guard covers types but not shapes, which is why a ragged batch passes it and
+fails inside XLA.
 
 | Component | Why |
 | --- | --- |
 | Function identity | The obvious part |
 | Argument types | Includes `st`'s train/eval mode, so the two paths separate for free |
-| Argument **shapes** | Reactant's `@generated` guard covers types but not shapes, since shape is a runtime field; that gap is why a ragged batch passes the guard and then fails inside XLA |
-| A hash of the **`GraphConst`** experiment fields | These bake as trace-time constants |
-| The **`primary_world` of every resolved user hook** | Method redefinition |
+| Argument shapes | Reactant's guard covers types but not shapes |
+| A hash of the `GraphConst` experiment fields | These bake as trace-time constants |
+| The `primary_world` of every resolved user hook | Method redefinition |
+| `baked` | `train!` keywords that reach a trace as constants (`accum`) |
 
-**Method redefinition is in the key.** Function identity is stable across a redefinition, so in a
-REPL with Revise, editing `forward` and calling `train!` again would hit the cache and silently run
-the old program. Since this framework is REPL-first, this is the most likely failure in practice.
-**Verified:** `which(f, argtypes).primary_world` moves when that method is redefined and is
-**stable** when an unrelated function is defined, while `Base.get_world_counter()` moves on any
-definition anywhere, which would invalidate the cache every time a user defines anything at the REPL.
-Hooks covered: `forward`, `loss`, `metrics`, `train_metrics`, `finalize_metrics`, `param_group`,
-`optimizer`, **plus every rule's `apply!`, for the optimizer program only**.
+Method redefinition is in the key because function identity is stable across one: in a REPL with
+Revise, editing `forward` and calling `train!` again would otherwise run the old program.
+`primary_world` moves only when that method is redefined, where `Base.get_world_counter()` moves
+on any definition. Hooks covered: `forward`, `loss`, `metrics`, `train_metrics`,
+`finalize_metrics`, `param_group`, `optimizer`, plus every rule's `apply!` for the optimizer program
+only. All of it is resolved at construction into `nitro.frozen`, so only a new `Nitro` observes a
+redefinition (see [`frozen_dispatch`](@ref) and [`stale_hooks`](@ref)).
 
-**All of it is resolved at CONSTRUCTION**, into `nitro.frozen`, so an existing handle is a fixed
-point and only a new `Nitro` observes a redefinition. See
-[`ReactantNitro.frozen_dispatch`](@ref) for the three tuples and why they are not one, and
-[`ReactantNitro.stale_hooks`](@ref) for what tells a user their handle is stale.
+`accum` and `gradient_clip_norm` have no world entry: both are resolved once into the handle and
+reach a trace through `baked` and through `Val`'s type parameter, so an accessor override cannot
+change a program without moving a component already present, and a world entry could only fire
+spuriously (it once re-bought a 500 s gradient compile for a byte-identical program). `accum`
+invalidates the gradient program and the clip the optimizer program, so a clip sweep re-pays the
+cheap compile only.
 
-**`accum` and `gradient_clip_norm` are deliberately NOT covered**, though they once were. Both are
-resolved once, at `Nitro` construction, into `nitro.accum` and
-`nitro.gradient_clip_norm`, and the value that reaches a trace is always the stored field: `accum`
-through `baked = (; accum = nitro.accum)` and the clip through `Val(nitro.gradient_clip_norm)`, whose
-value lives in the argument's **type**. So an accessor override cannot reach a trace without also
-moving a key component that is already present, which makes the world entry unable to catch anything
-and able to fire spuriously: revising `accum(::MyExp)` on a handle built before the edit used to
-recompile **both** programs, 495.6 s plus 63.1 s, to rebuild the identical `inv_n = 1/nitro.accum`.
-Worse than wasted, because the recompile the user sits through is their only evidence that Revise
-"worked", and it is caused by the world entry rather than by any change in the program. See
-[`fixed_config_report`](@ref) for what tells them instead.
+`Device` fields are skipped (traced inputs) and `Host` fields are skipped (not in the traced view);
+the key hashes `compile_view(e)`'s `GraphConst` fields only, since hashing the view itself would
+include device scalars that change every step. Every included field must hash by content, which
+[`assert_graphconst_hashable`](@ref) enforces: identity hashing fails in both directions, a
+harmless miss on two identical configurations and a silent hit on a value mutated in place.
 
-**Skip `Device` fields** (traced inputs, so their values cannot affect the program) **and skip
-`Host` fields** (not in the traced view at all). **Both exclusions are needed, and one does not
-follow from `compile_view`**: that view strips `Host` and leaves `Device` in place, so keying on it
-would hash device scalars that change every step and **every optimizer step would miss and
-recompile**. The key is computed over `compile_view(e)`'s `GraphConst` fields only, that is
-`setdiff(fieldnames(typeof(e)), device_fields(typeof(e)), host_fields(typeof(e)))`.
-
-**`train!` keywords that bake must be in the key too.** `accum` reaches the gradient program as
-`inv_n = 1/N`, a host constant, so two calls in one session at different `accum` would otherwise hit
-the same program and silently train at the wrong micro-gradient scale. Today that set is `accum` and
-`gradient_clip_norm`; `seed` is deliberately excluded because it reaches no trace. **The two differ
-in which program they invalidate**: `accum` bakes into the **gradient** program (measured 495.6 s)
-and the clip into the **optimizer** program (63.1 s), so the key is naturally per program rather
-than per run, and a clip sweep re-pays the cheap compile and reuses the expensive one. Compiling no
-fused program is what keeps that true.
-
-**Hashing rule:** `hash` each included field, and **refuse at setup any field that does not hash by
-content** (see [`assert_graphconst_hashable`](@ref)).
-
-!!! warning "This rule was reversed, and the earlier version of it was wrong"
-    This paragraph used to read: a field whose type has no value-based `hash` "falls
-    back to object identity and therefore misses on every reconstruction of the experiment, which is
-    a **recompile rather than a wrong answer, and is the safe direction**. Document it; do not try to
-    detect it." **The safe-direction claim is false, and it was the reason nobody looked.** Identity
-    hashing fails in BOTH directions: two identical configurations miss, which is the harmless half,
-    and a value **mutated in place** still hashes the same, so the cache serves a program compiled
-    for the old value and the resume check passes. That is a wrong answer, silently, and it is a
-    second hole beside the method-body one below. Measured, and found by a port rather than by
-    reasoning about the rule.
-
-**What the key does not cover, and must not be assumed to:** constants reached from method *bodies*,
-such as a `const` in the user's module, a global, or a literal that changed on edit. The
-`primary_world` component catches the common case, the method itself being edited, but a `const`
-redefined without touching the method is not visible. **That is the one thing requiring a REPL
-restart.**
-
-**What the entry-point guard adds, and what still requires a restart.** A method redefinition
-anywhere in the trace call tree BELOW the hooks (a helper `forward` calls, a dependency method)
-moves no hook world, so the key alone would serve the stale program silently.
-[`world_closure_staleness`](@ref) closes that at the entry points: each entry carries the
-transitive closure of the methods it was compiled against, and a moved closure poisons the entry,
-so a NEW `Nitro` recompiles against current dispatch while an existing `Nitro` keeps its programs,
-now stale, and is told so in the report (the handle-local thunk store is what makes "existing" and
-"new" different: only a handle that never compiled a program can miss). What still
-requires a REPL restart is the same class, values rather than methods: a `const` redefined, a
-global, a literal, and a custom ChainRules `rrule` (a user method the backward pass calls that
-plain inference cannot see). These are the cases a method world cannot express.
+Not covered: constants reached from method bodies, a `const` in the user's module, a global, a
+literal changed on edit, and a custom ChainRules `rrule`. The closure guard catches a method
+redefinition below the hooks; values are the one thing that still requires a REPL restart.
 """
 const CACHE_HITS = Ref(0)
 const CACHE_MISSES = Ref(0)
 
-# Shapes are in the key because Reactant's `@generated` guard covers types but not shapes, since
-# shape is a runtime field; that gap is why a ragged batch passes the guard and then fails inside
-# XLA.
+# Shapes are in the key because Reactant's `@generated` guard covers types but not shapes.
 _shape(x::AbstractArray) = size(x)
 _shape(x::Union{Tuple, NamedTuple}) = map(_shape, x)
 _shape(x::Optimisers.Leaf) = (_shape(x.rule), _shape(x.state))
@@ -169,33 +87,17 @@ _shape(x) = nothing
 """
     ReactantNitro.graphconst_field_hash(ev) -> UInt
 
-A hash of `compile_view(e)`'s **`GraphConst` fields only**, that is
-`setdiff(fieldnames(typeof(e)), device_fields(typeof(e)), host_fields(typeof(e)))`.
-
-**Both exclusions are needed and neither subsumes the other.** `compile_view` strips `Host` and
-leaves `Device` in place, so hashing the view itself would hash device scalars that change every
-step and **every optimizer step would miss the cache and recompile**.
-
-**Hashing rule:** `hash` each included field. This hashes the **instance of `T`**, never the
-`GraphConst{T}` marker, which is a zero-field type the `@experiment` macro strips: the declared field
-type is `T` and the stored value is a `T`.
-
-That is necessary and not sufficient. Hashing the instance is
-content-based only if `T` **has** a `hash` method. A config struct holding a `Vector` has none, so
-`Base.hash` falls through to `hash(objectid(x), h)` and reaches the vector by identity rather than
-descending into it; the vector's own content-based `hash`, one level down, is never called.
-[`assert_graphconst_hashable`](@ref) refuses that at setup rather than letting it reach a compile,
-and carries the full argument for refusing over hashing structurally.
+A hash of `compile_view(e)`'s `GraphConst` fields only. Both exclusions are needed: `compile_view`
+strips `Host` and leaves `Device` in place, so hashing the view would hash device scalars that
+change every step. Each field's instance is hashed, which is content-based only if its type has a
+`hash` method; a struct holding a `Vector` falls through to `objectid`, and
+[`assert_graphconst_hashable`](@ref) refuses that at setup.
 """
 function graphconst_field_hash(ev)
     T = typeof(ev)
     df, hf = device_fields(T), host_fields(T)
-    # The seed is the type NAME, not the type. `Device` and `Host` fields each carry their own type
-    # PARAMETER, so `typeof(e)` changes whenever a Device is converted to device residency, which
-    # the framework does at setup and again on every optimizer step. Seeding with `hash(T)`
-    # therefore makes every step miss and recompile, which is the exact failure keying on
-    # `GraphConst` fields avoids, and which the cache tests cover. `typename` is stable across those
-    # parameterizations and still distinguishes two experiment types that share field names.
+    # Seeded on the type NAME: `Device` and `Host` fields carry their own type parameters, so
+    # `typeof(e)` changes at every device conversion and `hash(T)` would make every step miss.
     h = hash(Base.typename(T))
     for f in fieldnames(T)
         (f in df || f in hf) && continue
@@ -207,38 +109,14 @@ end
 """
     ReactantNitro.assert_graphconst_hashable(e) -> nothing
 
-Refuse at setup a `GraphConst` value that does **not** hash and compare by CONTENT, because every
-guarantee the compile cache and the resume check make about configuration rests on `hash` and
-`isequal` answering "is this the same configuration" rather than "is this the same object".
-
-**The check is one line of semantics:** a value and its `deepcopy` must hash equal and be `isequal`.
-A `deepcopy` is structurally identical and a different object, so the two agree exactly when the
-answer comes from contents.
-
-**What this catches, and what it deliberately does not.** A `GraphConst{Vector{Int}}` passes:
-`hash(::AbstractArray)` is content-based, and using a vector in a configuration is an ordinary thing
-to do. What fails is a `GraphConst` whose value is a **struct containing** a mutable field, because
-`Base.hash` has no method for that struct and falls through to `hash(objectid(x), h)`, and
-`objectid` reaches a `Vector` field by identity rather than descending into it. The perfectly good
-`hash` of the vector one level down is never called.
-
-Three symptoms follow, and the third is why this is an error rather than a warning:
-
-  * **A full recompile per `Nitro` handle.** Two identically constructed experiments produce
-    different keys, and the gradient program is measured in hundreds of seconds.
-  * **A spurious resume refusal.** [`check_config_compatible`](@ref) reports a field as changed and
-    prints a diff whose two sides are identical.
-  * **Silent reuse of the wrong program.** Mutating the vector in place does **not** move the key,
-    so the framework serves a program compiled for the old value and the resume check passes. The
-    cache's contract is that the framework refuses to silently reuse a program a change it can see
-    would invalidate; this is a change it cannot see, and it is a second hole beside the documented
-    one.
-
-**Why refusing beats fixing it in the framework.** A structural hash that descends into any struct
-without its own `hash` method would work, and was rejected: it would change the key of every
-existing experiment carrying a struct-valued `GraphConst`, so every checkpoint for those models
-would refuse to resume once, and it would silently paper over a type whose author never decided what
-equality means. Refusing costs three lines in the model and makes the contract visible.
+Refuse at setup a `GraphConst` value that does not hash and compare by content, since the compile
+cache and the resume check both rest on `hash` and `isequal` meaning "the same configuration". The
+check: a value and its `deepcopy` must hash equal and be `isequal`. A `GraphConst{Vector{Int}}`
+passes, since arrays hash by content; a struct containing a mutable field fails, since `Base.hash`
+falls through to `objectid` for it. Left through, that costs a full recompile per handle, a spurious
+resume refusal with an identical-looking diff, and, silently, reuse of a program compiled for a
+value since mutated in place. Refused rather than fixed by a structural hash, which would change
+every existing key and paper over a type whose author never decided what equality means.
 """
 function assert_graphconst_hashable(e)
     for (f, x) in pairs(graphconst_fields(e))
@@ -313,17 +191,11 @@ end
 """
     ReactantNitro.method_world(f, argtypes) -> UInt
 
-`which(f, argtypes).primary_world`, or `0` when the hook has no method.
-
-**Verified:** `primary_world` moves when that method is redefined and is **stable** when an
-unrelated function is defined, while `Base.get_world_counter()` moves on any definition anywhere.
-So the key uses the per-hook method world; the global counter would invalidate the cache every time a
-user defines anything at the REPL, which for a REPL-first design is every few seconds.
-
-`Method.primary_world` is one of the two load-bearing internals the Julia floor of 1.12 is pinned
-for. The documented fallback, `Base.get_world_counter()` with its over-firing accepted, is taken
-automatically if the field ever goes away, and [`primary_world_available`](@ref) is the test that
-fails loudly when it does.
+`which(f, argtypes).primary_world`, or `0` when the hook has no method. `primary_world` moves when
+that method is redefined and is stable otherwise, where the global world counter moves on any
+definition at the REPL. It is one of the load-bearing internals the Julia floor of 1.12 is pinned
+for; `Base.get_world_counter()` is the over-firing fallback if it goes away, and
+[`primary_world_available`](@ref) is the test that says so.
 """
 function method_world(f, argtypes)
     hasmethod(f, argtypes) || return UInt(0)
@@ -343,48 +215,23 @@ primary_world_available() = hasfield(Method, :primary_world)
 """
     ReactantNitro.hook_worlds(ev; model, ps, st, chains) -> Tuple
 
-The `primary_world` of every resolved user hook. Function identity is stable across a
-redefinition, so without this, editing `forward` in a REPL with Revise and calling `train!` again
-would hit the cache and silently run the old program. **Since this framework is REPL-first, this is
-the most likely failure in practice.**
-
-**The `chains` loop below WAS dead code, and is not any more.** Until it was fixed, all three
-call sites omitted `chains`, so the `()` default always applied and `_rules_of` was never reached;
-`compile_cached`'s fallback could not rescue it either, because every call site passed `worlds`
-explicitly and the fallback only fires on `nothing`. A user with a custom `Optimisers.AbstractRule`
-who revised its `apply!` got a stale optimizer program with no invalidation, which is the failure
-class this function exists to prevent, and two docstrings asserted the opposite.
-
-Its caller is now [`ReactantNitro.frozen_dispatch`](@ref), and it is the **only** one, because the
-chain set has to be resolved **once, at construction**: `rebuild_rules` reconstructs chains every
-optimizer step, so a per-call resolution has nothing correct to hand it, while only the rules' VALUES
-move per step and their types, hence their `apply!` methods, are the ones built at setup. The result
-goes into `worlds_opt` and **not** into `worlds_train`, so a rule edit cannot re-buy the 495.6 s
-gradient compile: `opt_program` traces no user hook, and `grad_program` contains no `apply!`.
-
-**`accum` and `gradient_clip_norm` are absent by design.** Both are snapshotted into the `Nitro` at
-construction, so neither can reach a trace except through `baked` or through `Val`'s type parameter,
-both already in the key. Including them could only ever fire spuriously; [`cache_key`](@ref) carries
-the measurement.
-
-**What this does not cover, and must not be assumed to:** constants reached from method *bodies*, a
-`const` in the user's module, a global, or a literal that changed on edit. The `primary_world`
-component catches the common case, the method itself being edited. A `const` redefined without
-touching the method is **the one thing that requires a REPL restart**.
+The `primary_world` of every resolved user hook, so that editing `forward` in a REPL and calling
+`train!` again does not run the old program. Its only caller is [`frozen_dispatch`](@ref), at
+construction: the chain set has to be resolved once, since `rebuild_rules` reconstructs chains
+every step while only their values move, and the rules' `apply!` worlds go into `worlds_opt` only,
+so a rule edit cannot re-buy the gradient compile. `accum` and `gradient_clip_norm` are absent by
+design (see [`cache_key`](@ref)). A `const` redefined without touching a method is the one thing
+that requires a REPL restart.
 """
 function hook_worlds(ev; model = Any, ps = Any, st = Any, chains = ())
-    # An INSTANCE, not a type. Every other hook here is only RESOLVED, so a type would do, but
-    # `metrics_residency` has to be EVALUATED to know whether a metric hook is even in the key,
-    # and evaluating it needs something to dispatch on. Handed a type, the call would fall through
-    # to the defaults and silently key on the wrong set of hooks, so it is rejected instead.
+    # An instance, not a type: `metrics_residency` has to be evaluated to know whether a metric
+    # hook is even in the key.
     ev isa Type && error("ReactantNitro: `hook_worlds` needs an experiment instance rather than the \
         type `$ev`. `metrics_residency` decides which metric hooks are in the compile key and must \
         be evaluated, which a type cannot dispatch.")
     E = typeof(ev)
     T(x) = x isa Type ? x : typeof(x)
-    # A metric hook is in the key only when it is TRACED. A `:host` hook is part of no program, so
-    # including its world would recompile `forward` every time a user edited a metric that never
-    # entered the graph, which is the friction the host default for metrics exists to remove.
+    # A metric hook is in the key only when traced; a `:host` hook is part of no program.
     traced_metric(hook) = metrics_residency(ev, hook) === :device
     ws = UInt[
         method_world(forward, Tuple{E, T(model), T(ps), T(st)}),
@@ -395,23 +242,15 @@ function hook_worlds(ev; model = Any, ps = Any, st = Any, chains = ())
         method_world(param_group, Tuple{E, Any}),
         method_world(optimizer, Tuple{E}),
     ]
-    # NO `accum` and NO `gradient_clip_norm`. Both are resolved once at `Nitro`
-    # construction and read from the stored field thereafter, so the value that reaches a trace is
-    # already in the key: `accum` via `baked = (; accum = nitro.accum)` and the clip via
-    # `Val(nitro.gradient_clip_norm)`, whose value IS its type parameter. An accessor override
-    # therefore cannot change a program without moving a component that is already present, so a
-    # world entry here catches nothing and can only fire spuriously. Adding one back re-buys the
-    # 495.6 s gradient recompile for a byte-identical program; if you think you need it, you need
-    # `baked`. `fixed_config_report` is what tells the user their handle is stale.
+    # No `accum` and no `gradient_clip_norm`: both reach a trace through components already in the
+    # key, so a world entry could only fire spuriously (see `cache_key`).
     for chain in chains, r in _rules_of(chain)
         push!(ws, method_world(Optimisers.apply!, Tuple{typeof(r), Any, Any, Any}))
     end
     return Tuple(ws)
 end
 
-# `gc_hash` is the experiment-derived component, supplied by a caller that already has it and
-# recomputed only when it does not. See `frozen_dispatch`'s `graphconst_hash` for why passing it is
-# safe for a whole run, and why the ARGUMENT half above it must still be recomputed every call.
+# `gc_hash` is supplied by a caller that already has it and recomputed only when it does not.
 _gc_hash(ev, gc_hash) = gc_hash === nothing ? graphconst_field_hash(ev) : gc_hash
 
 function cache_key(f, ev, args, baked = (); gc_hash = nothing)
@@ -425,26 +264,13 @@ end
 """
     ReactantNitro.compile_cached(f, ev, args...; phase, baked) -> thunk
 
-Look the program up and compile on a miss. Compile follows data: the cache is created after
-`build_data` and populated lazily on first use, not from declared shapes. There is no
-`batch_shapes` declaration.
-
-**When `nitro` is passed, the thunk is memoized on the handle as well as the module cache.**
-A handle that has already compiled a program keeps its thunk even if the module entry is later
-poisoned by [`world_closure_staleness`](@ref): the run paths consult the module cache at most once
-per program per handle, so an existing `Nitro` is a true fixed point and a stale program is served
-explicitly, not silently, with the report telling the user to rebuild.
-
-An XLA compile failure surfaces as an enormous MLIR dump with no context, so **every compile is
-wrapped in a handler that names the phase, the function, and the argument shapes before
-rethrowing**, truncating the dump to a bounded prefix with a pointer to the full text on disk.
-
-**`nitro` is how the `Compiling` phases become real transitions.** A cache HIT is not a compile
-and publishes nothing; a MISS publishes the phase before the blocking call and the previous phase
-after it. This is the one place that knows which of the two happened, which is why the firing lives
-here rather than at the four call sites. On a compile that throws, the phase is left where it is and
-the caller's handler moves the run to `Failed`, rather than announcing a return to `TrainStepping` that
-never happened.
+Look the program up and compile on a miss; the cache is populated lazily from real batches, not
+declared shapes. When `nitro` is passed, the thunk is also memoized on the handle, so a handle that
+has compiled a program keeps its thunk even after the module entry is poisoned: an existing `Nitro`
+is a true fixed point and a stale program is served explicitly, with the report saying to rebuild.
+A miss publishes the `Compiling` phase before the blocking call and restores the previous phase
+after it; a hit publishes nothing. A compile that throws is wrapped by
+[`compile_with_context`](@ref) and leaves the phase where it is.
 """
 function compile_cached(
         f, ev, args...; phase = nothing, baked = (), worlds = nothing,
@@ -454,11 +280,8 @@ function compile_cached(
     w = worlds === nothing ? hook_worlds(ev; model, ps, st, chains) : worlds
     key = cache_key(f, ev, args, baked, w; gc_hash)
 
-    # The handle-local memo: a `Nitro` that has already compiled a program keeps
-    # ITS thunk, even if the module entry is later poisoned. This is what makes "an existing handle
-    # is a fixed point" literal: the entry-point guard poisons the module cache so NEW handles
-    # recompile, and a handle that already holds its programs never re-looks-up, so it can never be
-    # made to recompile behind the user's back.
+    # The handle-local memo: a handle that holds its programs never re-looks-up, so it can never
+    # be made to recompile behind the user's back.
     programs = nitro === nothing ? nothing : nitro.programs
     if programs isa Dict && haskey(programs, key)
         CACHE_HITS[] += 1          # a memo hit IS a hit: the program exists, nothing recompiles
@@ -475,24 +298,15 @@ function compile_cached(
     end
     CACHE_MISSES[] += 1
 
-    # Compiled OUTSIDE the lock. Holding it across a compile measured in hundreds of seconds would
-    # block every other lookup in the process; the cost is that two concurrent runs can compile the
-    # same program once each, which is wasteful and correct. One run per process is the supported
-    # configuration anyway, and the lock exists so concurrent runs cannot CORRUPT each other's
-    # bookkeeping, not to make them efficient.
-    #
-    # This is a MISS, so a compile really is about to happen and the phase is published. The
-    # `Compiling` supertype exists so a watchdog can widen its timeout here rather than kill a run
-    # mid-compile, and it is only useful if the transition actually fires.
+    # Compiled outside the lock, so a minutes-long compile does not block every other lookup; two
+    # concurrent runs may compile the same program once each, which is wasteful and correct. A miss
+    # is a real compile, so the phase is published.
     resume_phase = nitro === nothing || phase === nothing ? nothing : nitro.phase
     resume_phase === nothing || set_phase!(nitro, phase)
     thunk = compile_with_context(f, args; phase)
     resume_phase === nothing || set_phase!(nitro, resume_phase)
-    # The world-closure guard: capture the dependency closure of the program just compiled, so
-    # [`world_closure_staleness`](@ref) can detect a downstream redefinition at the next entry
-    # point. A failed capture leaves the entry UNGUARDED rather than poisoning the run: the guard
-    # is additive and the hook worlds are still in the key, so a capture failure is a return to
-    # pre-guard behavior, not a new hole. `maxlog = 1` so a session that hits it hears it once.
+    # Capture the dependency closure for the world-closure guard. A failed capture leaves the entry
+    # unguarded rather than poisoning the run, since the hook worlds are still in the key.
     closure = try
         cf, at = _closure_target(f, args)
         world_closure(cf, at)
@@ -551,11 +365,9 @@ const MAX_DUMP_CHARS = 2000
 """
     ReactantNitro.world_closure_available() -> Bool
 
-Whether the internals the world-closure guard builds on still behave: `Base.specialize_method`,
-`Base._which`, and `Core.CodeInstance.edges`. Each load-bearing internal needs a test asserting it
-still behaves as documented, and this is the one for the closure guard: a `false` here means the
-guard has silently degraded to no coverage, which is the one direction the cache invariant forbids
-(an under-specific key runs the wrong program).
+Whether the internals the world-closure guard builds on (`Base.specialize_method`, `Base._which`,
+`Core.CodeInstance.edges`) still exist. `false` means the guard has silently degraded to no
+coverage, the one direction the cache invariant forbids.
 """
 world_closure_available() =
     isdefined(Base, :specialize_method) && isdefined(Base, :_which) &&
@@ -564,17 +376,11 @@ world_closure_available() =
 """
     ReactantNitro.world_closure(f, argtypes) -> Vector{Tuple{Method, Type}}
 
-The transitive closure of the methods a program depends on, taken from the compiler's own
-invalidation edges: force inference of `f` at `argtypes`, then walk `CodeInstance.edges` (each
-compiled method's callees) from the root. Julia records exactly this graph for its own invalidation,
-so this is the same data the runtime uses, exposed through the compiler.
-
-**Only dispatch winners are kept.** Inference also records intersection edges to methods involved
-in dispatch but not selected, and re-resolving those against `Base._which` is a false positive (the
-`convert(::Type{T}, ...)` family, measured at ~0.25% of a real closure). So each candidate
-`(method, signature)` is verified at capture time: `_which(sig)` must return that exact method, else
-the pair is dropped. What remains is the set whose redefinition provably changes what dispatch
-would pick, which is exactly the set a recompile would notice.
+The transitive closure of the methods a program depends on, from the compiler's own invalidation
+edges: force inference of `f` at `argtypes`, then walk `CodeInstance.edges` from the root. Only
+dispatch winners are kept: inference also records intersection edges to methods not selected, and
+re-resolving those is a false positive, so each `(method, signature)` is verified with `_which` at
+capture time.
 """
 function world_closure(f, argtypes::Type)
     fullsig = Core.apply_type(Tuple, typeof(f), argtypes.parameters...)
@@ -630,18 +436,11 @@ end
 """
     ReactantNitro._closure_target(f, args) -> (f, argtypes)
 
-Which function and argtypes an entry's closure is captured from. Everything captures its own
-closure; `grad_program` captures [`fwd_program`](@ref)'s instead, at the argument types derivable
-from grad's own (`ev, model, ps, st, batch, router`): the backward pass runs inside Enzyme's
-interpreter, which plain inference cannot descend into, so `grad_program`'s own closure captures
-nothing but glue (measured: 143 methods, missing `forward` and `loss` entirely). The gradient
-program's user-code behavior IS `forward`'s, so `fwd_program`'s closure is the guard that makes a
-downstream edit a miss for the expensive program too.
-
-`fwd_program` rather than `forward` directly, because a hook takes its batch fields as KEYWORDS:
-plain inference of the positional `forward` method cannot see past the kwcall shim, so `img` is
-unbound and the body's callees (the helpers that matter) are never reached. `fwd_program` calls
-`forward` through the routing machinery with real kwargs, which is exactly the path the trace used.
+Which function and argtypes an entry's closure is captured from. `grad_program` captures
+[`fwd_program`](@ref)'s instead of its own: the backward pass runs inside Enzyme's interpreter,
+which inference cannot descend into, so its own closure is glue with no `forward` or `loss` in it.
+`fwd_program` rather than `forward` directly, because a hook takes its batch fields as keywords and
+inference of the positional method stops at the kwcall shim.
 """
 _closure_target(f, args) = f === grad_program ?
     (
@@ -659,18 +458,10 @@ _closure_target(f, args) = f === grad_program ?
 """
     ReactantNitro.world_closure_staleness() -> (; poisoned, drifted)
 
-The entry-point guard. Re-resolves every cached entry's closure against live dispatch and
-POISONS (deletes from the module cache) any entry whose closure moved, so the next `compile_cached`
-on that key misses and rebuilds against current dispatch for a NEW `Nitro`. An existing `Nitro`
-that already compiled the program keeps its thunk (the handle-local memo), stays frozen, and is
-told it is stale by `fixed_config_report`. This is what turns a downstream redefinition the hook
-worlds cannot see (a helper `forward` calls, a dependency method) from a silent stale hit into a
-real miss for new handles.
-
-The world check is memoized: a drift is only possible if the world counter moved since the last
-scan, so an unchanged counter skips the whole re-resolution. Per-entry-point cost is one counter
-compare; the ~25 ms re-resolution is paid only when something was actually defined. `cache_reset!`
-resets the memo, so a test that redefines and re-checks always gets a fresh scan.
+The entry-point guard: re-resolve every cached entry's closure against live dispatch and poison
+(delete) any entry whose closure moved, so a new `Nitro` recompiles against current dispatch while
+an existing one keeps its thunk and is told it is stale. Memoized on the world counter, so an
+unchanged counter skips the scan; `cache_reset!` resets the memo.
 """
 function world_closure_staleness()
     w = Base.get_world_counter()

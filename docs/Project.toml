@@ -11,6 +11,7 @@
 # entry yet); CI's Pkg.instantiate() resolves it like any other package.
 # No Node is involved anywhere in the build anymore.
 [deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 DocumenterCodeBlocks = "b6400b83-267f-4b55-9fd8-bffc853bdfd8"
 DocumenterLandingPage = "1c52b33b-3e2f-4e99-b3b5-a6ad63f0d6d2"
@@ -23,7 +24,3 @@ ReactantNitro = "0.1"
 
 [sources]
 ReactantNitro = {path = ".."}
-# The landing-page plugin, from its git URL so the docs CI can resolve it;
-# a local build can override this with a path entry
-# ({path = "../../DocumenterLandingPage.jl"}) and instantiate again.
-DocumenterLandingPage = {url = "https://github.com/csvance/DocumenterLandingPage.jl"}

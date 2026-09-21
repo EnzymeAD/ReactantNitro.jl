@@ -5,38 +5,20 @@
 """
     EarlyStopping(; metric = :val_loss, mode = :min, patience = 5, min_delta = 1f-4)
 
-A small dedicated component, **independent of the checkpointer** even though both track improvement.
-The metrics can legitimately differ (checkpoint on `mae`, stop on `val_loss`), and the jobs differ
-(retention versus control flow); they share only the *convention* of a `metric` name and a
-`:min`/`:max` mode. Duplicating three lines of comparison beats the abstraction that would avoid it.
+The stopping policy, independent of the checkpointer: the metrics can differ and the jobs differ
+(retention versus control flow). `:val_loss` is what the default `metrics` emits; an experiment
+defining its own `metrics` names one of its keys, and a metric nothing emits is a setup error.
+`patience` counts epochs without improvement and `min_delta` is absolute, matching Keras and
+Lightning. `early_stop` defaults to `nothing`, so a bare experiment does not early-stop.
 
 ```julia
 train!(e; early_stop = EarlyStopping(; metric = :val_loss, mode = :min,
                                        patience = 5, min_delta = 1f-4))
 ```
 
-`:val_loss` is not a magic name: it is what the default `metrics` emits. An experiment defining its
-own `metrics` names one of its own keys instead, and **a metric no `metrics` emits is a setup error
-naming the available ones**, checked before training rather than at the first epoch.
-
-`patience` counts **epochs without improvement**; `min_delta` is **absolute**. Both match Keras and
-Lightning.
-
-**`early_stop` defaults to `nothing`, so a bare experiment does not early-stop.** A framework that
-truncates your run by default is surprising, any patience value would be a guess, and the licence
-this framework takes to be opinionated is scoped to where the evidence is one-sided, which here it
-is not. The test suite is worded to match and asserts a bare experiment does **not** early-stop.
-
-**Stopping is graceful:** finish the epoch, validate, checkpoint, finalize the logger, exit through
-the normal [`Done`](@ref) path. Aborting mid-epoch skips exactly the steps that make the run useful.
-
-**Stopping is recorded** as `stop_reason` in the checkpoint record, since "completed 40/40" and
-"stopped at 37 on patience" are different outcomes. That also makes resume comprehensible: a run that
-early-stopped and is resumed with `:auto` would immediately re-satisfy the condition, and with the
-reason stored it says so instead of exiting silently.
-
-[`request_stop!`](@ref) sets the same flag imperatively, from a REPL or a phase monitor. Both are
-checked once per epoch after validation.
+Stopping is graceful (the epoch finishes, validates, checkpoints, and exits through `Done`) and
+recorded as `stop_reason` in the checkpoint record, so a resume into a stopped run says so.
+[`request_stop!`](@ref) sets the same flag imperatively.
 """
 mutable struct EarlyStopping
     metric::Symbol
@@ -56,17 +38,9 @@ EarlyStopping(;
 """
     should_stop(es, epoch, metrics) -> Bool
 
-The stopping policy. Custom policies implement this for their own type; a `::Nothing` method returns
-`false`, which is how "no early stopping" stays the default with no branch in the driver.
-
-`patience` counts **epochs without improvement** and `min_delta` is **absolute**, both matching Keras
-and Lightning: an epoch improves when it beats the best seen **by more than `min_delta`**, and
-anything else, including an equal or slightly better value, counts against patience.
-
-**The metric is read through [`check_control_readback`](@ref)**, because this is control flow and
-every scalar the framework branches on must be validated: a failed `BufferToHost` on this stack
-returns garbage without raising, and a garbage value here either truncates a healthy run or lets a
-stalled one continue.
+The stopping policy; custom policies implement this for their own type, and the `::Nothing` method
+returns `false`. An epoch improves when it beats the best seen by more than `min_delta`. The metric
+is read through [`check_control_readback`](@ref), since it drives control flow.
 """
 function should_stop(es::EarlyStopping, epoch, metrics)
     haskey(metrics, es.metric) || error(
@@ -93,13 +67,9 @@ should_stop(::Nothing, epoch, metrics) = false
 """
     ReactantNitro.check_early_stop(es, collection, routing) -> nothing
 
-The setup-time early-stopping checks, run before training rather than at the first epoch.
-
-Three of the four things that can be wrong here are visible at setup and are errors here. The fourth,
-a metric name no `metrics` emits, is **only** visible at setup when the experiment defines no
-`metrics` at all, since the framework then knows the whole key set is `(:val_loss,)`; otherwise the
-keys exist only once the hook has run, and [`should_stop`](@ref) raises at the first epoch naming
-what was actually emitted. Saying so is better than implying a check the framework cannot make.
+The setup-time early-stopping checks: `mode`, `patience`, the presence of a `val` split, and, when
+the experiment defines no `metrics` (so the only key is `:val_loss`), the metric name. Otherwise
+the keys exist only once the hook has run, and [`should_stop`](@ref) raises at the first epoch.
 """
 check_early_stop(::Nothing, collection, routing) = nothing
 
