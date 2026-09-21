@@ -130,9 +130,10 @@ export Nitro, train!, validate, evaluate, predict
 # writing one provably reuses the compiled programs.
 export set_device!, device_value
 
-# Data. Prefetch is a framework DEFAULT rather than an opt-in helper: setup wraps the `train`
-# split in a `PrefetchIterator` at `depth = 1` and `workers = Threads.nthreads(:default)`, so a model
-# package names none of it. What stays public is the way to override those defaults, the one way to
+# Data. Prefetch is a framework DEFAULT rather than an opt-in helper: setup wraps EVERY split in a
+# `PrefetchIterator` at `workers = Threads.nthreads(:default)`, `device_batches = 1`,
+# `host_batches = 2 * workers` and ordered delivery, so a model package names none of it. What
+# stays public is the way to override those defaults, the one way to
 # decline them, and the two-method trait a source implements to get real concurrency.
 #
 # `batch_at` and `begin_epoch!` are exported because a model EXTENDS them, which is the same reason

@@ -480,8 +480,9 @@ function _train!(nitro::Nitro)
             t_wait = 0.0
             t_step = 0.0
             # One loop body for all three paths. Inline it is a lazy generator transferring on
-            # this task; with one producer it is a depth-N channel; with the fan-out it is N workers, a
-            # transfer task, and the same channel. The `finally` is not optional: `request_stop!`, a
+            # this task; with one producer it is a `Channel` of `device_batches`; with the fan-out it
+            # is N workers, a transfer task, and the same channel. The `finally` is not optional:
+            # `request_stop!`, a
             # non-finite loss, and any error mid-epoch all leave the loop with a full channel behind
             # it, and closing it is what stops the producers.
             # PLANNING IS ITS OWN STRETCH, because it is not free and nothing else covers it.

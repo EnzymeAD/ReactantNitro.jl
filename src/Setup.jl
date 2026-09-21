@@ -388,8 +388,9 @@ function _build_nitro(
     # draws its batch through `prefetch_source`. Wrapping earlier would put a framework wrapper in
     # front of a `derive` that reaches into a split, which is a break nothing in the contract forbids.
     #
-    # Only `train` is wrapped, and the reason is that `run_eval` iterates its split directly and
-    # never enters `batch_stream`, so a wrapped eval split would report a worker count nothing uses.
+    # EVERY split is wrapped, the eval ones included. It was `train` alone while `run_eval` iterated
+    # its split directly, when a wrapped eval split would have reported a worker count nothing used;
+    # `eval_stream` is what made the eval splits stream too.
     collection = auto_prefetch(collection)
     # AFTER the wrap, because the question is about the resolved pipeline and not about the source:
     # a split the user declined with `NoPrefetch` runs its data path inline, consuming each batch
@@ -705,8 +706,8 @@ function warn_no_concurrency(train_split)
         ReactantNitro: the `train` split runs ONE producer task and leaves \
         $(prefetch_workers(train_split)) workers idle, because `$(typeof(src))` implements \
         neither half of the index-addressable trait.
-        Depth is lookahead, not concurrency: a producer slower per batch than the device is per \
-        step starves it at any depth. Watch `data_wait_frac` in the per-epoch metrics.
+        Staging is lookahead, not concurrency: a producer slower per batch than the device is per \
+        step starves it at any `device_batches`. Watch `data_wait_frac` in the per-epoch metrics.
         Implement BOTH `ReactantNitro.batch_at(src, i)`, where `i` is a BATCH index, and \
         `ReactantNitro.begin_epoch!(src)`. With only `batch_at`, every epoch after the first \
         replays the first epoch's plan."""
@@ -719,7 +720,7 @@ function warn_no_concurrency(train_split)
     elseif cfg.path === :single
         @warn """
         ReactantNitro: the `train` split runs its host data path in ONE producer task, because
-        `workers = 1` was requested explicitly. Depth is lookahead, not
+        `workers = 1` was requested explicitly. Staging is lookahead, not
         concurrency; watch `data_wait_frac` in the per-epoch metrics."""
     end
     return nothing

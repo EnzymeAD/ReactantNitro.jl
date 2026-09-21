@@ -544,7 +544,7 @@ what keeps the device fed across variable host latency.
 may exist ON THE HOST at once: built but not yet transferred, counting the workers' hands, the
 hand-off channel, and the reorder buffer together. Neither is per-worker.
 
-**The framework wraps the `train` split with this automatically** (see [`auto_prefetch`](@ref)), at
+**The framework wraps every split with this automatically** (see [`auto_prefetch`](@ref)), at
 these defaults, so a user normally never writes it. It stays public for the case where the defaults
 are wrong, and [`NoPrefetch`](@ref) is how a split declines entirely.
 
@@ -664,7 +664,7 @@ Base.eltype(::Type{PrefetchIterator{S}}) where {S} = eltype(S)
 
 **The only way to decline prefetch**, and it is deliberately a marker rather than a number.
 
-The framework wraps the `train` split in a [`PrefetchIterator`](@ref) at its own defaults, so a split
+The framework wraps every split in a [`PrefetchIterator`](@ref) at its own defaults, so a split
 that must run its host data path inline on the training task says so with this. It is a visible,
 greppable declaration that a reviewer will question; a numeric `prefetch_device_batches = 0` field on an
 experiment reads as ordinary tuning, which is precisely how one model ran its entire data path inline

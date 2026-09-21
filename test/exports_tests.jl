@@ -55,9 +55,10 @@
         :set_device!, :device_value,
     ]
     # The prefetch surface. `PrefetchIterator` was exported as an optional helper the
-    # user wrapped their loader in; prefetch is now a framework DEFAULT (setup wraps the `train` split at
-    # `depth = 1`, `workers = Threads.nthreads(:default)`), so what is public is the override, the one
-    # opt-out, and the two-method trait a source EXTENDS to get real concurrency.
+    # user wrapped their loader in; prefetch is now a framework DEFAULT (setup wraps every split at
+    # `workers = Threads.nthreads(:default)`, `device_batches = 1`, `host_batches = 2 * workers`),
+    # so what is public is the override, the one opt-out, and the two-method trait a source EXTENDS
+    # to get real concurrency.
     #
     # `batch_at` and `begin_epoch!` are exported for the same reason the hooks are: a model defines methods
     # on them. `check_batch_at`, `NoPrefetch`'s internals, and `prefetch_config` stay internal.
