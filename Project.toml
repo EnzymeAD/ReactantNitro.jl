@@ -40,8 +40,8 @@ ReactantNitroTensorBoardLoggerExt = "TensorBoardLogger"
 
 [compat]
 Enzyme = "0.13"
-Functors = "0.5 - 0"
-JLD2 = "0.5 - 0"
+Functors = "0.5"
+JLD2 = "0.5, 0.6"
 JSON3 = "1"
 KaimonGate = "1"
 Lux = "1"
