@@ -21,6 +21,17 @@ ReactantNitro.cache_stats
 ReactantNitro.cache_reset!
 ```
 
+## The data-source trait
+
+`batch_at` and `begin_epoch!` are exported and appear above. The rest of the trait is extended
+qualified, as `ReactantNitro.epoch_token(::MySource)`, and is documented here.
+
+```@docs
+ReactantNitro.epoch_token
+ReactantNitro.check_source_options
+ReactantNitro.release!
+```
+
 ## Internals referenced by the docstrings
 
 Several docstrings of the public surface point at internal helpers that carry their own docstrings.
@@ -49,6 +60,7 @@ ReactantNitro.eval_stream
 ReactantNitro.check_batch_at
 ReactantNitro.close_stream!
 ReactantNitro.fanout_capable
+ReactantNitro.prefetch_config
 ReactantNitro.strip_rules
 ReactantNitro.merge_rules
 ```

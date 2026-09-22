@@ -155,6 +155,12 @@ know runs in one producer and says so at setup; implementing the two methods is 
 `ReactantNitro.check_batch_at` verifies an implementation. A `Vector` of batches never warns,
 because producing one is a pointer load.
 
+A source that holds something open, a data server or a file, defines `ReactantNitro.release!`,
+which the framework calls once per handle at `Done` or `Failed`; `ReactantNitro.release!(nitro)`
+calls it for a handle that only evaluated or exported. A loader's package can ship these methods
+itself as a package extension with ReactantNitro as a weak dependency, which is how a private data
+pipeline joins the fan-out without the framework naming it.
+
 Delivery is ordered by default, so a fixed seed reproduces a run bitwise at any worker count;
 `ordered = false` trades that for throughput. Two `DataLoader` options do not survive prefetching
 and are checked at setup: `buffer = true` is refused, because it reuses one batch through `getobs!`

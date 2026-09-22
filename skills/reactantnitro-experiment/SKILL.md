@@ -264,6 +264,19 @@ immunity to a straggling batch. Real concurrency needs the two-method trait, `ba
 and `begin_epoch!(source)`. The handle's display shows each split's resolved `workers`,
 `device_batches`, `host_batches` and path.
 
+**The source trait, in full, and who implements it.** Five functions, all owned by ReactantNitro
+and extended on the source type: `begin_epoch!(source)` (the per-epoch plan; return it, or
+`nothing` when the source stores it), `batch_at(source, i)` or `batch_at(source, i, plan)`
+(the two storage choices; `i` is a BATCH index), `epoch_token(source)` (a counter the fan-out
+asserts advances once per epoch), `check_source_options(source, name, cfg)` (setup-time refusal
+of options the resolved pipeline cannot honour), and `release!(source)` (close what the source
+holds open, called once per handle at `Done` or `Failed`, or by `release!(nitro)` for a handle
+that only evaluated or exported). All but the first two are unexported and written qualified.
+One implementer per source type: the framework carries the extension for a public loader it
+chooses to support (`ReactantNitroMLUtilsExt`); any other loader's package declares
+ReactantNitro as a weak dependency and ships the extension itself. Defining the trait on a type
+you do not own is the last resort.
+
 **Runs leave the interactive thread, and ^C is a graceful stop.** Every entry point
 (`train!`, `validate`, `evaluate`, `predict`, `export_model`) runs its body on a default-pool
 worker thread when one exists, so a long XLA compile or execute never starves your logger tasks

@@ -389,7 +389,8 @@ function _build_nitro(
         # No metrics and no elapsed time yet, even for a restored handle.
         (;), nothing, nothing,
         weights === nothing ? nothing : weights_origin(weights),
-        NamedTuple[]
+        NamedTuple[],
+        false
     )
     # Two builds from one set of pieces: the text goes to `log_other!` so the record says where
     # every value bound, and the sections are what `show(nitro)` appends to the handle's display.

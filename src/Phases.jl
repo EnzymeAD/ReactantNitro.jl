@@ -189,6 +189,9 @@ mutable struct Nitro
     # `loss` the epoch's mean train loss. Fresh per handle; a resumed run's earlier epochs belong to
     # the process that trained them.
     history::Vector{NamedTuple}
+    # Whether `release!` has run on this handle's splits; set by the first `Terminal` or an explicit
+    # `release!(nitro)`, so the sources are released once however many times either happens.
+    sources_released::Bool
 end
 
 # ── The accessors, which are reads and which everything downstream is specified in terms of.
@@ -694,7 +697,10 @@ function set_phase!(nitro::Nitro, phase::Phase; info...)
     # A compile produces no units of work, so the bar would sit at zero and read as a hang; the
     # reporter is told the phase instead.
     progress_phase!(phase isa Compiling ? _compiling_label(phase) : "")
-    return fire_monitors(nitro, phase; info...)
+    fire_monitors(nitro, phase; info...)
+    # After the monitors, so one that reads a metric off the data source still can.
+    phase isa Terminal && release_sources!(nitro)
+    return nothing
 end
 
 # Which program is compiling, in words: the gradient compile is the long one and the eval compile
@@ -715,7 +721,35 @@ guard, since there is no stored phase to compare against; the depth counter keep
 event per outermost call.
 """
 function publish_phase(nitro::Nitro, phase::Phase; info...)
-    return fire_monitors(nitro, phase; info...)
+    fire_monitors(nitro, phase; info...)
+    phase isa Terminal && release_sources!(nitro)
+    return nothing
+end
+
+"""
+    ReactantNitro.release!(nitro) -> nothing
+
+Release every split of the handle's data collection through the source trait's
+[`release!`](@ref) method, once per handle. `train!` does this itself at `Done` or `Failed`; call
+it for a handle that only validated, predicted or exported, whose sources would otherwise stay
+open. A split that raises is warned about and never takes the others, or the run's result, with
+it. After this the handle cannot iterate a released source again.
+"""
+release!(nitro::Nitro) = release_sources!(nitro)
+
+function release_sources!(nitro::Nitro)
+    nitro.sources_released && return nothing
+    nitro.sources_released = true
+    for name in keys(nitro.data)
+        src = prefetch_source(getproperty(nitro.data, name))
+        try
+            release!(src)
+        catch err
+            @warn "ReactantNitro: `release!` raised on the `$name` split; the run's result is \
+                   unaffected, but whatever the source held may still be open." source = typeof(src) exception = (err, catch_backtrace())
+        end
+    end
+    return nothing
 end
 
 """
