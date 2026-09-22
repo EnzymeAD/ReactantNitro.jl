@@ -45,10 +45,12 @@
     @testset "`Done` releases every split exactly once, after the monitors" begin
         n, tr, va = mk()
         seen_at_terminal = Ref(-1)
-        register_phase_monitor!(n) do ph, _step, _epoch, _info
-            ph isa Terminal && (seen_at_terminal[] = tr.released)
-            return nothing
-        end
+        register_phase_monitor!(
+            n, (ph, _step, _epoch, _info) -> begin
+                ph isa Terminal && (seen_at_terminal[] = tr.released)
+                nothing
+            end
+        )
         train!(n)
         @test phase(n) isa Done
         @test tr.released == 1
@@ -65,7 +67,8 @@
 
     @testset "`Failed` releases too, and the error still surfaces" begin
         n, tr, va = mk(; train_kw = (; fail_at = 2))
-        @test_throws ErrorException train!(n)
+        # The single-producer path surfaces the source's error through its `Channel`, wrapped.
+        @test_throws Exception train!(n)
         @test phase(n) isa Failed
         @test tr.released == 1
         @test va.released == 1
