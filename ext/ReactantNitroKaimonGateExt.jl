@@ -933,8 +933,8 @@ function nitro_export(
     return "started run $(state.id) (kind=export). Poll `nitro_status(run_id=\"$(state.id)\")`."
 end
 
-# Publish `Done` on a `Nitro` that exists only for an export, so its Terminal monitors run. Never
-# throws: the export's result is already decided.
+# Publish `Done` on a `Nitro` that exists only for an export, so its Terminal monitors run and its
+# data sources are released. Never throws: the export's result is already decided.
 function _finish_export_nitro!(nitro::Nitro)
     try
         # Idempotent; a monitor registered after setup would otherwise be missed.

@@ -346,6 +346,26 @@ augmentation. A monotone `Int` counter is the intended implementation.
 epoch_token(source) = nothing
 
 """
+    ReactantNitro.release!(source) -> nothing
+
+Optional: release what a source holds open (a data server, a client, a file). The framework calls
+it once per handle, on every split of the data collection unwrapped from its
+[`PrefetchIterator`](@ref) or [`NoPrefetch`](@ref), at the first [`Terminal`](@ref) phase the
+handle publishes, `Done` or `Failed`, after the phase monitors have fired. `release!(nitro)` calls
+it explicitly for a handle that only evaluates or exports and so never publishes one. The default
+does nothing, so a source holding nothing defines nothing.
+
+A method must tolerate a second call, since a source may be released explicitly and then again at
+`Terminal`. A collection shared between two handles (`Nitro(e2; data = nitro.data)`) is released
+by whichever finishes first; give each handle its own collection.
+
+A source package owns this method along with the rest of the trait. When the loader is public, the
+framework may carry the extension (`ReactantNitroMLUtilsExt`); otherwise the loader's package
+declares ReactantNitro as a weak dependency and ships the extension itself.
+"""
+release!(source) = nothing
+
+"""
     ReactantNitro.fanout_capable(source) -> Bool
 
 Whether `source` implements both halves of the index-addressable trait. Either [`batch_at`](@ref)
