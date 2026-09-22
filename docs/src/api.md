@@ -60,6 +60,7 @@ ReactantNitro.eval_stream
 ReactantNitro.check_batch_at
 ReactantNitro.close_stream!
 ReactantNitro.fanout_capable
+ReactantNitro.prefetch_config
 ReactantNitro.strip_rules
 ReactantNitro.merge_rules
 ```
