@@ -1235,24 +1235,29 @@
         end
     end
 
-    @testset "grad's entry is guarded by fwd_program's closure, not its own" begin
-        # The routing: `grad_program` captures `fwd_program` at the argtypes derivable from grad's own
-        # (ev, model, ps, st, batch, router), because plain inference cannot descend into Enzyme's
-        # backward pass (its own closure is glue-only).
+    @testset "grad's entry is guarded by objective_wrapper's closure, not its own" begin
+        # The routing: `grad_program` captures `objective_wrapper` (forward, loss, traced
+        # train_metrics) at the argtypes derivable from grad's own (ev, model, ps, st, batch,
+        # routers, metrics-residency Val), because plain inference cannot descend into Enzyme's
+        # backward pass (its own closure is glue-only). The stand-in used to be `fwd_program`,
+        # which calls `forward` alone, so a helper under `loss` was invisible to the guard.
         fake_router = (;
             forward = ReactantNitro.Router{(:x,)}(), loss = nothing, metrics = nothing,
             train_metrics = nothing,
         )
-        fake = (Int(1), Float64(2.0), Char('x'), :sym, Vector{F4}([1.0]), 6, 7, 8, fake_router, 10, 11)
+        fake = (
+            Int(1), Float64(2.0), Char('x'), :sym, Vector{F4}([1.0]), 6, 7, 8, fake_router, 10,
+            Val(:device),
+        )
         cf, at = _closure_target(grad_program, fake)
-        @test cf === fwd_program
-        # The seventh element is the hook FUNCTION, which `fwd_program` now takes alongside its
-        # router so a hook supplied as a value (see Hooks.jl) is the one the closure is captured
-        # at. A `fake_router` carrying no map resolves it to the method, as here.
+        @test cf === ReactantNitro.objective_wrapper
         @test at == Tuple{
-            Int, Float64, Char, Symbol, Vector{F4}, ReactantNitro.Router{(:x,)},
-            typeof(ReactantNitro.forward),
+            Int, Float64, Char, Symbol, Vector{F4}, typeof(fake_router), Val{:device},
         }
+        # A caller that omits the residency Val gets the `:device` default, matching
+        # `grad_program`'s own default.
+        _, at_short = _closure_target(grad_program, fake[1:10])
+        @test at_short == at
         cf2, at2 = _closure_target(fwd_program, fake[1:5])
         @test cf2 === fwd_program
         @test at2 == Tuple{Int, Float64, Char, Symbol, Vector{F4}}
@@ -1272,6 +1277,152 @@
         @test any(p -> string(p[1].name) == "apply", cl)
         # and a freshly captured closure matches current dispatch, so a clean capture never drifts
         @test !closure_drift(cl).drift
+    end
+
+    # ── a helper under `loss` is guarded too ─────────────────────────────────────────────
+
+    # File-level for the same reason as `wc_helper`: `@eval` redefines in Main.
+    wc_loss_helper(d) = d
+    @experiment struct LossHelperExp
+        n::Int = 1
+    end
+    ReactantNitro.build_model(::LossHelperExp, rng) = (m = frozen_chain(); (m, Lux.setup(rng, m)...))
+    ReactantNitro.forward(::LossHelperExp, model, ps, st; img) = Lux.apply(model, img, ps, st)
+    ReactantNitro.loss(::LossHelperExp, out; lab) = sum(abs2, wc_loss_helper(out .- lab))
+
+    @testset "the objective closure reaches a helper that `loss` calls (host types)" begin
+        model = frozen_chain()
+        ps, st = Lux.setup(Xoshiro(7), model)
+        batch = (; img = randn(F4, 3, 2), lab = randn(F4, 2, 2))
+        routers = (;
+            forward = ReactantNitro.Router{(:img,)}(), loss = ReactantNitro.Router{(:lab,)}(),
+            metrics = nothing, train_metrics = nothing,
+        )
+        at = Tuple{
+            LossHelperExp, typeof(model), typeof(ps), typeof(st), typeof(batch), typeof(routers),
+            Val{:device},
+        }
+        cl = world_closure(ReactantNitro.objective_wrapper, at)
+        names_ = Set(p[1].name for p in cl)
+        @test :wc_loss_helper in names_     # the method the old fwd_program stand-in never saw
+        @test :apply in names_              # and forward's side is still covered
+        @test !closure_drift(cl).drift
+    end
+
+    @testset "redefining a `loss` helper poisons the trained gradient entry (device types)" begin
+        # End to end, because the capture that matters runs at the program's real argument types
+        # (device arrays): if inference lost `forward`'s output type there, `loss` would dispatch
+        # dynamically and its helper would silently drop out of the closure.
+        cache_reset!()
+        n = Nitro(
+            LossHelperExp(); run_dir = mktempdir(), max_epochs = 1,
+            data = (; train = frozen_data(), val = frozen_data())
+        )
+        train!(n)
+        grad_keys = [k for k in keys(ReactantNitro.CACHE_CLOSURES) if first(k) === grad_program]
+        @test length(grad_keys) == 1
+        cl = ReactantNitro.CACHE_CLOSURES[only(grad_keys)]
+        @test cl !== nothing
+        @test any(p -> p[1].name === :wc_loss_helper, cl)
+
+        @eval wc_loss_helper(d) = d .* 2.0f0
+        staleness = world_closure_staleness()
+        @test only(grad_keys) in staleness.poisoned
+        @test :wc_loss_helper in staleness.drifted
+        @test !haskey(CACHE, only(grad_keys))   # a new Nitro will recompile against the new helper
+    end
+
+    # ── helpers under device-resident metrics hooks ──────────────────────────────────────
+
+    wc_metric_helper(d) = d
+    wc_tm_helper(d) = d
+    @experiment struct MetricHelperExp
+        n::Int = 1
+    end
+    ReactantNitro.build_model(::MetricHelperExp, rng) = (m = frozen_chain(); (m, Lux.setup(rng, m)...))
+    ReactantNitro.forward(::MetricHelperExp, model, ps, st; img) = Lux.apply(model, img, ps, st)
+    ReactantNitro.loss(::MetricHelperExp, out; lab) = sum(abs2, out .- lab)
+    ReactantNitro.metrics(::MetricHelperExp, out; lab) =
+        (; mae = (sum(abs, wc_metric_helper(out .- lab)), length(lab)))
+    ReactantNitro.train_metrics(::MetricHelperExp, out; lab) = (; d = sum(wc_tm_helper(out)))
+    ReactantNitro.metrics_residency(::MetricHelperExp, ::Symbol) = :device
+    # `metrics` replaces the `val_loss` substitution, so the default checkpointer has nothing to rank.
+    ReactantNitro.checkpointer(::MetricHelperExp) =
+        ReactantNitro.TopKCheckpointer(; k = 1, metric = :mae, mode = :min)
+
+    @testset "device metrics: each helper poisons exactly the program that calls it" begin
+        # `eval_metric_program` is captured directly (it is not differentiated), so a helper under a
+        # traced `metrics` is in its own closure. A traced `train_metrics` runs inside the gradient
+        # program, so its helper is covered only through the `objective_wrapper` stand-in.
+        cache_reset!()
+        n = Nitro(
+            MetricHelperExp(); run_dir = mktempdir(), max_epochs = 1,
+            data = (; train = frozen_data(), val = frozen_data())
+        )
+        train!(n)                                   # compiles grad AND the traced val metrics
+        keys_of(f) = [k for k in keys(ReactantNitro.CACHE_CLOSURES) if first(k) === f]
+        grad_keys = keys_of(grad_program)
+        metric_keys = keys_of(ReactantNitro.eval_metric_program)
+        @test length(grad_keys) == 1
+        @test !isempty(metric_keys)
+        @test any(p -> p[1].name === :wc_tm_helper, ReactantNitro.CACHE_CLOSURES[only(grad_keys)])
+        @test all(
+            k -> any(p -> p[1].name === :wc_metric_helper, ReactantNitro.CACHE_CLOSURES[k]),
+            metric_keys
+        )
+        # `HOOK === :metrics` folds, so the `val_loss` arm (which calls `loss`) is not in a metrics
+        # program's closure. This needs the match's static parameters in `world_closure`: with them
+        # missing, both arms were inferred and every loss edit poisoned the metrics programs too.
+        is_our_loss(p) = occursin("loss", string(p[1].name)) &&
+            occursin("MetricHelperExp", string(p[2]))
+        @test !any(k -> any(is_our_loss, ReactantNitro.CACHE_CLOSURES[k]), metric_keys)
+        @test any(is_our_loss, ReactantNitro.CACHE_CLOSURES[only(grad_keys)])  # control: it can match
+
+        @eval wc_metric_helper(d) = d .* 2.0f0
+        staleness = world_closure_staleness()
+        @test Set(metric_keys) ⊆ Set(staleness.poisoned)
+        @test !(only(grad_keys) in staleness.poisoned)   # metrics is not part of the objective
+        @test haskey(CACHE, only(grad_keys))
+
+        @eval wc_tm_helper(d) = d .* 2.0f0
+        staleness = world_closure_staleness()
+        @test only(grad_keys) in staleness.poisoned
+        @test :wc_tm_helper in staleness.drifted
+    end
+
+    # Host residency must NOT drag a hook into the gradient closure: under `Val(:host)` the objective
+    # returns the raw outputs and the driver calls `train_metrics` as live Julia, where Revise applies
+    # directly, so a helper edit there invalidating the compiled gradient would be a needless recompile.
+    wc_host_tm_helper(d) = d
+    @experiment struct HostTMExp
+        n::Int = 1
+    end
+    ReactantNitro.forward(::HostTMExp, model, ps, st; img) = Lux.apply(model, img, ps, st)
+    ReactantNitro.loss(::HostTMExp, out; lab) = sum(abs2, out .- lab)
+    ReactantNitro.train_metrics(::HostTMExp, out; lab) = (; d = sum(wc_host_tm_helper(out)))
+
+    @testset "host-resident train_metrics stays OUT of the gradient closure" begin
+        model = frozen_chain()
+        ps, st = Lux.setup(Xoshiro(7), model)
+        batch = (; img = randn(F4, 3, 2), lab = randn(F4, 2, 2))
+        routers = (;
+            forward = ReactantNitro.Router{(:img,)}(), loss = ReactantNitro.Router{(:lab,)}(),
+            metrics = nothing, train_metrics = ReactantNitro.Router{(:lab,)}(),
+        )
+        base = (HostTMExp, typeof(model), typeof(ps), typeof(st), typeof(batch), typeof(routers))
+        host = Set(
+            p[1].name for p in world_closure(
+                    ReactantNitro.objective_wrapper, Tuple{base..., Val{:host}}
+                )
+        )
+        dev = Set(
+            p[1].name for p in world_closure(
+                    ReactantNitro.objective_wrapper, Tuple{base..., Val{:device}}
+                )
+        )
+        @test !(:wc_host_tm_helper in host)     # host: not part of any program, never invalidates
+        @test :wc_host_tm_helper in dev         # control: the same hook traced IS covered
+        @test :apply in host                    # and forward is covered either way
     end
 
 end
