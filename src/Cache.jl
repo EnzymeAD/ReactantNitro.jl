@@ -22,8 +22,9 @@ The world-closure guard: each entry's dependency closure, captured at compile ti
 key as [`CACHE`](@ref). [`world_closure_staleness`](@ref) re-resolves it against live dispatch at
 the entry points and poisons any entry whose methods moved, so a redefinition below the hooks (a
 helper `forward` calls) becomes a miss for a new `Nitro`; an existing one keeps its programs and is
-told so. The gradient program stores [`fwd_program`](@ref)'s closure, since the backward pass runs
-inside Enzyme's interpreter, which inference cannot descend into. `LAST_WORLD_CHECKED` memoizes the
+told so. The gradient program stores [`objective_wrapper`](@ref)'s closure (`forward`, `loss` and a
+traced `train_metrics`), since the backward pass runs inside Enzyme's interpreter, which inference
+cannot descend into. `LAST_WORLD_CHECKED` memoizes the
 scan on the world counter.
 """
 const CACHE_CLOSURES = Dict{Any, Any}()
@@ -384,8 +385,13 @@ capture time.
 """
 function world_closure(f, argtypes::Type)
     fullsig = Core.apply_type(Tuple, typeof(f), argtypes.parameters...)
-    m = Base.which(f, argtypes)
-    mi = Base.specialize_method(m, fullsig, Core.svec())
+    # The match carries the method's static parameters. They MUST reach `specialize_method`: with an
+    # empty `svec` the MethodInstance is created (and cached) with its `where` parameters unknown, so
+    # inference cannot fold a branch on one (`objective_wrapper`'s `TM === :host`,
+    # `eval_metric_program`'s `HOOK === :metrics`) and records the edges of BOTH arms. The closure
+    # then over-approximates and a helper edit needlessly poisons a program that never calls it.
+    match = Base._which(fullsig; raise = true)
+    mi = Base.specialize_method(match.method, match.spec_types, match.sparams)
     Base.return_types(f, argtypes)
     seen = Base.IdSet{Core.MethodInstance}()
     stack = Core.MethodInstance[mi]
@@ -437,23 +443,31 @@ end
     ReactantNitro._closure_target(f, args) -> (f, argtypes)
 
 Which function and argtypes an entry's closure is captured from. `grad_program` captures
-[`fwd_program`](@ref)'s instead of its own: the backward pass runs inside Enzyme's interpreter,
+[`objective_wrapper`](@ref)'s instead of its own: the backward pass runs inside Enzyme's interpreter,
 which inference cannot descend into, so its own closure is glue with no `forward` or `loss` in it.
-`fwd_program` rather than `forward` directly, because a hook takes its batch fields as keywords and
-inference of the positional method stops at the kwcall shim.
+`objective_wrapper` is the plain-Julia function that `grad_program` differentiates, `forward` then
+`loss` then a traced `train_metrics`, each through `call_hook`, so inference reaches every user
+method the objective calls. Going through `call_hook` is also what gets past the kwcall shim a hook's
+keyword batch fields put in front of a direct capture.
+
+The stand-in used to be [`fwd_program`](@ref), which calls `forward` alone: a Revise edit to a
+helper that `loss` calls moved neither the closure nor the key (only the `loss` hook's own world is
+in the key), and the next `Nitro` in the process silently reused the gradient program compiled
+against the old helper.
+
+The argtypes are grad's own `(ev, model, ps, st, batch)`, its routers (`args[9]`, which also carry
+any hook supplied as a value), and its metrics-residency `Val` (`args[11]`, `Val(:device)` when a
+caller omits it), so the capture resolves the same hooks and the same `:host`/`:device` branch the
+compiled program does.
 """
-_closure_target(f, args) = f === grad_program ?
-    (
-        fwd_program,
-        Core.apply_type(
-            Tuple,
-            map(typeof, args[1:4])...,
-            typeof(args[5]),
-            typeof(args[9].forward),
-            typeof(hook_fn(hook_fns(args[9]), :forward, forward)),
-        ),
-    ) :
-    (f, Core.apply_type(Tuple, map(typeof, args)...))
+function _closure_target(f, args)
+    f === grad_program || return (f, Core.apply_type(Tuple, map(typeof, args)...))
+    tm = length(args) >= 11 ? args[11] : Val(:device)
+    return (
+        objective_wrapper,
+        Core.apply_type(Tuple, map(typeof, args[1:5])..., typeof(args[9]), typeof(tm)),
+    )
+end
 
 """
     ReactantNitro.world_closure_staleness() -> (; poisoned, drifted)

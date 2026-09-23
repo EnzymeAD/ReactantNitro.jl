@@ -82,6 +82,7 @@
         # Named for what gets built on the registry (a heartbeat, a watchdog, a progress display)
         # rather than for how the function is invoked. It was `register_phase_callback!`.
         :register_phase_monitor!, :unregister_phase_monitor!, :progress_counter,
+        :progress_note!, :with_progress_note,
         :request_stop!, :run_dir,
         :current_step, :current_epoch, :phase, :experiment, :parameters, :states,
         :EarlyStopping, :should_stop,
