@@ -99,6 +99,12 @@ function ReactantNitro.log_metrics!(lgr::RecordingLogger, metrics; context = "tr
         if context == "train"
             lgr.state.train_metrics = metrics
             hasproperty(metrics, :loss) && (lgr.state.loss = _to_float(metrics.loss))
+            # Monitors fire only on phase transitions, so without this the status step would be
+            # sampled at epoch boundaries while the loss above advances every optimizer step.
+            step = get(kwargs, :step, nothing)
+            epoch = get(kwargs, :epoch, nothing)
+            step === nothing || (lgr.state.step = step)
+            epoch === nothing || (lgr.state.epoch = epoch)
         elseif context == "validate"
             lgr.state.val_metrics = metrics
         end
