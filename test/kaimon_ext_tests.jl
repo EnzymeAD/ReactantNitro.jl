@@ -480,6 +480,14 @@
         @test ReactantNitro.logger_info(bare) == (;)
         @test ReactantNitro.run_id(bare) === nothing
         @test ReactantNitro.run_url(bare) === nothing
+        # A train-context log advances the status step and epoch between phase transitions; a
+        # call without them, or in another context, leaves them where they were.
+        ReactantNitro.log_metrics!(bare, (; loss = 0.5); step = 7, epoch = 2, context = "train")
+        @test (bare.state.step, bare.state.epoch, bare.state.loss) == (7, 2, 0.5)
+        ReactantNitro.log_metrics!(bare, (; loss = 0.25); context = "train")
+        @test (bare.state.step, bare.state.epoch, bare.state.loss) == (7, 2, 0.25)
+        ReactantNitro.log_metrics!(bare, (; mae = 1.0); step = 9, epoch = 3, context = "validate")
+        @test (bare.state.step, bare.state.epoch) == (7, 2)
     end
 
     @testset "validate, evaluate, predict, export" begin
