@@ -683,6 +683,23 @@ reporter directly, your own function of the same five arguments, or `nothing` to
 (`setup [building data]`) and closing as `setup done`. Nothing compiles during setup; the first
 compile is reported by the first verb that needs it.
 
+A hook that takes a while can say what it is doing. [`with_progress_note`](@ref) shows a note
+beside the phase for the length of a block, with the innermost block shown when they nest, and
+[`progress_note!`](@ref) updates the current one. A new phase clears them.
+
+```julia
+function ReactantNitro.build_data(e::MyExp, dist)
+    index = with_progress_note(() -> load_index(e), "loading index")
+    with_progress_note("decoding") do
+        for (i, f) in enumerate(files)
+            progress_note!("decoding $i/$(length(files))")
+            ...
+        end
+    end
+    ...
+end
+```
+
 ## Predicting on new data
 
 [`predict`](@ref) is [`forward`](@ref) alone, in eval mode, on any `Nitro`. It takes a batch

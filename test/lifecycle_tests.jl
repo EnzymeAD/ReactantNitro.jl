@@ -736,6 +736,88 @@
         @test ps[end].done
         @test ps[end].name == "setup done"
         @test ReactantNitro._PLOG[] === nothing
+
+        # A note from a hook reaches the reporter inside its phase.
+        events = Tuple{Symbol, String}[]
+        prev = ReactantNitro.progress_reporter!((v, l, t, e, m) -> (push!(events, (v, l)); nothing))
+        noting = (e, d) -> (progress_note!("decoding 1/2"); ReactantNitro.build_data(e, d))
+        try
+            mk_life(; max_epochs = 1, hooks = (; build_data = noting))
+        finally
+            ReactantNitro.progress_reporter!(prev)
+        end
+        i = findfirst(==((:note, "decoding 1/2")), events)
+        @test i !== nothing
+        @test events[findlast(e -> e[1] === :phase, events[1:i])] == (:phase, "building data")
+    end
+
+    @testset "a note is drawn beside the phase and cleared by the next one" begin
+        r = ReactantNitro._RunProgress()
+        ReactantNitro._begin_stretch!(r, "setup", 0, 0, 0)
+        r.phase, r.note = "building data", "decoding 3/5"
+        @test ReactantNitro._run_name(r) == "setup [building data] (decoding 3/5)"
+        r.phase = ""
+        @test ReactantNitro._run_name(r) == "setup (decoding 3/5)"
+        ReactantNitro._begin_stretch!(r, "setup", 0, 0, 0)
+        @test isempty(r.note)
+
+        # The framework keeps a stack; the reporter sees only the top.
+        notes = String[]
+        prev = ReactantNitro.progress_reporter!(
+            (v, l, t, e, m) -> (v === :note && push!(notes, l); nothing)
+        )
+        try
+            ReactantNitro.progress_begin!("setup", 0, 0, 0)
+            ReactantNitro.progress_phase!("building data")
+            with_progress_note("outer") do
+                with_progress_note("inner") do
+                    progress_note!("inner 1/2")               # within the interval: held
+                    sleep(ReactantNitro._NOTE_INTERVAL)
+                    progress_note!("inner 2/2")
+                end
+                @test_throws ErrorException with_progress_note(() -> error("x"), "failing")
+            end
+            @test notes == ["outer", "inner", "inner 2/2", "outer", "failing", "outer", ""]
+
+            # A phase change clears the stack, and a pop after it is a no-op.
+            empty!(notes)
+            with_progress_note("spanning") do
+                ReactantNitro.progress_phase!("deriving")
+            end
+            @test notes == ["spanning"]
+            @test isempty(ReactantNitro._NOTES)
+            # Re-announcing the current phase keeps the notes.
+            with_progress_note("kept") do
+                ReactantNitro.progress_phase!("deriving")
+                @test ReactantNitro._NOTES[end].second == "kept"
+            end
+            # A bare note starts an entry of its own, and a new stretch clears it.
+            progress_note!("bare")
+            @test ReactantNitro._NOTES[end].second == "bare"
+            ReactantNitro.progress_begin!("next", 0, 0, 0)
+            @test isempty(ReactantNitro._NOTES)
+            ReactantNitro.progress_end!()
+            ReactantNitro.progress_done!()
+        finally
+            ReactantNitro.progress_reporter!(prev)
+        end
+
+        # The log reporter draws each note it is given, beside the phase.
+        logger = Test.TestLogger(; min_level = ProgressLevel)
+        rep = ReactantNitro.progress_log_reporter
+        with_logger(logger) do
+            rep(:begin, "setup", 0, 0, 0)
+            rep(:phase, "building data", 0, 0, 0)
+            rep(:note, "decoding 1/3", 0, 0, 0)
+            rep(:note, "", 0, 0, 0)
+            rep(:phase, "deriving", 0, 0, 0)
+            rep(:done, "setup done", 0, 0, 0)
+        end
+        names = [ProgressLogging.asprogress(r.level, r.message).name for r in logger.logs]
+        @test names == [
+            "setup", "setup [building data]", "setup [building data] (decoding 1/3)",
+            "setup [building data]", "setup [deriving]", "setup done",
+        ]
     end
 
     # ── the checkpoint write, which emits no units and used to emit no bar ───────────────

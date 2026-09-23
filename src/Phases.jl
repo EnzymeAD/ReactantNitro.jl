@@ -867,6 +867,9 @@ default is [`default_progress_reporter`](@ref). `f` is called as
     terminal line can close it. `label` is the closing text, or `""` for the default.
   * `:phase`, when the current stretch starts or stops doing something that produces no units;
     `label` names it (`"compiling gradient"`) or is `""` when ordinary work resumes.
+  * `:note`, when the note user code set with [`progress_note!`](@ref) or
+    [`with_progress_note`](@ref) changes; `label` is the note, `""` when there is none. A new
+    `:phase` or `:begin` clears it.
 
 A reporter that throws is switched off rather than propagated: losing GPU hours to a broken
 progress bar is not a trade this framework makes.
@@ -877,9 +880,14 @@ function progress_reporter!(f)
     return prev
 end
 
+# Held for every call: `progress_note!` may come from a hook's worker threads while the driver
+# reports steps and phases.
+const _PROGRESS_LOCK = ReentrantLock()
+
 function _progress_report(verb::Symbol, label::String, total::Int, epoch::Int, max_epochs::Int)
     r = _PROGRESS_REPORTER[]
     r === nothing && return nothing
+    lock(_PROGRESS_LOCK)
     try
         r(verb, label, total, epoch, max_epochs)
     catch err
@@ -888,6 +896,8 @@ function _progress_report(verb::Symbol, label::String, total::Int, epoch::Int, m
         @warn "ReactantNitro: the progress reporter threw and has been switched off for this \
                process. The run is unaffected. Reinstall one with `progress_reporter!`." exception =
             (err, catch_backtrace())
+    finally
+        unlock(_PROGRESS_LOCK)
     end
     return nothing
 end
@@ -900,7 +910,10 @@ Open and close one stretch of reported work. Both are no-ops with no reporter in
 the default. `total = 0` means the length is not known ahead of time.
 """
 progress_begin!(label::AbstractString, total::Integer, epoch::Integer, max_epochs::Integer) =
+    lock(_PROGRESS_LOCK) do
+    _clear_notes!("")
     _progress_report(:begin, String(label), Int(total), Int(epoch), Int(max_epochs))
+end
 
 progress_end!() = _progress_report(:end, "", 0, 0, 0)
 
@@ -937,7 +950,87 @@ Tell the reporter what the current stretch is doing while its counter is not mov
 it is back to ordinary work. A compile emits no units, so without this a bar stalls at zero for the
 length of an XLA compile with nothing to say why.
 """
-progress_phase!(label::AbstractString) = _progress_report(:phase, String(label), 0, 0, 0)
+progress_phase!(label::AbstractString) = lock(_PROGRESS_LOCK) do
+    label == _NOTE_PHASE[] || _clear_notes!(String(label))
+    _progress_report(:phase, String(label), 0, 0, 0)
+end
+
+# ── Notes, a stack user code pushes onto ─────────────────────────────────────────────
+#
+# The top entry is what the reporter draws. Entries carry an id so a pop after a phase has cleared
+# the stack is a no-op. Guarded by `_PROGRESS_LOCK`, and cleared where the reporter clears its
+# note: a new stretch, or a changed phase.
+const _NOTES = Pair{Int, String}[]
+const _NOTE_ID = Ref(0)
+const _NOTE_PHASE = Ref("")
+const _NOTE_LAST = Ref(0.0)
+# `progress_note!` may be called per item, so its frames are throttled to this. Pushes and pops
+# always draw, or a finished block could leave its note on screen.
+const _NOTE_INTERVAL = 0.1
+
+function _clear_notes!(phase::String)
+    empty!(_NOTES)
+    _NOTE_PHASE[] = phase
+    _NOTE_LAST[] = 0.0
+    return nothing
+end
+
+function _report_note!()
+    _NOTE_LAST[] = time()
+    return _progress_report(:note, isempty(_NOTES) ? "" : last(_NOTES).second, 0, 0, 0)
+end
+
+"""
+    progress_note!(msg) -> nothing
+
+Show `msg` beside the current phase of the progress display, as
+`setup [building data] (decoding 1200/5000)`. Inside [`with_progress_note`](@ref) it replaces
+that block's note; outside one it sets a note that lasts until the next phase or stretch. Cheap
+enough to call per item: it redraws at most ten times a second.
+"""
+function progress_note!(msg::AbstractString)
+    lock(_PROGRESS_LOCK) do
+        if isempty(_NOTES)
+            push!(_NOTES, (_NOTE_ID[] += 1) => String(msg))
+        else
+            _NOTES[end] = first(_NOTES[end]) => String(msg)
+        end
+        time() - _NOTE_LAST[] >= _NOTE_INTERVAL && _report_note!()
+    end
+    return nothing
+end
+
+"""
+    with_progress_note(f, msg)
+
+Run `f` with `msg` shown beside the current phase, and restore the enclosing note when it returns
+or throws. Nested blocks stack, and the innermost one is shown:
+
+```julia
+with_progress_note("loading index") do
+    for (i, f) in enumerate(files)
+        with_progress_note(() -> decode(f), "decoding \$i/\$(length(files))")
+    end
+end
+```
+
+A new phase or stretch clears every note, including those of blocks still open.
+"""
+function with_progress_note(f, msg::AbstractString)
+    id = lock(_PROGRESS_LOCK) do
+        push!(_NOTES, (_NOTE_ID[] += 1) => String(msg))
+        _report_note!()
+        _NOTE_ID[]
+    end
+    return try
+        f()
+    finally
+        lock(_PROGRESS_LOCK) do
+            i = findlast(n -> first(n) == id, _NOTES)
+            i === nothing || (deleteat!(_NOTES, i); _report_note!())
+        end
+    end
+end
 
 # On the hot path: an atomic add, then one `Ref` load and a branch. Here rather than at a second
 # call site so the bar and the watchdog cannot disagree about what a unit of work is.
@@ -956,16 +1049,17 @@ end
 mutable struct _RunProgress
     label::String
     phase::String
+    note::String
     epoch::Int
     max_epochs::Int
     total::Int
     counter::Int
     floor::Float64
 end
-_RunProgress() = _RunProgress("", "", 0, 0, 0, 0, 0.0)
+_RunProgress() = _RunProgress("", "", "", 0, 0, 0, 0, 0.0)
 
 function _begin_stretch!(r::_RunProgress, label::String, total::Int, epoch::Int, max_epochs::Int)
-    r.label, r.phase, r.epoch, r.max_epochs = label, "", epoch, max_epochs
+    r.label, r.phase, r.note, r.epoch, r.max_epochs = label, "", "", epoch, max_epochs
     r.total, r.counter = total, 0
     return r
 end
@@ -979,7 +1073,8 @@ end
 
 function _run_name(r::_RunProgress)
     name = r.max_epochs > 0 ? "epoch $(r.epoch)/$(r.max_epochs): $(r.label)" : r.label
-    return isempty(r.phase) ? name : name * " [" * r.phase * "]"
+    isempty(r.phase) || (name *= " [" * r.phase * "]")
+    return isempty(r.note) ? name : name * " (" * r.note * ")"
 end
 
 _done_name(r::_RunProgress, label::String = "") =
@@ -1046,7 +1141,12 @@ function progress_bar_reporter(
         r = _BAR_RUN[]
         r === nothing && return nothing
         r.phase == label && return nothing
-        r.phase = label
+        r.phase, r.note = label, ""
+        _bar_frame!(r)
+    elseif verb === :note
+        r = _BAR_RUN[]
+        (r === nothing || r.note == label) && return nothing
+        r.note = label
         _bar_frame!(r)
     elseif verb === :step
         r = _BAR_RUN[]
@@ -1136,7 +1236,12 @@ function progress_log_reporter(
         st = _PLOG[]
         st === nothing && return nothing
         st.run.phase == label && return nothing
-        st.run.phase = label
+        st.run.phase, st.run.note = label, ""
+        _plog_emit!(st)
+    elseif verb === :note
+        st = _PLOG[]
+        (st === nothing || st.run.note == label) && return nothing
+        st.run.note = label
         _plog_emit!(st)
     elseif verb === :step
         st = _PLOG[]

@@ -32,6 +32,18 @@ ReactantNitro.check_source_options
 ReactantNitro.release!
 ```
 
+## Progress reporting
+
+`progress_note!` and `with_progress_note` are exported and appear above. The reporter contract it feeds is extended
+qualified, as `ReactantNitro.progress_reporter!(f)`.
+
+```@docs
+ReactantNitro.progress_reporter!
+ReactantNitro.default_progress_reporter
+ReactantNitro.progress_bar_reporter
+ReactantNitro.progress_log_reporter
+```
+
 ## Internals referenced by the docstrings
 
 Several docstrings of the public surface point at internal helpers that carry their own docstrings.
