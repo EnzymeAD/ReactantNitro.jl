@@ -864,7 +864,7 @@ default is [`default_progress_reporter`](@ref). `f` is called as
   * `:step`, once per completed unit. The other arguments are placeholders.
   * `:end`, once when the stretch finishes, however it finishes.
   * `:done`, once when the last stretch of an entry point is over, so a reporter reusing one
-    terminal line can close it.
+    terminal line can close it. `label` is the closing text, or `""` for the default.
   * `:phase`, when the current stretch starts or stops doing something that produces no units;
     `label` names it (`"compiling gradient"`) or is `""` when ordinary work resumes.
 
@@ -922,12 +922,13 @@ function with_progress_stretch(
 end
 
 """
-    ReactantNitro.progress_done!() -> nothing
+    ReactantNitro.progress_done!(label = "") -> nothing
 
-Tell the reporter that the last stretch of an entry point is over. Separate from
-[`progress_end!`](@ref) because only the entry point knows whether another stretch is coming.
+Tell the reporter that the last stretch of an entry point is over, closing with `label` when it is
+not empty. Separate from [`progress_end!`](@ref) because only the entry point knows whether
+another stretch is coming.
 """
-progress_done!() = _progress_report(:done, "", 0, 0, 0)
+progress_done!(label::AbstractString = "") = _progress_report(:done, String(label), 0, 0, 0)
 
 """
     ReactantNitro.progress_phase!(label) -> nothing
@@ -981,7 +982,8 @@ function _run_name(r::_RunProgress)
     return isempty(r.phase) ? name : name * " [" * r.phase * "]"
 end
 
-_done_name(r::_RunProgress) = r.max_epochs > 0 ? "done: $(r.epoch)/$(r.max_epochs) epochs" : "done"
+_done_name(r::_RunProgress, label::String = "") =
+    !isempty(label) ? label : r.max_epochs > 0 ? "done: $(r.epoch)/$(r.max_epochs) epochs" : "done"
 
 # ── The terminal bar ─────────────────────────────────────────────────────────────────
 
@@ -1064,12 +1066,12 @@ function progress_bar_reporter(
         _BAR_DIRTY[] = false
         if p === nothing
             # A name-only run: the line is still open, so the final word and the newline.
-            ProgressMeter.printover(stderr, _done_name(r), _BAR_COLOR)
+            ProgressMeter.printover(stderr, _done_name(r, label), _BAR_COLOR)
             println(stderr)
         else
             # Not `finish!`, which is a no-op once the counter has reached the total and would
             # leave the last stretch's name on the line. `keep = true` prints the newline.
-            p.core.desc = _done_name(r) * " "
+            p.core.desc = _done_name(r, label) * " "
             ProgressMeter.update!(p, _BAR_RES; keep = true, force = true)
         end
     end
@@ -1093,9 +1095,9 @@ const _PLOG_INTERVAL = 0.1
 
 # The record `@logprogress` emits, both halves: the `progress` keyword is the old API Pluto and
 # VS Code read, the `ProgressString` message is the new one TerminalLoggers reads.
-function _plog_emit!(st::_ProgressLog; done::Bool = false)
+function _plog_emit!(st::_ProgressLog; done::Bool = false, label::String = "")
     fraction = _run_fraction(st.run)
-    name = done ? _done_name(st.run) : _run_name(st.run)
+    name = done ? _done_name(st.run, label) : _run_name(st.run)
     msg = ProgressLogging.ProgressString(
         ProgressLogging.Progress(st.id, fraction; name, done)
     )
@@ -1146,7 +1148,7 @@ function progress_log_reporter(
     elseif verb === :done
         st = _PLOG[]
         _PLOG[] = nothing
-        st === nothing || _plog_emit!(st; done = true)
+        st === nothing || _plog_emit!(st; done = true, label)
     end
     return nothing
 end

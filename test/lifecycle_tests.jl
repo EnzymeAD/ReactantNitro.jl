@@ -635,11 +635,12 @@
     # ProgressMeter renders a bar correctly is ProgressMeter's business.
     @testset "the progress reporter sees every unit of work, bracketed" begin
         events = Tuple{Symbol, String, Int, Int, Int}[]
+        # Built before the recorder, so the events are `train!`'s and not setup's.
+        n = mk_life(; max_epochs = 2)
         prev = ReactantNitro.progress_reporter!(
             (v, l, t, e, m) -> (push!(events, (v, l, t, e, m)); nothing)
         )
         try
-            n = mk_life(; max_epochs = 2)
             train!(n)
         finally
             ReactantNitro.progress_reporter!(prev)
@@ -692,6 +693,51 @@
         @test any(e -> e[1] === :phase && e[2] == "closing data stream", events)
     end
 
+    # ── setup, which runs before any verb and can take minutes in `build_data` ─────────────
+    @testset "setup is one unknown-length stretch, phased by step" begin
+        events = Tuple{Symbol, String, Int, Int, Int}[]
+        prev = ReactantNitro.progress_reporter!(
+            (v, l, t, e, m) -> (push!(events, (v, l, t, e, m)); nothing)
+        )
+        try
+            mk_life(; max_epochs = 1)
+        finally
+            ReactantNitro.progress_reporter!(prev)
+        end
+        @test [e for e in events if e[1] in (:begin, :end, :done)] ==
+            [(:begin, "setup", 0, 0, 0), (:end, "", 0, 0, 0), (:done, "setup done", 0, 0, 0)]
+        @test [e[2] for e in events if e[1] === :phase] == [
+            "building data", "deriving", "setting up devices", "building model",
+            "reading first batch", "building optimizer", "starting logger",
+        ]
+
+        # A failed setup still closes its line, and says so.
+        events = Tuple{Symbol, String}[]
+        prev = ReactantNitro.progress_reporter!((v, l, t, e, m) -> (push!(events, (v, l)); nothing))
+        try
+            @test_throws Exception mk_life(; data = [1, 2])
+        finally
+            ReactantNitro.progress_reporter!(prev)
+        end
+        @test events[end] == (:done, "setup failed")
+        @test count(e -> e[1] === :end, events) == 1
+
+        # In a notebook: one bar named by the step, closed as `setup done`.
+        logger = Test.TestLogger(; min_level = ProgressLevel)
+        prev = ReactantNitro.progress_reporter!(ReactantNitro.progress_log_reporter)
+        try
+            with_logger(() -> mk_life(; max_epochs = 1), logger)
+        finally
+            ReactantNitro.progress_reporter!(prev)
+        end
+        ps = [ProgressLogging.asprogress(r.level, r.message) for r in logger.logs]
+        @test allequal(p.id for p in ps)
+        @test any(p -> p.name == "setup [building data]" && p.fraction === nothing, ps)
+        @test ps[end].done
+        @test ps[end].name == "setup done"
+        @test ReactantNitro._PLOG[] === nothing
+    end
+
     # ── the checkpoint write, which emits no units and used to emit no bar ───────────────
     #
     # A write is not a countable stretch, so nothing on the progress path noticed it and an epoch
@@ -700,11 +746,12 @@
     # label and the epoch it belongs to.
     @testset "a checkpointed run reports its writes" begin
         events = Tuple{Symbol, String, Int, Int, Int}[]
+        n = Nitro(LifeMLP(); run_dir = mktempdir(), max_epochs = 2, resume = false)
         prev = ReactantNitro.progress_reporter!(
             (v, l, t, e, m) -> (push!(events, (v, l, t, e, m)); nothing)
         )
         try
-            train!(Nitro(LifeMLP(); run_dir = mktempdir(), max_epochs = 2, resume = false))
+            train!(n)
         finally
             ReactantNitro.progress_reporter!(prev)
         end
@@ -740,9 +787,10 @@
         # program `LifeMLP` needs and this run would otherwise compile nothing and report nothing.
         # Resetting is what makes the compile actually happen here.
         cache_reset!()
+        n = mk_life(; max_epochs = 1)
         prev = ReactantNitro.progress_reporter!((v, l, t, e, m) -> (push!(ev, (v, l)); nothing))
         try
-            train!(mk_life(; max_epochs = 1))
+            train!(n)
         finally
             ReactantNitro.progress_reporter!(prev)
         end
@@ -769,9 +817,9 @@
 
     # A reporter that throws is a display bug, and a training run is not the place to pay for one.
     @testset "a reporter that throws is switched off, not propagated" begin
+        n = mk_life(; max_epochs = 1)
         prev = ReactantNitro.progress_reporter!((args...) -> error("reporter is broken"))
         try
-            n = mk_life(; max_epochs = 1)
             @test_logs (:warn,) match_mode = :any train!(n)
             @test phase(n) isa Done                       # the run finished regardless
             @test ReactantNitro._PROGRESS_REPORTER[] === nothing   # and said so once
@@ -795,7 +843,7 @@
             @test ReactantNitro._BAR[] === nothing
             @test ReactantNitro._BAR_RUN[] === nothing
         end
-        # Setup compiles before any stretch has begun, so a `:phase` with no run is ordinary.
+        # A `:phase` with no run open is a no-op.
         @test rep(:phase, "compiling gradient", 0, 0, 0) === nothing
     end
 
@@ -913,16 +961,18 @@
         # Under a logger that accepts progress, a training run is one logged bar.
         logger = Test.TestLogger(; min_level = ProgressLevel)
         prev = ReactantNitro.progress_reporter!(ReactantNitro.default_progress_reporter)
+        # Built outside the loggers, so each captures one `train!` bar and not setup's as well.
+        n1, n2 = mk_life(; max_epochs = 1), mk_life(; max_epochs = 1)
         try
             with_logger(logger) do
                 @test ReactantNitro._logging_progress()
-                train!(mk_life(; max_epochs = 1))
+                train!(n1)
             end
             # Under the stdlib default, which drops the level, the same run emits nothing.
             quiet = Test.TestLogger(; min_level = Logging.Info)
             with_logger(quiet) do
                 @test !ReactantNitro._logging_progress()
-                train!(mk_life(; max_epochs = 1))
+                train!(n2)
             end
             @test isempty(filter(r -> r.message isa ProgressLogging.ProgressString, quiet.logs))
         finally

@@ -679,6 +679,10 @@ emits those records and the environment draws them its own way. In a CI log or a
 transcript it emits nothing. `ReactantNitro.progress_reporter!` installs either built-in
 reporter directly, your own function of the same five arguments, or `nothing` to silence it.
 
+`Nitro(e)` reports its setup the same way, as one line naming the current step
+(`setup [building data]`) and closing as `setup done`. Nothing compiles during setup; the first
+compile is reported by the first verb that needs it.
+
 ## Predicting on new data
 
 [`predict`](@ref) is [`forward`](@ref) alone, in eval mode, on any `Nitro`. It takes a batch

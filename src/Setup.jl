@@ -30,10 +30,12 @@ keyword-only, each naming a fact about this invocation. `early_stop` defaults to
 | 7 | Capture `w0` | Immediately after, before any restore or step |
 | 8 | Param groups, the flat permutation, the per-group ranges | Needs `ps`; unconditional, since the resume path validates against it |
 | 9 | **Training only.** Flatten `ps`, build optimizer state, normalize it to device residency | Needs the layout |
-| 10 | Create the compile cache; resolve routing against `typeof(compile_view(e))` | Needs the batch schema and the hooks |
+| 10 | Resolve routing against `typeof(compile_view(e))` from the first batch | Needs the batch schema and the hooks |
 | 11 | **Training only.** Check `length(train) % accum == 0`; resolve the horizon and call each schedule factory once | Needs `length(train)`, `accum`, `max_epochs` |
 | 12 | Construct the logger, log parameters and the seed | Before the first compile, which can crash |
-| 13 | First trace and compile, against `compile_view(e)` | The tracer never sees the full `e` |
+
+Nothing is compiled here. Each program is traced and compiled, against `compile_view(e)`, by the
+first verb that runs it.
 
 `build_data` and `derive` see the pre-conversion experiment, where `Device` fields hold host values;
 every other hook sees the post-conversion one.
@@ -53,12 +55,23 @@ for leaf. `w0` says what `decay_anchor = :w0` anchors to: `:build_model` (the de
 
 **Without a `train` split** steps 9 and 11 are skipped. Routing falls back to the first batch of
 whichever split exists; with no split at all it is deferred to the first `predict` call.
+
+**Progress.** The sequence is reported as one `"setup"` stretch of unknown length, with the current
+step as its phase (`setup [building data]`), closing as `setup done`. See
+[`progress_reporter!`](@ref).
 """
 # `Starting` is published before the build, through the module-level monitors, because `build_data`
 # can start and compile a data server and this was the longest undeclared stretch there was.
 Nitro(e; kwargs...) = _off_interactive() do
     publish_phase(Starting())
-    return _build_nitro(e; kwargs...)
+    return try
+        n = with_progress_stretch(() -> _build_nitro(e; kwargs...), "setup", 0, 0, 0)
+        progress_done!("setup done")
+        n
+    catch
+        progress_done!("setup failed")
+        rethrow()
+    end
 end
 
 # Split out so the public constructor can move it off the interactive thread: construction blocks
@@ -109,6 +122,7 @@ function _build_nitro(
     # extension's RecordingLogger) forwards the pin, and a user's own logger is untouched.
     logger = _adopt_logger!(logger, run_dir)
 
+    (checkpoint !== nothing || resume !== false) && progress_phase!("loading checkpoint")
     record, source = nothing, nothing
     if checkpoint !== nothing
         # `load_checkpoint` dispatches on the checkpointer, so `checkpointer = nothing` has no
@@ -165,6 +179,7 @@ function _build_nitro(
     rng = Random.default_rng()
 
     # ── 3. data. `build_data` sees the PRE-conversion experiment ───────────────────
+    progress_phase!("building data")
     collection = data === nothing ? hook_fn(hooks, :build_data, build_data)(e, nothing) : data
     collection isa NamedTuple || error("ReactantNitro: `build_data` must return a NAMED collection, \
         `(; train, val)` or `(; train, val, test)`, and returned a `$(typeof(collection))`. Named and \
@@ -179,6 +194,7 @@ function _build_nitro(
     # ── 4. derive, still pre-conversion, so it returns host values ─────────────────
     # `checkpoint = path` takes the derived values from the record; `resume` recomputes them, and
     # the config comparison excludes derived values for that reason.
+    progress_phase!("deriving")
     e = weights_only ? merge_derived(e, restored_devices(record, e)) :
         merge_derived(e, derive(e, collection))
 
@@ -192,9 +208,11 @@ function _build_nitro(
     record === nothing || check_config_compatible(record, e, source)
 
     # ── 4.5 devices, before conversion places values on the mesh ───────────────────
+    progress_phase!("setting up devices")
     mesh = setup_devices(n_devs)
 
     # ── 5. convert Device fields. `e`'s TYPE CHANGES HERE ─────────────────────────
+    progress_phase!("building model")
     e = to_device_config(e, mesh)
     ev = compile_view(e)
 
@@ -244,6 +262,7 @@ function _build_nitro(
     if !isempty(keys(collection))
         schema_split = training ? :train : first(keys(collection))
         # Through the source; the wrapper's `iterate` is a passthrough so it is the same batch.
+        progress_phase!("reading first batch")
         probe = first(prefetch_source(getproperty(collection, schema_split)))
         routing = resolve_routing(ev, probe; model, ps, st, hooks)
         if training && manual
@@ -294,6 +313,7 @@ function _build_nitro(
     # ── 9, 11. training only ───────────────────────────────────────────────────────
     # Manual mode flattens nothing: the closure owns the optimizer state, the masks and the
     # accumulator, so `()` / `nothing` is correct rather than a placeholder.
+    training && progress_phase!("building optimizer")
     flat = manual ? () : flatten(ps, layout, mesh)
     resolved, total = nothing, nothing
     # Hoisted so the freeze below can see it. `()` for a no-train `Nitro` and for manual mode,
@@ -346,6 +366,7 @@ function _build_nitro(
     # ── 12. the logger, BEFORE the first compile, which can crash ──────────────────
     # Reattachment before any metric is logged, so a backend continues one history rather than
     # opening a second experiment.
+    progress_phase!("starting logger")
     record === nothing || record.logger_state === nothing ||
         reattach!(logger, record.logger_state)
     # The preset name is logged with the config it produced, omitted when none. The resolved
