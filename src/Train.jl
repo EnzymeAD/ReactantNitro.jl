@@ -479,7 +479,7 @@ function _train!(nitro::Nitro)
                 progress_end!()
             end
             nitro.st = st
-            check_epoch_length(
+            nitro.stop_requested || check_epoch_length(
                 seen, length(nitro.data.train), :train;
                 horizon_dependent = nitro.schedules !== nothing &&
                     nitro.schedules.horizon_dependent
@@ -687,7 +687,7 @@ function _train_manual!(nitro::Nitro)
                 progress_end!()
             end
             nitro.st = st
-            check_epoch_length(
+            nitro.stop_requested || check_epoch_length(
                 seen, length(nitro.data.train), :train;
                 horizon_dependent = nitro.schedules !== nothing &&
                     nitro.schedules.horizon_dependent
