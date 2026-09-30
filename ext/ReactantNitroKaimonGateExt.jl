@@ -353,7 +353,7 @@ end
 
 const TOOL_NITRO_KWARGS = (
     :max_epochs, :run_dir, :seed, :n_devs, :accum, :gradient_clip_norm, :preset, :resume,
-    :checkpoint,
+    :weights, :restore_optimizer, :restore_best,
 )
 
 function _check_overrides(::Type{T}, overrides::Dict{Symbol}, kwargs) where {T}
@@ -388,9 +388,54 @@ function _collect_run_kwargs(;
     return kwargs
 end
 
-# `resume` mirrors the constructor's own three-way split: the symbol `:auto` (find the latest
-# checkpoint in run_dir), `false` (the default, start over), or a checkpoint path.
-_parse_resume(s::AbstractString) = s == "auto" ? :auto : s == "false" ? false : String(s)
+# A checkpoint source as a string, mirroring the constructor's `run => checkpoint`: `"a => b"`,
+# spaces optional. On the left `latest` and `all` are the symbols and anything else is a run id; on
+# the right `best` and `latest`. A string with no `=>` is a path. Bare `"best"` and `"latest"` name
+# no run and are refused with the pair to use, as the constructor refuses `:best`. `:current` has
+# no string form: it needs a live handle, which a tool argument cannot carry.
+function _parse_source(s::AbstractString, kw::AbstractString)
+    t = strip(s)
+    if t in ("best", "latest")
+        error(
+            "ReactantNitro ReactantNitroKaimonGateExt: `$(kw) = \"$(t)\"` names a checkpoint and not \
+             the run it belongs to. Pass `$(kw) = \"latest => $(t)\"` for the most recent run in \
+             `run_dir`, or `\"<run id> => $(t)\"` for another (`runs(run_dir)` lists them)\
+             $(t == "best" ? ", or `\"all => best\"` for the best across every run" : "")."
+        )
+    end
+    occursin("=>", t) || return String(t)
+    left, right = strip.(split(t, "=>"; limit = 2))
+    (isempty(left) || isempty(right)) && error(
+        "ReactantNitro ReactantNitroKaimonGateExt: `$(kw) = \"$(t)\"` needs a run on the left of \
+         `=>` (`latest`, `all` or a run id) and a checkpoint on the right (`best` or `latest`)."
+    )
+    run = left == "latest" ? :latest : left == "all" ? :all : String(left)
+    which = right == "best" ? :best : right == "latest" ? :latest : error(
+            "ReactantNitro ReactantNitroKaimonGateExt: `$(kw) = \"$(t)\"` names no checkpoint of the \
+         run: `$(right)` is not `best` or `latest`."
+        )
+    return run => which
+end
+
+# `resume`: `"auto"` (the same as `"latest => latest"`, starting fresh when there is nothing),
+# `"false"` (the default, start over), or a source as above.
+_parse_resume(s::AbstractString) = s == "auto" ? :auto : s == "false" ? false : _parse_source(s, "resume")
+
+# `weights`: a source as above. The tools' `checkpoint` argument is the deprecated spelling, mapped
+# here so the constructor sees `weights` alone.
+_parse_weights(s::AbstractString) = _parse_source(s, "weights")
+
+function _weights_arg(weights, checkpoint)
+    checkpoint === nothing && return weights === nothing ? nothing : _parse_weights(weights)
+    weights === nothing || error(
+        "ReactantNitro ReactantNitroKaimonGateExt: `checkpoint` is the deprecated spelling of \
+         `weights`, and both were given. Pass `weights` only."
+    )
+    @warn "ReactantNitro ReactantNitroKaimonGateExt: the tools' `checkpoint` argument is deprecated \
+           and will be removed in 0.2.0. Pass `weights` (a checkpoint path, or a source such as \
+           \"latest => best\")." maxlog = 1
+    return _parse_weights(checkpoint)
+end
 
 # `nitro_export`'s `data`: `"none"` (the default) builds no data, since an export reads weights and
 # traces a graph, and is what lets a model whose exportable handle is a different build from its
@@ -540,7 +585,7 @@ end
 
 function _target_nitro(
         state::RunState, run_id::Union{AbstractString, Nothing},
-        spec::Union{AbstractString, Nothing}, checkpoint::Union{AbstractString, Nothing},
+        spec::Union{AbstractString, Nothing}, weights::Union{AbstractString, Pair, Nothing},
         overrides::Union{AbstractString, Nothing}, kwargs::Vector{Pair{Symbol, Any}},
         preset::Union{AbstractString, Nothing}
     )
@@ -559,12 +604,12 @@ function _target_nitro(
         )
         src.nitro === nothing && error(
             "ReactantNitro ReactantNitroKaimonGateExt: run `$(run_id)` (kind $(src.kind)) holds no `Nitro` to \
-             operate on. Pass `experiment` (with `checkpoint` for trained weights) instead."
+             operate on. Pass `experiment` (with `weights` for trained weights) instead."
         )
         return src.nitro
     end
     kw = copy(kwargs)
-    checkpoint === nothing || push!(kw, :checkpoint => checkpoint)
+    weights === nothing || push!(kw, :weights => weights)
     return _build_nitro(state, spec, overrides, kw, preset)
 end
 
@@ -683,23 +728,36 @@ end
 
 """
     nitro_train(experiment; max_epochs, run_dir, seed, n_devs, accum, gradient_clip_norm,
-                preset, resume, checkpoint, overrides) -> String
+                preset, resume, weights, restore_optimizer, restore_best, overrides) -> String
 
 Start training an experiment in the background and return the run id immediately.
 
 `experiment` is a module-qualified type string for an `@experiment` struct loaded in this session,
 e.g. `MyModels.MnistMLP`. The typed keywords are run knobs passed to `Nitro`, beating the
 experiment's own accessor for this run: `max_epochs`, `run_dir`, `seed`, `n_devs`, `accum`,
-`gradient_clip_norm`, `preset` (a name from `presets(MyExp)`), `resume` (`"auto"`, `"false"`, or a
-checkpoint path), and `checkpoint`. `overrides` carries experiment-field values as a
-comma-separated `name=value` list of Julia literals, e.g. `overrides="width=128, labels=[1.0,2.0]"`;
-an unknown field or a key given in both places is an error.
+`gradient_clip_norm`, `preset` (a name from `presets(MyExp)`), `resume` and `weights`.
+
+`weights` and `resume` take a checkpoint source: a path, or `"run => checkpoint"` with the run
+`latest` (the most recent run in `run_dir`), `all` (every run, only as `"all => best"`) or a run id
+(the `run` of `read_manifest`, listed by `runs(run_dir)`), and the checkpoint `best` (the best by
+the checkpointer's current metric) or `latest` (the run's newest record): `"latest => best"`,
+`"a1b2c3d4 => best"`, `"all => best"`, `"latest => latest"`. Bare `"best"` and `"latest"` are
+refused. `resume` also takes `"auto"` (the same as `"latest => latest"`, starting fresh when there
+is nothing to resume) and `"false"` (the default). `weights` gives the parameters alone, with a
+fresh optimizer; `restore_optimizer = true` also takes that record's optimizer state, with a fresh
+step, epoch and schedule. `restore_best = true` ends the run by loading its own best checkpoint
+into the handle, which a later `nitro_validate`/`nitro_evaluate`/`nitro_export` with this run's id
+then uses. `overrides` carries experiment-field values as a comma-separated `name=value` list of
+Julia literals, e.g. `overrides="width=128, labels=[1.0,2.0]"`; an unknown field or a key given in
+both places is an error.
 
 Poll `nitro_status(run_id=...)` until the run completes; `nitro_runs()` lists all runs.
 `nitro_stop(run_id=...)` stops gracefully after the current epoch's validation and checkpoint.
 
 ```julia
 nitro_train(experiment="MyModels.MnistMLP", max_epochs=40, run_dir="runs/mnist_v1")
+nitro_train(experiment="MyModels.MnistMLP", max_epochs=10, run_dir="runs/mnist_ft",
+            weights="runs/mnist_v1/epoch-0040.jld2", restore_best=true)
 ```
 """
 function nitro_train(
@@ -712,13 +770,20 @@ function nitro_train(
         gradient_clip_norm::Union{Float64, Nothing} = nothing,
         preset::Union{String, Nothing} = nothing,
         resume::Union{String, Nothing} = nothing,
+        weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
+        restore_optimizer::Bool = false,
+        restore_best::Bool = false,
         overrides::Union{String, Nothing} = nothing,
     )
     kwargs = _collect_run_kwargs(;
         max_epochs, run_dir, seed, n_devs, accum, gradient_clip_norm, preset, resume,
     )
-    checkpoint === nothing || push!(kwargs, :checkpoint => checkpoint)
+    w = _weights_arg(weights, checkpoint)
+    w === nothing || push!(kwargs, :weights => w)
+    # Passed only when set, so the constructor's own default stays the one authority.
+    restore_optimizer && push!(kwargs, :restore_optimizer => true)
+    restore_best && push!(kwargs, :restore_best => true)
     state = _new_run(:train, experiment)
     _launch_run!(state) do
         _train_task(state, experiment, overrides, kwargs, preset)
@@ -729,18 +794,20 @@ function nitro_train(
 end
 
 """
-    nitro_validate(; run_id, experiment, checkpoint, overrides, ...) -> String
+    nitro_validate(; run_id, experiment, weights, overrides, ...) -> String
 
 Run the `val` split over a `Nitro` in the background and return the run id immediately. Pass
 exactly one of `run_id` (a completed train run in this session, whose trained `Nitro` is reused)
-or `experiment` (a type string; `checkpoint` loads trained weights). The remaining typed keywords
-are run knobs for the `experiment` construction; `overrides` has `nitro_train`'s format. Poll
-`nitro_status(run_id=...)` for the finalized metrics.
+or `experiment` (a type string; `weights` loads trained weights: a path, or a source such as
+`"latest => best"` or `"<run id> => best"`, as for `nitro_train`). The remaining typed keywords are run knobs for the `experiment`
+construction; `overrides` has `nitro_train`'s format. Poll `nitro_status(run_id=...)` for the
+finalized metrics.
 """
 function nitro_validate(
         ;
         run_id::Union{String, Nothing} = nothing,
         experiment::Union{String, Nothing} = nothing,
+        weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
         overrides::Union{String, Nothing} = nothing,
         max_epochs::Union{Int, Nothing} = nothing,
@@ -756,24 +823,28 @@ function nitro_validate(
         max_epochs, run_dir, seed, n_devs, accum, gradient_clip_norm, preset, resume,
     )
     label = something(experiment, run_id, "")
+    # Parsed here, not in the run body: a malformed source is the caller's mistake and is refused
+    # before a run exists.
+    w = _weights_arg(weights, checkpoint)
     state = _new_run(:validate, label)
     _launch_run!(state) do
-        nitro = _target_nitro(state, run_id, experiment, checkpoint, overrides, kwargs, preset)
+        nitro = _target_nitro(state, run_id, experiment, w, overrides, kwargs, preset)
         _eval_task(state, nitro, :val)
     end
     return "started run $(state.id) (kind=validate). Poll `nitro_status(run_id=\"$(state.id)\")`."
 end
 
 """
-    nitro_evaluate(; run_id, experiment, split="test", checkpoint, overrides, ...) -> String
+    nitro_evaluate(; run_id, experiment, split="test", weights, overrides, ...) -> String
 
 Run one split (default `"test"`) over a `Nitro` in the background and return the run id
 immediately. Otherwise identical to `nitro_validate`: pass `run_id` or `experiment` (plus
-`checkpoint` for trained weights), and poll `nitro_status(run_id=...)` for the metrics.
+`weights` for trained weights), and poll `nitro_status(run_id=...)` for the metrics.
 
 ```julia
 nitro_evaluate(run_id="a1b2c3d4")
-nitro_evaluate(experiment="MyModels.MnistMLP", split="val", checkpoint="runs/mnist_v1/latest")
+nitro_evaluate(experiment="MyModels.MnistMLP", split="val", run_dir="runs/mnist_v1",
+               weights="latest => best")
 ```
 """
 function nitro_evaluate(
@@ -781,6 +852,7 @@ function nitro_evaluate(
         run_id::Union{String, Nothing} = nothing,
         experiment::Union{String, Nothing} = nothing,
         split::String = "test",
+        weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
         overrides::Union{String, Nothing} = nothing,
         max_epochs::Union{Int, Nothing} = nothing,
@@ -796,9 +868,12 @@ function nitro_evaluate(
         max_epochs, run_dir, seed, n_devs, accum, gradient_clip_norm, preset, resume,
     )
     label = something(experiment, run_id, "")
+    # Parsed here, not in the run body: a malformed source is the caller's mistake and is refused
+    # before a run exists.
+    w = _weights_arg(weights, checkpoint)
     state = _new_run(:evaluate, label)
     _launch_run!(state) do
-        nitro = _target_nitro(state, run_id, experiment, checkpoint, overrides, kwargs, preset)
+        nitro = _target_nitro(state, run_id, experiment, w, overrides, kwargs, preset)
         _eval_task(state, nitro, Symbol(split))
     end
     return "started run $(state.id) (kind=evaluate, split=$split). Poll \
@@ -806,7 +881,7 @@ function nitro_evaluate(
 end
 
 """
-    nitro_predict(; run_id, experiment, inputs, checkpoint, overrides, ...) -> String
+    nitro_predict(; run_id, experiment, inputs, weights, overrides, ...) -> String
 
 Run `predict` on one batch in the background and return the run id immediately.
 
@@ -815,13 +890,14 @@ Run `predict` on one batch in the background and return the run id immediately.
 LAST, exactly as the framework asserts on every batch. Arrays are converted to Float32. The
 result carries each output's shape and the first few values, never the full arrays.
 
-Pass `run_id` (a completed train run) or `experiment` plus `checkpoint` for trained weights.
+Pass `run_id` (a completed train run) or `experiment` plus `weights` for trained weights.
 """
 function nitro_predict(
         ;
         run_id::Union{String, Nothing} = nothing,
         experiment::Union{String, Nothing} = nothing,
         inputs::String = "",
+        weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
         overrides::Union{String, Nothing} = nothing,
         max_epochs::Union{Int, Nothing} = nothing,
@@ -837,9 +913,12 @@ function nitro_predict(
         max_epochs, run_dir, seed, n_devs, accum, gradient_clip_norm, preset, resume,
     )
     label = something(experiment, run_id, "")
+    # Parsed here, not in the run body: a malformed source is the caller's mistake and is refused
+    # before a run exists.
+    w = _weights_arg(weights, checkpoint)
     state = _new_run(:predict, label)
     _launch_run!(state) do
-        nitro = _target_nitro(state, run_id, experiment, checkpoint, overrides, kwargs, preset)
+        nitro = _target_nitro(state, run_id, experiment, w, overrides, kwargs, preset)
         _predict_task(state, nitro, inputs)
     end
     return "started run $(state.id) (kind=predict). Poll `nitro_status(run_id=\"$(state.id)\")`."
@@ -847,7 +926,7 @@ end
 
 """
     nitro_export(; run_id, experiment, dir, name, backend="reactant_server",
-                 batch_sizes="[1]", provenance_root, provenance, checkpoint,
+                 batch_sizes="[1]", provenance_root, provenance, weights,
                  overrides, ...) -> String
 
 Export a trained model in the background and return the run id immediately.
@@ -855,7 +934,7 @@ Export a trained model in the background and return the run id immediately.
 `dir` and `name` are required; the artifact lands in `dir/name`. `backend` is
 `"reactant_server"` (the shipped StableHLO bundle backend, loaded on demand) or a backend
 registered for this session. `batch_sizes` is a vector literal, e.g. `"[1, 8]"`. Pass `run_id` (a
-completed train run) or `experiment` plus `checkpoint`; export asserts a single-device handle.
+completed train run) or `experiment` plus `weights`; export asserts a single-device handle.
 
 `provenance_root` is the repository root to collect repository state from: the git commit, tree
 hash and, on a dirty tree, the `working_tree.patch` that ties the artifact to the code that produced
@@ -864,7 +943,7 @@ fine for a throwaway export and wrong for anything that gets registered. `proven
 `name=value` list merged last, for one-off scalars; a model's own facts belong in its
 `export_provenance_extra` hook.
 
-An `experiment` export does not build the training data (the `Nitro(e; checkpoint, data = (;))`
+An `experiment` export does not build the training data (the `Nitro(e; weights, data = (;))`
 construction `export_model` prescribes), so a model whose exportable handle differs from its
 trainable one is exportable by putting the flag in `overrides`. `data = "build"` calls `build_data`
 anyway, for a model whose `derive` reads its data on an export with no checkpoint.
@@ -875,7 +954,7 @@ nitro_export(run_id="a1b2c3d4", dir="export_out", name="mnist_v1",
 
 # a handle whose export build differs from its train build
 nitro_export(experiment="MyModels.MyExperiment", preset="my_preset",
-             checkpoint="runs/v2/epoch-0040.jld2", overrides="export_inference=true",
+             weights="runs/v2/epoch-0040.jld2", overrides="export_inference=true",
              dir="runs/export_out", name="my_model", provenance_root="/path/to/model/repo")
 ```
 """
@@ -889,6 +968,7 @@ function nitro_export(
         batch_sizes::String = "[1]",
         provenance_root::Union{String, Nothing} = nothing,
         provenance::Union{String, Nothing} = nothing,
+        weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
         overrides::Union{String, Nothing} = nothing,
         max_epochs::Union{Int, Nothing} = nothing,
@@ -921,9 +1001,12 @@ function nitro_export(
     # loading a package has no business inside a run task (see `_launch_run!`).
     resolved = _resolve_backend(backend)
     label = something(experiment, run_id, "")
+    # Parsed here, not in the run body: a malformed source is the caller's mistake and is refused
+    # before a run exists.
+    w = _weights_arg(weights, checkpoint)
     state = _new_run(:export, label)
     _launch_run!(state) do
-        nitro = _target_nitro(state, run_id, experiment, checkpoint, overrides, kwargs, preset)
+        nitro = _target_nitro(state, run_id, experiment, w, overrides, kwargs, preset)
         bs = _parse_batch_sizes(batch_sizes)
         prov = _parse_provenance(provenance)
         # A `Nitro` built for this export has no run to end it, so `Done` is published when the

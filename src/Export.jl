@@ -655,7 +655,7 @@ which is [`site_provenance`](@ref)'s job.
 It stamps `checkpoint` when the handle restored from one, naming the file the restore actually
 read (`Nitro.checkpoint_source`), and omits the key for fresh weights. It stamps the training run's
 `trained_run_id` and `trained_run_url` from the restored record rather than this handle's logger,
-which on a `checkpoint = path` construction is a fresh one naming the exporting process. The
+which on a `weights = path` construction is a fresh one naming the exporting process. The
 checkpoint's epoch and metric are not carried; the record has them if that is ever wanted.
 """
 function export_provenance(nitro::Nitro)
@@ -711,7 +711,7 @@ export code loads a checkpoint.
 ```julia
 using ReactantServerExport                       # the extension that provides the backend
 
-nitro = Nitro(e; checkpoint = "runs/x/best.jld2", data = (;))
+nitro = Nitro(e; weights = "runs/x/best.jld2", data = (;))
 export_model(nitro, ReactantServerBundle(); dir = "export_out", name = "my_model_v1")
 ```
 

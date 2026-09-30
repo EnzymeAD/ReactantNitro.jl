@@ -6,7 +6,7 @@ ecosystem between the first `train!` and the served bundle.
 ```julia
 using ReactantServerExport                  # the extension that provides the backend
 
-n = Nitro(e; checkpoint = "runs/x/best.jld2", data = (;))   # no training in this process
+n = Nitro(e; weights = "runs/x/best.jld2", data = (;))   # no training in this process
 export_model(n, ReactantServerBundle(); dir = "export_out", name = "mnist_v1")
 ```
 

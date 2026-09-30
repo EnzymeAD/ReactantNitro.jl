@@ -69,6 +69,8 @@
     const CHECKPOINTING = [
         :TopKCheckpointer, :save_checkpoint!, :load_checkpoint, :CheckpointRecord,
         :checkpoint_filename, :read_manifest, :checkpoint_info,
+        # The run ids a checkpoint source names: every run a directory holds, and a handle's own.
+        :runs, :checkpoint_run,
     ]
     const LOGGING = [
         :log_metrics!, :log_params!, :log_tags!, :log_other!, :log_confusion!, :finish!,

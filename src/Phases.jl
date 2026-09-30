@@ -107,7 +107,7 @@ process; `train!(e)` is sugar for `train!(Nitro(e))`, and every keyword belongs 
 
 ```julia
 nitro = Nitro(e)                                  # fresh weights from build_model
-nitro = Nitro(e; checkpoint = "runs/x/latest")    # trained weights, no training this process
+nitro = Nitro(e; weights = "runs/x/latest")    # trained weights, no training this process
 nitro = Nitro(e; data = (; test = loader))        # supply data directly, skip build_data
 ```
 
@@ -142,7 +142,7 @@ mutable struct Nitro
     # or `nothing` for fresh weights. Export stamps it into the bundle.
     checkpoint_source::Any
 
-    # The run that trained these weights, from the restored record. A `checkpoint = path`
+    # The run that trained these weights, from the restored record. A `weights = path`
     # construction gets a fresh logger, so this handle's own `run_id` would name the exporting
     # process rather than the training run. `nothing` for fresh weights.
     trained_run_id::Any
@@ -192,6 +192,11 @@ mutable struct Nitro
     # Whether `release!` has run on this handle's splits; set by the first `Terminal` or an explicit
     # `release!(nitro)`, so the sources are released once however many times either happens.
     sources_released::Bool
+    # `restore_best = true`: `train!` ends by loading this run's selected checkpoint into `ps` and
+    # `st`. `restored_best` is that checkpoint, `(; path, epoch, metric, score, run)`, once it has,
+    # and a handle holding it refuses a further `train!`.
+    restore_best::Bool
+    restored_best::Any
 end
 
 # ── The accessors, which are reads and which everything downstream is specified in terms of.
@@ -433,6 +438,9 @@ end
 # Where these weights came from and whether this handle trained them are two questions. The four
 # wordings share a shape: an origin, and `trained here` in front of it when this handle trained.
 function _nitro_weights(nitro::Nitro)
+    rb = nitro.restored_best
+    rb === nothing || return "trained here, then restored to the best checkpoint, epoch " *
+        string(rb.epoch) * " (`restore_best`)"
     src = nitro.checkpoint_source
     ws = nitro.weights_source
     origin = ws !== nothing ?
@@ -501,7 +509,14 @@ function _show_nitro(io::IO, mime::MIME, nitro::Nitro)
     el = _nitro_elapsed(nitro.elapsed)
     el === nothing || push!(state, ["elapsed", el * "  (this `train!` call)"])
     push!(state, ["weights", _nitro_weights(nitro)])
-    push!(state, ["run_dir", nitro.run_dir])
+    # The run id beside the directory: it is what names this run in `weights = "<id>" => :best`.
+    ck_run = checkpoint_run(nitro)
+    push!(
+        state, [
+            "run_dir",
+            nitro.run_dir * (nitro.checkpointer isa TopKCheckpointer ? "   run " * run_key(ck_run) : ""),
+        ]
+    )
     push!(state, ["seed", string(nitro.seed, "   accum ", nitro.accum)])
     nitro.preset === nothing || push!(state, ["preset", string(nitro.preset)])
 
@@ -523,7 +538,11 @@ function _show_nitro(io::IO, mime::MIME, nitro::Nitro)
                 [
                     [
                         "selected",
-                        string("epoch ", bc.epoch, ", ", bc.metric, " ", _shown(bc.score)),
+                        string(
+                            "epoch ", bc.epoch, ", ", bc.metric, " ", _shown(bc.score),
+                            hasproperty(bc, :run) ? ", run " * run_key(bc.run) : "",
+                            nitro.restored_best === nothing ? "" : "  (the handle holds these weights)",
+                        ),
                     ],
                     ["path", _nitro_relpath(bc.path)],
                 ]

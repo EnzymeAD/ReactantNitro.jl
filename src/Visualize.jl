@@ -64,7 +64,7 @@ renders diff cleanly only if the validation loader is deterministic.
 
 ```julia
 render(Nitro(e); split = :val)                                        # the data gate
-render(Nitro(e; checkpoint = "runs/x/best.jld2"); predictions = true) # from a checkpoint
+render(Nitro(e; weights = "runs/x/best.jld2"); predictions = true) # from a checkpoint
 render(nitro, batch; predictions = true)                              # a batch in hand
 ```
 """

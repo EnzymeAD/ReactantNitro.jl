@@ -134,16 +134,26 @@ e.max_epochs                # else a field of the same name, when the struct dec
 Ten keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`, `schedules`,
 `gradient_clip_norm`, `logger`, `checkpointer`, `early_stop`. `schedules` is the one whose accessor
 reads no field. Four keywords name a fact about this construction and have no accessor: `data`,
-`checkpoint`, `resume`, `run_ref`. `weights` and `w0` are two more of that kind.
+`weights`, `resume`, `run_ref`. `w0`, `restore_optimizer` and `restore_best` are more of that
+kind, and `checkpoint` is the deprecated spelling of `weights = path`.
 
-## Weights: the four ways in
+## Weights: the ways in
+
+`weights` and `resume` name a record the same way: a path, or `run => checkpoint` with the run
+`:latest`, a run id, `:all` or another `Nitro`, and the checkpoint `:best` or `:latest`
+(`weights = :latest => :best`). See the `Nitro` docstring for the whole grammar.
 
 | construction | weights | optimizer | epoch | `derive` |
 | --- | --- | --- | --- | --- |
 | `Nitro(e)` | `build_model`'s init | fresh | 0 | runs |
-| `Nitro(e; checkpoint = path)` | the record's | fresh | 0 | skipped, values restored |
-| `Nitro(e; resume = :auto)` | the latest record's | restored | restored | runs |
+| `Nitro(e; weights = path)` or `run => :best` | the record's | fresh | 0 | skipped, values restored |
+| `Nitro(e; weights = run => :best, restore_optimizer = true)` | the record's | the record's | 0 | skipped, values restored |
+| `Nitro(e; resume = :auto)` (`:latest => :latest`) | the latest record's | restored | restored | runs |
+| `Nitro(e; resume = run => :best)` | the record's | restored | restored (a branch) | runs |
 | `Nitro(e; weights = other)` | `other`'s `ps` and `st` | fresh | 0 | runs |
+
+`restore_best = true` changes where a handle ends rather than where it starts: `train!` finishes by
+loading the run's own best checkpoint into `ps` and `st`.
 
 `w0`, the anchor for `decay_anchor = :w0`, is `build_model`'s init unless `w0 = :weights` or a tree
 says otherwise.

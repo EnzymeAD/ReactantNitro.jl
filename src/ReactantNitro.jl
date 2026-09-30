@@ -103,6 +103,9 @@ export seed, accum, n_devs, checkpointer, early_stop, logger
 # manifest without opening a record, and `checkpoint_info(path)` reads one record's metadata with
 # none of its weights. Public because sessions otherwise opened the JLD2 by hand.
 export read_manifest, checkpoint_info
+# Which runs a run directory holds, and which one a handle writes: the ids a `"<id>" => :best`
+# checkpoint source names.
+export runs, checkpoint_run
 
 # Accelerator configuration; the Kaimon tool `nitro_setup` is a thin wrapper over it.
 export setup_devices!

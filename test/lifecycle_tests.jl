@@ -477,6 +477,16 @@
         @test length([v for v in of(lg, :metrics) if v.context == "validate"]) == 1
     end
 
+    @testset "`request_stop!` MID-EPOCH under a horizon-dependent schedule exits through `Done`" begin
+        n = mk_life(; max_epochs = 2, schedules = (; eta = total -> t -> 1.0f-2 * (1 - t / total)))
+        register_phase_monitor!(n, (p, s, e, info) -> p isa TrainStepping && request_stop!(info.nitro))
+        train!(n)
+
+        @test phase(n) isa Done                                     # the short epoch did not raise
+        @test n.stop_reason === :requested
+        @test n.step - 1 < length(LIFE_TRAIN)                       # it really stopped mid-epoch
+    end
+
     @testset "a run that throws exits through `Failed`, and finalizes the logger" begin
         lg = RecLogger()
         n = mk_life(; logger = lg, max_epochs = 1)

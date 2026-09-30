@@ -317,6 +317,36 @@
         @test EXT._parse_resume("runs/x/epoch-0003.jld2") == "runs/x/epoch-0003.jld2"
     end
 
+    @testset "checkpoint sources as strings: `run => checkpoint`, or a path" begin
+        # Spaces optional; `latest` and `all` on the left are the symbols, anything else a run id.
+        @test EXT._parse_weights("latest => best") == (:latest => :best)
+        @test EXT._parse_weights("latest=>best") == (:latest => :best)
+        @test EXT._parse_weights("latest => latest") == (:latest => :latest)
+        @test EXT._parse_weights("all => best") == (:all => :best)
+        got = EXT._parse_weights("  a1b2c3d4 =>  latest ")
+        @test got == ("a1b2c3d4" => :latest) && first(got) isa String
+        @test EXT._parse_weights("a1b2c3d4 => best") == ("a1b2c3d4" => :best)
+        @test EXT._parse_weights("runs/x/epoch-0003.jld2") == "runs/x/epoch-0003.jld2"
+        @test EXT._parse_resume("latest => latest") == (:latest => :latest)
+        @test EXT._parse_resume("a1b2c3d4 => best") == ("a1b2c3d4" => :best)
+        @test EXT._parse_resume("all => best") == (:all => :best)
+        # Bare names are refused, with the pair to write instead.
+        for (f, kw) in ((EXT._parse_weights, "weights"), (EXT._parse_resume, "resume")), bare in ("best", "latest")
+            err = try
+                f(bare); nothing
+            catch ex
+                ex
+            end
+            @test err isa ErrorException && occursin("`$(kw) = \"latest => $(bare)\"`", err.msg)
+        end
+        @test_throws "not `best` or `latest`" EXT._parse_weights("latest => newest")
+        @test_throws "needs a run on the left" EXT._parse_weights(" => best")
+        # Through the tool: refused synchronously, before any run starts.
+        @test_throws "latest => best" EXT.nitro_train(GATE_SPEC; weights = "best")
+        @test_throws "latest => latest" EXT.nitro_train(GATE_SPEC; resume = "latest")
+        @test_throws "latest => best" EXT.nitro_evaluate(experiment = GATE_SPEC, weights = "best")
+    end
+
     # KaimonGate's registered-tool list is PRIVATE and has moved: `_SESSION_TOOLS::Ref{Vector}`
     # before the GateSession refactor, the accessor `_session_tools()` after it. Probe both, for
     # the same reason the extension does: pinning a test to one release's internals is how this
@@ -444,6 +474,45 @@
         @test_throws ErrorException ReactantNitro.run_state("no-such-run")
     end
 
+    @testset "sources, `restore_optimizer` and `restore_best` through the tools" begin
+        dir = mktempdir()
+        first_id = run_id(EXT.nitro_train(GATE_SPEC, max_epochs = 2, run_dir = dir))
+        a = wait_run(first_id)
+        @test a.status == :completed
+        ida = checkpoint_run(a.nitro)
+        best = ReactantNitro.selected_checkpoint(a.nitro.checkpointer, dir; run = ida)
+
+        # A new run in the same directory from A's best, with its optimizer state, ending on its own best.
+        id = run_id(
+            EXT.nitro_train(
+                GATE_SPEC, max_epochs = 2, run_dir = dir, weights = "$(ida) => best",
+                restore_optimizer = true, restore_best = true
+            )
+        )
+        s = wait_run(id)
+        @test s.status == :completed
+        n = s.nitro
+        @test checkpoint_run(n) != ida
+        @test n.restored_best !== nothing
+        own = ReactantNitro.selected_checkpoint(n.checkpointer, dir; run = checkpoint_run(n))
+        @test n.checkpoint_source == own.path == n.restored_best.path
+        # A second train on that handle is refused (here, by building a train on it directly).
+        @test_throws "cannot train again" train!(n)
+
+        # `resume` with a run id continues that run from its newest record.
+        rid = run_id(EXT.nitro_train(GATE_SPEC, max_epochs = 3, run_dir = dir, resume = "$(ida) => latest"))
+        r = wait_run(rid)
+        @test r.status == :completed
+        @test checkpoint_run(r.nitro) == ida && r.epoch == 3
+        # `evaluate` reads the best of the most recent run by the pair form.
+        eid = run_id(EXT.nitro_evaluate(experiment = GATE_SPEC, split = "test", run_dir = dir, weights = "all => best"))
+        e = wait_run(eid)
+        @test e.status == :completed
+        @test e.nitro.checkpoint_source ==
+            ReactantNitro.resolve_checkpoint(TopKCheckpointer(; dir), dir, :all, :best; what = "the test").path
+        @test isfile(best.path)
+    end
+
     @testset "nitro_logger reports the run's logger, live" begin
         dir = mktempdir()
         msg = EXT.nitro_train(GATE_SPEC, max_epochs = 1, run_dir = dir)
@@ -509,7 +578,7 @@
         # `run_dir = dir` keeps this fresh construction (which writes its default logger's file)
         # inside the test's temp directory rather than the suite's working directory.
         e_msg = EXT.nitro_evaluate(
-            experiment = GATE_SPEC, split = "test", checkpoint = ckpt, run_dir = dir
+            experiment = GATE_SPEC, split = "test", weights = ckpt, run_dir = dir
         )
         e_id = run_id(e_msg)
         e = wait_run(e_id)
@@ -553,7 +622,7 @@
 
         # export from `experiment` + checkpoint constructs a single-device handle automatically.
         x2_msg = EXT.nitro_export(
-            experiment = GATE_SPEC, checkpoint = ckpt, run_dir = dir,
+            experiment = GATE_SPEC, weights = ckpt, run_dir = dir,
             dir = dir, name = "gate_v2", backend = "recording",
         )
         x2_id = run_id(x2_msg)
@@ -593,7 +662,7 @@
         x = wait_run(
             run_id(
                 EXT.nitro_export(
-                    experiment = GATE_SPEC, checkpoint = ckpt, run_dir = dir,
+                    experiment = GATE_SPEC, weights = ckpt, run_dir = dir,
                     dir = dir, name = "late_v1", backend = "late", provenance_root = dir,
                 )
             )
@@ -611,7 +680,7 @@
 
     # ── `data`: the keyword that made an inference-only export expressible ───────────────
     #
-    # `Nitro(e; checkpoint = path, data = (;))` is the construction `export_model` prescribes, and
+    # `Nitro(e; weights = path, data = (;))` is the construction `export_model` prescribes, and
     # this tool once could not express it: `build_data` always ran. A model whose exportable handle
     # is a different build from its trainable one was therefore not exportable through the tool in
     # either direction, which pushes every export back onto a hand-written `export_model` call.
@@ -652,7 +721,7 @@
         x = wait_run(
             run_id(
                 EXT.nitro_export(
-                    experiment = EXPORT_ONLY_SPEC, checkpoint = ckpt, run_dir = dir,
+                    experiment = EXPORT_ONLY_SPEC, weights = ckpt, run_dir = dir,
                     dir = dir, name = "inference_v1", backend = "recording",
                     overrides = "export_inference=true",
                 )
@@ -668,7 +737,7 @@
         x2 = wait_run(
             run_id(
                 EXT.nitro_export(
-                    experiment = EXPORT_ONLY_SPEC, checkpoint = ckpt, run_dir = dir,
+                    experiment = EXPORT_ONLY_SPEC, weights = ckpt, run_dir = dir,
                     dir = dir, name = "inference_v2", backend = "recording",
                     overrides = "export_inference=true", data = "build",
                 )
@@ -683,7 +752,7 @@
         x3 = wait_run(
             run_id(
                 EXT.nitro_export(
-                    experiment = EXPORT_ONLY_SPEC, checkpoint = ckpt, run_dir = dir,
+                    experiment = EXPORT_ONLY_SPEC, weights = ckpt, run_dir = dir,
                     dir = dir, name = "inference_v3", backend = "recording",
                 )
             )

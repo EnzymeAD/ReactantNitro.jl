@@ -75,9 +75,9 @@
         err = caught(() -> mk(; w0 = :weights))
         @test err isa ErrorException
         @test occursin("no `weights = `", err.msg)
-        err = caught(() -> mk(; weights = "runs/x/latest.jld2"))
+        err = caught(() -> mk(; weights = 42))
         @test err isa ErrorException
-        @test occursin("takes a `Nitro`", err.msg)
+        @test occursin("takes a checkpoint path", err.msg)
         err = caught(() -> mk(; weights = n1, w0 = :nope))
         @test err isa ErrorException
         @test occursin(":build_model", err.msg)
