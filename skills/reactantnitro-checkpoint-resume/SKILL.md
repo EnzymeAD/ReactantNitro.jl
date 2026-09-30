@@ -12,8 +12,8 @@ description: >
 # Checkpointing and resume
 
 **`resume = false` is the default: a fresh `Nitro` does not resume.** Resuming is opt in.
-`resume = :auto` looks for `latest` in the run directory and continues from it, and an explicit
-path names one directly. The default used to be `:auto`, and it was changed because `run_dir`
+`resume = :auto` looks for `latest` of the most recent run in the run directory and continues from
+it, and an explicit path names one directly. The default used to be `:auto`, and it was changed because `run_dir`
 defaults to a name derived from the experiment type, so a second `Nitro(MyExp())` in the same
 working directory silently continued the previous run. Picking up weights nobody named is not
 something a constructor should do on its own.
@@ -51,8 +51,30 @@ that is K+1 files when the newest is not among the best and exactly K when it is
 during entirely normal operation, and checkpoint directories get copied between paths where tools
 handle symlinks inconsistently.
 
-A small manifest sits alongside with file, epoch, metric, and stop reason, so resume can find the
-newest without reading every file.
+A small manifest sits alongside with file, epoch, score, stop reason, and the run, metric and mode
+that wrote each entry, so resume can find the newest without reading every file.
+
+**Retention is per run, and one directory can hold several.** The default `run_dir` is the
+experiment's type name, so two fresh runs routinely share one. Setup gives every run an id
+(`n.checkpointer.run`, and `run` on each `read_manifest` entry), and the rule above applies to a
+run's own entries only: a second run never ranks, rotates, deletes or overwrites the first run's
+checkpoints, and a name that would land on another run's file (same seed and config, same epoch,
+step and score) is written as `...-run-<id>.jld2` instead. Within a run, top-K ranks only entries
+scored under the checkpointer's current `metric` and `mode`; entries the run wrote under another
+pair (a resume that changed the selection) are kept and never ranked. A manifest written before
+runs were recorded reads as one unnamed run (`run === nothing`), the oldest, and a new run leaves
+it alone. A fresh run into an occupied directory says so at setup.
+
+**Resuming continues a run or branches from it.** `resume = :auto` restores the newest record of
+the MOST RECENT run in the directory, and adopts that run's id, so its later checkpoints join the
+same run. `resume = path` does the same when the path is its run's newest record; anything else,
+an earlier record such as a best epoch or a file this manifest does not list, starts a new run and
+logs that it branched, and from which run and epoch. That is what keeps a resume from epoch 5 of a
+run that reached epoch 12 from rewriting epochs 6 to 12 and rotating the originals away. The
+branch's entries carry the source path as `parent`. `resume = other => :latest` (another handle's
+run's newest record, continuing it when resumed into its directory) and `other => :best` (its
+selected checkpoint, a branch) name the record through the handle. `resume = other` and
+`other => :current` are refused as not supported yet; use `weights = other` for the parameters.
 
 ## Early stopping
 
@@ -96,6 +118,25 @@ like one that stopped on patience.
 on every checkpoint including top-K ones, not only on a dedicated resume checkpoint, because an API
 that says checkpoint and hands back something unresumable has picked the wrong word. Anything
 producing parameters alone for export or serving is named for weights.
+
+**Loading a finished run's weights needs no file name.** `weights = :best` loads the checkpoint
+the most recent run in `run_dir` selected by its checkpointer's `metric` and `mode`, and
+`weights = :latest` that run's newest record, both looked up through the manifest; a directory
+holding several runs logs which run it read:
+
+```julia
+n = Nitro(MyExp, :baseline; run_dir = "runs/my_run", weights = :best, logger = nothing)
+```
+
+That is the construction for evaluation, mining and export. The symbol is resolved to the actual
+file at setup, so `checkpoint_source` and an exported bundle's provenance name the file, not the
+word. It raises when the directory holds no such checkpoint rather than handing back fresh weights.
+With the handle that trained still in hand, `weights = trained => :best` (or `=> :latest`) names
+the record of THAT handle's run, whatever else has written to its directory since, and
+`weights = trained` (the same as `trained => :current`) takes its parameters from memory. A path
+still works for a checkpoint outside the run directory, and `read_manifest(dir)` lists what a
+directory holds, by `run`, when you want to choose by hand. The gate tools take the same values as
+strings (`weights = "best"`).
 
 ## Every value in a record is a HOST value
 

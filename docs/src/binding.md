@@ -134,14 +134,15 @@ e.max_epochs                # else a field of the same name, when the struct dec
 Ten keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`, `schedules`,
 `gradient_clip_norm`, `logger`, `checkpointer`, `early_stop`. `schedules` is the one whose accessor
 reads no field. Four keywords name a fact about this construction and have no accessor: `data`,
-`checkpoint`, `resume`, `run_ref`. `weights` and `w0` are two more of that kind.
+`weights`, `resume`, `run_ref`. `w0` is one more of that kind, and `checkpoint` is the deprecated
+spelling of `weights = path`.
 
 ## Weights: the four ways in
 
 | construction | weights | optimizer | epoch | `derive` |
 | --- | --- | --- | --- | --- |
 | `Nitro(e)` | `build_model`'s init | fresh | 0 | runs |
-| `Nitro(e; checkpoint = path)` | the record's | fresh | 0 | skipped, values restored |
+| `Nitro(e; weights = path)` | the record's | fresh | 0 | skipped, values restored |
 | `Nitro(e; resume = :auto)` | the latest record's | restored | restored | runs |
 | `Nitro(e; weights = other)` | `other`'s `ps` and `st` | fresh | 0 | runs |
 

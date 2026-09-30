@@ -504,7 +504,7 @@ max_epochs(e) = _field(e, :max_epochs, 1)
 #
 # Each is a defaulted accessor whose `Nitro` keyword defaults to the accessor call: declare it on
 # the experiment and omit the keyword, or pass the keyword to replace it for one run. `data`,
-# `checkpoint`, `resume` and `run_ref` stay keyword-only, since each names a fact about the
+# `weights`, `resume` and `run_ref` stay keyword-only, since each names a fact about the
 # invocation rather than the experiment.
 
 """

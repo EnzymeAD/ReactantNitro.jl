@@ -600,8 +600,8 @@
             )
             latest = find_latest(TopKCheckpointer(; dir), dir)
 
-            # Weights-only (`checkpoint = path`): declining the logger is legal and reattaches nothing.
-            n = Nitro(CkptMLP(); run_dir = dir, checkpoint = latest, logger = nothing)
+            # Weights-only (`weights = path`): declining the logger is legal and reattaches nothing.
+            n = Nitro(CkptMLP(); run_dir = dir, weights = latest, logger = nothing)
             @test n isa Nitro
             @test current_epoch(n) == 0                     # continues no trajectory
 
@@ -619,7 +619,7 @@
             # And the TYPE check still applies to a logger that IS passed on the weights-only path, so a
             # mismatched backend cannot be handed another's opaque state.
             err2 = try
-                Nitro(CkptMLP(); run_dir = dir, checkpoint = latest, logger = HandleLog())
+                Nitro(CkptMLP(); run_dir = dir, weights = latest, logger = HandleLog())
                 nothing
             catch ex
                 ex
@@ -673,12 +673,12 @@
 
     # ── weights-only construction ────────────────────────────────────────────────────────
 
-    @testset "`checkpoint = path` restores weights, not a trajectory" begin
+    @testset "`weights = path` restores weights, not a trajectory" begin
         dir = mktempdir()
         trained = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 2))
         path = find_latest(trained.checkpointer, dir)
 
-        served = Nitro(CkptMLP(); data = (; test = CK_VAL), checkpoint = path, run_dir = mktempdir())
+        served = Nitro(CkptMLP(); data = (; test = CK_VAL), weights = path, run_dir = mktempdir())
         @test params_of(served) == params_of(trained)            # the trained weights, exactly
         @test current_epoch(served) == 0                         # but NOT the trajectory
         @test current_step(served) == 0
@@ -690,13 +690,56 @@
         # loader. Asking to load one anyway is a contradiction, and answering with freshly initialized
         # weights that look plausible is the worst way to resolve it.
         err = try
-            Nitro(CkptMLP(); checkpoint = path, checkpointer = nothing, run_dir = mktempdir())
+            Nitro(CkptMLP(); weights = path, checkpointer = nothing, run_dir = mktempdir())
             nothing
         catch ex
             ex
         end
         @test err isa ErrorException
         @test occursin("has no loader", err.msg)
+    end
+
+    @testset "`weights = :best` / `:latest` name a checkpoint of the run directory" begin
+        dir = mktempdir()
+        trained = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 3))
+        best = ReactantNitro.selected_checkpoint(trained.checkpointer, dir)
+        latest = find_latest(trained.checkpointer, dir)
+
+        # Resolved to the file the manifest names, so the handle, and anything exported from it,
+        # records the actual path rather than the symbol.
+        nb = Nitro(CkptMLP(); data = (; test = CK_VAL), run_dir = dir, weights = :best)
+        @test nb.checkpoint_source == best.path
+        nl = Nitro(CkptMLP(); data = (; test = CK_VAL), run_dir = dir, weights = :latest)
+        @test nl.checkpoint_source == latest
+        @test params_of(nl) == params_of(trained)       # the newest record is the final weights
+
+        # Every miss raises: fresh weights in place of the ones asked for would look plausible.
+        msg(f) = try
+            f(); ""
+        catch ex
+            ex isa ErrorException ? ex.msg : rethrow()
+        end
+        @test occursin("found no checkpoint", msg(() -> Nitro(CkptMLP(); run_dir = mktempdir(), weights = :best)))
+        @test occursin("not a checkpoint name", msg(() -> Nitro(CkptMLP(); run_dir = dir, weights = :newest)))
+        @test occursin("has none", msg(() -> Nitro(CkptMLP(); run_dir = dir, weights = :best, checkpointer = nothing)))
+    end
+
+    @testset "`checkpoint = path` still loads, warns it is deprecated, and yields to `weights`" begin
+        dir = mktempdir()
+        trained = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 2))
+        path = find_latest(trained.checkpointer, dir)
+        old = @test_logs (:warn, r"deprecated") match_mode = :any Nitro(
+            CkptMLP(); data = (; test = CK_VAL), checkpoint = path, run_dir = mktempdir()
+        )
+        @test params_of(old) == params_of(trained)
+        @test old.checkpoint_source == path
+        @test old.opt_state === nothing                       # still weights-only
+        err = try
+            Nitro(CkptMLP(); weights = path, checkpoint = path, run_dir = mktempdir()); nothing
+        catch ex
+            ex
+        end
+        @test err isa ErrorException && occursin("both were given", err.msg)
     end
 
     @testset "the checkpointer's own configuration is checked at setup" begin
@@ -871,6 +914,274 @@
         @test !isempty(entries)
         @test any(e.epoch == rec.epoch for e in entries)
         @test all(hasproperty(e, f) for e in entries for f in (:file, :epoch, :score, :stop_reason))
+    end
+
+    # ── several runs in one directory ───────────────────────────────────────────────────
+    #
+    # The default `run_dir` is `runs/<ExperimentTypeName>`, so two fresh runs of one experiment
+    # share a directory unless someone thought to vary it. The manifest records which run wrote
+    # each entry, and every rule below is a rule about ONE run: retention, top-K, the names
+    # `:best` and `:latest`, and `resume = :auto`. `epoch_file` above assumes one entry per epoch,
+    # which a shared directory breaks, so these testsets ask by run.
+    run_entries(dir, run) = [e for e in read_manifest(dir) if isequal(e.run, run)]
+    run_file(dir, run, epoch) =
+        joinpath(dir, only(e.file for e in run_entries(dir, run) if e.epoch == epoch))
+    run_files(dir, run) = Set(e.file for e in run_entries(dir, run))
+    runs_in(dir) = Set(e.run for e in read_manifest(dir))
+    run_of(n) = n.checkpointer.run
+    # What `retained` promises for one run's entries: the top K by score in union with the newest.
+    function expected_kept(entries, k)
+        newest = entries[argmax([e.epoch for e in entries])]
+        by = sort([e for e in entries if e.score !== nothing]; by = e -> e.score)
+        return Set(vcat([e.file for e in first(by, k)], newest.file))
+    end
+    k1() = TopKCheckpointer(; k = 1)
+
+    @testset "a second fresh run in the directory deletes none of the first run's checkpoints" begin
+        dir = mktempdir()
+        a = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 4, seed = 1, checkpointer = k1()))
+        a_files = run_files(dir, run_of(a))
+        @test a_files == expected_kept(run_entries(dir, run_of(a)), 1)
+        b = @test_logs (:info, r"already holds") match_mode = :any Nitro(
+            CkptMLP(); run_dir = dir, max_epochs = 4, seed = 2, checkpointer = k1()
+        )
+        train!(b)
+
+        @test run_of(a) isa String && run_of(b) isa String && run_of(a) != run_of(b)
+        @test runs_in(dir) == Set([run_of(a), run_of(b)])
+        # Every one of A's retained files is still listed and still on disk.
+        @test run_files(dir, run_of(a)) == a_files
+        @test all(isfile(joinpath(dir, f)) for f in a_files)
+        # B retains its OWN newest and its OWN top K, ranked against its own entries only.
+        b_entries = run_entries(dir, run_of(b))
+        @test maximum(e.epoch for e in b_entries) == 4
+        @test run_files(dir, run_of(b)) == expected_kept(b_entries, 1)
+        @test all(isfile(joinpath(dir, e.file)) for e in b_entries)
+        # And every entry records the metric and mode that produced its score.
+        @test all(e.metric === :val_loss && e.mode === :min for e in read_manifest(dir))
+        # After `train!`, the handle reports ITS run's selection, not the directory's.
+        @test a.best_checkpoint.path in (joinpath(dir, f) for f in a_files)
+        @test basename(b.best_checkpoint.path) in run_files(dir, run_of(b))
+    end
+
+    @testset "the same seed and config twice: identical names, and neither overwrites the other" begin
+        dir = mktempdir()
+        a = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 2))
+        a_files = run_files(dir, run_of(a))
+        stamps = Dict(f => mtime(joinpath(dir, f)) for f in a_files)
+        a_params = params_of(a)
+        b = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 2))
+        @test params_of(b) == a_params                       # the two runs really are identical
+
+        @test length(read_manifest(dir)) == 4
+        @test run_files(dir, run_of(a)) == a_files
+        # A's bytes are A's: not rewritten, which the same name would otherwise have done.
+        @test all(mtime(joinpath(dir, f)) == stamps[f] for f in a_files)
+        b_files = run_files(dir, run_of(b))
+        @test isempty(intersect(a_files, b_files))
+        @test all(occursin("-run-$(run_of(b))", f) for f in b_files)
+        for f in union(a_files, b_files)
+            @test load_checkpoint(TopKCheckpointer(), joinpath(dir, f)).epoch in (1, 2)
+        end
+        # The final rewrite of B's last epoch landed on B's disambiguated file, not on A's.
+        @test load_checkpoint(TopKCheckpointer(), run_file(dir, run_of(b), 2)).stop_reason === :completed
+        @test load_checkpoint(TopKCheckpointer(), run_file(dir, run_of(a), 2)).stop_reason === :completed
+    end
+
+    @testset "`:best`, `:latest` and `resume = :auto` mean the most recent run" begin
+        dir = mktempdir()
+        a = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 2, seed = 1))
+        b = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 3, seed = 2))
+        b_best = ReactantNitro.selected_checkpoint(b.checkpointer, dir; run = run_of(b))
+        # With no run named, both lookups answer for the most recent run.
+        @test find_latest(TopKCheckpointer(; dir), dir) == run_file(dir, run_of(b), 3)
+        @test ReactantNitro.selected_checkpoint(TopKCheckpointer(; dir), dir).path == b_best.path
+        # And a named run answers for that run.
+        @test find_latest(TopKCheckpointer(; dir), dir; run = run_of(a)) == run_file(dir, run_of(a), 2)
+
+        nl = @test_logs (:info, r"holds 2 runs") match_mode = :any Nitro(
+            CkptMLP(); data = (; test = CK_VAL), run_dir = dir, weights = :latest
+        )
+        @test nl.checkpoint_source == run_file(dir, run_of(b), 3)
+        @test params_of(nl) == params_of(b)
+        nb = Nitro(CkptMLP(); data = (; test = CK_VAL), run_dir = dir, weights = :best)
+        @test nb.checkpoint_source == b_best.path
+
+        r = @test_logs (:info, r"holds 2 runs") match_mode = :any Nitro(
+            CkptMLP(); run_dir = dir, max_epochs = 4, resume = :auto
+        )
+        @test r.checkpoint_source == run_file(dir, run_of(b), 3)
+        @test current_epoch(r) == 3
+        # It CONTINUES B: its later checkpoints join B's run rather than starting a third.
+        @test run_of(r) == run_of(b)
+        train!(r)
+        @test runs_in(dir) == Set([run_of(a), run_of(b)])
+        @test maximum(e.epoch for e in run_entries(dir, run_of(b))) == 4
+    end
+
+    @testset "a legacy manifest loads, is one run, and a new run never deletes its files" begin
+        dir = mktempdir()
+        train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 3, seed = 1))
+        # Rewrite the manifest in the shape every earlier framework version wrote: four fields.
+        Old = @NamedTuple{
+            file::String, epoch::Int, score::Union{Float64, Nothing},
+            stop_reason::Union{Symbol, Nothing},
+        }
+        old = Old[Old((e.file, e.epoch, e.score, e.stop_reason)) for e in read_manifest(dir)]
+        JLD2.jldsave(joinpath(dir, "manifest.jld2"); entries = old)
+        legacy = read_manifest(dir)
+        @test length(legacy) == 3
+        @test all(e.run === nothing && e.metric === nothing && e.mode === nothing for e in legacy)
+        @test all(e.written == 0.0 for e in legacy)
+        legacy_files = Set(e.file for e in legacy)
+
+        # A legacy run on its own is still the directory's run.
+        @test find_latest(TopKCheckpointer(; dir), dir) == run_file(dir, nothing, 3)
+        @test ReactantNitro.selected_checkpoint(TopKCheckpointer(; dir), dir) !== nothing
+
+        b = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 3, seed = 2, checkpointer = k1()))
+        @test run_files(dir, nothing) == legacy_files
+        @test all(isfile(joinpath(dir, f)) for f in legacy_files)
+        # Legacy entries count as the oldest run.
+        @test find_latest(TopKCheckpointer(; dir), dir) == run_file(dir, run_of(b), 3)
+
+        @testset "and `resume = :auto` into a legacy-only directory continues that run" begin
+            dir2 = mktempdir()
+            train!(Nitro(CkptMLP(); run_dir = dir2, max_epochs = 2))
+            old2 = Old[Old((e.file, e.epoch, e.score, e.stop_reason)) for e in read_manifest(dir2)]
+            JLD2.jldsave(joinpath(dir2, "manifest.jld2"); entries = old2)
+            r = Nitro(CkptMLP(); run_dir = dir2, max_epochs = 3, resume = :auto)
+            @test current_epoch(r) == 2
+            @test run_of(r) === nothing                   # the unnamed run, adopted
+            train!(r)
+            @test runs_in(dir2) == Set([nothing])
+            @test maximum(e.epoch for e in read_manifest(dir2)) == 3
+        end
+    end
+
+    @testset "entries scored under another metric or mode are kept and never ranked" begin
+        dir = mktempdir()
+        a = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 3, checkpointer = k1()))
+        a_files = run_files(dir, run_of(a))
+        # The same run resumed, selecting the other way. Its earlier entries' scores were written
+        # under `:min`, which `:max` cannot rank, so they stay.
+        r = Nitro(
+            CkptMLP(); run_dir = dir, max_epochs = 5, resume = :auto,
+            checkpointer = TopKCheckpointer(; k = 1, mode = :max)
+        )
+        @test run_of(r) == run_of(a)
+        train!(r)
+        mine = run_entries(dir, run_of(a))
+        @test issubset(a_files, Set(e.file for e in mine))
+        @test all(isfile(joinpath(dir, f)) for f in a_files)
+        maxed = [e for e in mine if e.mode === :max]
+        # Ranked among themselves: the newest (epoch 5) and at most one best besides.
+        @test 5 in Set(e.epoch for e in maxed) && issubset(Set(e.epoch for e in maxed), Set([4, 5]))
+        # Selection ranks only entries under the checkpointer's own metric and mode.
+        sel = ReactantNitro.selected_checkpoint(r.checkpointer, dir; run = run_of(r))
+        @test sel.epoch in (4, 5)
+        @test r.best_checkpoint.epoch in (4, 5)
+
+        # And a FRESH run selecting on another mode leaves both of those alone too.
+        before = Set(e.file for e in read_manifest(dir))
+        train!(
+            Nitro(
+                CkptMLP(); run_dir = dir, max_epochs = 2, seed = 3,
+                checkpointer = TopKCheckpointer(; k = 1, mode = :max)
+            )
+        )
+        @test issubset(before, Set(e.file for e in read_manifest(dir)))
+        @test all(isfile(joinpath(dir, f)) for f in before)
+    end
+
+    @testset "resuming from an earlier record branches; resuming from the newest continues" begin
+        dir = mktempdir()
+        a = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 3))
+        a_files = run_files(dir, run_of(a))
+        @test length(a_files) == 3
+        stamps = Dict(f => mtime(joinpath(dir, f)) for f in a_files)
+
+        # From A's newest record: that IS continuing A.
+        cont = Nitro(CkptMLP(); run_dir = dir, max_epochs = 4, resume = run_file(dir, run_of(a), 3))
+        @test run_of(cont) == run_of(a)
+
+        # From epoch 1: a new run, since continuing A from there would rewrite A's epochs 2 and 3.
+        # Deterministic, so the branch's epochs 2 and 3 carry the SAME names as A's.
+        br = @test_logs (:info, r"branch") match_mode = :any Nitro(
+            CkptMLP(); run_dir = dir, max_epochs = 3, resume = run_file(dir, run_of(a), 1)
+        )
+        @test run_of(br) isa String && run_of(br) != run_of(a)
+        train!(br)
+        @test run_files(dir, run_of(a)) == a_files
+        @test all(mtime(joinpath(dir, f)) == stamps[f] for f in a_files)
+        br_entries = run_entries(dir, run_of(br))
+        @test Set(e.epoch for e in br_entries) == Set([2, 3])
+        # The branch records where it came from.
+        @test all(e.parent == run_file(dir, run_of(a), 1) for e in br_entries)
+
+        # A file this manifest does not list is a branch too.
+        other = mktempdir()
+        train!(Nitro(CkptMLP(); run_dir = other, max_epochs = 1))
+        ext = Nitro(CkptMLP(); run_dir = dir, max_epochs = 2, resume = find_latest(TopKCheckpointer(; dir = other), other))
+        @test !(run_of(ext) in (run_of(a), run_of(br)))
+
+        # `:auto` continues the most recent run, which is now the branch, and keeps its parent.
+        r = Nitro(CkptMLP(); run_dir = dir, max_epochs = 4, resume = :auto)
+        @test run_of(r) == run_of(br)
+        train!(r)
+        @test all(e.parent == run_file(dir, run_of(a), 1) for e in run_entries(dir, run_of(br)))
+    end
+
+    @testset "another handle as the source: `other => :current | :best | :latest`" begin
+        dir = mktempdir()
+        a = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 3, seed = 1))
+        a_latest = find_latest(a.checkpointer, dir; run = run_of(a))
+        a_best = ReactantNitro.selected_checkpoint(a.checkpointer, dir; run = run_of(a))
+        # A newer run in A's directory, so "A's run" and "the most recent run" differ.
+        b = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 2, seed = 2))
+
+        wl = Nitro(CkptMLP(); data = (; test = CK_VAL), run_dir = mktempdir(), weights = a => :latest)
+        @test wl.checkpoint_source == a_latest
+        @test params_of(wl) == params_of(a)
+        @test current_epoch(wl) == 0
+        wb = Nitro(CkptMLP(); data = (; test = CK_VAL), run_dir = mktempdir(), weights = a => :best)
+        @test wb.checkpoint_source == a_best.path
+
+        # `:current` is the in-memory warm start, exactly as the bare handle is.
+        wc = Nitro(CkptMLP(); run_dir = mktempdir(), weights = a => :current)
+        @test wc.checkpoint_source === nothing && wc.weights_source.epoch == 3
+        @test params_of(wc) == params_of(a)
+        wbare = Nitro(CkptMLP(); run_dir = mktempdir(), weights = a)
+        @test params_of(wbare) == params_of(a) && wbare.weights_source.epoch == 3
+
+        # A full resume from A's run's newest record, into A's own directory: that continues A.
+        ra = Nitro(CkptMLP(); run_dir = dir, max_epochs = 4, resume = a => :latest)
+        @test ra.checkpoint_source == a_latest
+        @test current_epoch(ra) == 3
+        @test run_of(ra) == run_of(a)
+        rb = Nitro(CkptMLP(); run_dir = dir, max_epochs = 4, resume = a => :best)
+        @test rb.checkpoint_source == a_best.path
+        @test current_epoch(rb) == a_best.epoch
+        a_best.epoch == 3 || @test run_of(rb) != run_of(a)
+
+        msg(f) = try
+            f(); ""
+        catch ex
+            ex isa ErrorException ? ex.msg : rethrow()
+        end
+        m = msg(() -> Nitro(CkptMLP(); run_dir = dir, resume = a => :current))
+        @test occursin("not supported yet", m) && occursin("weights = ", m)
+        m = msg(() -> Nitro(CkptMLP(); run_dir = dir, resume = a))
+        @test occursin("not supported yet", m) && occursin("weights = ", m)
+        @test occursin(":current", msg(() -> Nitro(CkptMLP(); run_dir = dir, weights = a => :newest)))
+        @test occursin(":latest", msg(() -> Nitro(CkptMLP(); run_dir = dir, resume = a => :newest)))
+        # A handle with no checkpointer has no records to name.
+        bare = Nitro(CkptMLP(); run_dir = mktempdir(), checkpointer = nothing)
+        @test occursin("no checkpointer", msg(() -> Nitro(CkptMLP(); run_dir = dir, weights = bare => :best)))
+        @test occursin("no checkpointer", msg(() -> Nitro(CkptMLP(); run_dir = dir, resume = bare => :latest)))
+        # And a handle that never wrote one has no such checkpoint.
+        unrun = Nitro(CkptMLP(); run_dir = mktempdir())
+        @test occursin("found no checkpoint", msg(() -> Nitro(CkptMLP(); run_dir = dir, weights = unrun => :latest)))
     end
 
 end

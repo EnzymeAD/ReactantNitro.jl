@@ -509,7 +509,7 @@
         # `run_dir = dir` keeps this fresh construction (which writes its default logger's file)
         # inside the test's temp directory rather than the suite's working directory.
         e_msg = EXT.nitro_evaluate(
-            experiment = GATE_SPEC, split = "test", checkpoint = ckpt, run_dir = dir
+            experiment = GATE_SPEC, split = "test", weights = ckpt, run_dir = dir
         )
         e_id = run_id(e_msg)
         e = wait_run(e_id)
@@ -553,7 +553,7 @@
 
         # export from `experiment` + checkpoint constructs a single-device handle automatically.
         x2_msg = EXT.nitro_export(
-            experiment = GATE_SPEC, checkpoint = ckpt, run_dir = dir,
+            experiment = GATE_SPEC, weights = ckpt, run_dir = dir,
             dir = dir, name = "gate_v2", backend = "recording",
         )
         x2_id = run_id(x2_msg)
@@ -593,7 +593,7 @@
         x = wait_run(
             run_id(
                 EXT.nitro_export(
-                    experiment = GATE_SPEC, checkpoint = ckpt, run_dir = dir,
+                    experiment = GATE_SPEC, weights = ckpt, run_dir = dir,
                     dir = dir, name = "late_v1", backend = "late", provenance_root = dir,
                 )
             )
@@ -611,7 +611,7 @@
 
     # ── `data`: the keyword that made an inference-only export expressible ───────────────
     #
-    # `Nitro(e; checkpoint = path, data = (;))` is the construction `export_model` prescribes, and
+    # `Nitro(e; weights = path, data = (;))` is the construction `export_model` prescribes, and
     # this tool once could not express it: `build_data` always ran. A model whose exportable handle
     # is a different build from its trainable one was therefore not exportable through the tool in
     # either direction, which pushes every export back onto a hand-written `export_model` call.
@@ -652,7 +652,7 @@
         x = wait_run(
             run_id(
                 EXT.nitro_export(
-                    experiment = EXPORT_ONLY_SPEC, checkpoint = ckpt, run_dir = dir,
+                    experiment = EXPORT_ONLY_SPEC, weights = ckpt, run_dir = dir,
                     dir = dir, name = "inference_v1", backend = "recording",
                     overrides = "export_inference=true",
                 )
@@ -668,7 +668,7 @@
         x2 = wait_run(
             run_id(
                 EXT.nitro_export(
-                    experiment = EXPORT_ONLY_SPEC, checkpoint = ckpt, run_dir = dir,
+                    experiment = EXPORT_ONLY_SPEC, weights = ckpt, run_dir = dir,
                     dir = dir, name = "inference_v2", backend = "recording",
                     overrides = "export_inference=true", data = "build",
                 )
@@ -683,7 +683,7 @@
         x3 = wait_run(
             run_id(
                 EXT.nitro_export(
-                    experiment = EXPORT_ONLY_SPEC, checkpoint = ckpt, run_dir = dir,
+                    experiment = EXPORT_ONLY_SPEC, weights = ckpt, run_dir = dir,
                     dir = dir, name = "inference_v3", backend = "recording",
                 )
             )

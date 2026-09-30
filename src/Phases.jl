@@ -107,7 +107,7 @@ process; `train!(e)` is sugar for `train!(Nitro(e))`, and every keyword belongs 
 
 ```julia
 nitro = Nitro(e)                                  # fresh weights from build_model
-nitro = Nitro(e; checkpoint = "runs/x/latest")    # trained weights, no training this process
+nitro = Nitro(e; weights = "runs/x/latest")    # trained weights, no training this process
 nitro = Nitro(e; data = (; test = loader))        # supply data directly, skip build_data
 ```
 
@@ -142,7 +142,7 @@ mutable struct Nitro
     # or `nothing` for fresh weights. Export stamps it into the bundle.
     checkpoint_source::Any
 
-    # The run that trained these weights, from the restored record. A `checkpoint = path`
+    # The run that trained these weights, from the restored record. A `weights = path`
     # construction gets a fresh logger, so this handle's own `run_id` would name the exporting
     # process rather than the training run. `nothing` for fresh weights.
     trained_run_id::Any

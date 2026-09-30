@@ -16,14 +16,14 @@ reads, and about three facts that are not obvious and are expensive to discover 
 
 **When driving from a Kaimon session, the tool form is `nitro_export`** (`reactantnitro-kaimon`):
 it takes the same hooks and adds the run-registry forms, `nitro_export(run_id = ...)` to reuse a
-completed train run's `Nitro`, or `nitro_export(experiment = ..., checkpoint = ...)` to build a
+completed train run's `Nitro`, or `nitro_export(experiment = ..., weights = ...)` to build a
 weights-only handle, with `dir`/`name` required and `batch_sizes` defaulting to `[1]`. Everything
 on this page about the hooks, the wire seam, and provenance still applies; the tool is the driver.
 
 ```julia
 using ReactantServerExport                   # the extension that makes a backend exist
 
-nitro = Nitro(e; checkpoint = "runs/x/best.jld2", data = (;))
+nitro = Nitro(e; weights = "runs/x/best.jld2", data = (;))
 export_model(nitro, ReactantServerBundle(); dir = "export_out", name = "my_model_v1")
 ```
 
@@ -51,7 +51,7 @@ sharded program is not servable as one artifact, so build the export handle with
 ## The handle, and why export never reads a checkpoint
 
 The framework distinguishes a **checkpoint**, which is full training state, from **weights**, which
-are parameters alone. Export wants the second and `Nitro(e; checkpoint = path)` already produces it:
+are parameters alone. Export wants the second and `Nitro(e; weights = path)` already produces it:
 a weights-only restore that takes the parameters and the derived `Device` values from the record and
 runs setup and nothing else.
 
@@ -215,7 +215,7 @@ that fact living in a launch script nobody kept.
 records the name; `Nitro(from_preset(E, :name))` does not, because the second form is just an
 experiment value and the framework has nothing to read the name off. So an export built the second way
 produces a manifest with no `preset` key at all, silently, which defeats the one thing provenance is
-most useful for. Build export handles as `Nitro(E, :name; checkpoint = path, data = (;))`.
+most useful for. Build export handles as `Nitro(E, :name; weights = path, data = (;))`.
 
 **It does not guess at repository state.** A commit, a tree hash and a working-tree patch are site
 policy, and a framework that shelled out to `git` would be asserting that the process's working

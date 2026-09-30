@@ -427,8 +427,8 @@ train!(e; accum = 4)                  # new gradient program, the costly one
 ```
 
 The other four keywords have no accessor because each names a fact about this invocation: `data`
-substitutes for [`build_data`](@ref), `checkpoint` and `resume` point at a file this call should
-read, and `run_ref` is a channel back to the caller, filled before the loop starts.
+substitutes for [`build_data`](@ref), `weights` and `resume` name where this call's parameters
+come from (a file, `:best` or `:latest`, or another handle), and `run_ref` is a channel back to the caller, filled before the loop starts.
 
 ## Binding
 
@@ -496,7 +496,7 @@ On a live handle, [`set_device!`](@ref) writes a `Device` field in place and tak
 immediately. This is the supported inference-sweep loop:
 
 ```julia
-n = Nitro(e; data = (;), checkpoint = "runs/mnist/best.jld2")   # no training split needed
+n = Nitro(e; data = (;), weights = "runs/mnist/best.jld2")   # no training split needed
 
 for t in (0.5f0, 1f0, 1.5f0, 2f0)
     set_device!(n; temperature = t)
@@ -558,7 +558,7 @@ Nitro(e2; weights = n, w0 = :weights)
 ```
 
 The trees must match leaf for leaf; a `width = 512` experiment refuses `weights` from a
-`width = 128` run with a diff naming the leaves. `weights` with `checkpoint` or `resume` is an
+`width = 128` run with a diff naming the leaves. `weights` with `resume` is an
 error, and `show` says where the weights came from.
 
 The same rule covers Revise:
@@ -749,12 +749,12 @@ fresh = Nitro(e)
 predict(fresh, batch)
 
 # Trained weights from a checkpoint, no training in this process.
-trained = Nitro(e; checkpoint = "runs/mnist/latest")
+trained = Nitro(e; weights = "runs/mnist/latest")
 evaluate(trained; split = :test)
 
 # Serving: `data = (;)` skips `build_data` entirely. Routing and batch width are resolved from the
 # first batch `predict` is handed, and nothing is padded because you supplied it whole.
-serving = Nitro(e; checkpoint = "runs/mnist/latest", data = (;))
+serving = Nitro(e; weights = "runs/mnist/latest", data = (;))
 predict(serving, batch)
 ```
 

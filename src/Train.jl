@@ -439,7 +439,7 @@ function _train!(nitro::Nitro)
         # Through `try`: a run that died on I/O is the one whose manifest may be unreadable, and a
         # display helper must not replace the real exception.
         nitro.best_checkpoint = try
-            selected_checkpoint(nitro.checkpointer, nitro.run_dir)
+            own_selected_checkpoint(nitro.checkpointer, nitro.run_dir)
         catch
             nothing
         end
@@ -459,7 +459,7 @@ function _train!(nitro::Nitro)
     # Per entry point, not per epoch: only here is it known that nothing follows.
     progress_done!()
     # After the final rewrite above, so the winning entry is the one the manifest ends up holding.
-    nitro.best_checkpoint = selected_checkpoint(nitro.checkpointer, nitro.run_dir)
+    nitro.best_checkpoint = own_selected_checkpoint(nitro.checkpointer, nitro.run_dir)
     set_phase!(nitro, Done())
     finish!(nitro.logger, nitro.stop_reason === :completed ? :completed : :early_stop)
     return nitro
@@ -641,7 +641,7 @@ function _train_manual!(nitro::Nitro)
         progress_done!()
         # Through `try`: a display helper must not replace the real exception.
         nitro.best_checkpoint = try
-            selected_checkpoint(nitro.checkpointer, nitro.run_dir)
+            own_selected_checkpoint(nitro.checkpointer, nitro.run_dir)
         catch
             nothing
         end
@@ -656,7 +656,7 @@ function _train_manual!(nitro::Nitro)
     # Per entry point, not per epoch.
     progress_done!()
     # After the final rewrite above, so the winning entry is the one the manifest ends up holding.
-    nitro.best_checkpoint = selected_checkpoint(nitro.checkpointer, nitro.run_dir)
+    nitro.best_checkpoint = own_selected_checkpoint(nitro.checkpointer, nitro.run_dir)
     set_phase!(nitro, Done())
     finish!(nitro.logger, nitro.stop_reason === :completed ? :completed : :early_stop)
     return nitro

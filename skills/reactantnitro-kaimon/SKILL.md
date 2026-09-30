@@ -112,7 +112,7 @@ the tools appear.
 ### Run knobs and experiment fields
 
 The typed keywords (`max_epochs`, `run_dir`, `seed`, `n_devs`, `accum`, `gradient_clip_norm`,
-`preset`, `resume`, `checkpoint`) are run knobs passed to `Nitro`, where a keyword beats the
+`preset`, `resume`, `weights`) are run knobs passed to `Nitro`, where a keyword beats the
 experiment's own accessor for this run (the same rule the framework documents). Experiment
 fields are per-model and cannot be in the schema, so they arrive through `overrides`, a
 comma-separated `name=value` list of Julia literals:
@@ -130,11 +130,12 @@ from `presets(MyExp)`, and `overrides` may add field values on top of it.
 
 `nitro_validate`, `nitro_evaluate`, `nitro_predict`, and `nitro_export` accept either `run_id`
 (a completed train run in this session, whose trained `Nitro` is reused) or `experiment` plus
-`checkpoint` (a checkpoint file, for work in a process that did not train):
+`weights` (a checkpoint file, or `"best"` / `"latest"` of `run_dir`, for work in a process that
+did not train; `checkpoint` is its deprecated spelling):
 
 ```julia
 nitro_validate(run_id="a1b2c3d4")
-nitro_evaluate(experiment="MyModels.MnistMLP", split="test", checkpoint="runs/mnist_v1/epoch-0040.jld2")
+nitro_evaluate(experiment="MyModels.MnistMLP", split="test", weights="runs/mnist_v1/epoch-0040.jld2")
 nitro_predict(run_id="a1b2c3d4", inputs="x=[1.0 2.0 3.0; 4.0 5.0 6.0]")
 nitro_export(run_id="a1b2c3d4", dir="export_out", name="mnist_v1")
 ```

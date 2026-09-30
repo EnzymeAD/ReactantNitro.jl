@@ -104,7 +104,7 @@ Three entry points, one driver, none of which needs `train!`:
 
 ```julia
 render(Nitro(e); split = :val)                                        # the data gate
-render(Nitro(e; checkpoint = "runs/x/best.jld2"); predictions = true) # from a checkpoint
+render(Nitro(e; weights = "runs/x/best.jld2"); predictions = true) # from a checkpoint
 render(nitro, batch; predictions = true)                              # a batch in hand
 ```
 
@@ -119,8 +119,8 @@ which costs nothing since a field no other hook declares is never transferred to
 | --- | --- | --- |
 | **Data gate**, before any training | `Nitro(e)`, with `predictions = false` | question 1 |
 | **During a run**, every k epochs | a phase monitor | whether a failure mode is moving |
-| **Post-hoc**, on a checkpoint | `Nitro(e; checkpoint = path)` | questions 2 and 3 |
-| **Inference**, on unseen data | `Nitro(e; checkpoint = path, data = (; test = loader))` | what shipping looks like |
+| **Post-hoc**, on a checkpoint | `Nitro(e; weights = path)` | questions 2 and 3 |
+| **Inference**, on unseen data | `Nitro(e; weights = path, data = (; test = loader))` | what shipping looks like |
 
 **Three of the four are free**, and they are free because of a property worth naming: `Nitro(e)`
 runs the setup sequence and nothing else, so parameters, data, keyword routing and the compiled
