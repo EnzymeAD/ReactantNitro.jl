@@ -132,15 +132,22 @@ step as its phase (`setup [building data]`), closing as `setup done`. See
 """
 # `Starting` is published before the build, through the module-level monitors, because `build_data`
 # can start and compile a data server and this was the longest undeclared stretch there was.
+# Construction counts as work in flight, so an idle reconciler does not rewrite `Starting` to `Repl`
+# mid-build. It publishes no `Repl` on exit: the verb that usually follows declares its own phases.
 Nitro(e; kwargs...) = _off_interactive() do
-    publish_phase(Starting())
+    repl_enter!()
     return try
-        n = with_progress_stretch(() -> _build_nitro(e; kwargs...), "setup", 0, 0, 0)
-        progress_done!("setup done")
-        n
-    catch
-        progress_done!("setup failed")
-        rethrow()
+        publish_phase(Starting())
+        try
+            n = with_progress_stretch(() -> _build_nitro(e; kwargs...), "setup", 0, 0, 0)
+            progress_done!("setup done")
+            n
+        catch
+            progress_done!("setup failed")
+            rethrow()
+        end
+    finally
+        repl_exit!()
     end
 end
 
