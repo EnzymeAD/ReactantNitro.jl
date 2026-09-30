@@ -42,6 +42,7 @@
     ReactantNitro.build_data(::LifeMLP, dist) = (; train = LIFE_TRAIN, val = LIFE_VAL)
 
     mk_life(; kw...) = Nitro(LifeMLP(); checkpointer = nothing, run_dir = mktempdir(), kw...)
+    const BUILD_IN_FLIGHT = Ref(false)
 
     # ── the logger contract: a logger implementing ALL TEN verbs ────────────────────────
     #
@@ -243,8 +244,8 @@
 
         @testset "a nested entry point stays quiet, and a throwing one hands control back" begin
             n = mk_life(; max_epochs = 1)
-            # A fresh handle reports `Starting`, not `Repl`: construction publishes no transitions, so
-            # there is nothing for a monitor to miss and nothing to invent a phase for.
+            # A fresh handle reports `Starting`, not `Repl`: construction publishes only a handle-free
+            # `Starting`, never `Repl`.
             @test phase(n) isa Starting
             seen = []
             h = register_phase_monitor!(n, (p, s, e, i) -> push!(seen, typeof(p)))
@@ -759,6 +760,27 @@
         i = findfirst(==((:note, "decoding 1/2")), events)
         @test i !== nothing
         @test events[findlast(e -> e[1] === :phase, events[1:i])] == (:phase, "building data")
+    end
+
+    @testset "construction is work in flight, and publishes `Starting` but no `Repl`" begin
+        # An idle reconciler rewrites the phase to `Repl` when nothing is in flight, so a build
+        # that did not count would lose its `Starting` mid-construction.
+        # Hooks may not capture, so the probe writes to a const.
+        probing = (e, d) -> (BUILD_IN_FLIGHT[] = ReactantNitro.work_in_flight(); ReactantNitro.build_data(e, d))
+        seen = []
+        h = register_phase_monitor!(record!(seen))
+        try
+            mk_life(; max_epochs = 1, hooks = (; build_data = probing))
+        finally
+            unregister_phase_monitor!(h)
+        end
+        @test BUILD_IN_FLIGHT[]
+        @test !ReactantNitro.work_in_flight()
+        @test [typeof(p) for (p, _, _, _) in seen] == [Starting]
+
+        failing = (e, d) -> error("boom")
+        @test_throws "boom" mk_life(; hooks = (; build_data = failing))
+        @test !ReactantNitro.work_in_flight()
     end
 
     @testset "a note is drawn beside the phase and cleared by the next one" begin
