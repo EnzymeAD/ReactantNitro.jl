@@ -6,7 +6,8 @@
 
 """
     Nitro(e; seed, resume, run_dir, data, n_devs, weights, accum, max_epochs, schedules,
-             gradient_clip_norm, logger, checkpointer, early_stop, run_ref, w0) -> Nitro
+             gradient_clip_norm, logger, checkpointer, early_stop, run_ref, w0,
+             restore_optimizer, restore_best) -> Nitro
 
 Run the setup sequence and return the handle. No training.
 
@@ -48,39 +49,73 @@ sweep that forgot to vary `run_dir` into N identical runs); after 7, restore `ps
 restored `opt_state` to device residency, without which a resumed run trains at the wrong point of
 its optimizer's bias correction with no error.
 
-`resume` is `false` (the default), `:auto`, a checkpoint path, or `other::Nitro => :latest | :best`.
-One `run_dir` can hold several runs (the default is the experiment's type name), each with its own
-id in the manifest and its own retention; see [`TopKCheckpointer`](@ref). `:auto` restores the
-newest record of the MOST RECENT run and starts fresh when there is none. Resuming a run's newest
-record continues that run: its id is adopted and later checkpoints join it. Resuming anything else
-(an earlier record, or a file this directory's manifest does not list) branches into a new run, so
-the original run's later epochs are never overwritten, and says so. `other => :latest` is the
-newest record of `other`'s own run, which continues it when resumed into the same directory, and
-`other => :best` its selected checkpoint. `resume = other` and `other => :current`, a continuation
-from the handle's in-memory state, are not supported yet; `weights = other` takes the parameters.
+**Checkpoint sources.** `weights` and `resume` name a checkpoint the same way: a path, or
+`run => checkpoint`, resolved to a file through the manifest ([`resolve_source`](@ref)).
+
+| Run (left) | Means |
+| --- | --- |
+| `:latest` | the most recent run in `run_dir`: the run of the entry written last (legacy entries count as oldest) |
+| `"<id>"` | that run; [`runs`](@ref)`(run_dir)` lists the ids, [`checkpoint_run`](@ref)`(n)` is a handle's own, `"legacy"` the unnamed run of an old manifest |
+| `:all` | every run in `run_dir`, only as `:all => :best` |
+| `other::Nitro` | that handle's own run, in its own run directory |
+
+| Checkpoint (right) | Means |
+| --- | --- |
+| `:best` | the run's best record by the CURRENT checkpointer's `metric` and `mode` (for `other`, its checkpointer's) |
+| `:latest` | the run's newest retained record |
+| `:current` | a live handle's in-memory state; only as `weights = other => :current` |
+
+Bare `:best` and `:latest` are refused, naming the pair to use (`weights = :latest => :best`), as
+is `:all => :latest`, which is `:latest => :latest`. A source that cannot be found raises, naming
+the directory and the runs it holds. `:best` selects among entries scored under the current metric
+and mode only, warns when the run also holds entries under another, and raises when it holds none
+under the current one, listing the ones it has.
+
+**`resume`** is always exact continuation: parameters, layer state, optimizer state, step, epoch
+and schedule position, under the compatibility checks. It is `false` (the default), a path,
+`run => :latest | :best` with any run above including `other`, or `:auto`, which is exactly
+`:latest => :latest` and logs what it resolved to, except that a directory with nothing to resume
+starts a fresh run with a warning (`:latest => :latest` raises there). One `run_dir` can hold
+several runs, each with its own id in the manifest; see [`TopKCheckpointer`](@ref). Resuming a
+run's newest record continues that run: its id is adopted and later checkpoints join it. Resuming
+anything else (an earlier record such as `:best`, `:all => :best`, or a file this directory's
+manifest does not list) branches into a new run, so the original run's later epochs are never
+overwritten, and says so. Under a checkpointer with `keep_latest = false` a run's newest record is
+its most recent top-K epoch, not where it stopped, and the epochs after it are trained again.
+`resume = other` and `other => :current`, a continuation from the handle's in-memory state, are
+not supported yet; `weights = other` takes the parameters.
 
 **`weights`** names where the initial parameters come from, and takes nothing of a trajectory:
-no optimizer state, no step, no epoch. `resume` is the keyword that continues training. Either
-way, a run that trains is a new run in `run_dir`, and a directory already holding checkpoints
-keeps them.
+no step, no epoch, no schedule position, and no optimizer state unless `restore_optimizer` asks.
+Either way, a run that trains is a new run in `run_dir`, and a directory already holding
+checkpoints keeps them (under the default retention `scope = :run`).
 
-- `weights = path` restores `ps` and `st` from a checkpoint record, and the derived `Device` values
-  with them, so `derive` is skipped and the construction works with no training data.
-- `weights = :best` loads the checkpoint the most recent run in `run_dir` selected by its
-  checkpointer's metric, and `weights = :latest` that run's newest record, both looked up through
-  the manifest; a directory holding several runs logs which it read. Reloading a finished run's
-  best weights needs no file name:
+- `weights = path` or `run => :best | :latest` restores `ps` and `st` from a checkpoint record, and
+  the derived `Device` values with them, so `derive` is skipped and the construction works with no
+  training data. Reloading a finished run's best weights needs no file name:
 
   ```julia
-  n = Nitro(MyExp, :baseline; run_dir = "runs/my_run", weights = :best, logger = nothing)
+  n = Nitro(MyExp, :baseline; run_dir = "runs/my_run", weights = :latest => :best, logger = nothing)
   ```
 
-- `weights = other::Nitro => :best` and `=> :latest` are the same two records of `other`'s own
-  run, looked up in `other`'s run directory, and raise if `other` has no checkpointer or no such
-  record.
 - `weights = other::Nitro`, or `other => :current`, is a warm start from a handle in this process:
   `ps` and `st` are taken after step 7, through host memory, and otherwise the fresh sequence runs.
   The trees must match leaf for leaf.
+
+**`restore_optimizer = true`** also restores the optimizer state of a `weights` record (a path or
+any `run => :best | :latest`), normalized to device residency as a resume normalizes it and checked
+against the optimizer this run builds (rule and group layout; a mismatch refuses), while step, epoch
+and the schedule start fresh: a new run with a new schedule and `max_epochs`. It refuses a source
+that is not a record (none, a bare `Nitro`, `other => :current`: restoring a live handle's
+optimizer is not supported yet), refuses alongside `resume`, which restores the optimizer anyway,
+and refuses on a handle with no `train` split, which has no optimizer to restore into.
+
+**`restore_best = true`** ends every `train!` that does not fail (completion, early stop, a
+requested stop) by loading this run's own best checkpoint, under the current metric, into `ps` and
+`st`; step, epoch, `history` and the last metrics stay as training ended. `checkpoint_source`
+becomes that file, so export provenance names it, and `show` says the handle holds it. With no
+scored checkpoint it warns and keeps the final weights. A handle restored this way refuses a later
+`train!`, and the error shows the three constructions that continue from the best checkpoint.
 
 `w0` says what `decay_anchor = :w0` anchors to: `:build_model` (the default), `:weights` (the
 transferred parameters, for L2-SP fine-tuning), or a parameter tree.
@@ -133,10 +168,14 @@ function _build_nitro(
         resume = false,
         data = nothing,
         run_ref = nothing,
-        # Where the initial parameters come from (a path, `:best`, `:latest`, or another `Nitro`),
-        # and what `:w0` anchoring means for them.
+        # Where the initial parameters come from (a path, `run => checkpoint`, or another
+        # `Nitro`), and what `:w0` anchoring means for them.
         weights = nothing,
         w0 = :build_model,
+        # Whether a `weights` record's optimizer state comes with its parameters.
+        restore_optimizer::Bool = false,
+        # Whether `train!` ends by loading this run's best checkpoint into the handle.
+        restore_best::Bool = false,
         # DEPRECATED spelling of `weights = path`; removed in 0.2.0.
         checkpoint = nothing,
         # PROTOTYPE: hooks supplied as values shadow the method of the same name (Hooks.jl).
@@ -151,7 +190,7 @@ function _build_nitro(
         )
         weights, checkpoint = checkpoint, nothing
     end
-    check_weights_kwargs(weights, w0; resume)
+    check_weights_kwargs(weights, w0; resume, restore_optimizer)
 
     # ── before step 2: locate a checkpoint (the resume path) ───────────────────────
     # `run_dir` is the one path concept in the framework, so a checkpointer constructed without an
@@ -167,20 +206,14 @@ function _build_nitro(
     # extension's RecordingLogger) forwards the pin, and a user's own logger is untouched.
     logger = _adopt_logger!(logger, run_dir)
 
-    # Weights from a file: a path, or `:best` / `:latest`, which name a checkpoint of THIS run
-    # directory and are resolved to its path here, after the checkpointer has adopted `run_dir`, so
+    # Weights from a file: a path, or `run => :best | :latest`, which names a record through a
+    # manifest and is resolved to its path here, after the checkpointer has adopted `run_dir`, so
     # everything below (the compatibility check, `checkpoint_source`, the exported provenance) sees
-    # the actual file. `other => :best | :latest` names one of another handle's records, scoped to
-    # that handle's run, and resolves the same way; `other => :current` is the bare `other`, a
-    # `Nitro` source that stays in `weights` and is transferred after step 7.
-    if weights isa Pair
-        src, state = weights
-        weights = state === :current ? src : handle_checkpoint(src, state, "weights")
-    end
+    # the actual file. `other => :current` is the bare `other`, a `Nitro` source that stays in
+    # `weights` and is transferred after step 7.
+    weights = resolve_source(checkpointer, run_dir, weights, :weights)
     weights_file = nothing
-    if weights isa Symbol
-        weights_file, weights = resolve_named_checkpoint(checkpointer, run_dir, weights), nothing
-    elseif weights isa AbstractString
+    if weights isa AbstractString
         weights_file, weights = String(weights), nothing
     end
     resume_file = resume_path(resume, checkpointer, run_dir)
@@ -270,9 +303,15 @@ function _build_nitro(
         check_data_source(prefetch_source(getproperty(collection, name)), name)
     end
     training = haskey(collection, :train)
+    restore_optimizer && !training && error(
+        "ReactantNitro: `restore_optimizer = true` restores a record's optimizer state for training, \
+         and this handle has no `train` split, so it builds no optimizer to restore into. Drop \
+         `restore_optimizer`: an evaluation or export handle takes the parameters alone."
+    )
     # Said once, for a run that will write: a directory that already holds checkpoints is
-    # shared from here on, and nothing of the earlier runs is rotated away.
-    training && occupied && @info "ReactantNitro: `$(checkpointer.dir)` already holds checkpoints \
+    # shared from here on, and under `scope = :run` nothing of the earlier runs is rotated away.
+    # Under `scope = :dir` that is not so, and `warn_retention_scope` below says what may go.
+    training && occupied && checkpointer.scope === :run && @info "ReactantNitro: `$(checkpointer.dir)` already holds checkpoints \
         of $(length(manifest_runs(read_manifest(checkpointer.dir)))) earlier run(s). They are kept: \
         this is a new run, `$(checkpointer.run)`, and retention ranks and rotates its own \
         checkpoints only."
@@ -359,8 +398,10 @@ function _build_nitro(
             opt_state = to_device_leaf(opt_state; mesh)
             assert_opt_state_device(opt_state)
             # A restore constructs nothing, so it is re-normalized as the automatic path does at
-            # step 9. Weights-only constructions keep a fresh optimizer.
-            if record !== nothing && !weights_only
+            # step 9. Weights-only constructions keep a fresh optimizer unless `restore_optimizer`
+            # asks for the record's, which must fit the one just built.
+            if record !== nothing && (!weights_only || restore_optimizer)
+                weights_only && check_optimizer_compatible(record, opt_state, source)
                 opt_state = to_device_leaf(record.opt_state; mesh)
                 assert_opt_state_device(opt_state)
             end
@@ -395,6 +436,8 @@ function _build_nitro(
     # split, or naming a metric the experiment cannot emit, is a configuration error.
     check_early_stop(early_stop, collection, routing)
     check_checkpointer(checkpointer, collection, routing)
+    training && warn_keep_latest(checkpointer, resume)
+    training && warn_retention_scope(checkpointer)
 
     # ── 9, 11. training only ───────────────────────────────────────────────────────
     # Manual mode flattens nothing: the closure owns the optimizer state, the masks and the
@@ -424,8 +467,10 @@ function _build_nitro(
             # Re-normalize a RESTORED `opt_state`. Step 9's normalization applies to state the
             # framework constructed; a restore constructs nothing, and without this RAdam's `t`
             # stays host, never advances under trace, and the run silently trains at the wrong
-            # point of its bias correction. A weights-only construction keeps a fresh optimizer.
-            if record !== nothing && !weights_only
+            # point of its bias correction. A weights-only construction keeps a fresh optimizer
+            # unless `restore_optimizer` asks for the record's, which must fit the one just built.
+            if record !== nothing && (!weights_only || restore_optimizer)
+                weights_only && check_optimizer_compatible(record, opt_state, source)
                 opt_state = to_device_leaf(record.opt_state; mesh)
                 for gi in 1:n_groups(layout)
                     assert_device_state(
@@ -497,7 +542,8 @@ function _build_nitro(
         (;), nothing, nothing,
         weights === nothing ? nothing : weights_origin(weights),
         NamedTuple[],
-        false
+        false,
+        restore_best, nothing
     )
     # Two builds from one set of pieces: the text goes to `log_other!` so the record says where
     # every value bound, and the sections are what `show(nitro)` appends to the handle's display.
@@ -516,32 +562,41 @@ function _build_nitro(
 end
 
 """
-    ReactantNitro.check_weights_kwargs(weights, w0; resume) -> nothing
+    ReactantNitro.check_weights_kwargs(weights, w0; resume, restore_optimizer = false) -> nothing
 
-The weight-source keywords, validated before anything is built: `weights` is a path, `:best`,
-`:latest`, a `Nitro`, `other::Nitro => :current | :best | :latest`, or `nothing`, and names the only
-weight source; `w0` is `:build_model`, `:weights`, or a parameter tree, and `:weights` needs a
-`weights` to point at. `resume`'s own shape is checked where it is resolved, by `resume_path`.
+The weight-source keywords, validated before anything is built. `weights` and `resume` are each a
+checkpoint source ([`check_source`](@ref)); `weights` may also be a `Nitro` and `resume` also
+`false` or `:auto`. They are two answers to one question, so at most one is given.
+`restore_optimizer` needs a checkpoint RECORD in `weights`, a path or `run => :best | :latest`,
+and is meaningless with `resume`, which always restores the optimizer. `w0` is `:build_model`,
+`:weights`, or a parameter tree, and `:weights` needs a `weights` to point at.
 """
-function check_weights_kwargs(weights, w0; resume)
-    if weights !== nothing
-        weights isa Union{Nitro, AbstractString, Symbol, Pair{<:Nitro, Symbol}} || error(
-            "ReactantNitro: `weights` takes a checkpoint path, `:best` or `:latest` (a checkpoint of \
-             `run_dir`), a `Nitro` whose `ps` and `st` become this run's initial weights, or \
-             `other => :current | :best | :latest` (that handle's parameters, or one of its run's \
-             records), and was given a `$(typeof(weights))`."
+function check_weights_kwargs(weights, w0; resume, restore_optimizer::Bool = false)
+    check_source(weights, :weights)
+    check_source(resume, :resume)
+    resuming = resume !== false && resume !== nothing
+    weights !== nothing && resuming && error(
+        "ReactantNitro: `weights = ` names where the initial parameters come from, and `resume` \
+         names a checkpoint to continue training from, weights and all. Two sources for one set \
+         of weights; pass one. `resume` also restores the optimizer state and the step, which \
+         `weights` never does."
+    )
+    if restore_optimizer
+        resuming && error(
+            "ReactantNitro: `restore_optimizer = true` is meaningless with `resume`: a resume always \
+             restores the optimizer state, together with the step, epoch and schedule position. \
+             Drop `restore_optimizer`, or use `weights = <source>, restore_optimizer = true` for a \
+             record's parameters and optimizer state under a fresh schedule."
         )
-        weights isa Pair && !(last(weights) in (:current, :best, :latest)) && error(
-            "ReactantNitro: `weights = other => $(repr(last(weights)))` names no state of `other`. \
-             The states are `:current` (its parameters now, in memory, the same as `weights = \
-             other`), `:best` (the checkpoint its run selected by its metric) and `:latest` (its \
-             run's newest record)."
-        )
-        resume !== false && resume !== nothing && error(
-            "ReactantNitro: `weights = ` names where the initial parameters come from, and `resume` \
-             names a checkpoint to continue training from, weights and all. Two sources for one set \
-             of weights; pass one. `resume` also restores the optimizer state and the step, which \
-             `weights` never does."
+        record = weights isa AbstractString ||
+            (weights isa Pair && last(weights) in (:best, :latest))
+        record || error(
+            "ReactantNitro: `restore_optimizer = true` restores the optimizer state of a checkpoint \
+             RECORD, so it needs `weights` to name one: a path, or `run => :best | :latest` \
+             (`:latest => :best`, `\"<run id>\" => :best`, `:all => :best`, `other => :best`). It \
+             was given $(weights === nothing ? "no `weights`" : "`weights = " * source_repr(weights) * "`"), \
+             which carries no optimizer state; restoring a live handle's optimizer state is not \
+             supported yet."
         )
     end
     w0 === :build_model || w0 === :weights || w0 isa NamedTuple || error(
@@ -556,66 +611,152 @@ function check_weights_kwargs(weights, w0; resume)
     return nothing
 end
 
+# How a source is named in a message: the handle as `other`, everything else as written.
+source_repr(src::Pair) = _source_side(first(src)) * " => " * repr(last(src))
+source_repr(src) = _source_side(src)
+_source_side(::Nitro) = "other"
+_source_side(x) = repr(x)
+
+# The grammar, once, for the messages that teach it.
+const SOURCE_FORMS = "a checkpoint path, or `run => checkpoint`: the run is `:latest` (the most \
+    recent run in `run_dir`), a run id string (`runs(run_dir)` lists them), `:all` (every run, \
+    with `:best`) or another `Nitro` (its own run), and the checkpoint is `:best` (the best by the \
+    checkpointer's current metric), `:latest` (the run's newest record) or, for a `Nitro`, \
+    `:current` (its parameters now, in memory)"
+
+"""
+    ReactantNitro.check_source(src, kw) -> nothing
+
+The shape of a checkpoint source, checked before anything is built, for `kw` in `:weights` and
+`:resume`: `nothing`, a path, or `run => checkpoint`. The run is `:latest`, `:all`, a run id, or a
+`Nitro`; the checkpoint is `:best`, `:latest`, or `:current` (a `Nitro`'s in-memory state).
+`weights` also takes a bare `Nitro` (the same as `other => :current`), and `resume` takes `false`
+and `:auto`. Refused with the form to use instead: bare `:best` and `:latest` (which run?),
+`:all => :latest` (that is `:latest => :latest`), `:current` without a `Nitro`, and for `resume` a
+bare `Nitro` and `other => :current`, a continuation from memory, which is not supported yet.
+"""
+function check_source(src, kw::Symbol)
+    (src === nothing || src isa AbstractString) && return nothing
+    kw === :resume && (src === false || src === :auto) && return nothing
+    if src isa Symbol && src in (:best, :latest)
+        error(
+            "ReactantNitro: `$(kw) = :$(src)` names a checkpoint and not the run it belongs to. Use \
+             `$(kw) = :latest => :$(src)` for the most recent run in `run_dir`, `$(kw) = \"<run \
+             id>\" => :$(src)` for another (`runs(run_dir)` lists them)$(src === :best ? ", or \
+             `$(kw) = :all => :best` for the best across every run" : "")."
+        )
+    end
+    if src isa Nitro
+        kw === :weights && return nothing
+        error(
+            "ReactantNitro: `resume = other` would continue from another handle's in-memory state, \
+             optimizer and step included, and that is not supported yet. For its parameters alone \
+             pass `weights = other` (a warm start with a fresh optimizer); to continue its run from \
+             a record pass `resume = other => :latest` or `resume = other => :best`."
+        )
+    end
+    takes = kw === :weights ?
+        "`weights` takes $(SOURCE_FORMS); or a bare `Nitro`, the same as `other => :current`" :
+        "`resume` takes `false` (the default, a fresh start), `:auto` (the same as `:latest => \
+         :latest`, starting fresh when there is nothing to resume), $(SOURCE_FORMS)"
+    src isa Pair || error("ReactantNitro: $(takes). Got `$(repr(src))`.")
+    run, which = src
+    (run isa Union{Nitro, AbstractString} || run === :latest || run === :all) || error(
+        "ReactantNitro: `$(kw) = $(source_repr(src))` names no run: $(repr(run)) is not `:latest`, \
+         `:all`, a run id string or a `Nitro`. $(takes)."
+    )
+    which in (:best, :latest, :current) || error(
+        "ReactantNitro: `$(kw) = $(source_repr(src))` names no checkpoint of the run: \
+         $(repr(which)) is not `:best`, `:latest` or `:current`. $(takes)."
+    )
+    if which === :current
+        run isa Nitro || error(
+            "ReactantNitro: `$(kw) = $(source_repr(src))`: `:current` is a live handle's parameters \
+             in memory, so it needs a `Nitro` on the left (`weights = other => :current`). A run in \
+             `run_dir` has records, `:best` and `:latest`."
+        )
+        kw === :resume && error(
+            "ReactantNitro: `resume = other => :current` would continue from another handle's \
+             in-memory state, optimizer and step included, and that is not supported yet. For its \
+             parameters alone pass `weights = other` (a warm start with a fresh optimizer); to \
+             continue its run from a record pass `resume = other => :latest` or `resume = other => \
+             :best`."
+        )
+    end
+    (run === :all && which === :latest) && error(
+        "ReactantNitro: `$(kw) = :all => :latest` would be the newest record across every run, \
+         which is the most recent run's newest: use `$(kw) = :latest => :latest`."
+    )
+    return nothing
+end
+
+"""
+    ReactantNitro.resolve_source(ckpt, run_dir, src, kw) -> path, `Nitro`, or nothing
+
+The one resolver for a `weights` or `resume` source that [`check_source`](@ref) accepted: a path
+is itself, a `Nitro` and `other => :current` are the handle (the in-memory warm start), and every
+other `run => checkpoint` names a record, resolved to its file through the manifest by
+[`resolve_checkpoint`](@ref). `run` is `:latest`, `:all` or a run id of `run_dir` read by this
+run's checkpointer, whose current metric decides `:best`; `other::Nitro` is that handle's own run,
+read in its own run directory through its own checkpointer, whatever else has written there since.
+Raises when a record cannot be found, so nothing asked for is silently replaced by fresh weights.
+`resume = :auto` is resolved by [`resume_path`](@ref), not here.
+"""
+function resolve_source(ckpt, run_dir, src, kw::Symbol)
+    src === nothing && return nothing
+    src isa AbstractString && return String(src)
+    src isa Nitro && return src
+    run, which = src
+    which === :current && return run
+    what = "`$(kw) = $(source_repr(src))`"
+    run isa Nitro || return resolve_checkpoint(ckpt, run_dir, run, which; what).path
+    ck = run.checkpointer
+    has = ck === nothing ? "`checkpointer = nothing`" : "a `$(typeof(ck))`"
+    ck isa TopKCheckpointer || error(
+        "ReactantNitro: $(what) names one of `other`'s checkpoint records, and `other` has no \
+         checkpointer whose manifest can be read ($(has)), so there is no record to name. \
+         `weights = other` takes its parameters from memory."
+    )
+    return resolve_checkpoint(ck, run.run_dir, run_key(ck.run), which; what).path
+end
+
 """
     ReactantNitro.resume_path(resume, ckpt, run_dir) -> path or nothing
 
 The checkpoint `resume` names, or `nothing` for a fresh start. `false` (and `nothing`) resume
-nothing; `:auto` is the newest record of the directory's most recent run, and `nothing` when the
-directory holds none, so a first run starts fresh; a path is itself; `other::Nitro => :latest` and
-`=> :best` are that handle's run's newest record and its selected checkpoint. Which run the
-resumed handle then belongs to is `resumed_run`'s question. `resume = other` and `other =>
-:current` would continue from the handle's in-memory state, optimizer and all, and are refused
-until that exists; bare `other` stays an error so that it can later mean `:current`.
+nothing; a path is itself; `run => :latest | :best` is resolved by [`resolve_source`](@ref).
+`:auto` is exactly `:latest => :latest`, the newest record of the directory's most recent run,
+announced with an `@info` naming the run and epoch it continues, except that a directory with
+nothing to resume in it is a fresh run with a `@warn` rather than an error, which is what makes it
+usable as a standing setting in a harness that may be starting or recovering. Which run the resumed
+handle then belongs to is `resumed_run`'s question.
 """
 function resume_path(resume, ckpt, run_dir)
     (resume === false || resume === nothing) && return nothing
-    if resume === :auto
-        announce_recent_run(ckpt, run_dir, "`resume = :auto`")
-        return find_latest(ckpt, run_dir)
+    resume === :auto || return resolve_source(ckpt, run_dir, resume, :resume)
+    if ckpt isa TopKCheckpointer
+        dir = lookup_dir(ckpt, run_dir)
+        if isempty(isdir(dir) ? read_manifest(dir) : ManifestEntry[])
+            @warn "ReactantNitro: `resume = :auto` found nothing to resume in `$(dir)`, so this \
+                   handle starts a fresh run. `resume = :latest => :latest` raises instead where \
+                   there is nothing to resume."
+            return nothing
+        end
+        found = resolve_checkpoint(ckpt, run_dir, :latest, :latest; what = "`resume = :auto`")
+        @info "ReactantNitro: `resume = :auto`: continuing `:latest => :latest`, \
+               $(run_label(found.run)), epoch $(found.epoch), from `$(found.path)`."
+        return found.path
     end
-    resume isa AbstractString && return String(resume)
-    current = resume isa Nitro || (resume isa Pair{<:Nitro, Symbol} && last(resume) === :current)
-    current && error(
-        "ReactantNitro: `resume = $(resume isa Nitro ? "other" : "other => :current")` would \
-         continue from another handle's in-memory state, optimizer and step included, and that is \
-         not supported yet. For its parameters alone pass `weights = other` (a warm start with a \
-         fresh optimizer); to continue its run from a record pass `resume = other => :latest` or \
-         `resume = other => :best`."
-    )
-    if resume isa Pair{<:Nitro, Symbol}
-        last(resume) in (:latest, :best) || error(
-            "ReactantNitro: `resume = other => $(repr(last(resume)))` names no record of `other`. \
-             The records are `:latest` (its run's newest, to continue it) and `:best` (the \
-             checkpoint its run selected, which continues as a branch)."
-        )
-        return handle_checkpoint(first(resume), last(resume), "resume")
+    # `checkpointer = nothing` reads nothing; a checkpointer of the user's own answers through its
+    # own `find_latest` method.
+    found = find_latest(ckpt, run_dir)
+    if found === nothing
+        @warn "ReactantNitro: `resume = :auto` found nothing to resume in `$(run_dir)`$(ckpt === nothing ? " (`checkpointer = nothing` reads no manifest)" : ""), \
+               so this handle starts a fresh run."
+    else
+        @info "ReactantNitro: `resume = :auto`: continuing from `$(found)`."
     end
-    return error(
-        "ReactantNitro: `resume` takes `false` (the default, a fresh start), `:auto` (the newest \
-         record of the most recent run in `run_dir`), a checkpoint path, or `other => :latest | \
-         :best` (a record of another handle's run); got `$(repr(resume))`."
-    )
-end
-
-"""
-    ReactantNitro.handle_checkpoint(other::Nitro, state, kw) -> path
-
-The file `kw = other => state` names: `other`'s run's newest record for `:latest`, its selected
-checkpoint for `:best`, both looked up in `other`'s run directory and scoped to `other`'s own run,
-so another run in the same directory can never answer for it. Raises when `other` has no
-checkpointer to read, or its run has no such record.
-"""
-function handle_checkpoint(other::Nitro, state::Symbol, kw)
-    ck = other.checkpointer
-    has = ck === nothing ? "`checkpointer = nothing`" : "a `$(typeof(ck))`"
-    ck isa TopKCheckpointer || error(
-        "ReactantNitro: `$(kw) = other => :$(state)` names one of `other`'s checkpoint records, and \
-         `other` has no checkpointer whose manifest can be read ($(has)), so there is no record to \
-         name. `weights = other` takes its parameters from memory."
-    )
-    return resolve_named_checkpoint(
-        ck, other.run_dir, state; run = ck.run, what = "`$(kw) = other => :$(state)`"
-    )
+    return found
 end
 
 """
@@ -625,8 +766,8 @@ The deprecation notice for `Nitro(...; checkpoint = path)`, logged once per sess
 """
 function warn_checkpoint_keyword()
     @warn "ReactantNitro: `Nitro(...; checkpoint = path)` is deprecated and will be removed in \
-           0.2.0. Use `weights = path`, which loads the same parameters, or `weights = :best` / \
-           `weights = :latest` for a checkpoint of `run_dir`." maxlog = 1
+           0.2.0. Use `weights = path`, which loads the same parameters, or `weights = :latest => \
+           :best` / `weights = :latest => :latest` for a checkpoint of `run_dir`." maxlog = 1
     return nothing
 end
 

@@ -428,7 +428,7 @@ train!(e; accum = 4)                  # new gradient program, the costly one
 
 The other four keywords have no accessor because each names a fact about this invocation: `data`
 substitutes for [`build_data`](@ref), `weights` and `resume` name where this call's parameters
-come from (a file, `:best` or `:latest`, or another handle), and `run_ref` is a channel back to the caller, filled before the loop starts.
+come from (a file, a `run => checkpoint` pair such as `:latest => :best`, or another handle), and `run_ref` is a channel back to the caller, filled before the loop starts.
 
 ## Binding
 

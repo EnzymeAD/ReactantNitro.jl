@@ -201,8 +201,83 @@ purely-logged metrics are not.
 Ctrl+C is a graceful stop: the loop runs on a worker thread, ^C becomes [`request_stop!`](@ref),
 the step loop breaks at its next boundary, validation and the checkpoint still run, and the call
 returns with `stop_reason = :requested`.
+
+A handle built with `restore_best = true` ends every `train!` that did not fail (completion, early
+stop, a requested stop) by loading its own run's selected checkpoint into `ps` and `st`; step,
+epoch, `history` and the last metrics stay as training ended. It then refuses a further `train!`,
+since those weights with the optimizer state and step training ended in are no state any run was
+in; the error shows the constructions that are. With no scored checkpoint it warns and keeps the
+final weights.
 """
-train!(nitro::Nitro) = with_repl(() -> _train!(nitro), nitro; on_interrupt = _stop_on_interrupt)
+function train!(nitro::Nitro)
+    check_trainable_after_restore(nitro)
+    return with_repl(() -> _train!(nitro), nitro; on_interrupt = _stop_on_interrupt)
+end
+
+"""
+    ReactantNitro.check_trainable_after_restore(nitro) -> nothing
+
+The refusal of `train!` on a handle whose weights `restore_best` replaced: the best epoch's
+parameters beside the optimizer state, step and schedule position training ENDED in would train
+from a state no run was ever in. The message names the three states that are real, as code with
+this handle's experiment, preset, run directory and run id filled in.
+"""
+function check_trainable_after_restore(nitro::Nitro)
+    rb = nitro.restored_best
+    rb === nothing && return nothing
+    T = string(nameof(typeof(nitro.e)))
+    head = nitro.preset === nothing ? "$(T)()" : "$(T), :$(nitro.preset)"
+    id = run_key(rb.run)
+    dir = repr(nitro.run_dir)
+    return error(
+        """
+        ReactantNitro: this handle's weights were replaced at the end of `train!` by its best
+        checkpoint (`restore_best = true`): epoch $(rb.epoch) of run `$(id)`, `$(rb.path)`.
+        It cannot train again. Its optimizer state, step and schedule position are still where
+        training ended, at epoch $(nitro.epoch), so the best weights beside them are not a training
+        state any run was ever in, and training on would continue from a mixture.
+        Build a new handle for the state you want:
+          the best weights with a fresh optimizer (a new run):
+            Nitro($(head); run_dir = $(dir), weights = "$(id)" => :best)
+            (or, with this handle in hand, `run_dir = "<new dir>", weights = n => :best`)
+          the best weights and their optimizer state, with a new schedule:
+            Nitro($(head); run_dir = $(dir), weights = "$(id)" => :best, restore_optimizer = true)
+          the exact training state at the best epoch (continues as a branch of run `$(id)`):
+            Nitro($(head); run_dir = $(dir), resume = "$(id)" => :best)"""
+    )
+end
+
+"""
+    ReactantNitro.restore_best!(nitro) -> nothing
+
+`restore_best = true`'s last step of `train!`: `ps` and `st` from this run's selected checkpoint,
+`nitro.best_checkpoint`, which is scoped to the handle's own run and the checkpointer's current
+metric. `checkpoint_source` becomes that file, so export provenance names it, and
+`restored_best` records it for `show` and for the refusal of a further `train!`. A run that saved
+no scored checkpoint warns and keeps its final weights.
+"""
+function restore_best!(nitro::Nitro)
+    nitro.restore_best || return nothing
+    bc = nitro.best_checkpoint
+    if bc === nothing
+        @warn "ReactantNitro: `restore_best = true`, and this run saved no scored checkpoint (no \
+               `val` split, no checkpointer, or no epoch under the checkpointer's metric), so the \
+               handle keeps the weights training ended with."
+        return nothing
+    end
+    record = load_checkpoint(nitro.checkpointer, bc.path)
+    nitro.ps = place_replicated(from_host(to_host(record.ps)), nitro.mesh)
+    nitro.st = place_replicated(from_host(to_host(record.st)), nitro.mesh)
+    nitro.checkpoint_source = bc.path
+    nitro.restored_best = (;
+        path = bc.path, epoch = bc.epoch, metric = bc.metric, score = bc.score,
+        run = hasproperty(bc, :run) ? bc.run : checkpoint_run(nitro),
+    )
+    @info "ReactantNitro: `restore_best = true`: the handle now holds the weights of its best \
+           checkpoint, epoch $(bc.epoch) ($(bc.metric) $(_shown(bc.score))), `$(bc.path)`; step and \
+           epoch stay at $(nitro.step) and $(nitro.epoch)."
+    return nothing
+end
 
 # Ctrl+C lands on the parked caller, never on the worker, so it becomes the graceful stop; a
 # failure during the wind-down surfaces its own exception rather than the interrupt.
@@ -267,7 +342,9 @@ function _train!(nitro::Nitro)
     t_started = time()
     last_metrics = (;)
     # The final checkpoint rewrite applies only to an epoch THIS call wrote. `nitro.epoch > 0` is
-    # not that condition: a resume restores the counter.
+    # not that condition: a resume restores the counter. Nor is having written some earlier epoch:
+    # under `keep_latest = false` the checkpointer declines an epoch outside the top K, and the
+    # rewrite then has no record of the final epoch to rewrite.
     wrote_epoch = false
 
     try
@@ -420,8 +497,7 @@ function _train!(nitro::Nitro)
                 context = "validate"
             )
             set_phase!(nitro, Checkpointing())
-            save_checkpoint_reported!(nitro, nitro.epoch, metrics_out)
-            wrote_epoch = true
+            wrote_epoch = save_checkpoint_reported!(nitro, nitro.epoch, metrics_out) !== false
 
             # Both stopping routes set one flag, checked after validation and the checkpoint, so a
             # stop is a finished epoch exiting through `Done`. `should_stop` runs even when a stop
@@ -450,9 +526,10 @@ function _train!(nitro::Nitro)
     nitro.stop_reason === nothing && (nitro.stop_reason = :completed)
     # Checkpoints are written per epoch, before the outcome is known, so the final epoch's record
     # is rewritten with `stop_reason` once it is: same file, one manifest entry replaced. Gated on
-    # THIS call having written an epoch, not on `nitro.epoch > 0`: a resume into a finished run
-    # restores the counter, exits the loop at once, and would otherwise overwrite the previous
-    # process's final record with empty metrics, dropping it out of the top-K ranking.
+    # THIS call having written the final epoch, not on `nitro.epoch > 0`: a resume into a finished
+    # run restores the counter, exits the loop at once, and would otherwise overwrite the previous
+    # process's final record with empty metrics, dropping it out of the top-K ranking. An epoch the
+    # checkpointer declined (`keep_latest = false`, outside the top K) is not written here either.
     wrote_epoch && save_checkpoint_reported!(nitro, nitro.epoch, last_metrics)
     # `Done` for both stopping routes; `stop_reason` is where the difference lives.
     nitro.elapsed = time() - t_started
@@ -460,6 +537,8 @@ function _train!(nitro::Nitro)
     progress_done!()
     # After the final rewrite above, so the winning entry is the one the manifest ends up holding.
     nitro.best_checkpoint = own_selected_checkpoint(nitro.checkpointer, nitro.run_dir)
+    # Before `Done`, so a Terminal monitor (an export, say) sees the weights the handle will hold.
+    restore_best!(nitro)
     set_phase!(nitro, Done())
     finish!(nitro.logger, nitro.stop_reason === :completed ? :completed : :early_stop)
     return nitro
@@ -626,8 +705,7 @@ function _train_manual!(nitro::Nitro)
                 context = "validate"
             )
             set_phase!(nitro, Checkpointing())
-            save_checkpoint_reported!(nitro, nitro.epoch, metrics_out)
-            wrote_epoch = true
+            wrote_epoch = save_checkpoint_reported!(nitro, nitro.epoch, metrics_out) !== false
 
             stopped = should_stop(nitro.early_stop, nitro.epoch, metrics_out)
             if stopped || nitro.stop_requested
@@ -650,13 +728,16 @@ function _train_manual!(nitro::Nitro)
         rethrow()
     end
     nitro.stop_reason === nothing && (nitro.stop_reason = :completed)
-    # The final rewrite, as in the automatic loop, gated on this call having written an epoch.
+    # The final rewrite, as in the automatic loop, gated on this call having written the final
+    # epoch.
     wrote_epoch && save_checkpoint_reported!(nitro, nitro.epoch, last_metrics)
     nitro.elapsed = time() - t_started
     # Per entry point, not per epoch.
     progress_done!()
     # After the final rewrite above, so the winning entry is the one the manifest ends up holding.
     nitro.best_checkpoint = own_selected_checkpoint(nitro.checkpointer, nitro.run_dir)
+    # Before `Done`, so a Terminal monitor (an export, say) sees the weights the handle will hold.
+    restore_best!(nitro)
     set_phase!(nitro, Done())
     finish!(nitro.logger, nitro.stop_reason === :completed ? :completed : :early_stop)
     return nitro
@@ -836,6 +917,7 @@ end
 filesystem from an epoch that finished and hung. Nothing is reported without a checkpointer, since
 `save_checkpoint!(::Nothing, ...)` is a no-op. Every write gets the one label `"checkpoint"`,
 including the final rewrite; a watcher has nothing to do differently about which is in flight.
+Returns what `save_checkpoint!` returned, so `false` still means the epoch was declined.
 """
 function save_checkpoint_reported!(nitro::Nitro, epoch, metrics)
     write() = save_checkpoint!(nitro.checkpointer, epoch, metrics, snapshot(nitro))

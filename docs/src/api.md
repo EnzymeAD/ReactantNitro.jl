@@ -75,4 +75,12 @@ ReactantNitro.fanout_capable
 ReactantNitro.prefetch_config
 ReactantNitro.strip_rules
 ReactantNitro.merge_rules
+ReactantNitro.RunSummary
+ReactantNitro.check_source
+ReactantNitro.resolve_source
+ReactantNitro.resume_path
+ReactantNitro.resolve_checkpoint
+ReactantNitro.warn_mixed_metrics
+ReactantNitro.find_latest
+ReactantNitro.selected_checkpoint
 ```

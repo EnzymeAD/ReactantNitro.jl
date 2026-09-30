@@ -443,6 +443,30 @@
         @test phase(n2) isa Done
     end
 
+    @testset "`restore_best` and `restore_optimizer` reach the manual driver" begin
+        dir = mktempdir()
+        d_ckpt() = TopKCheckpointer(; metric = :d, mode = :min)
+        host_leaves(x) = [v isa AbstractArray ? Array(v) : v for v in Functors.fleaves(ReactantNitro.to_host(x))]
+        n = train!(Nitro(ToyGAN(); checkpointer = d_ckpt(), run_dir = dir, max_epochs = 3, restore_best = true))
+        bc = n.best_checkpoint
+        @test n.restored_best !== nothing && n.restored_best.path == bc.path == n.checkpoint_source
+        rec = load_checkpoint(n.checkpointer, bc.path)
+        @test host_leaves(parameters(n)) == host_leaves(rec.ps)
+        @test_throws "cannot train again" train!(n)
+        # The record's own optimizer state, the user's tree, under a fresh step count.
+        w = Nitro(
+            ToyGAN(); checkpointer = d_ckpt(), run_dir = mktempdir(), weights = bc.path,
+            restore_optimizer = true
+        )
+        @test current_step(w) == 0 && current_epoch(w) == 0
+        assert_opt_state_device(w.opt_state)
+        @test host_leaves(w.opt_state) == host_leaves(rec.opt_state)
+        fresh = Nitro(ToyGAN(); checkpointer = d_ckpt(), run_dir = mktempdir(), weights = bc.path)
+        @test host_leaves(fresh.opt_state) != host_leaves(rec.opt_state)
+        train!(w)
+        @test current_epoch(w) == 2
+    end
+
     # ── a 1-D GAN that demonstrably learns its target: the whole feature, end to end ────
 
     @experiment struct OneDGan

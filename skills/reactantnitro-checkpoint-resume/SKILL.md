@@ -2,32 +2,39 @@
 name: reactantnitro-checkpoint-resume
 description: >
   Checkpoint and resume a ReactantNitro run: `TopKCheckpointer` and the latest-plus-top-K
-  retention rule, what a checkpoint record holds and why every value in it is a host
-  value, opt-in `resume = :auto` and the four refusals behind it, and what
-  is recomputed rather than restored. Invoke when configuring checkpointing, resuming or
-  continuing a run, debugging a refused or failed resume, or deciding which artifact to
-  load for evaluation or export, or configuring an early stop.
+  retention rule (`keep_latest`, `scope = :run | :dir`, current-metric-only selection),
+  the `run => checkpoint` source grammar shared by `weights` and `resume`, `resume = :auto`,
+  `restore_optimizer`, `restore_best`, finding run ids with `runs()` and `checkpoint_run()`,
+  what a checkpoint record holds and why every value in it is a host value, the four
+  refusals behind a resume, and what is recomputed rather than restored. Invoke when
+  configuring checkpointing, resuming or continuing a run, debugging a refused or failed
+  resume, or deciding which artifact to load for evaluation or export, or configuring an
+  early stop.
 ---
 
 # Checkpointing and resume
 
 **`resume = false` is the default: a fresh `Nitro` does not resume.** Resuming is opt in.
-`resume = :auto` looks for `latest` of the most recent run in the run directory and continues from
-it, and an explicit path names one directly. The default used to be `:auto`, and it was changed because `run_dir`
-defaults to a name derived from the experiment type, so a second `Nitro(MyExp())` in the same
-working directory silently continued the previous run. Picking up weights nobody named is not
-something a constructor should do on its own.
+`resume = :auto` is exactly `resume = :latest => :latest`, the newest record of the most recent run
+in the run directory, and logs what it resolved to (`resume = :auto: continuing :latest => :latest,
+run <id>, epoch <n>`). The one difference: in a directory with nothing to resume it warns and
+starts a fresh run, where `:latest => :latest` raises. The default used to be `:auto`, and it was
+changed because `run_dir` defaults to a name derived from the experiment type, so a second
+`Nitro(MyExp())` in the same working directory silently continued the previous run. Picking up
+weights nobody named is not something a constructor should do on its own.
 
 **When driving from a Kaimon session, the tools pass this through unchanged** (`reactantnitro-kaimon`):
-`nitro_train(..., run_dir = ..., resume = ...)` accepts `"auto"`, `"false"`, or a checkpoint path,
-and the same default applies: a reused `run_dir` does NOT resume unless asked. The tools' run
-registry is process-local, so a session restart loses in-flight runs and `resume = "auto"` is the
-recovery path, not a convenience. Ask for it explicitly after a restart.
+`nitro_train(..., run_dir = ..., resume = ...)` accepts `"auto"`, `"false"`, a checkpoint path, or
+a source string such as `"latest => latest"` or `"<run id> => best"`, and the same default applies:
+a reused `run_dir` does NOT resume unless asked. The tools' run registry is process-local, so a
+session restart loses in-flight runs and `resume = "auto"` is the recovery path, not a convenience.
+Ask for it explicitly after a restart.
 
 ## Configuring it
 
 ```julia
-TopKCheckpointer(; k = 3, metric = :val_loss, mode = :min, dir = nothing)
+TopKCheckpointer(; k = 3, metric = :val_loss, mode = :min, dir = nothing,
+                   keep_latest = true, scope = :run)
 ```
 
 `metric` names a key your `finalize_metrics` returns (`:val_loss` is what the default `metrics`
@@ -45,7 +52,18 @@ and runs one seed N times. Vary `run_dir` too.
 
 **Retention is top-K plus a `latest` rule: never rotate out the newest, whatever it scored.** On disk
 that is K+1 files when the newest is not among the best and exactly K when it is. Resuming from the
-*best* checkpoint is not resuming from where you were, which is why both exist.
+*best* checkpoint is not resuming from where you were, which is why both exist. That is the default,
+`TopKCheckpointer(; keep_latest = true)`.
+
+`keep_latest = false` is the opt-in escape hatch when a record is large and the filesystem slow:
+the run keeps exactly its top K, and an epoch that cannot enter them is never written at all
+(it must beat the K-th best strictly), so there is no per-epoch write-then-delete. The final
+`stop_reason` rewrite follows the same rule. What it costs: the state training ended in is saved
+only if the last epoch was a top-K epoch, `weights = :latest => :latest` and `resume = :auto`
+resolve to the run's newest *retained* record (its most recent improvement, not where it stopped), a resume from
+it continues the same run id and retrains the epochs after it, and a crash loses every epoch since
+that improvement. Setup warns once about this for a handle that trains, and refuses the flag for a
+training run with no `val` split, since no epoch would have a score to be kept by.
 
 `latest` is a retained file, **not a symlink** into the top-K set: top-K rotation deletes its target
 during entirely normal operation, and checkpoint directories get copied between paths where tools
@@ -60,21 +78,42 @@ experiment's type name, so two fresh runs routinely share one. Setup gives every
 run's own entries only: a second run never ranks, rotates, deletes or overwrites the first run's
 checkpoints, and a name that would land on another run's file (same seed and config, same epoch,
 step and score) is written as `...-run-<id>.jld2` instead. Within a run, top-K ranks only entries
-scored under the checkpointer's current `metric` and `mode`; entries the run wrote under another
-pair (a resume that changed the selection) are kept and never ranked. A manifest written before
-runs were recorded reads as one unnamed run (`run === nothing`), the oldest, and a new run leaves
-it alone. A fresh run into an occupied directory says so at setup.
+scored under the checkpointer's current `metric` and `mode`. A manifest written before runs were
+recorded reads as one unnamed run (`run === nothing`, listed by `runs()` as `"legacy"`), the
+oldest, and a new run leaves it alone. A fresh run into an occupied directory says so at setup.
 
-**Resuming continues a run or branches from it.** `resume = :auto` restores the newest record of
-the MOST RECENT run in the directory, and adopts that run's id, so its later checkpoints join the
-same run. `resume = path` does the same when the path is its run's newest record; anything else,
-an earlier record such as a best epoch or a file this manifest does not list, starts a new run and
-logs that it branched, and from which run and epoch. That is what keeps a resume from epoch 5 of a
-run that reached epoch 12 from rewriting epochs 6 to 12 and rotating the originals away. The
-branch's entries carry the source path as `parent`. `resume = other => :latest` (another handle's
-run's newest record, continuing it when resumed into its directory) and `other => :best` (its
-selected checkpoint, a branch) name the record through the handle. `resume = other` and
-`other => :current` are refused as not supported yet; use `weights = other` for the parameters.
+**`scope = :dir` is the space-saving alternative.** The whole directory keeps only its top K by the
+current metric across every run, plus this run's newest (by write time, and only under
+`keep_latest`); every other entry scored the same way is deleted, another run's and legacy ones
+included. Ranking is by score alone. With `keep_latest = false` as well, at most K such files
+remain in the directory. Names still never collide: a file another run owns gets the `-run-<id>`
+suffix rather than being overwritten. Setup of a training handle warns how many checkpoints of
+other runs the directory already holds and that they may be deleted as this run beats them.
+
+**Selection only ever uses the CURRENT metric and mode, and never prunes the others.** Every
+selection (retention under either scope and either `keep_latest`, `:best`, `:all => :best`) ranks
+the entries scored under the checkpointer's `metric` and `mode` and nothing else. Entries scored
+under another pair, written by an earlier run or by this run before a resume changed the selection,
+are disjoint: never ranked against current ones and never deleted. When the entries being
+considered are mixed, setup of a training handle (over its retention scope) and every `:best`
+lookup `@warn`, naming the other metrics and modes with counts and saying they are kept. A run with
+no entry under the current metric cannot answer `run => :best`: it raises, listing the metrics the
+run does have; set the checkpointer's `metric` and `mode` to match, or pass the path. Legacy entries
+with no recorded metric count as matching. **The manifest records a metric's name and mode, not its
+definition**: a metric whose name stays the same while what it computes changes (a new
+`finalize_metrics`, a different split) cannot be detected, and old and new scores will be ranked
+together as if comparable. Rename the metric when its definition changes.
+
+**Resuming is always exact continuation, of a run or as a branch from it.** A resume restores
+parameters, layer state, optimizer state, step, epoch and schedule position, under the refusals
+below. Resuming a run's newest record (`:auto`, `:latest => :latest`, `"<id>" => :latest`,
+`other => :latest`, or that record's path) adopts that run's id, so its later checkpoints join the
+same run. Anything else, an earlier record (`=> :best`, `:all => :best`) or a file this manifest
+does not list, starts a new run and logs that it branched, and from which run and epoch. That is
+what keeps a resume from epoch 5 of a run that reached epoch 12 from rewriting epochs 6 to 12 and
+rotating the originals away. The branch's entries carry the source path as `parent`.
+`resume = other` and `other => :current` are refused as not supported yet; use `weights = other`
+for the parameters.
 
 ## Early stopping
 
@@ -119,24 +158,71 @@ on every checkpoint including top-K ones, not only on a dedicated resume checkpo
 that says checkpoint and hands back something unresumable has picked the wrong word. Anything
 producing parameters alone for export or serving is named for weights.
 
-**Loading a finished run's weights needs no file name.** `weights = :best` loads the checkpoint
-the most recent run in `run_dir` selected by its checkpointer's `metric` and `mode`, and
-`weights = :latest` that run's newest record, both looked up through the manifest; a directory
-holding several runs logs which run it read:
+**Checkpoint sources: one grammar for `weights` and `resume`.** Either keyword takes a path, or
+`run => checkpoint`:
+
+| Run (left) | Means |
+| --- | --- |
+| `:latest` | the most recent run in `run_dir` (the run of the entry written last; legacy entries count as oldest) |
+| `"<run id>"` | that run; `"legacy"` is the unnamed run of a manifest written before runs were recorded |
+| `:all` | every run in `run_dir`; only `:all => :best` |
+| `other::Nitro` | that handle's own run, read in its own run directory through its own checkpointer |
+
+| Checkpoint (right) | Means |
+| --- | --- |
+| `:best` | the run's best record by the CURRENT checkpointer's `metric` and `mode` |
+| `:latest` | the run's newest retained record |
+| `:current` | a live handle's in-memory parameters; only `weights = other => :current` |
+
+`weights = other` (a bare handle) is the same as `other => :current`. Bare `:best` and `:latest` are
+refused with the pair to use (`weights = :latest => :best`), `:all => :latest` is refused in favour
+of `:latest => :latest`, and `:all => :current` is invalid. A source that cannot be found raises,
+naming the directory, the run ids it holds, and `runs(run_dir)`; nothing asked for is silently
+replaced by fresh weights. The pair is resolved to the actual file at setup, so
+`checkpoint_source` and an exported bundle's provenance name the file, not the words.
 
 ```julia
-n = Nitro(MyExp, :baseline; run_dir = "runs/my_run", weights = :best, logger = nothing)
+n = Nitro(MyExp, :baseline; run_dir = "runs/my_run", weights = :latest => :best, logger = nothing)
+n = Nitro(MyExp, :baseline; run_dir = "runs/my_run", weights = "a1b2c3d4" => :best)  # a named run
+n = Nitro(MyExp, :baseline; run_dir = "runs/my_run", weights = :all => :best)        # best of all
 ```
 
-That is the construction for evaluation, mining and export. The symbol is resolved to the actual
-file at setup, so `checkpoint_source` and an exported bundle's provenance name the file, not the
-word. It raises when the directory holds no such checkpoint rather than handing back fresh weights.
-With the handle that trained still in hand, `weights = trained => :best` (or `=> :latest`) names
-the record of THAT handle's run, whatever else has written to its directory since, and
-`weights = trained` (the same as `trained => :current`) takes its parameters from memory. A path
-still works for a checkpoint outside the run directory, and `read_manifest(dir)` lists what a
-directory holds, by `run`, when you want to choose by hand. The gate tools take the same values as
-strings (`weights = "best"`).
+That is the construction for evaluation, mining and export. With the handle that trained still in
+hand, `weights = trained => :best` names the record of THAT handle's run, whatever else has written
+to its directory since. The gate tools take the same sources as strings (`weights = "latest =>
+best"`).
+
+**Finding run ids.** `runs(run_dir)` lists the runs a directory's manifest holds, most recent
+first: id, checkpoints kept and their epochs, best score with its metric and mode, last write, and
+the parent of a branch. `checkpoint_run(nitro)` is a handle's own id (not `run_id`, which is the
+logger's), and `show(nitro)` prints it beside `run_dir` and on the selected checkpoint.
+`read_manifest(dir)` is the per-entry view.
+
+**`restore_optimizer = true`: a record's parameters and its optimizer state, under a new schedule.**
+With `weights` naming a record (a path or any `run => :best | :latest`), the record's optimizer
+state is restored as well, normalized to device residency exactly as a resume normalizes it and
+checked against the optimizer this run builds: a different rule or group layout refuses. Step,
+epoch and schedule start fresh: it is a new run with its own `max_epochs`. It is refused with no
+record to take the state from (no `weights`, a bare handle, `other => :current`; restoring a live
+handle's optimizer is not supported yet), with `resume` (which always restores it), and on a handle
+with no `train` split.
+
+| You want | Write |
+| --- | --- |
+| the exact training state of a record (a branch unless it is the newest) | `resume = run => :best` |
+| a record's parameters and optimizer state, fresh step and schedule | `weights = run => :best, restore_optimizer = true` |
+| a record's parameters, fresh optimizer | `weights = run => :best` |
+
+**`restore_best = true`: end `train!` holding the run's best weights.** When training completes,
+stops early or is stopped on request (not on error), the handle loads `ps` and `st` from its OWN
+run's best checkpoint under the current metric. Step, epoch, `history` and the last metrics stay as
+training ended; `checkpoint_source` becomes the best file, so an export names it, and `show` says
+the handle holds that checkpoint's weights and which epoch. A run that saved no scored checkpoint
+warns and keeps its final weights. A handle restored this way refuses a later `train!`: the best
+weights beside the optimizer state and step training ended in are not a state any run was in. The
+error prints the three real ones, filled in with the handle's experiment, preset, run directory
+and run id (the table above, with `"<id>" => :best`). `train!(e; restore_best = true)` and the
+`nitro_train` tool's `restore_best` argument reach the same keyword.
 
 ## Every value in a record is a HOST value
 

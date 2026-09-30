@@ -98,7 +98,8 @@ function Base.show(io::IO, ::MIME"text/plain", r::CheckpointRecord)
 end
 
 """
-    TopKCheckpointer(; k = 3, metric = :val_loss, mode = :min, dir = nothing, name = nothing)
+    TopKCheckpointer(; k = 3, metric = :val_loss, mode = :min, dir = nothing, name = nothing,
+                       keep_latest = true, scope = :run)
 
 The default checkpointer, writing into [`run_dir`](@ref). Constructible for an arbitrary
 experiment because the default `metrics` guarantees `:val_loss`; a user `metrics` that does not
@@ -106,23 +107,46 @@ emit the configured metric is a setup error.
 
 The retention rule is the top K by `metric` in union with the newest, whatever it scored: K+1
 files when the newest is not among the best, K when it is. `latest` is a rule, not a symlink,
-since a symlink into the top-K set dangles the moment rotation deletes its target. A small
+since a symlink into the top-K set dangles the moment rotation deletes its target.
+
+**`keep_latest = false`** drops the newest from the rule: the run keeps its top K and nothing
+else, and an epoch whose score cannot enter the current top K is not written at all, which
+saves writing a full record (hundreds of MB on a remote filesystem) only to delete it. A score must
+beat the K-th best strictly; a tie with it does not enter. The final `stop_reason` rewrite follows
+the same rule, so the state training ended in is saved only when the last epoch was a top-K epoch,
+and `weights = :latest => :latest` and `resume = :auto` resolve to the run's newest RETAINED
+record, its most recent improvement, rather than to where training stopped. A crash loses every
+epoch since that improvement, and a resume from it retrains them. Setup warns once about all of
+this for a handle that trains, and refuses the flag for a training run with no `val` split, whose
+epochs have no score and could never be kept. The default, `true`, is the rule above. A small
 manifest (file, epoch, score, `stop_reason`, and the run, metric and mode that wrote it) is written
 alongside so resume finds the newest without reading every file. `checkpointer = nothing` disables
 checkpointing. `name` is the filename hook, `name(; epoch, step, metric, score)`; `nothing` adopts
 the experiment's [`checkpoint_filename`](@ref) at setup, as `dir` adopts `run_dir`.
 
-**Retention is per run.** One directory routinely holds several runs (the default `run_dir` is
-the experiment's type name), so setup gives every run an id, `run`, and the rule above applies to
-that run's entries alone: another run's checkpoints are never ranked, rotated, deleted or
-overwritten, and a name that would land on a file this run does not own gets `-run-<id>` inserted
-before `.jld2`. Within the run, top-K ranks only entries scored under this checkpointer's `metric`
-and `mode`; the run's entries scored under another pair are kept and never ranked. A fresh run
-gets a new id; `resume` continues the id of the run it resumes when it resumes that run's newest
-record, and branches into a new one, recording the source in `parent`, otherwise. Setup assigns
-both fields every time, so a checkpointer object reused across handles belongs to the latest one.
-A checkpointer driven by hand, which never went through setup, has `run = nothing`, the same
-unnamed run every manifest entry written before runs were recorded belongs to.
+**Retention is per run by default (`scope = :run`).** One directory routinely holds several runs
+(the default `run_dir` is the experiment's type name), so setup gives every run an id, `run`, and
+the rule above applies to that run's entries alone: another run's checkpoints are never ranked,
+rotated, deleted or overwritten. A fresh run gets a new id; `resume` continues the id of the run it
+resumes when it resumes that run's newest record, and branches into a new one, recording the source
+in `parent`, otherwise. Setup assigns both fields every time, so a checkpointer object reused across
+handles belongs to the latest one. A checkpointer driven by hand, which never went through setup,
+has `run = nothing`, the same unnamed run every manifest entry written before runs were recorded
+belongs to.
+
+**`scope = :dir`** is the space-saving strategy: the whole directory keeps only its top K by
+`metric` across every run, plus this run's newest (by write time, and only under `keep_latest`),
+and a write deletes every other entry scored the same way, another run's included. Ranking is by
+score alone. Under `keep_latest = false` at most K such files remain in the directory. Setup warns
+a training handle when the directory already holds checkpoints this rule may delete.
+
+**Only the current `metric` and `mode` are ever ranked.** An entry scored under another pair
+(written by an earlier run, or by this run before a resume changed the selection) is not
+comparable, so under either scope and either `keep_latest` it is never ranked and never deleted.
+Setup warns when the entries in the handle's retention scope are mixed this way, and so does a
+`:best` lookup. An entry with no recorded metric predates the field and counts as matching.
+Under either scope a name that would land on a file this run does not own gets `-run-<id>`
+inserted before `.jld2`, so no write ever replaces another run's file by name.
 """
 mutable struct TopKCheckpointer
     k::Int
@@ -134,26 +158,42 @@ mutable struct TopKCheckpointer
     # This run's id, and the checkpoint a branched run was resumed from. Assigned at setup.
     run::Union{String, Nothing}
     parent::Union{String, Nothing}
+    # Whether the run's newest record is retained whatever it scored. `false` keeps the top K only.
+    keep_latest::Bool
+    # Which entries retention ranks and prunes: `:run` (this run's) or `:dir` (the directory's).
+    scope::Symbol
 end
 
-TopKCheckpointer(;
-    k::Int = 3, metric::Symbol = :val_loss, mode::Symbol = :min,
-    dir::Union{String, Nothing} = nothing, name = nothing
-) =
-    TopKCheckpointer(k, metric, mode, dir, name, nothing, nothing, nothing)
+function TopKCheckpointer(;
+        k::Int = 3, metric::Symbol = :val_loss, mode::Symbol = :min,
+        dir::Union{String, Nothing} = nothing, name = nothing, keep_latest::Bool = true,
+        scope::Symbol = :run
+    )
+    check_scope(scope)
+    return TopKCheckpointer(k, metric, mode, dir, name, nothing, nothing, nothing, keep_latest, scope)
+end
+
+check_scope(scope) = scope in (:run, :dir) || error(
+    "ReactantNitro: the checkpointer's `scope` is $(repr(scope)); it must be `:run` (retention \
+     within this run's own checkpoints, the default) or `:dir` (the top K across every run in the \
+     directory)."
+)
 
 # A run id: eight characters from the OS entropy source. Not the global rng, which setup has
 # seeded, so two runs with one seed would draw the same id and be one run to the manifest.
 new_run_id() = Random.randstring(Random.RandomDevice(), 8)
 
 """
-    save_checkpoint!(ckpt, epoch, metrics, snapshot) -> nothing
+    save_checkpoint!(ckpt, epoch, metrics, snapshot) -> Bool or nothing
 
-The checkpointer decides internally whether an epoch warrants a write. Writes go through
-[`with_io_retry`](@ref) to a temporary path renamed into place, and rotation deletes the displaced
-file only after the new one is durable. `e` is deliberately not an argument: the filename comes
-from the checkpointer's bound `name`, so the one object holding device leaves by design never
-reaches the function that serializes.
+The checkpointer decides internally whether an epoch warrants a write, and returns `false` when it
+declined; any other return, `nothing` included, means the epoch was written. `train!` reads it to
+decide whether the final `stop_reason` rewrite has a record to rewrite. [`TopKCheckpointer`](@ref)
+returns `true` or `false`, and declines only under `keep_latest = false`, for an epoch that cannot
+enter the run's top K. Writes go through [`with_io_retry`](@ref) to a temporary path renamed into
+place, and rotation deletes the displaced file only after the new one is durable. `e` is
+deliberately not an argument: the filename comes from the checkpointer's bound `name`, so the one
+object holding device leaves by design never reaches the function that serializes.
 """
 function save_checkpoint! end
 save_checkpoint!(::Nothing, epoch, metrics, snapshot) = nothing
@@ -175,6 +215,27 @@ function save_checkpoint!(ckpt::TopKCheckpointer, epoch, metrics, snapshot)
         `:val_loss` is not a magic name: it is what the framework substitutes when an experiment
         defines no `metrics`. An experiment defining its own names one of its own keys."""
     )
+    (score === nothing && !ckpt.keep_latest) && error(
+        """
+        ReactantNitro: this checkpointer has `keep_latest = false` and epoch $(epoch) has no
+        `$(ckpt.metric)` score (the run has no `val` split), so it could never be kept.
+        `keep_latest = false` retains only the top K by score. Keep the default
+        `keep_latest = true`, which retains the newest record whatever it scored, or add a `val`
+        split."""
+    )
+
+    # This run's entries and everyone else's. The one-entry-per-epoch rule and the displaced file
+    # are applied to this run's alone. Under `scope = :run` so is retention, and another run's
+    # entries go back into the manifest exactly as read, their files never touched; under
+    # `scope = :dir` retention ranks the whole directory and may prune another run's entries.
+    prior = read_manifest(dir)
+    own = ManifestEntry[e for e in prior if isequal(e.run, ckpt.run)]
+    others = ManifestEntry[e for e in prior if !isequal(e.run, ckpt.run)]
+    pool_others = ckpt.scope === :dir ? others : ManifestEntry[]
+    # Without the newest protected, an epoch outside the top K would be written only for the
+    # rotation below to delete it. Decided before the record is built or the name hook is called.
+    ckpt.keep_latest || enters_top_k(vcat(pool_others, own), ckpt, Int(epoch), score) ||
+        return false
 
     record = CheckpointRecord(
         FORMAT_VERSION, framework_version(),
@@ -188,12 +249,6 @@ function save_checkpoint!(ckpt::TopKCheckpointer, epoch, metrics, snapshot)
         hasproperty(snapshot, :preset) ? snapshot.preset : nothing
     )
 
-    # This run's entries and everyone else's. Every rule below (one entry per epoch, the displaced
-    # file, retention) is applied to this run's alone; another run's entries go back into the
-    # manifest exactly as read and its files are never touched.
-    prior = read_manifest(dir)
-    own = ManifestEntry[e for e in prior if isequal(e.run, ckpt.run)]
-    others = ManifestEntry[e for e in prior if !isequal(e.run, ckpt.run)]
     name = owned_name(
         checkpoint_name(ckpt, epoch, snapshot.step, score), dir, ckpt.run,
         Set(e.file for e in own), Set(e.file for e in others)
@@ -220,18 +275,44 @@ function save_checkpoint!(ckpt::TopKCheckpointer, epoch, metrics, snapshot)
         e.file for e in own
             if e.epoch == Int(epoch) && e.file != entry.file
     ]
-    keep = retained(entries, ckpt)
+    # The entries retention decides over, and the ones it leaves exactly as they were.
+    pool = vcat(pool_others, entries)
+    untouched = ckpt.scope === :dir ? ManifestEntry[] : others
+    keep = retained(pool, ckpt)
     # The manifest is written before the rotation deletes anything, so a failure leaves at worst
     # an unlisted file rather than fewer checkpoints than the policy promises.
-    write_manifest(dir, vcat(others, [e for e in entries if e.file in keep]))
-    # A file another run's entry names is never deleted, whatever this run's entries say.
-    theirs = Set(e.file for e in others)
-    for f in Iterators.flatten((displaced, (e.file for e in entries if !(e.file in keep))))
-        f in theirs && continue
+    write_manifest(dir, vcat(untouched, [e for e in pool if e.file in keep]))
+    # A file an entry still listed names is never deleted, whatever the rotation says.
+    listed = union(Set(e.file for e in untouched), keep)
+    for f in Iterators.flatten((displaced, (e.file for e in pool if !(e.file in keep))))
+        f in listed && continue
         p = joinpath(dir, f)
         isfile(p) && with_io_retry(() -> rm(p))
     end
-    return nothing
+    return true
+end
+
+"""
+    ReactantNitro.enters_top_k(pool, ckpt, epoch, score) -> Bool
+
+Whether a write of `epoch` scoring `score` would be among the top K, which is the write condition
+under `keep_latest = false`. `pool` is the entries retention ranks: the run's own under
+`scope = :run`, the whole directory's under `scope = :dir`. The ones ranked are those
+[`retained`](@ref) ranks (scored, under this checkpointer's `metric` and `mode`), less this run's
+entry for `epoch` itself, since the write replaces it. That exclusion is what lets the final
+`stop_reason` rewrite of a top-K epoch through, and turns away the rewrite of an epoch that was
+never written. With fewer than K rivals the answer is yes; otherwise the score must beat the K-th
+best strictly, because a tie sorts after the entries already held and would be rotated out.
+"""
+function enters_top_k(pool, ckpt::TopKCheckpointer, epoch::Int, score)
+    rivals = [
+        e.score for e in pool
+            if !(isequal(e.run, ckpt.run) && e.epoch == epoch) && e.score !== nothing &&
+            same_selection(e, ckpt)
+    ]
+    length(rivals) < ckpt.k && return true
+    kth = sort(rivals; rev = ckpt.mode === :max)[ckpt.k]
+    return ckpt.mode === :max ? score > kth : score < kth
 end
 
 """
@@ -257,22 +338,33 @@ function owned_name(name, dir, run, own, theirs)
 end
 
 """
-    ReactantNitro.retained(entries, ckpt) -> Set{String}
+    ReactantNitro.retained(pool, ckpt) -> Set{String}
 
-The retention rule over ONE run's entries: the top K by the selection metric, in union with the
-newest whatever it scored. An entry with no score (a run with no `val` split) is never among the
-top K and is retained only by being the newest, which keeps a train-only run resumable. Only
-entries scored under the checkpointer's own `metric` and `mode` are ranked, since a score is
-comparable only with scores of the same metric and direction; the run's entries written under
-another pair (a resume that changed the selection) are all retained. An entry with no recorded
-metric predates the field and is ranked as before.
+The retention rule over the entries retention decides for (`pool`: one run's under
+`scope = :run`, the directory's under `scope = :dir`): the top K by the selection metric, in union
+with this run's newest whatever it scored, or the top K alone under `keep_latest = false`. The
+newest is the highest epoch under `:run` and the most recent write under `:dir`, where the pool
+holds other runs' epochs too. An entry with no score (a run with no `val` split) is never among the
+top K and is retained only by being the newest, which keeps a train-only run resumable; under
+`keep_latest = false` it is not retained. Only entries scored under the checkpointer's own
+`metric` and `mode` are ranked, since a score is comparable only with scores of the same metric and
+direction, and every entry written under another pair is retained, under either scope: selection
+never prunes what it cannot rank. An entry with no recorded metric predates the field and is
+ranked as before.
 """
-function retained(entries, ckpt::TopKCheckpointer)
-    newest = entries[argmax([e.epoch for e in entries])]
-    scored = [e for e in entries if e.score !== nothing && same_selection(e, ckpt)]
+function retained(pool, ckpt::TopKCheckpointer)
+    mine = [e for e in pool if isequal(e.run, ckpt.run)]
+    newest = if !ckpt.keep_latest || isempty(mine)
+        String[]
+    elseif ckpt.scope === :dir
+        [mine[argmax([e.written for e in mine])].file]
+    else
+        [mine[argmax([e.epoch for e in mine])].file]
+    end
+    scored = [e for e in pool if e.score !== nothing && same_selection(e, ckpt)]
     by_score = sort(scored; by = e -> e.score, rev = ckpt.mode === :max)
-    other = [e.file for e in entries if !same_selection(e, ckpt)]
-    return Set(vcat([e.file for e in first(by_score, max(ckpt.k, 0))], newest.file, other))
+    other = [e.file for e in pool if !same_selection(e, ckpt)]
+    return Set(vcat([e.file for e in first(by_score, max(ckpt.k, 0))], newest, other))
 end
 
 # Whether an entry's score was produced by this checkpointer's selection. An entry with no recorded
@@ -720,6 +812,53 @@ function check_permutation_compatible(record, layout::FlatLayout, path)
 end
 
 """
+    ReactantNitro.check_optimizer_compatible(record, fresh, path) -> nothing
+
+The optimizer half of `restore_optimizer = true`: the record's `opt_state` replaces the one setup
+just built, so it must be the same optimizer over the same groups. Compared per group: the rule
+(its type name, and each member's for an `OptimiserChain`) and the shape of every state leaf. A
+resume needs no such check because it restores a state the run itself wrote under the same config;
+a warm start with the optimizer state is a new run, with a new `optimizer` hook free to have
+changed. Refuses, naming the group and both sides, rather than stepping moments meant for another
+rule. The permutation check has already run, so the groups hold the same leaves.
+"""
+function check_optimizer_compatible(record, fresh, path)
+    was, now = to_host(record.opt_state), to_host(fresh)
+    diff = String[]
+    if was isa Tuple && now isa Tuple && length(was) != length(now)
+        push!(diff, "  the checkpoint has $(length(was)) optimizer groups and this run has $(length(now))")
+    elseif was isa Tuple && now isa Tuple
+        for gi in eachindex(now)
+            a, b = was[gi], now[gi]
+            ra = a isa Optimisers.Leaf ? _rule_name(a.rule) : string(nameof(typeof(a)))
+            rb = b isa Optimisers.Leaf ? _rule_name(b.rule) : string(nameof(typeof(b)))
+            ra == rb || push!(diff, "  group $(gi): rule $(ra) in the checkpoint, $(rb) now")
+            sa = [_leaf_shape(x) for x in Functors.fleaves(a isa Optimisers.Leaf ? a.state : a)]
+            sb = [_leaf_shape(x) for x in Functors.fleaves(b isa Optimisers.Leaf ? b.state : b)]
+            sa == sb || push!(diff, "  group $(gi): state leaf shapes $(sa) in the checkpoint, $(sb) now")
+        end
+    else
+        sa = [_leaf_shape(x) for x in Functors.fleaves(was)]
+        sb = [_leaf_shape(x) for x in Functors.fleaves(now)]
+        sa == sb || push!(diff, "  optimizer state leaf shapes $(sa) in the checkpoint, $(sb) now")
+    end
+    isempty(diff) && return nothing
+    return error(
+        """
+        ReactantNitro: `restore_optimizer = true` takes the optimizer state of the checkpoint at
+        `$path`, and it does not fit the optimizer this run builds:
+        $(join(first(diff, 6), "\n"))
+        The state is restored as the moments of THIS run's rules, so a different rule or group
+        layout would apply them to the wrong thing. Build the run with the optimizer that wrote the
+        checkpoint, or leave `restore_optimizer` off for a fresh optimizer."""
+    )
+end
+
+_rule_name(r::Optimisers.OptimiserChain) = "OptimiserChain(" * join(map(_rule_name, r.opts), ", ") * ")"
+_rule_name(r) = string(nameof(typeof(r)))
+_leaf_shape(x) = x isa AbstractArray ? size(x) : ()
+
+"""
     ReactantNitro.anchor_checksums(anchors) -> NTuple or nothing
 
 The decay-anchor checksum per group, `nothing` for a `:zero` group. SHA256 over the host bytes,
@@ -827,13 +966,16 @@ end
 The checkpointer's setup-time checks: `k`, `mode`, and, when the experiment defines no `metrics`
 (so the only key is `:val_loss`), the selection metric. Otherwise the keys exist only once the hook
 has run, and [`save_checkpoint!`](@ref) raises at the first checkpoint. Selecting on a metric in a
-run with no `val` split is not an error: the newest checkpoint is retained regardless.
+run with no `val` split is not an error: the newest checkpoint is retained regardless. The one
+exception is `keep_latest = false`, which retains nothing unscored, so a handle with a `train`
+split and no `val` split is refused: every epoch it wrote would go unkept.
 """
 check_checkpointer(::Nothing, collection, routing) = nothing
 
 function check_checkpointer(ckpt::TopKCheckpointer, collection, routing)
     ckpt.mode in (:min, :max) || error("ReactantNitro: the checkpointer's `mode` is \
         $(repr(ckpt.mode)); it must be `:min` or `:max`.")
+    check_scope(ckpt.scope)
     ckpt.k >= 1 || error("ReactantNitro: the checkpointer's `k` is $(ckpt.k); it must be at least \
         1. Pass `checkpointer = nothing` to disable checkpointing, which is the documented \
         opt-out.")
@@ -846,6 +988,67 @@ function check_checkpointer(ckpt::TopKCheckpointer, collection, routing)
         `metrics` method, so the only metric the framework will emit is `:val_loss`.
         Either select on `:val_loss`, or define `metrics` emitting `$(ckpt.metric)`."""
     )
+    (!ckpt.keep_latest && haskey(collection, :train) && !haskey(collection, :val)) && error(
+        """
+        ReactantNitro: the checkpointer has `keep_latest = false`, and this run has a `train` split
+        and no `val` split, so no epoch gets a `$(ckpt.metric)` score.
+        `keep_latest = false` retains only the top K by score, so nothing this run trained would
+        ever be saved. Keep the default `keep_latest = true`, which retains the newest record
+        whatever it scored, or add a `val` split."""
+    )
+    return nothing
+end
+
+"""
+    ReactantNitro.warn_keep_latest(ckpt, resume) -> nothing
+
+Said once, at setup of a handle that trains, when its checkpointer has `keep_latest = false`: what
+the run gives up by not keeping its newest record. Everything it says follows from the retention
+rule, and each is the kind of thing found out only after a crash or a resume, so it is said up
+front. A `resume = :auto` in the same call is named, since that resume has already happened by the
+rule: it continued from the newest RETAINED record and will retrain the epochs after it.
+"""
+warn_keep_latest(ckpt, resume) = nothing
+function warn_keep_latest(ckpt::TopKCheckpointer, resume)
+    ckpt.keep_latest && return nothing
+    auto = resume === :auto ? " This handle was built with `resume = :auto`, so where the \
+        directory held a record it continues from the run's newest RETAINED record, one of its top \
+        $(ckpt.k), and retrains every epoch after it; under `keep_latest = false` that is not \
+        where the earlier process stopped." : ""
+    @warn "ReactantNitro: the checkpointer has `keep_latest = false`, so this run keeps only its \
+           top $(ckpt.k) by `$(ckpt.metric)` and does not write an epoch that cannot enter them. \
+           The state training ends in is not saved unless the last epoch is a top-$(ckpt.k) epoch. \
+           `resume = :auto` and `weights = :latest => :latest` resolve to the most recent \
+           improvement, not to where training stopped, and a crash loses every epoch since that \
+           improvement.$(auto)"
+    return nothing
+end
+
+"""
+    ReactantNitro.warn_retention_scope(ckpt) -> nothing
+
+Said at setup of a handle that trains, over the entries its retention will decide for: this run's
+own under `scope = :run`, the directory's under `scope = :dir`. Two warnings, each about something
+otherwise found out only by a checkpoint that is not where it was expected: the entries are mixed
+across metrics ([`warn_mixed_metrics`](@ref); those are kept), and, under `scope = :dir`, the
+directory already holds other runs' checkpoints that this run deletes as it beats them.
+"""
+warn_retention_scope(ckpt) = nothing
+function warn_retention_scope(ckpt::TopKCheckpointer)
+    dir = checkpoint_dir(ckpt)
+    entries = isdir(dir) ? read_manifest(dir) : ManifestEntry[]
+    pool = ckpt.scope === :dir ? entries : ManifestEntry[e for e in entries if isequal(e.run, ckpt.run)]
+    warn_mixed_metrics(pool, ckpt, "this run's retention")
+    ckpt.scope === :dir || return nothing
+    theirs = [e for e in entries if !isequal(e.run, ckpt.run) && same_selection(e, ckpt)]
+    isempty(theirs) && return nothing
+    n = length(unique(e.run for e in theirs))
+    @warn "ReactantNitro: the checkpointer has `scope = :dir`, and `$(dir)` already holds \
+           $(length(theirs)) checkpoint(s) of $(n) other run(s) (legacy entries included) scored \
+           under $(_metric_label(ckpt.metric, ckpt.mode)). The directory keeps only its top \
+           $(ckpt.k) across every run$(ckpt.keep_latest ? " plus this run's newest" : ""), so they \
+           may be deleted as this run beats them. Checkpoints under other metrics are kept. \
+           `runs(\"$(dir)\")` lists what is there."
     return nothing
 end
 
@@ -856,19 +1059,22 @@ lookup_dir(ckpt::TopKCheckpointer, run_dir) = ckpt.dir === nothing ? String(run_
 # lookup that names no run means; `nruns` is how many the directory holds, for the announcement.
 function run_scope(dir, run)
     entries = isdir(dir) ? read_manifest(dir) : ManifestEntry[]
-    runs = manifest_runs(entries)
-    run === :recent && (run = isempty(runs) ? nothing : first(runs))
-    return (; run, entries = ManifestEntry[e for e in entries if isequal(e.run, run)], nruns = length(runs))
+    ids = manifest_runs(entries)
+    run === :recent && (run = isempty(ids) ? nothing : first(ids))
+    return (; run, entries = ManifestEntry[e for e in entries if isequal(e.run, run)], nruns = length(ids))
 end
 
 """
     ReactantNitro.find_latest(ckpt, run_dir; run = :recent) -> path or nothing
 
-`resume = :auto`'s lookup: the newest record of one run in `run_dir`, through the manifest. Newest,
-not best, since resuming from the best epoch would discard every epoch after it. `run` is a run id,
-`nothing` for the unnamed run of a manifest written before runs were recorded, or `:recent` (the
-default), the run that wrote the directory's most recent entry. `nothing` when there is nothing to
-resume from.
+The newest record of one run in `run_dir`, through the manifest: what `:latest => :latest` and
+`resume = :auto` resolve to. Newest, not best, since resuming from the best epoch would discard
+every epoch after it. Newest RETAINED: under `keep_latest = false` the epochs after the run's most
+recent improvement were never written, so "latest" is that improvement, one of the top K, and not
+where training stopped. `run` is a run id, `nothing` for the unnamed run of a manifest written
+before runs were recorded, or `:recent` (the default), the run that wrote the directory's most
+recent entry. `nothing` when there is nothing to resume from; the raising form, which says what
+the directory holds instead, is [`resolve_checkpoint`](@ref).
 """
 find_latest(::Nothing, run_dir; run = :recent) = nothing
 
@@ -885,11 +1091,13 @@ end
     ReactantNitro.selected_checkpoint(ckpt, run_dir; run = :recent) -> NamedTuple or `nothing`
 
 Which checkpoint a run would hand you, `(; path, epoch, metric, score, run)`: the best of that run's
-entries by the checkpointer's `metric` and `mode`, answered from the manifest alone. `run` is as for
-[`find_latest`](@ref), the most recent run by default; `train!` passes its own. Only entries scored
-under the same metric and mode are ranked, since another pair's scores are not comparable; an entry
-with no recorded metric predates the field and is ranked. `nothing` with no checkpointer, no
-directory, no scored entry, or a winning file that is gone.
+entries by the checkpointer's CURRENT `metric` and `mode`, answered from the manifest alone. `run`
+is as for [`find_latest`](@ref), the most recent run by default; `train!` passes its own. Only
+entries scored under the same metric and mode are ranked, since another pair's scores are not
+comparable; an entry with no recorded metric predates the field and is ranked. `nothing` with no
+checkpointer, no directory, no scored entry, or a winning file that is gone. This is the quiet
+form `show` and `train!` use; `:latest => :best` goes through [`resolve_checkpoint`](@ref), which
+raises and warns about mixed metrics.
 """
 selected_checkpoint(::Nothing, run_dir; run = :recent) = nothing
 
@@ -918,50 +1126,247 @@ function announce_recent_run(ckpt::TopKCheckpointer, run_dir, what)
     dir = lookup_dir(ckpt, run_dir)
     scope = run_scope(dir, :recent)
     scope.nruns > 1 && @info "ReactantNitro: `$(dir)` holds $(scope.nruns) runs; $(what) reads the \
-        most recent, $(run_label(scope.run)). `read_manifest(dir)` lists them by `run`."
+        most recent, $(run_label(scope.run)). `runs(\"$(dir)\")` lists them."
     return scope.run
 end
 
-"""
-    ReactantNitro.resolve_named_checkpoint(ckpt, run_dir, which::Symbol; run = :recent, what) -> path
+# ── Which runs a directory holds ────────────────────────────────────────────────────
 
-What `Nitro(e; run_dir, weights = :best)` and `weights = :latest` load: the checkpoint one run in
-`run_dir` selected, by the checkpointer's `metric` and `mode` ([`selected_checkpoint`](@ref)), or
-that run's newest record ([`find_latest`](@ref)). The run is the directory's most recent unless
-`run` names one (`weights = other => :best` names `other`'s), and a directory holding several
-announces which it read. Answered from the manifest, so it names a file of THIS run directory and
-nothing else, and it raises rather than returning `nothing`: a caller who asked for the best
-weights and got fresh ones would not find out until the numbers were wrong. `what` is how the
-messages name the request.
+# The id a run is named by in `runs` and in a `"<id>" => :best` source. The unnamed run of a
+# manifest written before runs were recorded is `"legacy"`, which no generated id can be: those are
+# eight characters.
+const LEGACY_RUN = "legacy"
+run_key(run) = run === nothing ? LEGACY_RUN : run
+run_from_key(id::AbstractString) = id == LEGACY_RUN ? nothing : String(id)
+
 """
-function resolve_named_checkpoint(
-        ckpt, run_dir, which::Symbol; run = :recent, what = "`weights = :$(which)`"
+    ReactantNitro.RunSummary
+
+One run of a run directory, as [`runs`](@ref) reports it: `id` (the run id, or `"legacy"` for
+the entries of a manifest written before runs were recorded), `checkpoints` (how many the manifest
+keeps), `epochs` (theirs, ascending), `metric` and `mode` (the selection of the run's most recently
+written scored entry, `nothing` for a run with no score), `best` (the best score under that
+selection), `metrics` (every `(metric, mode)` pair the run's entries were scored under, with
+counts), `written` (the wall-clock `time()` of its latest write, `0.0` for legacy) and `parent`
+(the checkpoint a branched run was resumed from).
+"""
+struct RunSummary
+    id::String
+    checkpoints::Int
+    epochs::Vector{Int}
+    metric::Union{Symbol, Nothing}
+    mode::Union{Symbol, Nothing}
+    best::Union{Float64, Nothing}
+    metrics::Vector{Pair{Tuple{Union{Symbol, Nothing}, Union{Symbol, Nothing}}, Int}}
+    written::Float64
+    parent::Union{String, Nothing}
+end
+
+function Base.show(io::IO, r::RunSummary)
+    n = r.checkpoints
+    print(io, "run ", r.id, ": ", n, n == 1 ? " checkpoint" : " checkpoints")
+    isempty(r.epochs) || print(io, ", epochs ", join(r.epochs, ", "))
+    r.best === nothing || print(
+        io, ", best ", something(r.metric, "score"),
+        r.mode === nothing ? "" : " (" * string(r.mode) * ")", " ", _shown(r.best)
     )
-    which in (:best, :latest) || error(
-        "ReactantNitro: `weights = :$(which)` is not a checkpoint name. The names are `:best` (the \
-         checkpoint the run selected by its metric) and `:latest` (its newest record); anything \
-         else is passed as a path."
+    length(r.metrics) > 1 && print(
+        io, ", mixed metrics: ",
+        join((_metric_label(m...) * " x" * string(c) for (m, c) in r.metrics), ", ")
     )
+    print(
+        io, ", last written ",
+        r.written == 0.0 ? "before runs were recorded" : Libc.strftime("%Y-%m-%d %H:%M:%S", r.written)
+    )
+    r.parent === nothing || print(io, ", branched from ", r.parent)
+    return nothing
+end
+
+_metric_label(metric, mode) = metric === nothing ? "unrecorded metric" :
+    "`" * string(metric) * "`" * (mode === nothing ? "" : " (" * string(mode) * ")")
+
+"""
+    runs(run_dir) -> Vector{RunSummary}
+
+The runs a run directory's manifest holds, most recent first, one [`RunSummary`](@ref) each: id,
+how many checkpoints it keeps and their epochs, its best score and the metric and mode that score
+is under, when it last wrote, and the checkpoint it branched from. The entries of a manifest
+written before runs were recorded are one run, `"legacy"`, listed last. An id names the run in a
+checkpoint source, `weights = "<id>" => :best`, and `checkpoint_run(nitro)` is a handle's own.
+Answered from the manifest; no record is opened. Empty for a directory no run has written to.
+
+```julia
+runs("runs/MyExp")
+n = Nitro(MyExp(); run_dir = "runs/MyExp", weights = first(runs("runs/MyExp")).id => :best)
+```
+"""
+function runs(run_dir::AbstractString)
+    entries = isdir(run_dir) ? read_manifest(run_dir) : ManifestEntry[]
+    out = RunSummary[]
+    for run in manifest_runs(entries)
+        mine = sort!([e for e in entries if isequal(e.run, run)]; by = e -> e.epoch)
+        scored = [e for e in mine if e.score !== nothing]
+        counts = Dict{Tuple{Union{Symbol, Nothing}, Union{Symbol, Nothing}}, Int}()
+        for e in scored
+            counts[(e.metric, e.mode)] = get(counts, (e.metric, e.mode), 0) + 1
+        end
+        metric, mode, best = nothing, nothing, nothing
+        if !isempty(scored)
+            recent = scored[argmax([e.written for e in scored])]
+            metric, mode = recent.metric, recent.mode
+            same = [e.score for e in scored if e.metric === metric && e.mode === mode]
+            best = mode === :max ? maximum(same) : minimum(same)
+        end
+        push!(
+            out, RunSummary(
+                run_key(run), length(mine), [e.epoch for e in mine], metric, mode, best,
+                sort!(collect(counts); by = p -> -last(p)),
+                maximum(e.written for e in mine), mine[end].parent
+            )
+        )
+    end
+    return out
+end
+
+"""
+    checkpoint_run(nitro) -> String or nothing
+
+The id this handle's checkpoints are written under, the `run` of their manifest entries, and what
+names the run in a checkpoint source: `weights = "<id>" => :best`. `nothing` with no
+`TopKCheckpointer`, and for a run continuing the unnamed run of a manifest written before runs were
+recorded, which [`runs`](@ref) lists as `"legacy"`. Not [`run_id`](@ref), which is the logger's.
+"""
+checkpoint_run(nitro::Nitro) =
+    nitro.checkpointer isa TopKCheckpointer ? nitro.checkpointer.run : nothing
+
+# ── Mixed metrics ────────────────────────────────────────────────────────────────────
+
+# The entries scored under a (metric, mode) other than the checkpointer's, grouped with counts.
+# A legacy entry, with no recorded metric, is taken to match and is never "mixed".
+function other_selections(entries, ckpt::TopKCheckpointer)
+    counts = Dict{Tuple{Symbol, Union{Symbol, Nothing}}, Int}()
+    for e in entries
+        (e.score === nothing || same_selection(e, ckpt)) && continue
+        counts[(e.metric, e.mode)] = get(counts, (e.metric, e.mode), 0) + 1
+    end
+    return sort!(collect(counts); by = p -> -last(p))
+end
+
+"""
+    ReactantNitro.warn_mixed_metrics(entries, ckpt, what) -> nothing
+
+The `@warn` for a set of entries some of which were scored under a metric or mode other than the
+checkpointer's: which pairs, how many of each, and that they are kept. Selection only ever ranks
+the current pair, so those checkpoints are invisible to `:best` and to retention, and a reader who
+expected them to compete should hear so. Said at setup of a training handle, over the entries its
+retention decides for, and by every `:best` lookup, over the entries it considered. The manifest
+records a metric's NAME: a metric whose definition changed under the same name is not detectable
+here.
+"""
+function warn_mixed_metrics(entries, ckpt::TopKCheckpointer, what)
+    others = other_selections(entries, ckpt)
+    isempty(others) && return nothing
+    list = join((_metric_label(m...) * " x" * string(c) for (m, c) in others), ", ")
+    @warn "ReactantNitro: $(what) considers checkpoints scored under other metrics: $(list). \
+           Selection ranks only the current $(_metric_label(ckpt.metric, ckpt.mode)), so those \
+           checkpoints are neither ranked against it nor ever deleted by retention; they are kept."
+    return nothing
+end
+
+# ── Resolving a checkpoint source ───────────────────────────────────────────────────
+
+# What a directory holds, for a message: its run ids, and the reader that lists them.
+function holds_text(dir, entries)
+    ids = [run_key(r) for r in manifest_runs(entries)]
+    body = isempty(ids) ? "`$(dir)` holds no checkpoints" :
+        "`$(dir)` holds $(length(ids)) run(s): $(join(("`$(i)`" for i in ids), ", "))"
+    return body * "; `runs(\"$(dir)\")` lists them"
+end
+
+"""
+    ReactantNitro.resolve_checkpoint(ckpt, run_dir, run, which; what) -> (; path, epoch, run)
+
+The one resolver behind every `run => checkpoint` source of `weights` and `resume`, answered from
+the manifest of `lookup_dir(ckpt, run_dir)`:
+
+  * `run` is `:latest` (the directory's most recent run: the run of the entry written last, legacy
+    entries counting as oldest), `:all` (every run, only with `which = :best`), or a run id
+    (`"legacy"` for the unnamed run of a manifest written before runs were recorded).
+  * `which` is `:latest` (the run's newest retained record) or `:best` (the best of the run's
+    entries by the checkpointer's CURRENT `metric` and `mode`; across every run for `:all`).
+
+Raises rather than returning `nothing`: a caller who asked for the best weights and got fresh ones
+would not find out until the numbers were wrong. Every miss names the directory, the runs it holds
+and `runs(run_dir)`. A `:best` over entries scored under another metric warns that they were not
+ranked ([`warn_mixed_metrics`](@ref)), and a run with no entry under the current metric raises,
+naming the ones it has. A checkpointer of the user's own knows nothing of runs and answers
+`:latest => :best | :latest` through its own [`selected_checkpoint`](@ref) and
+[`find_latest`](@ref) methods. `what` is how the messages name the request.
+"""
+function resolve_checkpoint(ckpt, run_dir, run, which::Symbol; what)
     ckpt === nothing && error(
         "ReactantNitro: $(what) is looked up through the checkpointer's manifest, and \
          `checkpointer = nothing` has none. Leave `checkpointer` at its default to read the run \
-         directory the framework writes."
+         directory the framework writes, or pass the checkpoint's path."
     )
-    found, dir = if ckpt isa TopKCheckpointer
-        run === :recent && (run = announce_recent_run(ckpt, run_dir, what))
-        (which === :best ? selected_checkpoint(ckpt, run_dir; run) : find_latest(ckpt, run_dir; run)),
-            lookup_dir(ckpt, run_dir)
-    else
-        # A checkpointer of the user's own knows nothing of runs; it answers as it always has.
-        (which === :best ? selected_checkpoint(ckpt, run_dir) : find_latest(ckpt, run_dir)), run_dir
+    if !(ckpt isa TopKCheckpointer)
+        run === :latest || error(
+            "ReactantNitro: $(what) names a run, and this `$(typeof(ckpt))` checkpointer records \
+             none. Only `:latest => :best | :latest` or a path can be resolved through it."
+        )
+        found = which === :best ? selected_checkpoint(ckpt, run_dir) : find_latest(ckpt, run_dir)
+        found === nothing && error(
+            "ReactantNitro: $(what) found no checkpoint in `$(run_dir)` through this \
+             `$(typeof(ckpt))` checkpointer."
+        )
+        path = which === :best ? found.path : found
+        return (; path, epoch = nothing, run = nothing)
     end
-    found === nothing && error(
-        "ReactantNitro: $(what) found no checkpoint$(run isa String ? " of run `$(run)`" : "") in \
-         `$(dir)`" *
-            (which === :best ? " with a score (a run without a `val` split scores none; use `:latest`)" : "") *
-            ". `read_manifest(dir)` lists what the directory holds."
+    dir = lookup_dir(ckpt, run_dir)
+    entries = isdir(dir) ? read_manifest(dir) : ManifestEntry[]
+    pool, label = if run === :all
+        entries, "every run in `$(dir)`"
+    elseif run === :latest
+        isempty(entries) && error("ReactantNitro: $(what) found no checkpoint: $(holds_text(dir, entries)).")
+        r = announce_recent_run(ckpt, dir, what)
+        ManifestEntry[e for e in entries if isequal(e.run, r)], run_label(r)
+    else
+        r = run_from_key(run)
+        mine = ManifestEntry[e for e in entries if isequal(e.run, r)]
+        isempty(mine) && error(
+            "ReactantNitro: $(what) names run `$(run)`, which has no checkpoints here: \
+             $(holds_text(dir, entries))."
+        )
+        mine, run_label(r)
+    end
+    isempty(pool) && error("ReactantNitro: $(what) found no checkpoint: $(holds_text(dir, entries)).")
+    pick = if which === :latest
+        pool[argmax([e.epoch for e in pool])]
+    else
+        warn_mixed_metrics(pool, ckpt, what)
+        scored = [e for e in pool if e.score !== nothing && same_selection(e, ckpt)]
+        if isempty(scored)
+            others = other_selections(pool, ckpt)
+            has = isempty(others) ? "no scored checkpoint at all (a run without a `val` split \
+                scores none; use `=> :latest`)" :
+                "checkpoints scored only under " *
+                join((_metric_label(m...) * " x" * string(c) for (m, c) in others), ", ")
+            error(
+                "ReactantNitro: $(what) selects by the checkpointer's \
+                 $(_metric_label(ckpt.metric, ckpt.mode)), and $(label) has $(has). Set the \
+                 checkpointer's `metric` and `mode` to match (`checkpointer = \
+                 TopKCheckpointer(; metric = ..., mode = ...)`), or pass the checkpoint's path. \
+                 $(holds_text(dir, entries))."
+            )
+        end
+        scored[(ckpt.mode === :max ? argmax : argmin)([e.score for e in scored])]
+    end
+    path = joinpath(dir, pick.file)
+    isfile(path) || error(
+        "ReactantNitro: $(what) resolved to `$(path)` (epoch $(pick.epoch) of $(run_label(pick.run))), \
+         which the manifest lists and the directory no longer holds. $(holds_text(dir, entries))."
     )
-    return which === :best ? found.path : found
+    return (; path, epoch = pick.epoch, run = pick.run)
 end
 
 """
