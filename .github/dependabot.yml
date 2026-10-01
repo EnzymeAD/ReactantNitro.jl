@@ -12,3 +12,11 @@ updates:
       - "/examples/mnist"
     schedule:
       interval: "weekly"
+    # Stdlib versions are fixed by the `julia` compat entry.
+    ignore:
+      - dependency-name: "Dates"
+      - dependency-name: "LinearAlgebra"
+      - dependency-name: "Logging"
+      - dependency-name: "Printf"
+      - dependency-name: "Random"
+      - dependency-name: "UUIDs"
