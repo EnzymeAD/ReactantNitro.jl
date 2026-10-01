@@ -52,7 +52,7 @@ sharded program is not servable as one artifact, so build the export handle with
 
 The framework distinguishes a **checkpoint**, which is full training state, from **weights**, which
 are parameters alone. Export wants the second and `Nitro(e; weights = path)` already produces it:
-a weights-only restore that takes the parameters and the derived `Device` values from the record and
+a weights-only restore that takes the parameters and the derived values from the record and
 runs setup and nothing else.
 
 **So no model's export code should contain the words "load" or "checkpoint".** If you are reaching

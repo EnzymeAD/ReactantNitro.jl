@@ -53,6 +53,20 @@
     ReactantNitro.checkpoint_filename(::NamedCkpt; epoch, kwargs...) =
         "mine-" * lpad(epoch, 4, '0') * ".jld2"
 
+    # `code` stands in for program text built by `derive`, such as a frozen backbone's StableHLO.
+    @experiment struct DerivedCode
+        code::GraphConst{String} = ""
+        tag::GraphConst{Int} = 1
+        max_epochs::Host{Int} = 1
+    end
+    const CODE_NOW = Ref("program-a")
+    const DERIVE_CALLS = Ref(0)
+    ReactantNitro.build_model(::DerivedCode, rng) = (m = ckpt_chain(6); (m, Lux.setup(rng, m)...))
+    ReactantNitro.forward(::DerivedCode, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    ReactantNitro.loss(::DerivedCode, ŷ; y) = mean(abs2, ŷ .- y)
+    ReactantNitro.build_data(::DerivedCode, dist) = (; train = CK_TRAIN, val = CK_VAL)
+    ReactantNitro.derive(::DerivedCode, data) = (DERIVE_CALLS[] += 1; (; code = CODE_NOW[]))
+
     params_of(n) = [Array(l) for l in Functors.fleaves(parameters(n))]
 
     # The manifest makes the `file` the ONLY identity a checkpoint has, so a test asks it
@@ -161,12 +175,61 @@
         @test rec.format_version == 1 && rec.framework_version isa String
         @test rec.seed == 1 && rec.epoch == 0 && rec.step == 0
         @test rec.preset === nothing               # `preset` was ADDED at 4.23; absent reads as nothing
+        @test rec.derived === nothing              # so was `derived`
 
         # AND IT LOADS QUIETLY. JLD2 warns "missing field ... reconstructing" for any record predating a
         # field addition, which reads like breakage at someone resuming a run that is about to work. The
         # migration above is explicit and tested, so the warning is noise, and noise trains people to
         # ignore warnings. Suppressed narrowly: this asserts no Warn-level message escapes the load.
         @test_logs load_checkpoint(TopKCheckpointer(), path)
+    end
+
+    @testset "weights-only restores a derived `GraphConst` from the record" begin
+        dir = mktempdir()
+        n = train!(Nitro(DerivedCode(); run_dir = dir))
+        path = find_latest(n.checkpointer, dir)
+        rec = load_checkpoint(n.checkpointer, path)
+        @test rec.derived == (:code,)
+        @test rec.config.code == "program-a"
+
+        load(e = DerivedCode(); weights = path) =
+            Nitro(e; weights, run_dir = mktempdir(), logger = nothing, data = (; val = CK_VAL))
+        refusal(f) = try
+            f()
+            nothing
+        catch ex
+            ex
+        end
+
+        # Without calling `derive`: an evaluation process may not have what it reads.
+        DERIVE_CALLS[] = 0
+        CODE_NOW[] = "program-b"
+        m = load()
+        @test m.e.code == "program-a" && DERIVE_CALLS[] == 0
+        @test params_of(m) == params_of(n)
+        # A user-set `GraphConst` is still compared.
+        err = refusal(() -> load(DerivedCode(; tag = 2)))
+        @test err isa ErrorException && occursin("tag: 1 -> 2", err.msg)
+
+        @testset "a record saved without `derived` falls back to `derive`" begin
+            # A NamedTuple goes through the same migration as JLD2's reconstruction of an old struct.
+            ks = filter(!=(:derived), fieldnames(CheckpointRecord))
+            old = joinpath(mktempdir(), "old.jld2")
+            JLD2.jldsave(old; record = NamedTuple{ks}(map(f -> getfield(rec, f), ks)))
+            @test load_checkpoint(n.checkpointer, old).derived === nothing
+
+            DERIVE_CALLS[] = 0
+            CODE_NOW[] = "program-a"
+            @test load(; weights = old).e.code == "program-a" && DERIVE_CALLS[] == 1
+            # `derive` now builds a different program, which the check still refuses.
+            CODE_NOW[] = "program-b"
+            err = refusal(() -> load(; weights = old))
+            @test err isa ErrorException && occursin("code: \"program-a\" -> \"program-b\"", err.msg)
+            # A long value is cut, so the rest of the message survives a size-limited console.
+            CODE_NOW[] = repeat("x", 1000)
+            err = refusal(() -> load(; weights = old))
+            @test occursin("(1002 characters)", err.msg) && length(err.msg) < 1000
+        end
     end
 
     @testset "top-K retains the best K in union with the newest" begin
@@ -427,7 +490,7 @@
             rec.format_version, rec.framework_version, rec.ps, rec.st,
             rec.opt_state, moved, rec.step, rec.epoch, rec.seed, rec.config,
             rec.devices, rec.metrics, rec.run_id, rec.run_url, rec.logger_state,
-            rec.logger_type, rec.anchor_checksum, rec.stop_reason, rec.preset
+            rec.logger_type, rec.anchor_checksum, rec.stop_reason, rec.preset, rec.derived
         )
         err = try
             check_permutation_compatible(bad, n.layout, "x")
