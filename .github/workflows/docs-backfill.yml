@@ -1,0 +1,52 @@
+# Rebuilds and deploys the versioned docs for an existing release tag:
+#
+#   gh workflow run "Docs backfill" -f tag=v0.1.4
+#
+# For tags whose release build never ran (v0.1.0 through v0.1.4 predate TagBot
+# pushing over SSH). Dispatching docs.yml with `--ref <tag>` cannot do this: a
+# dispatch runs the workflow file as it exists at that ref, and those tags have
+# no workflow_dispatch trigger. So this runs from main and checks the tag's tree
+# out instead, building it with the tag's own docs/ environment.
+#
+# Backfill oldest first: Documenter points `stable` at the highest version it
+# has deployed, so the order only matters for what the intermediate states show.
+name: Docs backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, e.g. v0.1.4"
+        required: true
+
+# One backfill at a time: each run pushes to gh-pages, and two concurrent pushes
+# would race.
+concurrency:
+  group: docs-backfill
+  cancel-in-progress: false
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v2
+      - name: Install Julia dependencies
+        run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
+      - name: Build and deploy
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+          TAG: ${{ inputs.tag }}
+        # Documenter treats a workflow_dispatch run as a release build when
+        # GITHUB_REF names a tag, but a dispatch from main reports
+        # refs/heads/main. Set inside the Julia process, since a step cannot
+        # reliably override GitHub's own GITHUB_* variables.
+        run: julia --project=docs -e 'ENV["GITHUB_REF"] = "refs/tags/" * ENV["TAG"]; include("docs/make.jl")'
