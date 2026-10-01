@@ -31,6 +31,11 @@ on:
 permissions:
   contents: read
 
+# A newer PR run cancels the old one. Main and tag runs finish; only the newest queued one waits.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }}

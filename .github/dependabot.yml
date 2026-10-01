@@ -4,6 +4,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
   - package-ecosystem: "julia"
     directories:
       - "/"
@@ -12,6 +15,9 @@ updates:
       - "/examples/mnist"
     schedule:
       interval: "weekly"
+    groups:
+      julia:
+        patterns: ["*"]
     # Stdlib versions are fixed by the `julia` compat entry.
     ignore:
       - dependency-name: "Dates"
