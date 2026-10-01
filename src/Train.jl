@@ -967,6 +967,7 @@ function snapshot(nitro::Nitro)
         anchor_checksum = nitro.anchor_checksum,
         stop_reason = nitro.stop_reason,
         preset = nitro.preset,                  # the named configuration, if any
+        derived = nitro.derived,
     )
     # A structural walk over leaves, not elements: about a hundred checks per epoch.
     assert_host_record(snap)

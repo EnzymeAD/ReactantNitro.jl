@@ -138,6 +138,7 @@ mutable struct Nitro
     sections::Any             # the binding report as `TableSection`s, appended to `show`
     anchor_checksum::Any      # the per-group decay-anchor checksum; `nothing` if unanchored
     preset::Any               # the named configuration this run claimed; `nothing` if none
+    derived::Any              # the keys `derive` produced; the record saves them
     # The resolved checkpoint the restore read (the file `resume = :auto` found, not the symbol),
     # or `nothing` for fresh weights. Export stamps it into the bundle.
     checkpoint_source::Any

@@ -52,6 +52,8 @@ struct CheckpointRecord
     anchor_checksum::Any
     stop_reason::Any
     preset::Any
+    # The keys `derive` returned, so a weights-only load restores them; `nothing` in older records.
+    derived::Any
 end
 
 # ── Showing a record never shows the weights ─────────────────────────────────────────
@@ -246,7 +248,8 @@ function save_checkpoint!(ckpt::TopKCheckpointer, epoch, metrics, snapshot)
         snapshot.logger_state, snapshot.logger_type,
         snapshot.anchor_checksum, snapshot.stop_reason,
         # `nothing` for a run that named no preset, which is most of them.
-        hasproperty(snapshot, :preset) ? snapshot.preset : nothing
+        hasproperty(snapshot, :preset) ? snapshot.preset : nothing,
+        hasproperty(snapshot, :derived) ? snapshot.derived : nothing
     )
 
     name = owned_name(
@@ -641,13 +644,14 @@ _load_record_quietly(path) = Base.CoreLogging.with_logger(
     () -> JLD2.load(path, "record"), _QuietReconstruct(Base.CoreLogging.current_logger())
 )
 
-# Field-shape migrations: the `tunables` to `devices` rename, and the addition of `preset`.
+# Field-shape migrations: the `tunables` to `devices` rename, and the additions of `preset` and
+# `derived`.
 # JLD2 reconstructs an old record as a ReconstructedMutable with the on-disk field names, and the
 # rename is done here. A function because `checkpoint_info` reads the same records. FORMAT_VERSION
 # stays 1, since the semantics did not change.
 function _migrate_record(raw, path = "<record>")
     raw isa CheckpointRecord && return raw
-    if hasproperty(raw, :tunables) || !hasproperty(raw, :preset)
+    if hasproperty(raw, :tunables) || !hasproperty(raw, :preset) || !hasproperty(raw, :derived)
         return CheckpointRecord(
             raw.format_version, raw.framework_version,
             raw.ps, raw.st, raw.opt_state, raw.flat_permutation,
@@ -655,7 +659,8 @@ function _migrate_record(raw, path = "<record>")
             hasproperty(raw, :devices) ? raw.devices : raw.tunables,
             raw.metrics, raw.run_id, raw.run_url, raw.logger_state,
             raw.logger_type, raw.anchor_checksum, raw.stop_reason,
-            hasproperty(raw, :preset) ? raw.preset : nothing
+            hasproperty(raw, :preset) ? raw.preset : nothing,
+            hasproperty(raw, :derived) ? raw.derived : nothing
         )
     end
     return error("ReactantNitro: `$path` does not hold a `CheckpointRecord`; it holds a \
@@ -732,13 +737,13 @@ function check_config_compatible(record, e, path)
     (isempty(added) && isempty(removed) && isempty(changed)) && return nothing
     diff = String[]
     for k in changed
-        push!(diff, "  $k: $(repr(getproperty(was, k))) -> $(repr(getproperty(now, k)))")
+        push!(diff, "  $k: $(_diff_repr(getproperty(was, k))) -> $(_diff_repr(getproperty(now, k)))")
     end
     for k in added
-        push!(diff, "  $k: (absent in the checkpoint) -> $(repr(getproperty(now, k)))")
+        push!(diff, "  $k: (absent in the checkpoint) -> $(_diff_repr(getproperty(now, k)))")
     end
     for k in removed
-        push!(diff, "  $k: $(repr(getproperty(was, k))) -> (absent now)")
+        push!(diff, "  $k: $(_diff_repr(getproperty(was, k))) -> (absent now)")
     end
     error(
         """
@@ -751,6 +756,13 @@ function check_config_compatible(record, e, path)
         and `Host` fields are not compared, since raising `max_epochs` on resume is the normal case.
         Start a fresh run, or pass `resume = false` to train from scratch in this `run_dir`."""
     )
+end
+
+# A long value, such as program text, is cut so the diff stays readable in a size-limited console.
+function _diff_repr(x; limit = 200)
+    s = repr(x)
+    length(s) <= limit && return s
+    return first(s, 60) * "... ($(length(s)) characters)"
 end
 
 """
@@ -958,6 +970,19 @@ function restored_devices(record, e)
     df = device_fields(typeof(e))
     ks = Tuple(k for k in keys(record.devices) if k in df)
     return NamedTuple{ks}(map(k -> getproperty(record.devices, k), ks))
+end
+
+"""
+    ReactantNitro.restored_graphconsts(record, e) -> NamedTuple
+
+The weights-only restore's derived `GraphConst` values, read from `record.config` for the keys in
+`record.derived`. A key the experiment no longer declares as `GraphConst` is left for the config
+check to report.
+"""
+function restored_graphconsts(record, e)
+    gc = keys(graphconst_fields(e))
+    ks = Tuple(k for k in record.derived if k in gc && haskey(record.config, k))
+    return NamedTuple{ks}(map(k -> getproperty(record.config, k), ks))
 end
 
 """

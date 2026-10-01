@@ -91,8 +91,10 @@ Either way, a run that trains is a new run in `run_dir`, and a directory already
 checkpoints keeps them (under the default retention `scope = :run`).
 
 - `weights = path` or `run => :best | :latest` restores `ps` and `st` from a checkpoint record, and
-  the derived `Device` values with them, so `derive` is skipped and the construction works with no
-  training data. Reloading a finished run's best weights needs no file name:
+  the derived values with them, so `derive` is skipped and the construction works with no
+  training data. An older record holds no list of derived keys, so for it `derive` runs and the
+  record's `Device` values override what it returns. Reloading a finished run's best weights needs
+  no file name:
 
   ```julia
   n = Nitro(MyExp, :baseline; run_dir = "runs/my_run", weights = :latest => :best, logger = nothing)
@@ -243,8 +245,8 @@ function _build_nitro(
     elseif resume_file !== nothing
         record, source = load_checkpoint(checkpointer, resume_file), resume_file
     end
-    # Two restores, one compatibility check: `weights = path` takes the derived `Device` values
-    # from the record (an evaluation process may lack the training data), `resume` recomputes them.
+    # Two restores, one compatibility check: `weights = path` takes the derived values from the
+    # record (an evaluation process may lack the training data), `resume` recomputes them.
     weights_only = record !== nothing && weights_file !== nothing
 
     # This run's identity in the manifest, assigned every time, even to a checkpointer object the
@@ -324,11 +326,15 @@ function _build_nitro(
         checkpoints only."
 
     # ── 4. derive, still pre-conversion, so it returns host values ─────────────────
-    # `weights = path` takes the derived values from the record; `resume` recomputes them, and
-    # the config comparison excludes derived values for that reason.
+    # `weights = path` restores derived values from the record, since an evaluation process may
+    # lack the data `derive` reads. A record without `derived` falls back to `derive`, keeping the
+    # record's `Device` values. `resume` recomputes, so the config check compares fresh values.
     progress_phase!("deriving")
-    e = weights_only ? merge_derived(e, restored_devices(record, e)) :
-        merge_derived(e, derive(e, collection))
+    from_record = weights_only && record.derived !== nothing
+    derived = from_record ? restored_graphconsts(record, e) : derive(e, collection)
+    derived_keys = from_record ? Tuple(record.derived) : keys(derived)
+    weights_only && (derived = merge(derived, restored_devices(record, e)))
+    e = merge_derived(e, derived)
 
     # `GraphConst` values must hash and compare by content. Asserted before the comparison below,
     # which would otherwise print a diff whose two sides look identical. Here because `derive` has
@@ -535,6 +541,7 @@ function _build_nitro(
     nitro = Nitro(
         e, model, ps, st, w0_tree, layout, opt_state, collection, routing, schema, mesh,
         Dict{Any, Any}(), resolved, total, batch_size, logger, nothing, checksums, preset,
+        derived_keys,
         source === nothing ? nothing : String(source),
         # The training run's identity, kept because it cannot be recovered later.
         record === nothing ? nothing : record.run_id,
