@@ -60,7 +60,7 @@ jobs:
       - uses: julia-actions/setup-julia@v3
         with:
           version: '1.12'
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - name: Install Julia dependencies
         # docs/Manifest.toml is gitignored, so the docs environment is resolved
         # fresh here (ReactantNitro comes from the [sources] path, and
