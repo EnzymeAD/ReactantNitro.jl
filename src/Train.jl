@@ -63,8 +63,10 @@ function grad_program(
     g_scaled = map(x -> x .* Base.eltype(x)(inv_n), flatten(dps, resolve_layout(lref)))
     # A broadcast select (see the docstring): `ifelse.` not `ifelse`, an array flag not a scalar,
     # a select not a multiply by zero.
-    g_new = map((s, a) -> ifelse.(is_first .> 0.0f0, s, a .+ s), g_scaled, g_accum)
-    return l, g_new, st_new, aux
+    # Written into `g_accum` rather than returned as a new tree: Reactant donates only the arguments
+    # a trace mutates, so a fresh result would leave the old accumulator for the GC every micro-batch.
+    foreach((s, a) -> (a .= ifelse.(is_first .> 0.0f0, s, a .+ s)), g_scaled, g_accum)
+    return l, g_accum, st_new, aux
 end
 
 """
@@ -92,7 +94,13 @@ function opt_program(ev, g_accum, ps, opt_state, lref, ::Val{CLIP}) where {CLIP}
     # State only, never the `Leaf`: its rule's scalars cannot be program outputs on a mesh (every
     # multi-device run died in output codegen, even for a stateless `Descent`), and the driver
     # rebuilds the rules host-side each step anyway.
-    return unflatten(map(last, both), ps, layout), map(t -> first(t).state, both)
+    # Written into `ps` leaf for leaf, for the same donation reason as the accumulator: the
+    # parameters stay allocated once instead of leaving one superseded tree per step for the GC.
+    Functors.fmap(ps, unflatten(map(last, both), ps, layout)) do p, p_new
+        p isa AbstractArray && (p .= p_new)
+        return p
+    end
+    return ps, map(t -> first(t).state, both)
 end
 
 """

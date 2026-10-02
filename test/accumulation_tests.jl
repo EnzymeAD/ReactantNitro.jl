@@ -131,17 +131,21 @@
             Reactant.to_rarray(FA[first_flag]), inv_n, n.routing, lref,
             Val(:device)
         )
-        return n, call
+        return n, call, thunk
     end
+
+    # The program writes the accumulator in place and Reactant donates it, so a call consumes the
+    # tree it is handed: read a result back BEFORE passing it on, and pass a fresh copy of any
+    # accumulator used twice.
+    fresh(acc) = map(g -> Reactant.to_rarray(Array(g)), acc)
 
     @testset "the broadcast select lowers and selects correctly" begin
         n, call = grad_harness(; accum = 2)
-        zero_acc = n.g_accum
+        zero_acc = fresh(n.g_accum)
 
-        _, reset, _, _ = call(zero_acc, 1.0f0)          # is_first = 1 -> g/N
-        _, accumulated, _, _ = call(reset, 0.0f0)       # is_first = 0 -> acc + g/N
-
+        _, reset, _, _ = call(fresh(zero_acc), 1.0f0)   # is_first = 1 -> g/N
         r = Array(reset[1])
+        _, accumulated, _, _ = call(reset, 0.0f0)       # is_first = 0 -> acc + g/N
         a = Array(accumulated[1])
         @test all(isfinite, r)
         @test any(!=(0.0f0), r)
@@ -176,30 +180,114 @@
 
     @testset "shadow lifecycle: the shadow is allocated inside the program, every invocation" begin
         n, call = grad_harness(; accum = 2)
-        zero_acc = n.g_accum
+        zero_acc = fresh(n.g_accum)
 
         @testset "two calls on the SAME micro-batch with is_first = 1 are EQUAL, not double" begin
             # A `dps` hoisted out of the program and reused would add every past micro-batch's gradient
             # to the current one, on top of the deliberate accumulator, with no error and a loss
             # curve that reads as a badly chosen learning rate.
-            _, a, _, _ = call(zero_acc, 1.0f0)
-            _, b, _, _ = call(zero_acc, 1.0f0)
+            _, a, _, _ = call(fresh(zero_acc), 1.0f0)
+            _, b, _, _ = call(fresh(zero_acc), 1.0f0)
             @test Array(a[1]) == Array(b[1])          # bitwise, same inputs and same program
         end
 
         @testset "and the is_first = 0 half accumulates EXACTLY 2x and 3x" begin
             # Without this half, a select stuck on the reset arm would pass the first half trivially.
-            _, one_, _, _ = call(zero_acc, 1.0f0)
-            _, two_, _, _ = call(one_, 0.0f0)
-            _, three_, _, _ = call(two_, 0.0f0)
+            _, one_, _, _ = call(fresh(zero_acc), 1.0f0)
             r = Array(one_[1])
+            _, two_, _, _ = call(one_, 0.0f0)
             @test Array(two_[1]) ≈ 2 .* r rtol = 1.0e-5
+            _, three_, _, _ = call(two_, 0.0f0)
             @test Array(three_[1]) ≈ 3 .* r rtol = 1.0e-5
+        end
+
+        @testset "and the accumulator is donated, so it is never left for the GC" begin
+            # A program that returns a fresh accumulator instead of writing the input leaves one
+            # parameter-sized buffer per micro-batch until a collection: device OOM under a loader
+            # that allocates nothing on the host. The accumulator is the only argument written.
+            _, _, thunk = grad_harness(; accum = 2)
+            @test count(Bool, thunk.donated_args_mask) == length(zero_acc)
         end
 
         @testset "and the Nitro holds no shadow to hoist into" begin
             @test :dps ∉ fieldnames(Nitro)
         end
+    end
+
+    # ── buffer ownership across steps ────────────────────────────────────────────────────
+
+    # Every optimizer step, the device arrays the loop held one step earlier. Device memory is the
+    # thing that leaks, but the CPU client does not implement allocator stats, so this asserts the
+    # cause instead: a superseded array whose buffer still holds device memory that no live array
+    # uses is left for a GC collection to free. Device addresses, not objects or handles: Reactant
+    # writes an in-place result back into the argument AND returns a second wrapper over it, and
+    # across a chain of donations an old wrapper keeps a handle XLA has already consumed.
+    mutable struct OwnershipLog
+        nitro::Any
+        prev::Vector{Any}
+        leaked::Vector{Tuple{Int, Symbol, Int}}
+        steps::Int
+    end
+    OwnershipLog() = OwnershipLog(nothing, Any[], Tuple{Int, Symbol, Int}[], 0)
+    function device_arrays(n)
+        out = Any[]
+        for (name, tree) in ((:ps, n.ps), (:g_accum, n.g_accum), (:opt_state, n.opt_state))
+            # Arrays only: the rules' scalars are rebuilt host-side every step by design, and a
+            # 4-byte buffer is not what exhausts a device.
+            ReactantNitro._each_concrete_leaf(tree) do x
+                x isa Reactant.AbstractConcreteArray && push!(out, (name, x))
+            end
+        end
+        return out
+    end
+    # The device memory an array still holds. A donated or freed buffer holds none, and asking
+    # for its address is an error.
+    function device_addresses(x)
+        out = Ptr{Cvoid}[]
+        for b in ReactantNitro._device_buffers(x)
+            b.buffer == C_NULL && continue
+            try
+                push!(out, Reactant.XLA.unsafe_buffer_pointer(b))
+            catch err
+                occursin("deleted or donated", sprint(showerror, err)) || rethrow()
+            end
+        end
+        return out
+    end
+    function ReactantNitro.log_metrics!(l::OwnershipLog, metrics; context = "train", step = 0, kw...)
+        context == "train" || return nothing
+        now = device_arrays(l.nitro)
+        live = Set(p for (_, x) in now for p in device_addresses(x))
+        for (name, x) in l.prev
+            any(∉(live), device_addresses(x)) && push!(l.leaked, (step, name, length(x)))
+        end
+        l.prev = now
+        l.steps += 1
+        return nothing
+    end
+    ReactantNitro.log_params!(::OwnershipLog, params) = nothing
+    ReactantNitro.log_tags!(::OwnershipLog, tags) = nothing
+    ReactantNitro.log_other!(::OwnershipLog, key, value) = nothing
+    ReactantNitro.log_confusion!(::OwnershipLog, matrix, labels; kw...) = nothing
+    ReactantNitro.finish!(::OwnershipLog, status) = nothing
+    ReactantNitro.run_id(::OwnershipLog) = nothing
+    ReactantNitro.run_url(::OwnershipLog) = nothing
+    ReactantNitro.reattach!(::OwnershipLog, state) = nothing
+
+    @testset "no superseded parameter, accumulator or moment is left for the GC (accum = $accum)" for accum in (1, 2)
+        # The regression: `grad_program` and `opt_program` returned fresh trees, so with a data
+        # source that allocates nothing on the host the GC never ran and device memory grew by one
+        # parameter-sized buffer per micro-batch plus one per step until OOM.
+        log = OwnershipLog()
+        n = Nitro(
+            AccExp(); data = (; train = repeat(micro_batches(), 2)), accum, logger = log,
+            checkpointer = nothing, run_dir = mktempdir()
+        )
+        log.nitro = n
+        train!(n)
+        @test log.steps == 8 ÷ accum
+        @test !isempty(log.prev)
+        @test log.leaked == Tuple{Int, Symbol, Int}[]
     end
 
     # ── cache keys on accum ──────────────────────────────────────────────────────────────

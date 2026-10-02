@@ -25,5 +25,4 @@ updates:
       - dependency-name: "Logging"
       - dependency-name: "Printf"
       - dependency-name: "Random"
-      - dependency-name: "SHA"
       - dependency-name: "UUIDs"
