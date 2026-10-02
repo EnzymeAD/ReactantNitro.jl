@@ -280,6 +280,11 @@ function compile_cached(
     )
     w = worlds === nothing ? hook_worlds(ev; model, ps, st, chains) : worlds
     key = cache_key(f, ev, args, baked, w; gc_hash)
+    # The handle's `compile_options` produce a different executable from the same trace, so they
+    # are part of the key. Appended only when set, so every default key is unchanged.
+    copts = nitro === nothing || !hasproperty(nitro, :frozen) ? (;) :
+        get(nitro.frozen, :compile_options, (;))
+    isempty(copts) || (key = (key..., (; compile_options = copts)))
 
     # The handle-local memo: a handle that holds its programs never re-looks-up, so it can never
     # be made to recompile behind the user's back.
@@ -304,7 +309,7 @@ function compile_cached(
     # is a real compile, so the phase is published.
     resume_phase = nitro === nothing || phase === nothing ? nothing : nitro.phase
     resume_phase === nothing || set_phase!(nitro, phase)
-    thunk = compile_with_context(f, args; phase)
+    thunk = compile_with_context(f, args; phase, compile_options = copts)
     resume_phase === nothing || set_phase!(nitro, resume_phase)
     # Capture the dependency closure for the world-closure guard. A failed capture leaves the entry
     # unguarded rather than poisoning the run, since the hook worlds are still in the key.
@@ -326,15 +331,17 @@ function compile_cached(
 end
 
 """
-    ReactantNitro.compile_with_context(f, args; phase) -> thunk
+    ReactantNitro.compile_with_context(f, args; phase, compile_options = (;)) -> thunk
 
 An XLA compile failure surfaces as an enormous MLIR dump with no context, so every compile is
 wrapped in a handler that **names the phase, the function, and the argument shapes** before
 rethrowing, and truncates the dump to a bounded prefix with a pointer to the full text on disk.
+`compile_options` is the handle's, as [`check_compile_options`](@ref) normalized it: Reactant's
+compile keywords as a `NamedTuple`.
 """
-function compile_with_context(f, args; phase = nothing)
+function compile_with_context(f, args; phase = nothing, compile_options = (;))
     try
-        return Reactant.Compiler.compile(f, args)
+        return Reactant.Compiler.compile(f, args; compile_options...)
     catch err
         io = IOBuffer()
         showerror(io, err)

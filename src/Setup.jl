@@ -188,9 +188,14 @@ function _build_nitro(
         # DEPRECATED spelling of `weights = path`; removed in 0.2.0.
         checkpoint = nothing,
         # PROTOTYPE: hooks supplied as values shadow the method of the same name (Hooks.jl).
-        hooks = (;)
+        hooks = (;),
+        # Reactant compile keywords applied to every program this handle compiles: the
+        # Enzyme-JAX pass switches and, through `xla_debug_options`, XLA's per-compile flags.
+        # See `check_compile_options`.
+        compile_options = (;)
     )
     check_hooks(hooks)
+    compile_options = check_compile_options(compile_options)
     if checkpoint !== nothing
         warn_checkpoint_keyword()
         weights === nothing || error(
@@ -548,7 +553,9 @@ function _build_nitro(
         record === nothing ? nothing : record.run_url,
         String(run_dir), Int(seed), Int(accum), Int(max_epochs), gradient_clip_norm,
         checkpointer, early_stop, probe_accessors(e),
-        frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state),
+        # The compile options ride with the dispatch freeze: both are compile-cache key components
+        # fixed at construction (Cache.jl `compile_cached`).
+        merge(frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state), (; compile_options)),
         (; masks, anchors),
         map(zero, flat), RegisteredMonitor[], Int(step0), Int(epoch0), Starting(),
         false, nothing,
@@ -979,6 +986,65 @@ function decay_anchors(e, w0, layout::FlatLayout{G}, mesh = nothing) where {G}
                group's slice.")
     end
 end
+
+"""
+    ReactantNitro.check_compile_options(opts) -> NamedTuple
+
+The `compile_options` keyword of [`Nitro`](@ref), normalized to the keywords every program's
+`Reactant.Compiler.compile` call receives: either a `NamedTuple` of Reactant's compile keywords
+(`optimize`, `cudnn_hlo_optimize`, `transpose_propagate`, `xla_debug_options`, ...) or a
+`Reactant.CompileOptions`, which becomes `(; compile_options = opts)`. The keywords are exactly
+those `Reactant.Compiler.compile` accepts; the remaining `CompileOptions` fields (the pass switches)
+need a `CompileOptions` value.
+
+```julia
+Nitro(e; compile_options = (; xla_debug_options = (; xla_gpu_exhaustive_tiling_search = true)))
+Nitro(e; compile_options = (; cudnn_hlo_optimize = true, transpose_propagate = :down))
+Nitro(e; compile_options = Reactant.CompileOptions(; disable_slice_to_batch_passes = false))
+```
+
+An unknown keyword is refused here rather than minutes later at the first compile. So is
+`donated_args` other than `:auto`: the gradient accumulator and the parameters are written in place
+and must be donated, or every superseded buffer waits for the GC.
+"""
+function check_compile_options(opts)
+    if opts isa Reactant.CompileOptions
+        opts.donated_args === :auto || _refuse_donation(opts.donated_args)
+        return (; compile_options = opts)
+    end
+    opts isa NamedTuple || error(
+        "ReactantNitro: `compile_options` is a NamedTuple of Reactant's compile keywords or a \
+         `Reactant.CompileOptions`, not a `$(typeof(opts))`."
+    )
+    # Exactly the keywords `Reactant.Compiler.compile` takes; anything else would fall through to
+    # an inner call and fail at the first compile. The rest of `CompileOptions` (the pass switches
+    # such as `disable_slice_to_batch_passes`) is reachable only through a `CompileOptions` value.
+    known = _reactant_compile_keywords()
+    unknown = [k for k in keys(opts) if k ∉ known]
+    isempty(unknown) || error(
+        "ReactantNitro: `compile_options` keyword(s) $(join(unknown, ", ")) are not keywords of \
+         `Reactant.Compiler.compile`, which takes: $(join(sort(collect(known)), ", ")). Other \
+         `Reactant.CompileOptions` fields are set by passing a `Reactant.CompileOptions(; ...)` \
+         as `compile_options`, or as its `compile_options` keyword."
+    )
+    get(opts, :donated_args, :auto) === :auto || _refuse_donation(opts.donated_args)
+    co = get(opts, :compile_options, nothing)
+    co === nothing || co.donated_args === :auto || _refuse_donation(co.donated_args)
+    return opts
+end
+
+_reactant_compile_keywords() = Tuple(
+    k for k in
+        Base.kwarg_decl(only(methods(Reactant.Compiler.__get_compile_options_and_kwargs)))
+        if !endswith(String(k), "...")
+)
+
+_refuse_donation(d) = error(
+    "ReactantNitro: `compile_options` sets `donated_args = $(repr(d))`. The gradient accumulator and \
+     the parameters are written in place and rely on `:auto` donation; without it every superseded \
+     buffer stays allocated until a GC collection, which exhausts device memory under a data source \
+     that allocates little on the host."
+)
 
 """
     ReactantNitro.validate_config(e; kwargs...) -> nothing
@@ -1468,7 +1534,8 @@ function stale_hooks(nitro::Nitro)
         frozen_chains(nitro); manual = get(f, :manual, false),
         opt_state = nitro.opt_state
     )
-    return Symbol[k for k in keys(f) if getproperty(live, k) != getproperty(f, k)]
+    # Only the dispatch keys have a live counterpart; `compile_options` is fixed by construction.
+    return Symbol[k for k in keys(f) if hasproperty(live, k) && getproperty(live, k) != getproperty(f, k)]
 end
 
 # Rebuilt rather than stored, since only the rule TYPES matter and storing the construction-time

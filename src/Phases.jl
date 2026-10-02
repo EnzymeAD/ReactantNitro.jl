@@ -109,7 +109,12 @@ process; `train!(e)` is sugar for `train!(Nitro(e))`, and every keyword belongs 
 nitro = Nitro(e)                                  # fresh weights from build_model
 nitro = Nitro(e; weights = "runs/x/latest")    # trained weights, no training this process
 nitro = Nitro(e; data = (; test = loader))        # supply data directly, skip build_data
+nitro = Nitro(e; compile_options = (; cudnn_hlo_optimize = true,    # Reactant compile keywords,
+    xla_debug_options = (; xla_gpu_exhaustive_tiling_search = true))) # XLA flags among them
 ```
+
+`compile_options` applies to every program the handle compiles and is part of each program's
+compile-cache key; see [`check_compile_options`](@ref).
 
 Opaque, with accessors: [`experiment`](@ref), [`parameters`](@ref), [`states`](@ref),
 [`run_dir`](@ref), [`current_step`](@ref), [`current_epoch`](@ref), [`phase`](@ref),
