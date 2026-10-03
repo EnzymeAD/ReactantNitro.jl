@@ -586,3 +586,17 @@ file lazily, after setup has pinned its path to the resolved `run_dir`.
 """
 function logger end
 logger(e) = _field(e, :logger, JSONLogger())
+
+"""
+    check_divergence(e) -> Bool
+
+Whether a non-finite training loss stops the run. Default `_field(e, :check_divergence, true)`;
+also a `Nitro` keyword. With it on, the loss readback is validated and a `NaN` or `Inf` raises,
+naming step and epoch (see [`train!`](@ref)); the automatic loop reads each micro-batch's loss
+back one micro-batch late, so the error surfaces after at most one more micro-batch has been
+dispatched. With it off, the loss is still read back and logged, a non-finite value is dropped from
+the metrics line like any other, the epoch's mean train loss in `history` turns non-finite, and
+training continues from whatever state the divergence left. Host-side only: it compiles nothing.
+"""
+function check_divergence end
+check_divergence(e) = _field(e, :check_divergence, true)

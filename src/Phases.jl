@@ -160,6 +160,7 @@ mutable struct Nitro
     accum::Int
     max_epochs::Int
     gradient_clip_norm::Any
+    check_divergence::Bool
     checkpointer::Any
     early_stop::Any
     # What the pure scalar run accessors returned at construction, for `fixed_config_report`. The

@@ -131,8 +131,8 @@ e.max_epochs                # else a field of the same name, when the struct dec
 1                           # else the framework's value
 ```
 
-Ten keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`, `schedules`,
-`gradient_clip_norm`, `logger`, `checkpointer`, `early_stop`. `schedules` is the one whose accessor
+Eleven keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`, `schedules`,
+`gradient_clip_norm`, `check_divergence`, `logger`, `checkpointer`, `early_stop`. `schedules` is the one whose accessor
 reads no field. Four keywords name a fact about this construction and have no accessor: `data`,
 `weights`, `resume`, `run_ref`. `w0`, `restore_optimizer` and `restore_best` are more of that
 kind, and `checkpoint` is the deprecated spelling of `weights = path`.
@@ -162,7 +162,7 @@ says otherwise.
 
 | you change | what compiles again |
 | --- | --- |
-| a `Device` field, a `Host` field, `seed`, `run_dir`, `max_epochs`, a schedule | nothing |
+| a `Device` field, a `Host` field, `seed`, `run_dir`, `max_epochs`, `check_divergence`, a schedule | nothing |
 | a `GraphConst` field | every program that reads it |
 | `accum` | the gradient program |
 | `gradient_clip_norm` | the optimizer program |

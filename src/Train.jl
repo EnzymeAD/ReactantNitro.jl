@@ -201,10 +201,14 @@ monitor. Re-training under a different stopping rule means constructing another 
 compile cache is module-level, so it reuses every compiled program.
 
 There is no non-finite rollback: a non-finite loss stops the run with an error naming step and
-epoch, and recovery is a resume from the last checkpoint at a lower learning rate. Every scalar
-the framework branches on (the loss, the checkpoint metric, the early-stopping metric) is validated
-on readback, because a failed `BufferToHost` on this stack returns garbage without raising;
-purely-logged metrics are not.
+epoch, and recovery is a resume from the last checkpoint at a lower learning rate. The loss is read
+back one micro-batch late, so that the device runs the next micro-batch while the host waits, which
+means the error is raised after at most one further micro-batch (and, at a step's last micro-batch,
+its optimizer step) has been dispatched; it still names the step the loss belonged to.
+[`check_divergence`](@ref)` = false` turns the stop off: the loss is logged and training continues.
+Every scalar the framework branches on (the loss, the checkpoint metric, the early-stopping metric)
+is validated on readback, because a failed `BufferToHost` on this stack returns garbage without
+raising; purely-logged metrics are not, and neither is the loss under `check_divergence = false`.
 
 Ctrl+C is a graceful stop: the loop runs on a worker thread, ^C becomes [`request_stop!`](@ref),
 the step loop breaks at its next boundary, validation and the checkpoint still run, and the call
@@ -368,6 +372,10 @@ function _train!(nitro::Nitro)
             # that catches every variant of "the loader is the bottleneck".
             t_wait = 0.0
             t_step = 0.0
+            # The one dispatched micro-batch whose loss readback, batch free and (if it closed a
+            # step) train line are still owed; see `complete_micro_batch!`. Depth 1, and empty at
+            # every epoch edge: drained after the step loop on both exits, completion and a stop.
+            pending = nothing
             # One loop body for all three prefetch paths (inline, one producer, fan-out). Planning
             # is its own reported stretch because `begin_epoch!` may be a server round trip, and
             # the label is "planning" because the reporter appends "epoch N/M" itself.
@@ -418,25 +426,16 @@ function _train!(nitro::Nitro)
                         micro == 0 ? is_first : is_next, inv_n,
                         nitro.routing, lref, tmv
                     )
-                    # The readback is kept, not repeated: the divergence check already paid the
-                    # D2H for this scalar, and logging it again would pay it twice for one number.
-                    lh = check_finite(l, nitro.step, nitro.epoch)
-                    loss_sum += Float64(lh)
-                    loss_n += 1
-                    # Freed here, not when the compiled call returns: XLA is asynchronous and the
-                    # executable holds its inputs, but the loss readback above awaited the step, so
-                    # `b`'s buffers are dead. A use-after-free would surface as
-                    # `AssertionError: buffer.buffer !== C_NULL`.
-                    free_batch!(b)
-                    # The host path for `train_metrics`: `aux` is the primal, and the hook runs
-                    # in ordinary Julia on it. The transfer is the cost the user chose by asking.
-                    stats = tmv isa Val{:host} ?
-                        call_host_hook(
-                            train_metrics, :train_metrics, nitro.routing.train_metrics,
-                            batch, nitro.e, host_tree(aux)
-                        ) : aux
+                    # What this micro-batch's deferred half needs, captured now: the step it
+                    # belongs to (before the increment below, which is what the divergence error
+                    # names) and the `e` its host metrics see (the next step's `step_experiment`
+                    # may replace it before the record is completed).
+                    rec = (;
+                        l, b, batch, aux, e = nitro.e, step = nitro.step, epoch = nitro.epoch,
+                        closes = micro == nitro.accum - 1,
+                    )
 
-                    if micro == nitro.accum - 1
+                    if rec.closes
                         # A host branch, the only construct that genuinely skips: gated by a traced
                         # select, Adam's moments would decay once per micro-batch.
                         state = rebuild_rules(nitro, layout, masks, anchors, scalar_memo)
@@ -457,21 +456,36 @@ function _train!(nitro::Nitro)
                         nitro.step += 1
                         # One completed unit of work, for a monitor measuring time since progress.
                         note_progress!()
-                        # Once per optimizer step, the cadence the metrics contract names. The stats
-                        # are the closing micro-batch's, unreduced.
-                        log_metrics!(
-                            nitro.logger, finite_only((; loss = lh, stats...));
-                            step = nitro.step, epoch = nitro.epoch, context = "train"
-                        )
                     end
-                    # The step half ends after `check_finite`, which is where the device is awaited;
-                    # timing `gthunk` alone would report a near-zero step. Micro-batch 1 is excluded
-                    # from both halves because it carries the fan-out's spin-up.
+                    # The previous micro-batch's readback, one behind, so the host waits on
+                    # program k-1 while program k (and this step's optimizer program) is already
+                    # queued behind it, and the device is not idle through the host work between.
+                    if pending !== nothing
+                        loss_sum += complete_micro_batch!(nitro, pending, tmv)
+                        loss_n += 1
+                    end
+                    pending = rec
+                    # The step half ends after the readback, which is where the device is awaited;
+                    # timing `gthunk` alone would report a near-zero step. Lagged, it awaits the
+                    # previous micro-batch, so over an epoch it still sums the device time the host
+                    # waited through. Micro-batch 1 is excluded from both halves because it
+                    # carries the fan-out's spin-up.
                     seen > 1 && (t_step += time() - t_body)
                     nitro.stop_requested && break
                     t0 = time()
                     it = iterate(stream, st_stream)
                     seen > 1 && (t_wait += time() - t0)
+                end
+                # The drain, on both ways out of the step loop (exhausted, or a requested stop), so
+                # `loss_sum`, the last step's train line and the last batch's free all land before
+                # anything after the epoch reads them. An exception skips it on purpose: the record's
+                # program may still be in flight, so its batch is left to the GC, as before.
+                if pending !== nothing
+                    t_drain = time()
+                    loss_sum += complete_micro_batch!(nitro, pending, tmv)
+                    loss_n += 1
+                    pending = nothing
+                    seen > 1 && (t_step += time() - t_drain)
                 end
                 # The exactly-once ledger, only on an epoch that ran to completion. It catches a
                 # right count delivered with one index twice and another never.
@@ -552,6 +566,51 @@ function _train!(nitro::Nitro)
     return nitro
 end
 
+"""
+    ReactantNitro.complete_micro_batch!(nitro, rec, tmv) -> Float64
+
+The deferred half of one micro-batch of the automatic loop, run one micro-batch late, after the
+next micro-batch's gradient program (and its step's optimizer program) has been dispatched: read the
+loss back ([`check_finite`](@ref) under `check_divergence`, else [`read_loss`](@ref)), run a `:host`
+`train_metrics` on the transferred outputs, emit the train line if the micro-batch closed an
+optimizer step, and free its batch. Returns the host loss for the epoch mean.
+
+`rec` is `(; l, b, batch, aux, e, step, epoch, closes)`, captured at dispatch: `step` is the
+counter before that micro-batch's optimizer step, so the divergence error names the step it always
+named and the train line carries `step + 1`, the step the micro-batch belonged to, whatever the
+counter reads by now.
+
+The free is last and is safe: the loss readback awaited the record's program, and no later program
+reads its batch. `aux` is safe to hold across the later dispatches because no later program takes
+it: the gradient program donates only `g_accum`, which the objective never reads, and the optimizer
+program `ps` and the optimizer state. The one way to break that is a `forward` or `train_metrics`
+returning a parameter array unchanged, which Reactant may hand back as the input itself; the
+synchronous loop already read such stats after the optimizer step, so this is not new.
+"""
+function complete_micro_batch!(nitro::Nitro, rec, tmv)
+    # One D2H serves the divergence check, the epoch mean and the train line.
+    lh = nitro.check_divergence ? check_finite(rec.l, rec.step, rec.epoch) : read_loss(rec.l)
+    # The host path for `train_metrics`: `aux` is the primal, and the hook runs in ordinary Julia
+    # on it. The transfer is the cost the user chose by asking. Every micro-batch, as before, though
+    # only a step's closing one is logged.
+    stats = tmv isa Val{:host} ?
+        call_host_hook(
+            train_metrics, :train_metrics, nitro.routing.train_metrics,
+            rec.batch, rec.e, host_tree(rec.aux)
+        ) : rec.aux
+    # Once per optimizer step, the cadence the metrics contract names. The stats are the closing
+    # micro-batch's, unreduced. `finite_only` drops a non-finite loss when the check is off.
+    rec.closes && log_metrics!(
+        nitro.logger, finite_only((; loss = lh, stats...));
+        step = rec.step + 1, epoch = rec.epoch, context = "train"
+    )
+    # Freed here, not when the compiled call returns: XLA is asynchronous and the executable holds
+    # its inputs, but the readback above awaited this record's program, so `b`'s buffers are dead.
+    # A use-after-free would surface as `AssertionError: buffer.buffer !== C_NULL`.
+    free_batch!(rec.b)
+    return lh
+end
+
 # ── Manual mode: the driver ─────────────────────────────────────────────────────────
 
 """
@@ -594,9 +653,9 @@ end
     ReactantNitro._train_manual!(nitro) -> Nitro
 
 Manual mode's driver: the automatic loop's epoch skeleton (prefetch, checks, device schedules,
-the finite check, logging, `data_wait_frac`, validation, checkpointing, early stopping, phases,
-`request_stop!`) with the step body replaced by one call to the user's [`train_step`](@ref)
-closure, compiled once per run. The driver checks the closure's return, validates `loss`, stores
+the finite check under `check_divergence`, logging, `data_wait_frac`, validation, checkpointing,
+early stopping, phases, `request_stop!`) with the step body replaced by one call to the user's
+[`train_step`](@ref) closure, compiled once per run. Its loss readback is synchronous, not lagged. The driver checks the closure's return, validates `loss`, stores
 `ps` and `st`, and re-attaches the rules it handed in via `merge_rules`, since a `Leaf` cannot
 leave a compiled program on a mesh.
 """
@@ -660,8 +719,11 @@ function _train_manual!(nitro::Nitro)
                     out = check_train_step_return(
                         thunk(ev, nitro.model, nitro.ps, opt_state, st, bf, router)
                     )
-                    # One D2H serves both the divergence check and the log line.
-                    lh = check_finite(out.loss, nitro.step, nitro.epoch)
+                    # One D2H serves both the divergence check and the log line. Synchronous here,
+                    # not lagged as in the automatic loop: the closure's `stats` are the user's and
+                    # may alias the `ps` or optimizer state the next call donates.
+                    lh = nitro.check_divergence ? check_finite(out.loss, nitro.step, nitro.epoch) :
+                        read_loss(out.loss)
                     loss_sum += Float64(lh)
                     loss_n += 1
                     nitro.ps = out.ps
@@ -676,7 +738,7 @@ function _train_manual!(nitro::Nitro)
                         finite_only((; loss = lh, get(out, :stats, (;))...));
                         step = nitro.step, epoch = nitro.epoch, context = "train"
                     )
-                    # Safe to free: `check_finite` awaited the step.
+                    # Safe to free: the loss readback awaited the step.
                     free_batch!(b)
                     nitro.step += 1
                     note_progress!()
@@ -772,8 +834,10 @@ The per-epoch host-wait fraction `t_wait / (t_wait + t_step)`, logged as `data_w
 This is the generic guard: every other data-path check targets a specific mistake, while this one
 measures the outcome, so it catches a source that is simply too slow, a cache cap, or a contended
 sample server. `t_wait` is time blocked pulling from the stream; `t_step` is the rest of the
-micro-batch body through the loss readback, where the device work is awaited. Both exclude each
-epoch's first micro-batch. A third context because the `"train"` and `"validate"` cadences are
+micro-batch body through the loss readback, where the device work is awaited, plus the epoch-end
+drain of the last readback. Both exclude each epoch's first micro-batch. The readback lags one
+micro-batch, so the device is running micro-batch k while the host pulls k+1: the fraction is the
+host's time blocked on data, an upper bound on the device's idle time rather than equal to it. A third context because the `"train"` and `"validate"` cadences are
 asserted by the suite.
 """
 function report_data_wait!(nitro::Nitro, t_wait::Float64, t_step::Float64)
@@ -788,9 +852,9 @@ function report_data_wait!(nitro::Nitro, t_wait::Float64, t_step::Float64)
     pf = prefetch_config(nitro.data.train)
     @warn """
     ReactantNitro: the training loop spent $(round(100 * frac; digits = 1))% of epoch \
-    $(nitro.epoch) BLOCKED waiting for the data source. The device is idle for
-    that fraction of the epoch, so this is close to a $(round(1 / max(1 - frac, 1.0e-3); digits = 1))x
-    wall-clock penalty against a run whose loader keeps up.
+    $(nitro.epoch) BLOCKED waiting for the data source. The device is idle for up to
+    that fraction of the epoch (each wait overlaps one queued micro-batch), so this is up to a
+    $(round(1 / max(1 - frac, 1.0e-3); digits = 1))x wall-clock penalty against a run whose loader keeps up.
     Resolved prefetch for the `train` split: $(pf.workers) worker(s), $(pf.device_batches) batch(es)
     on device, $(pf.host_batches) on host, path $(pf.path). $(
         (pf.path === :fanout || pf.path === :fanout_unordered) ?
@@ -857,10 +921,13 @@ to_device_batch(batch::NamedTuple, routing, mesh = nothing) =
 
 No non-finite rollback: a non-finite loss stops the run with an error naming step and epoch, and
 recovery is a resume at a lower learning rate. The readback itself is validated because a failed
-`BufferToHost` on this stack returns garbage without raising.
+`BufferToHost` on this stack returns garbage without raising. Called only under
+[`check_divergence`](@ref); the automatic loop calls it one micro-batch late (see
+[`complete_micro_batch!`](@ref)), with the step and epoch captured when the micro-batch was
+dispatched.
 """
 function check_finite(l, step, epoch)
-    v = l isa Number ? Float64(l) : Float64(only(Array(l)))
+    v = read_loss(l)
     # Returned so the one D2H serves both the divergence check and the train-metric line.
     isfinite(v) && return v
     error(
@@ -871,6 +938,16 @@ function check_finite(l, step, epoch)
         poisoned state."""
     )
 end
+
+"""
+    ReactantNitro.read_loss(l) -> Float64
+
+The loss readback with no validation, for `check_divergence = false`: a non-finite value passes
+through to the epoch mean and to `finite_only`, which drops it from the train line. So does a
+failed `BufferToHost`, which on this stack returns garbage without raising; that is the cost of
+turning the check off.
+"""
+read_loss(l) = l isa Number ? Float64(l) : Float64(only(Array(l)))
 
 """
     ReactantNitro.check_control_readback(v, what, name) -> Float64
