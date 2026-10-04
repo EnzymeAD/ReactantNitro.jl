@@ -336,7 +336,7 @@ end
 An XLA compile failure surfaces as an enormous MLIR dump with no context, so every compile is
 wrapped in a handler that **names the phase, the function, and the argument shapes** before
 rethrowing, and truncates the dump to a bounded prefix with a pointer to the full text on disk.
-`compile_options` is the handle's, as [`check_compile_options`](@ref) normalized it: Reactant's
+`compile_options` is the handle's, as `ReactantNitro.check_compile_options` normalized it: Reactant's
 compile keywords as a `NamedTuple`.
 """
 function compile_with_context(f, args; phase = nothing, compile_options = (;))
