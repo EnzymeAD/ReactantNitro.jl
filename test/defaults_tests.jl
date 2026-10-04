@@ -22,7 +22,7 @@
     using ReactantNitro
     using ReactantNitro: check_checkpointer, clip_source, default_run_dir, is_framework_default,
         read_manifest
-    using JSON3, Lux, Optimisers, Random, Reactant, Statistics
+    using JSON, Lux, Optimisers, Random, Reactant, Statistics
 
     # The checkpoint manifest's `file` is the only identity a checkpoint has, and its name
     # carries a metric VALUE, which belongs to this fixture's loss rather than to the design.
@@ -300,7 +300,7 @@
         @testset "it logged, into the same directory, through the shipped JSON default" begin
             path = joinpath(BARE_DIR, "metrics.jsonl")
             @test isfile(path)
-            ls = [JSON3.read(ln) for ln in eachline(path)]
+            ls = [JSON.parse(ln) for ln in eachline(path)]
             @test first(ls)["type"] == "params"
             @test any(x -> x["type"] == "metrics" && x["context"] == "validate", ls)
             @test last(ls)["type"] == "finish" && last(ls)["status"] == "completed"

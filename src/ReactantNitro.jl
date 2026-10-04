@@ -18,7 +18,7 @@ module ReactantNitro
 import Enzyme
 import Functors
 import JLD2
-import JSON3
+import JSON
 import LinearAlgebra
 import Logging
 import Lux

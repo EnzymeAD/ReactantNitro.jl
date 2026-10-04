@@ -24,7 +24,7 @@
     using ReactantNitro
     using Reactant
     using ReactantNitro: @experiment, ExportBackend, read_manifest
-    using JSON3, Lux, Random, Statistics
+    using JSON, Lux, Random, Statistics
 
     const EXT = Base.get_extension(ReactantNitro, :ReactantNitroKaimonGateExt)
 
@@ -528,7 +528,7 @@
 
         # The wrapped default really wrote into the run directory.
         @test isfile(joinpath(dir, "metrics.jsonl"))
-        ls = [JSON3.read(ln) for ln in eachline(joinpath(dir, "metrics.jsonl"))]
+        ls = [JSON.parse(ln) for ln in eachline(joinpath(dir, "metrics.jsonl"))]
         @test first(ls)["type"] == "params"
 
         # `nitro_status` carries the same one-liner.

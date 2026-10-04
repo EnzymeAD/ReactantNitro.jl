@@ -6,7 +6,7 @@
     using Test
     using ReactantNitro
     using ReactantNitro: JSONLogger, METRICS_FILE, _adopt_logger!
-    using JSON3, Lux, Random, Statistics
+    using JSON, Lux, Random, Statistics
 
     # ── The experiment, one tiny train for the adoption and append testsets ─────────────
 
@@ -26,7 +26,7 @@
     )
     ReactantNitro.build_data(::JsonMLP, dist) = (; train = json_batches(2; seed = 1), val = json_batches(1; seed = 2))
 
-    lines(path) = [JSON3.read(ln) for ln in readlines(path)]
+    lines(path) = [JSON.parse(ln) for ln in readlines(path)]
 
     # ── The verbs, driven directly: every line is one well-formed JSON object ───────────
 
