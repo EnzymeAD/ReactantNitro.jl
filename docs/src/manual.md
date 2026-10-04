@@ -119,7 +119,7 @@ fail-fast rule, then logs `(; loss, stats...)`:
 
 | Key | Meaning |
 | --- | --- |
-| `loss` | **Required.** The scalar the driver validates (non-finite stops the run, naming step and epoch) and logs |
+| `loss` | **Required.** The scalar the driver validates (non-finite stops the run, naming step and epoch, unless `check_divergence = false`) and logs |
 | `ps` | The updated parameter tree |
 | `st` | The updated layer state |
 | `opt_state` | The new optimizer **states only**; the driver re-attaches the rules |

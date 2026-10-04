@@ -67,7 +67,7 @@ end
 """
     ReactantNitro._json_value(x) -> JSON-safe x
 
-Coerce a value to what JSON3 serializes: scalars pass through, arrays and tables are walked,
+Coerce a value to what JSON serializes: scalars pass through, arrays and tables are walked,
 anything else becomes its string. Non-finite floats become `null`; the framework already drops
 non-finite metrics, so this only sees them from a params table or a user's `log_other!`.
 """
@@ -90,7 +90,7 @@ the caller's responsibility so each verb names its own kind.
 """
 function _jsonl_write(lgr::JSONLogger, obj)
     io = _jsonl_open(lgr)
-    JSON3.write(io, _json_value(obj))
+    JSON.json(io, _json_value(obj))
     write(io, '\n')
     flush(io)
     return nothing

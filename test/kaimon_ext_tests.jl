@@ -24,7 +24,7 @@
     using ReactantNitro
     using Reactant
     using ReactantNitro: @experiment, ExportBackend, read_manifest
-    using JSON3, Lux, Random, Statistics
+    using JSON, Lux, Random, Statistics
 
     const EXT = Base.get_extension(ReactantNitro, :ReactantNitroKaimonGateExt)
 
@@ -528,7 +528,7 @@
 
         # The wrapped default really wrote into the run directory.
         @test isfile(joinpath(dir, "metrics.jsonl"))
-        ls = [JSON3.read(ln) for ln in eachline(joinpath(dir, "metrics.jsonl"))]
+        ls = [JSON.parse(ln) for ln in eachline(joinpath(dir, "metrics.jsonl"))]
         @test first(ls)["type"] == "params"
 
         # `nitro_status` carries the same one-liner.
@@ -765,17 +765,32 @@
         dir = mktempdir()
         msg = EXT.nitro_train(GATE_SPEC, max_epochs = 1000, run_dir = dir)
         id = run_id(msg)
-        sleep(2.0)
-        reply = EXT.nitro_stop(id)
-        @test occursin("stop requested", reply)
-        s = wait_run(id)
-        @test s.status == :completed
-        @test occursin("stop_reason=requested", s.result)
-        # The graceful stop still finished an epoch and checkpointed before exiting.
-        @test s.epoch >= 1
-        @test s.step >= 4
-        # Stopping a finished run is a no-op answer, not an error.
-        @test occursin("already", EXT.nitro_stop(id))
+        try
+            # Request the stop once the run has stepped, not after a fixed sleep: with one
+            # thread (`-t N,0`) the run executes on this task's thread, so a sleep cannot wake
+            # until the run yields, and a slow runner reached the stop before micro-batch 1.
+            # `step` is `nothing` until the first epoch's phase event.
+            deadline = time() + 240.0
+            while time() < deadline
+                st = EXT._get_run(id)
+                (st.status !== :running || something(st.step, 0) >= 4) && break
+                sleep(0.05)
+            end
+            @test EXT._get_run(id).status === :running
+            reply = EXT.nitro_stop(id)
+            @test occursin("stop requested", reply)
+            s = wait_run(id)
+            @test s.status == :completed
+            @test occursin("stop_reason=requested", s.result)
+            # The graceful stop still finished an epoch and checkpointed before exiting.
+            @test s.epoch >= 1
+            @test s.step >= 4
+            # Stopping a finished run is a no-op answer, not an error.
+            @test occursin("already", EXT.nitro_stop(id))
+        finally
+            # A failure above must not leave a 1000-epoch run behind on the worker.
+            EXT._get_run(id).status === :running && EXT.nitro_stop(id)
+        end
     end
 
     @testset "error paths" begin

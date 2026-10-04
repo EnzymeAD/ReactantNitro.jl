@@ -18,7 +18,7 @@ module ReactantNitro
 import Enzyme
 import Functors
 import JLD2
-import JSON3
+import JSON
 import LinearAlgebra
 import Logging
 import Lux
@@ -96,7 +96,7 @@ export train_step, setup_optimizers, manual_training, backward, step_optimizer
 export no_decay, default_no_decay
 export schedules, nonschedulable, dispatch_variant, max_epochs
 # The run accessors: each one's `Nitro` keyword defaults to the accessor call.
-export seed, accum, n_devs, checkpointer, early_stop, logger
+export seed, accum, n_devs, checkpointer, early_stop, logger, check_divergence
 
 # Asking a run's artifacts what they are, and PUBLIC because the alternative kept being
 # Asking a run's artifacts what they are: `read_manifest(dir)` lists retained checkpoints from the
