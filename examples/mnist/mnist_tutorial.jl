@@ -145,15 +145,15 @@ function ReactantNitro.metrics(::MnistMLP, logits; label)
     return (;
         # Per IMAGE: the denominator is the batch's real sample count, and the framework sums both
         # halves across the split and divides ONCE at the end.
-        acc = (sum(pred .== truth), size(label, 2)),
-        # `count === nothing` means accumulate by summation and do NOT divide, which is what a
+        acc = sum(pred .== truth) => size(label, 2),
+        # `:sum` means accumulate by summation and do NOT divide, which is what a
         # confusion-matrix-shaped quantity needs.
-        confusion = (confusion_matrix(pred, truth, 10), nothing),
+        confusion = confusion_matrix(pred, truth, 10) => :sum,
     )
 end
 
 function ReactantNitro.finalize_metrics(::MnistMLP, acc, split)
-    # `acc`'s counted keys arrive already divided; the `nothing`-counted ones arrive as raw totals,
+    # `acc`'s counted keys arrive already divided; the `:sum` ones arrive as raw totals,
     # so `acc.confusion` is the (10, 10) matrix for the WHOLE split.
     recall = [acc.confusion[c, c] / max(sum(acc.confusion[:, c]), 1) for c in 1:10]
     # `split` is a Symbol, so branching between :val and :test is free here.

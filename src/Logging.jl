@@ -55,7 +55,7 @@ log_other!(::Nothing, key, value) = nothing
     log_confusion!(lgr, matrix, labels; epoch) -> nothing
 
 Takes a plain `Matrix{Int}`; the backend adapts it. The framework never calls this: a confusion
-matrix is a user metric accumulated by the `count === nothing` rule, and only the experiment knows
+matrix is a user metric accumulated with `:sum`, and only the experiment knows
 both that one exists and what its labels mean. The shape that works is to accumulate it in
 [`metrics`](@ref), stash it from [`finalize_metrics`](@ref), and emit it from a phase monitor on
 the transition out of `EvalStepping`:

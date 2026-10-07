@@ -58,7 +58,7 @@ one positional argument**:
 | --- | --- |
 | `loss(e, outputs; label)` | a scalar, differentiated in the gradient program |
 | `train_metrics(e, outputs; label)` | scalars per step, traced beside the loss |
-| `metrics(e, outputs; label)` | `(sum, count)` per eval batch, with the padding already sliced off |
+| `metrics(e, outputs; label)` | `value => mode` pairs per eval batch, with the padding already sliced off |
 | `predict(nitro, batch)` | the same outputs, returned to you as host arrays |
 
 - Whatever `forward` puts in the first slot is what `loss` receives in its second. Nothing is
@@ -73,8 +73,9 @@ one positional argument**:
 
 ```julia
 metrics(e, outputs; label) = (;
-    acc = (sum(correct), size(label, 2)),   # per image: summed, then divided by the summed count
-    confusion = (cm, nothing),              # summed across the split, never divided
+    acc = sum(correct) => size(label, 2),   # per image: summed, then divided by the summed count
+    confusion = cm => :sum,                 # summed across the split, never divided
+    ranking = (; score = p, label) => :concat,  # every sample of the split, aligned
 )
 finalize_metrics(e, acc, split)             # acc.acc is a mean; acc.confusion is the split's matrix
 ```
