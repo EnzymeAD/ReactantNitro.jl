@@ -66,7 +66,7 @@ function grad_program(
     # Written into `g_accum` rather than returned as a new tree: Reactant donates only the arguments
     # a trace mutates, so a fresh result would leave the old accumulator for the GC every micro-batch.
     foreach((s, a) -> (a .= ifelse.(is_first .> 0.0f0, s, a .+ s)), g_scaled, g_accum)
-    return l, g_accum, st_new, aux
+    return l, g_accum, program_out(st_new), program_out(aux)
 end
 
 """
@@ -148,9 +148,10 @@ end
 # In train mode LuxLib's Reactant extension ignores running statistics, so threading changes only
 # what is validated and exported. State updates once per layer APPLICATION: N times per optimizer
 # step under accumulation, and more inside a weight-tied layer or an ODE solver, which matches
-# PyTorch. Multi-device statistics are per device (unsynced), also PyTorch's default; `st_new`
-# carries the same sharding annotation as `st` via `Reactant.Ops.sharding_group`. Keep constant
-# data out of `st`, since it is returned every step; a `Device` field is converted once.
+# PyTorch. On a mesh the program is one global computation, so batch statistics are over the
+# global batch (synced, unlike PyTorch's per-device default) and the returned state is replicated;
+# its `ReactantRNG`s leave through `program_out`. Keep constant data out of `st`, since it is
+# returned every step; a `Device` field is converted once.
 
 # ── Manual mode: the backward helper ────────────────────────────────────────────
 
@@ -420,12 +421,13 @@ function _train!(nitro::Nitro)
                         tmv; phase = GradCompiling(), worlds, nitro,
                         baked = (; accum = nitro.accum)
                     )
-                    l, nitro.g_accum, st, aux = gthunk(
+                    l, nitro.g_accum, st_out, aux = gthunk(
                         ev, nitro.model, nitro.ps, st, b,
                         nitro.g_accum,
                         micro == 0 ? is_first : is_next, inv_n,
                         nitro.routing, lref, tmv
                     )
+                    st, aux = program_in(st_out), program_in(aux)
                     # What this micro-batch's deferred half needs, captured now: the step it
                     # belongs to (before the increment below, which is what the divergence error
                     # names) and the `e` its host metrics see (the next step's `step_experiment`
@@ -621,7 +623,9 @@ The batch is narrowed to the closure's own routed fields and handed to `train_st
 through the same `call_hook` machinery as `forward`, so the missing-keyword error names the closure.
 """
 function manual_program(ev, model, ps, opt_state, st, batch, router)
-    return call_hook(train_step, :train_step, router, batch, ev, model, ps, opt_state, st)
+    out = call_hook(train_step, :train_step, router, batch, ev, model, ps, opt_state, st)
+    # Malformed returns pass through untouched for `check_train_step_return` to name.
+    return out isa NamedTuple && haskey(out, :st) ? merge(out, (; st = program_out(out.st))) : out
 end
 
 """
@@ -727,7 +731,7 @@ function _train_manual!(nitro::Nitro)
                     loss_sum += Float64(lh)
                     loss_n += 1
                     nitro.ps = out.ps
-                    st = out.st
+                    st = program_in(out.st)
                     # Re-attach the rules the closure was handed to the states it returned. The
                     # rules are not donated, so reuse across steps is safe.
                     nitro.opt_state = merge_rules(opt_state, out.opt_state)
@@ -1147,6 +1151,43 @@ function from_host(x)
 end
 
 """
+    ReactantNitro.ProgramRNG
+    ReactantNitro.ProgramPair
+
+How a `Reactant.ReactantRNG` and a `Pair` leave a compiled program. Reactant rebuilds a returned
+struct with the type its trace recorded, which names one-device buffers, so a struct holding a
+value replicated on a mesh fails `new` after the program has run. Untyped fields hold either;
+[`program_out`](@ref) wraps inside the program and [`program_in`](@ref) unwraps after.
+"""
+struct ProgramRNG
+    seed::Any
+    algorithm::String
+end
+
+struct ProgramPair
+    first::Any
+    second::Any
+end
+
+"""
+    ReactantNitro.program_out(x) -> x
+    ReactantNitro.program_in(x) -> x
+
+Every `ReactantRNG` and `Pair` in a program's returned layer state or metrics to its surrogate
+([`ProgramRNG`](@ref), [`ProgramPair`](@ref)) and back. Walks tuples and named tuples, which is what
+Lux state and the metrics contract are made of. Any other struct still cannot leave a program on a
+mesh.
+"""
+program_out(r::Reactant.ReactantRNG) = ProgramRNG(r.seed, r.algorithm)
+program_out(p::Pair) = ProgramPair(program_out(p.first), program_out(p.second))
+program_out(x::Union{Tuple, NamedTuple}) = map(program_out, x)
+program_out(x) = x
+program_in(r::ProgramRNG) = Reactant.ReactantRNG(r.seed, r.algorithm)
+program_in(p::ProgramPair) = program_in(p.first) => program_in(p.second)
+program_in(x::Union{Tuple, NamedTuple}) = map(program_in, x)
+program_in(x) = x
+
+"""
     ReactantNitro.device_paths(x, path = "") -> Vector{String}
 
 Every device-resident value reachable from `x`, as `path :: Type` strings, which is exactly what
@@ -1395,9 +1436,10 @@ function eval_metric_program(
     ) where {NREAL, HOOK}
     o = slice_last(outputs, NREAL)
     b = slice_last(batch, NREAL)
-    return HOOK === :metrics ?
+    m = HOOK === :metrics ?
         call_hook(hook_fn(fns, :metrics, metrics), :metrics, router, b, ev, o) :
         (; val_loss = call_hook(hook_fn(fns, :loss, loss), :loss, router, b, ev, o) => 1)
+    return program_out(m)
 end
 
 """
@@ -1495,7 +1537,9 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
                     Val(n_real), Val(hook), hook_fns(nitro.routing); phase = EvalCompiling(),
                     worlds = nitro.frozen.worlds_eval, nitro
                 )
-                thunk(ev, outputs, b, router, Val(n_real), Val(hook), hook_fns(nitro.routing))
+                program_in(
+                    thunk(ev, outputs, b, router, Val(n_real), Val(hook), hook_fns(nitro.routing))
+                )
             else
                 # `metrics` NEVER sees padding: the outputs are sliced back to `n_real`, and the
                 # batch handed to it is the split's own host batch, which was never padded.

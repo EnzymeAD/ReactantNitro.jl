@@ -93,6 +93,8 @@ const CACHE_MISSES = Ref(0)
 _shape(x::AbstractArray) = size(x)
 _shape(x::Union{Tuple, NamedTuple}) = map(_shape, x)
 _shape(x::Optimisers.Leaf) = (_shape(x.rule), _shape(x.state))
+# The algorithm is a trace-time constant the types do not carry.
+_shape(x::Reactant.ReactantRNG) = (size(x.seed), x.algorithm)
 _shape(x) = nothing
 
 """

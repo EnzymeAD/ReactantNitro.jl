@@ -74,6 +74,10 @@ the process level before any run, and a run never re-selects it.
   throughput and does not change the effective batch.
 - The default is every visible device, so a host with four GPUs data-parallelizes **without
   being asked**. If that is surprising, pin a count or set `CUDA_VISIBLE_DEVICES`.
+- The mesh runs one global program: BatchNorm statistics are over the global batch, and a
+  `Dropout` mask is one global mask split across devices. Every `ReactantRNG` is placed as
+  `"PHILOX"` on a mesh, because XLA's GPU SPMD partitioner miscompiles `"DEFAULT"`; a
+  single-device run keeps `"DEFAULT"`, so its dropout stream differs from a mesh run's.
 
 ### The pin and its precedence
 
