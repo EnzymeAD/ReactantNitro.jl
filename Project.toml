@@ -1,6 +1,6 @@
 name = "ReactantNitro"
 uuid = "641982cc-88f5-4d80-bec4-e68c6a8af0a5"
-version = "0.1.6"
+version = "0.1.7"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
@@ -13,6 +13,7 @@ Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
 Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+Preferences = "21216c6a-2e73-6563-6e65-726566657250"
 PrettyTables = "08abe8d2-0d0c-5749-adfa-8a2ac140af0d"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 ProgressLogging = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
@@ -49,6 +50,7 @@ MLUtils = "0.4"
 Makie = "0.24"
 Optimisers = "0.4.8"
 PrecompileTools = "1"
+Preferences = "1"
 PrettyTables = "3"
 ProgressLogging = "0.1"
 ProgressMeter = "1"

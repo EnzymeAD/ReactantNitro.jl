@@ -1239,8 +1239,9 @@
     @testset "grad's entry is guarded by objective_wrapper's closure, not its own" begin
         # The routing: `grad_program` captures `objective_wrapper` (forward, loss, traced
         # train_metrics) at the argtypes derivable from grad's own (ev, model, ps, st, batch,
-        # routers, metrics-residency Val), because plain inference cannot descend into Enzyme's
-        # backward pass (its own closure is glue-only). The stand-in used to be `fwd_program`,
+        # routers, metrics-residency Val), because plain inference of grad stops at
+        # `Enzyme.autodiff` (its own closure is glue-only; the backward pass is derived at the
+        # MLIR level and has no Julia methods). The stand-in used to be `fwd_program`,
         # which calls `forward` alone, so a helper under `loss` was invisible to the guard.
         fake_router = (;
             forward = ReactantNitro.Router{(:x,)}(), loss = nothing, metrics = nothing,
@@ -1310,27 +1311,45 @@
         @test !closure_drift(cl).drift
     end
 
-    @testset "redefining a `loss` helper poisons the trained gradient entry (device types)" begin
-        # End to end, because the capture that matters runs at the program's real argument types
-        # (device arrays): if inference lost `forward`'s output type there, `loss` would dispatch
-        # dynamically and its helper would silently drop out of the closure.
-        cache_reset!()
-        n = Nitro(
-            LossHelperExp(); run_dir = mktempdir(), max_epochs = 1,
-            data = (; train = frozen_data(), val = frozen_data())
-        )
-        train!(n)
-        grad_keys = [k for k in keys(ReactantNitro.CACHE_CLOSURES) if first(k) === grad_program]
-        @test length(grad_keys) == 1
-        cl = ReactantNitro.CACHE_CLOSURES[only(grad_keys)]
-        @test cl !== nothing
-        @test any(p -> p[1].name === :wc_loss_helper, cl)
+    # Precise invalidation is on by default and stores a trace record; with it off, the entry is
+    # guarded by the inference closure. Both must poison and name the helper. The closure-content
+    # checks read `(Method, signature)` pairs, so they run on the fallback only.
+    # `invokelatest`: each body resets its helpers with `@eval` first, and a compile in the same
+    # world would trace against the definitions from before the reset.
+    function with_precise(f, on::Bool)
+        on || ReactantNitro.TraceHook.uninstall!()
+        try
+            Base.invokelatest(f)
+        finally
+            ReactantNitro.TraceHook.install!()
+        end
+    end
 
-        @eval wc_loss_helper(d) = d .* 2.0f0
-        staleness = world_closure_staleness()
-        @test only(grad_keys) in staleness.poisoned
-        @test :wc_loss_helper in staleness.drifted
-        @test !haskey(CACHE, only(grad_keys))   # a new Nitro will recompile against the new helper
+    @testset "redefining a `loss` helper poisons the trained gradient entry (device types, $mode)" for mode in (:precise, :fallback)
+        @eval wc_loss_helper(d) = d   # undo the previous mode's edit
+        with_precise(mode === :precise) do
+            # End to end, because the capture that matters runs at the program's real argument types
+            # (device arrays): if inference lost `forward`'s output type there, `loss` would dispatch
+            # dynamically and its helper would silently drop out of the closure.
+            cache_reset!()
+            n = Nitro(
+                LossHelperExp(); run_dir = mktempdir(), max_epochs = 1,
+                data = (; train = frozen_data(), val = frozen_data())
+            )
+            train!(n)
+            grad_keys = [k for k in keys(ReactantNitro.CACHE_CLOSURES) if first(k) === grad_program]
+            @test length(grad_keys) == 1
+            cl = ReactantNitro.CACHE_CLOSURES[only(grad_keys)]
+            @test cl !== nothing
+            @test (cl isa ReactantNitro.TraceHook.TraceRecord) == (mode === :precise)
+            mode === :fallback && @test any(p -> p[1].name === :wc_loss_helper, cl)
+
+            @eval wc_loss_helper(d) = d .* 2.0f0
+            staleness = world_closure_staleness()
+            @test only(grad_keys) in staleness.poisoned
+            @test :wc_loss_helper in staleness.drifted
+            @test !haskey(CACHE, only(grad_keys))   # a new Nitro will recompile against the new helper
+        end
     end
 
     # ── helpers under device-resident metrics hooks ──────────────────────────────────────
@@ -1351,44 +1370,50 @@
     ReactantNitro.checkpointer(::MetricHelperExp) =
         ReactantNitro.TopKCheckpointer(; k = 1, metric = :mae, mode = :min)
 
-    @testset "device metrics: each helper poisons exactly the program that calls it" begin
-        # `eval_metric_program` is captured directly (it is not differentiated), so a helper under a
-        # traced `metrics` is in its own closure. A traced `train_metrics` runs inside the gradient
-        # program, so its helper is covered only through the `objective_wrapper` stand-in.
-        cache_reset!()
-        n = Nitro(
-            MetricHelperExp(); run_dir = mktempdir(), max_epochs = 1,
-            data = (; train = frozen_data(), val = frozen_data())
-        )
-        train!(n)                                   # compiles grad AND the traced val metrics
-        keys_of(f) = [k for k in keys(ReactantNitro.CACHE_CLOSURES) if first(k) === f]
-        grad_keys = keys_of(grad_program)
-        metric_keys = keys_of(ReactantNitro.eval_metric_program)
-        @test length(grad_keys) == 1
-        @test !isempty(metric_keys)
-        @test any(p -> p[1].name === :wc_tm_helper, ReactantNitro.CACHE_CLOSURES[only(grad_keys)])
-        @test all(
-            k -> any(p -> p[1].name === :wc_metric_helper, ReactantNitro.CACHE_CLOSURES[k]),
-            metric_keys
-        )
-        # `HOOK === :metrics` folds, so the `val_loss` arm (which calls `loss`) is not in a metrics
-        # program's closure. This needs the match's static parameters in `world_closure`: with them
-        # missing, both arms were inferred and every loss edit poisoned the metrics programs too.
-        is_our_loss(p) = occursin("loss", string(p[1].name)) &&
-            occursin("MetricHelperExp", string(p[2]))
-        @test !any(k -> any(is_our_loss, ReactantNitro.CACHE_CLOSURES[k]), metric_keys)
-        @test any(is_our_loss, ReactantNitro.CACHE_CLOSURES[only(grad_keys)])  # control: it can match
+    @testset "device metrics: each helper poisons exactly the program that calls it ($mode)" for mode in (:precise, :fallback)
+        @eval wc_metric_helper(d) = d   # undo the previous mode's edits
+        @eval wc_tm_helper(d) = d
+        with_precise(mode === :precise) do
+            # `eval_metric_program` is captured directly (it is not differentiated), so a helper under a
+            # traced `metrics` is in its own closure. A traced `train_metrics` runs inside the gradient
+            # program, so its helper is covered only through the `objective_wrapper` stand-in.
+            cache_reset!()
+            n = Nitro(
+                MetricHelperExp(); run_dir = mktempdir(), max_epochs = 1,
+                data = (; train = frozen_data(), val = frozen_data())
+            )
+            train!(n)                                   # compiles grad AND the traced val metrics
+            keys_of(f) = [k for k in keys(ReactantNitro.CACHE_CLOSURES) if first(k) === f]
+            grad_keys = keys_of(grad_program)
+            metric_keys = keys_of(ReactantNitro.eval_metric_program)
+            @test length(grad_keys) == 1
+            @test !isempty(metric_keys)
+            if mode === :fallback
+                @test any(p -> p[1].name === :wc_tm_helper, ReactantNitro.CACHE_CLOSURES[only(grad_keys)])
+                @test all(
+                    k -> any(p -> p[1].name === :wc_metric_helper, ReactantNitro.CACHE_CLOSURES[k]),
+                    metric_keys
+                )
+                # `HOOK === :metrics` folds, so the `val_loss` arm (which calls `loss`) is not in a metrics
+                # program's closure. This needs the match's static parameters in `world_closure`: with them
+                # missing, both arms were inferred and every loss edit poisoned the metrics programs too.
+                is_our_loss(p) = occursin("loss", string(p[1].name)) &&
+                    occursin("MetricHelperExp", string(p[2]))
+                @test !any(k -> any(is_our_loss, ReactantNitro.CACHE_CLOSURES[k]), metric_keys)
+                @test any(is_our_loss, ReactantNitro.CACHE_CLOSURES[only(grad_keys)])  # control: it can match
+            end
 
-        @eval wc_metric_helper(d) = d .* 2.0f0
-        staleness = world_closure_staleness()
-        @test Set(metric_keys) ⊆ Set(staleness.poisoned)
-        @test !(only(grad_keys) in staleness.poisoned)   # metrics is not part of the objective
-        @test haskey(CACHE, only(grad_keys))
+            @eval wc_metric_helper(d) = d .* 2.0f0
+            staleness = world_closure_staleness()
+            @test Set(metric_keys) ⊆ Set(staleness.poisoned)
+            @test !(only(grad_keys) in staleness.poisoned)   # metrics is not part of the objective
+            @test haskey(CACHE, only(grad_keys))
 
-        @eval wc_tm_helper(d) = d .* 2.0f0
-        staleness = world_closure_staleness()
-        @test only(grad_keys) in staleness.poisoned
-        @test :wc_tm_helper in staleness.drifted
+            @eval wc_tm_helper(d) = d .* 2.0f0
+            staleness = world_closure_staleness()
+            @test only(grad_keys) in staleness.poisoned
+            @test :wc_tm_helper in staleness.drifted
+        end
     end
 
     # Host residency must NOT drag a hook into the gradient closure: under `Val(:host)` the objective

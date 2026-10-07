@@ -24,6 +24,7 @@ import Logging
 import Lux
 import Optimisers
 # Checkpoint filenames use `%.6g` for the metric value, reproducible by anyone with `printf`.
+import Preferences
 import PrettyTables
 import Printf
 import ProgressLogging
@@ -58,6 +59,7 @@ include("Data.jl")        # the data contract and the dataloaders
 include("Decay.jl")       # weight decay
 include("Optimizer.jl")   # optimizer construction and parameter groups
 include("Schedules.jl")   # schedules
+include("TraceHook.jl")   # opt-in precise invalidation: records what each trace went through
 include("Cache.jl")       # the compiled-program cache
 include("Setup.jl")       # the setup sequence
 include("Train.jl")       # the training loop
@@ -170,6 +172,11 @@ export rank, world_size
 # precompiling process only. Nothing is drawn by this; the reporter decides per stretch of work.
 function __init__()
     progress_reporter!(default_progress_reporter)
+    # On by default: tracing cost is within noise and nothing is invalidated, and without it a
+    # method that dispatches only on traced types can be redefined under a cached program
+    # silently. Set the `precise_invalidation` preference to `false` to fall back to the inference
+    # closure. Must run before anything is traced (see `TraceHook`).
+    Preferences.load_preference(@__MODULE__, "precise_invalidation", true) && TraceHook.install!()
     return nothing
 end
 
