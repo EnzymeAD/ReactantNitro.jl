@@ -15,6 +15,7 @@ module ReactantNitro
 # name any of these packages exports (`Training` once collided with `Lux.Training`); the exports
 # test asserts the collision set is empty.
 
+import Dates
 import Enzyme
 import Functors
 import JLD2

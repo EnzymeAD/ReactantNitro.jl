@@ -715,19 +715,23 @@
             @test p["seed"] == 999
         end
 
-        @testset "a backend with no `site_provenance` refuses rather than stamping nothing" begin
-            err = try
-                export_model(
-                    mkexp(ExportProv), FakeBundle(); dir = mktempdir(), name = "m",
-                    batch_sizes = [2], provenance_root = "/some/repo"
-                )
-                nothing
-            catch e
-                e
-            end
-            @test err isa ErrorException
-            @test occursin("site_provenance", err.msg)
-            @test occursin("provenance_root", err.msg)
+        @testset "a backend with no `site_provenance` gets the git default" begin
+            RECORDED[] = nothing
+            export_model(
+                mkexp(ExportProv), FakeBundle(); dir = mktempdir(), name = "m",
+                batch_sizes = [2], provenance_root = pkgdir(ReactantNitro)
+            )
+            p = RECORDED[].provenance
+            @test p["git_commit"] == readchomp(`git -C $(pkgdir(ReactantNitro)) rev-parse HEAD`)
+            @test haskey(p, "exported_at")
+            @test haskey(p, "git_diff") == p["git_dirty"]
+
+            RECORDED[] = nothing
+            @test_logs (:warn, r"not inside a git work tree") export_model(
+                mkexp(ExportProv), FakeBundle(); dir = mktempdir(), name = "m",
+                batch_sizes = [2], provenance_root = mktempdir()
+            )
+            @test !haskey(RECORDED[].provenance, "git_commit")
         end
 
         @testset "the framework stamps the checkpoint the handle restored from" begin

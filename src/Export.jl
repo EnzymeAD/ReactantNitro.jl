@@ -314,29 +314,61 @@ end
     site_provenance(backend, root) -> Dict{String,Any}
 
 The site's half of a bundle's provenance: repository state collected at `root`, which the caller
-names so nothing is guessed. A verb on the backend because the artifact format owns what it can
-record: `ReactantServerBundle` answers with `ReactantServerExport.collect_provenance`, whose
-`git_diff` becomes `working_tree.patch` in the bundle. No default method, deliberately: a backend
-that cannot collect site provenance must say so rather than return an empty dictionary.
+names so nothing is guessed. The default is [`git_provenance`](@ref)`(root)`. A verb on the backend
+so a format with its own collector can use it: `ReactantServerBundle` answers with
+`ReactantServerExport.collect_provenance`. A `git_diff` entry is a full patch, which the backend
+writes beside the artifact rather than into its metadata.
 """
-function site_provenance end
+site_provenance(::ExportBackend, root) = git_provenance(root)
 
-# Erroring rather than returning `Dict()` is the point.
-function site_provenance(backend::ExportBackend, root)
-    hint = backend isa ReactantServerBundle ?
-        "`ReactantServerBundle` collects it through `ReactantServerExport.collect_provenance`, so add `using ReactantServerExport` and the method appears." :
-        backend isa TFSavedModel ?
-        "`TFSavedModel` collects it in the `PythonCall` extension, so add `using PythonCall` and the method appears." :
-        "A backend supplies its own `site_provenance` method; the ReactantServerExport extension is the shape of one."
-    return error(
-        """
-        ReactantNitro: `export_model` was given `provenance_root = $(repr(root))` and backend
-        `$(typeof(backend))` has no `site_provenance` method, so the repository state it asked for
-        would be silently missing from the bundle.
-        $hint
-        Leave `provenance_root` unset and pass what you want stamped through `provenance` if this
-        backend genuinely records no repository state."""
+# One git read, or `nothing` when git cannot answer.
+function _git(root, args)
+    return try
+        String(strip(read(pipeline(`git -C $root $args`; stderr = devnull), String)))
+    catch
+        nothing
+    end
+end
+
+"""
+    ReactantNitro.git_provenance(root) -> Dict{String,Any}
+
+Repository state at `root`: `git_commit`, `git_tree_sha1`, `git_branch`, `git_dirty`,
+`repo_remote`, and on a dirty tree `git_diff`, the full `git diff --binary HEAD`, so the commit
+plus the patch reconstructs the exported code (untracked files are not captured). Also
+`exported_at` (UTC) and `julia_version`. A field git cannot answer is omitted, and a `root` outside
+a work tree warns and omits them all.
+"""
+function git_provenance(root)
+    root = String(root)
+    prov = Dict{String, Any}(
+        "exported_at" => Dates.format(Dates.now(Dates.UTC), Dates.dateformat"yyyy-mm-dd\THH:MM:SS\Z"),
+        "julia_version" => string(VERSION),
     )
+    if _git(root, ["rev-parse", "--is-inside-work-tree"]) != "true"
+        @warn "ReactantNitro: $root is not inside a git work tree; the git provenance fields are omitted."
+        return prov
+    end
+    for (key, args) in (
+            "git_commit" => ["rev-parse", "HEAD"], "git_tree_sha1" => ["rev-parse", "HEAD^{tree}"],
+            "git_branch" => ["rev-parse", "--abbrev-ref", "HEAD"], "repo_remote" => ["remote", "get-url", "origin"],
+        )
+        v = _git(root, args)
+        v === nothing || (prov[key] = v)
+    end
+    status = _git(root, ["status", "--porcelain"])
+    status === nothing && return prov
+    prov["git_dirty"] = !isempty(status)
+    if prov["git_dirty"]
+        # Read raw: stripping the trailing newline corrupts the patch.
+        diff = try
+            read(pipeline(`git -C $root diff --binary HEAD`; stderr = devnull), String)
+        catch
+            ""
+        end
+        isempty(diff) || (prov["git_diff"] = diff)
+    end
+    return prov
 end
 
 # The framework's `forward` is keyword-routed by batch field name; a tracer wants one positional

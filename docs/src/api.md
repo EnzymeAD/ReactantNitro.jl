@@ -22,6 +22,12 @@ ReactantNitro.cache_reset!
 ReactantNitro.check_compile_options
 ```
 
+## Export internals
+
+```@docs
+ReactantNitro.git_provenance
+```
+
 ## The data-source trait
 
 `batch_at` and `begin_epoch!` are exported and appear above. The rest of the trait is extended

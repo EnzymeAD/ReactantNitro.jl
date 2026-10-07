@@ -9,7 +9,6 @@ import ReactantNitro
 import Reactant
 import JSON
 
-using Dates: Dates, @dateformat_str
 using PythonCall: Py, pyimport, pylist, pydict, pyfunc, pybytes, pyconvert
 using ReactantNitro: TFSavedModel
 
@@ -219,55 +218,6 @@ function ReactantNitro.write_export(
     diff === nothing || write(joinpath(extra, "working_tree.patch"), diff)
     open(io -> JSON.json(io, prov; pretty = true), joinpath(extra, "provenance.json"), "w")
     return path
-end
-
-# ── Site provenance ─────────────────────────────────────────────────────────────────
-
-function _git(root, args)
-    return try
-        String(strip(read(pipeline(`git -C $root $args`; stderr = devnull), String)))
-    catch
-        nothing
-    end
-end
-
-"""
-    ReactantNitro.site_provenance(::TFSavedModel, root) -> Dict{String,Any}
-
-Repository state at `root`: commit, tree hash, branch, dirty flag and remote, plus `git_diff`, the
-full `git diff --binary HEAD` on a dirty tree, which becomes `assets.extra/working_tree.patch`.
-Fields git cannot answer are omitted.
-"""
-function ReactantNitro.site_provenance(::TFSavedModel, root)
-    root = String(root)
-    prov = Dict{String, Any}(
-        "exported_at" => Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-dd\THH:MM:SS\Z"),
-        "julia_version" => string(VERSION),
-    )
-    if _git(root, ["rev-parse", "--is-inside-work-tree"]) != "true"
-        @warn "ReactantNitro: $root is not inside a git work tree; the git provenance fields are omitted."
-        return prov
-    end
-    for (key, args) in (
-            "git_commit" => ["rev-parse", "HEAD"], "git_tree_sha1" => ["rev-parse", "HEAD^{tree}"],
-            "git_branch" => ["rev-parse", "--abbrev-ref", "HEAD"], "repo_remote" => ["remote", "get-url", "origin"],
-        )
-        v = _git(root, args)
-        v === nothing || (prov[key] = v)
-    end
-    status = _git(root, ["status", "--porcelain"])
-    status === nothing && return prov
-    prov["git_dirty"] = !isempty(status)
-    if prov["git_dirty"]
-        # Read raw: stripping the trailing newline corrupts the patch.
-        diff = try
-            read(pipeline(`git -C $root diff --binary HEAD`; stderr = devnull), String)
-        catch
-            ""
-        end
-        isempty(diff) || (prov["git_diff"] = diff)
-    end
-    return prov
 end
 
 end # module ReactantNitroPythonCallExt
