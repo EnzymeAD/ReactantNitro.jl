@@ -39,6 +39,8 @@
         end
     end
 
+    # On by default: `__init__` installed it, and a second `install!` is a no-op that says so.
+    @test TraceHook.precise_available()
     @test TraceHook.install!()
     try
         function compile_rec()
@@ -103,6 +105,7 @@
             TraceHook.uninstall!()
             hlo_off = string(@code_hlo optimize = false th_g_off(x))
             r_off = Float32(@jit th_g_off(x))
+            @test TraceHook.install!()
             strip_names(s) = replace(s, r"loc\(.*?\)" => "", r"th_g_o(n|ff)" => "F")
             @test strip_names(hlo_on) == strip_names(hlo_off)
             @test r_on == r_off
@@ -110,6 +113,7 @@
 
         @test TraceHook.failure_reason() === nothing
     finally
-        TraceHook.uninstall!()
+        # Leave the worker as `__init__` left it, for the items that run after this one.
+        TraceHook.install!()
     end
 end

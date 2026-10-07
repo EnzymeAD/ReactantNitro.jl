@@ -29,10 +29,10 @@ forward pass once and Enzyme-JAX derives the gradient from that MLIR, so the for
 whole dependency set of a gradient program. `LAST_WORLD_CHECKED` memoizes the scan on the world
 counter.
 
-With the `precise_invalidation` preference set, an entry stores a `TraceHook.TraceRecord` instead:
-every specialization the trace actually went through, which also covers methods that dispatch only
-on traced types, Reactant overlays, and callees behind runtime dispatch, none of which inference on
-the concrete arguments sees. The inference closure remains the fallback whenever recording is
+With precise invalidation on (the default; the `precise_invalidation` preference turns it off), an
+entry stores a `TraceHook.TraceRecord` instead: every specialization the trace actually went
+through, which also covers methods that dispatch only on traced types, Reactant overlays, and
+callees behind runtime dispatch, none of which inference on the concrete arguments sees. The inference closure remains the fallback whenever recording is
 unavailable.
 """
 const CACHE_CLOSURES = Dict{Any, Any}()

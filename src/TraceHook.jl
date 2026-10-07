@@ -166,11 +166,15 @@ struct TraceRecord
     specs::Vector{TracedSpec}
 end
 
-function _valid_ci(mi::Core.MethodInstance, owner)
+# The CodeInstance the trace used: the one valid at the world the trace ran in. If that world is
+# already behind the latest one, its `max_world` is finite from the start, which `trace_drift`
+# reports as drift: the program was compiled against definitions that have since changed.
+function _valid_ci(mi::Core.MethodInstance, owner, world::UInt)
     isdefined(mi, :cache) || return nothing
     ci = getfield(mi, :cache)
     while ci isa Core.CodeInstance
-        getfield(ci, :owner) === owner && getfield(ci, :max_world) == typemax(UInt) && return ci
+        getfield(ci, :owner) === owner && getfield(ci, :min_world) <= world <= getfield(ci, :max_world) &&
+            return ci
         ci = isdefined(ci, :next) ? getfield(ci, :next) : nothing
     end
     return nothing
@@ -184,7 +188,9 @@ Run `f()`, typically a Reactant compile, and return what the trace went through.
 """
 function with_trace_recording(f)
     precise_available() || return (f(), nothing)
-    world = Base.get_world_counter()
+    # The world the trace runs in, which is the calling task's, not the latest: code that `@eval`s
+    # a definition and then compiles in the same function traces against the definitions before it.
+    world = Base.tls_world_age()
     buf = Set{Rec}()
     push!(_stack(), buf)
     result = try
@@ -200,9 +206,12 @@ function with_trace_recording(f)
     end
     reactant_owner = CC.cache_owner(Reactant.ReactantInterpreter(; world))
     specs = TracedSpec[
-        TracedSpec(mi, native, _valid_ci(mi, native ? nothing : reactant_owner))
+        TracedSpec(mi, native, _valid_ci(mi, native ? nothing : reactant_owner, world))
             for (mi, native) in buf
     ]
+    # Without its CodeInstance a specialization cannot vouch for the callees inlined into it, so
+    # this compile falls back to the inference closure rather than storing a partial record.
+    any(s -> s.ci === nothing, specs) && return (result, nothing)
     return (result, TraceRecord(world, specs))
 end
 
@@ -227,6 +236,40 @@ end
 
 _spec_name(s::TracedSpec) = (d = s.mi.def; d isa Method ? d.name : :toplevel)
 
+# When drift was seen only through a specialization's CodeInstance, the method that changed is a
+# callee inlined into it, possibly several calls down: each CodeInstance's edges name its direct
+# callees only. Walk down through the callees whose own CodeInstance (same owner, the one valid at
+# the trace world) was invalidated too, and report the methods that no longer resolve to the one
+# compiled against. Names only: drift is already established. Empty when none is found; the caller
+# then reports the specialization.
+function _changed_callees(ci::Core.CodeInstance, trace_world::UInt, world::UInt)
+    owner = getfield(ci, :owner)
+    names = Symbol[]
+    seen = Base.IdSet{Core.MethodInstance}()
+    stack = Core.CodeInstance[ci]
+    while !isempty(stack)
+        for e in getfield(pop!(stack), :edges)
+            mi = e isa Core.CodeInstance ? getfield(e, :def) : e
+            mi isa Core.MethodInstance && !(mi in seen) || continue
+            push!(seen, mi)
+            def = mi.def
+            def isa Method || continue
+            moved = getfield(def, :primary_world) > trace_world
+            if !moved && CC.isdispatchtuple(mi.specTypes)
+                m = Base._which(mi.specTypes; world, raise = false)
+                moved = m === nothing || m.method !== def
+            end
+            if moved
+                push!(names, def.name)
+                continue
+            end
+            callee = _valid_ci(mi, owner, trace_world)
+            callee === nothing || getfield(callee, :max_world) == typemax(UInt) || push!(stack, callee)
+        end
+    end
+    return unique!(names)
+end
+
 """
     TraceHook.trace_drift(record) -> (; drift, drifted)
 
@@ -238,7 +281,9 @@ function trace_drift(rec::TraceRecord)
     world == rec.world && return (; drift = false, drifted)
     overlay = CC.method_table(Reactant.ReactantInterpreter(; world))
     for s in rec.specs
-        _spec_invalidated(s, rec.world, world, overlay) && push!(drifted, _spec_name(s))
+        _spec_invalidated(s, rec.world, world, overlay) || continue
+        callees = s.ci === nothing ? Symbol[] : _changed_callees(s.ci, rec.world, world)
+        isempty(callees) ? push!(drifted, _spec_name(s)) : append!(drifted, callees)
     end
     return (; drift = !isempty(drifted), drifted)
 end

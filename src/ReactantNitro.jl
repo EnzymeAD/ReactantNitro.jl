@@ -172,9 +172,11 @@ export rank, world_size
 # precompiling process only. Nothing is drawn by this; the reporter decides per stretch of work.
 function __init__()
     progress_reporter!(default_progress_reporter)
-    # Opt-in: worth it in a Revise session, where a stale program is the risk; serving keeps the
-    # cheaper inference closure. Must run before anything is traced (see `TraceHook`).
-    Preferences.load_preference(@__MODULE__, "precise_invalidation", false) && TraceHook.install!()
+    # On by default: tracing cost is within noise and nothing is invalidated, and without it a
+    # method that dispatches only on traced types can be redefined under a cached program
+    # silently. Set the `precise_invalidation` preference to `false` to fall back to the inference
+    # closure. Must run before anything is traced (see `TraceHook`).
+    Preferences.load_preference(@__MODULE__, "precise_invalidation", true) && TraceHook.install!()
     return nothing
 end
 
