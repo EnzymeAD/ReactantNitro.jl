@@ -2,7 +2,7 @@
 
 Every exported name that carries a docstring appears below, collected automatically. The docstrings
 are the contract, and the guide pages give the worked context: [Tutorial](tutorial.md),
-[Experiments](experiments.md), [Recompilation](recompilation.md),
+[Experiments](experiments.md), [Recompilation](recompilation.md), [Compile options](compile_options.md),
 [Optimization](optimization.md), and [Schedules](schedules.md).
 
 ```@autodocs
@@ -19,6 +19,7 @@ REPL as `ReactantNitro.cache_stats`), and they are documented here so their refs
 ```@docs
 ReactantNitro.cache_stats
 ReactantNitro.cache_reset!
+ReactantNitro.check_compile_options
 ```
 
 ## The data-source trait

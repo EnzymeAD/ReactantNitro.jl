@@ -114,7 +114,7 @@ nitro = Nitro(e; compile_options = (; cudnn_hlo_optimize = true,    # Reactant c
 ```
 
 `compile_options` applies to every program the handle compiles and is part of each program's
-compile-cache key; see `ReactantNitro.check_compile_options`.
+compile-cache key; see [`ReactantNitro.check_compile_options`](@ref).
 
 Opaque, with accessors: [`experiment`](@ref), [`parameters`](@ref), [`states`](@ref),
 [`run_dir`](@ref), [`current_step`](@ref), [`current_epoch`](@ref), [`phase`](@ref),

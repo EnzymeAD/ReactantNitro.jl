@@ -48,6 +48,7 @@ Every program's key is a tuple, and each component earns its place:
 | the function, its argument types, and their shapes | shape is a runtime field, so Reactant's own guard covers types but not shapes |
 | a hash of the `GraphConst` fields only | they bake into the graph as trace-time constants |
 | the resolved method world of every user hook and every rule's `apply!` | so a redefinition is not silently ignored |
+| the handle's `compile_options`, when set | the same trace compiles to a different executable; see [Compile options](compile_options.md) |
 
 Shape is a runtime field, so a ragged batch passes Reactant's generated type guard and fails
 inside XLA; a key that skipped shapes would serve it a program compiled for a different width.

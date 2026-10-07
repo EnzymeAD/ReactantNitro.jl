@@ -991,8 +991,8 @@ end
 """
     ReactantNitro.check_compile_options(opts) -> NamedTuple
 
-The `compile_options` keyword of [`Nitro`](@ref), normalized to the keywords every program's
-`Reactant.Compiler.compile` call receives: either a `NamedTuple` of Reactant's compile keywords
+Validate the `compile_options` keyword of [`Nitro`](@ref). It is normalized to the keywords every
+program's `Reactant.Compiler.compile` call receives: either a `NamedTuple` of Reactant's compile keywords
 (`optimize`, `cudnn_hlo_optimize`, `transpose_propagate`, `xla_debug_options`, ...) or a
 `Reactant.CompileOptions`, which becomes `(; compile_options = opts)`. The keywords are exactly
 those `Reactant.Compiler.compile` accepts; the remaining `CompileOptions` fields (the pass switches)
@@ -1004,13 +1004,15 @@ Nitro(e; compile_options = (; cudnn_hlo_optimize = true, transpose_propagate = :
 Nitro(e; compile_options = Reactant.CompileOptions(; disable_slice_to_batch_passes = false))
 ```
 
-An unknown keyword is refused here rather than minutes later at the first compile. So is
+An unknown keyword is refused here rather than minutes later at the first compile, as is an
+unknown field of `xla_debug_options`, `xla_executable_build_options` or `xla_compile_options`. So is
 `donated_args` other than `:auto`: the gradient accumulator and the parameters are written in place
 and must be donated, or every superseded buffer waits for the GC.
 """
 function check_compile_options(opts)
     if opts isa Reactant.CompileOptions
         opts.donated_args === :auto || _refuse_donation(opts.donated_args)
+        _check_xla_fields(opts)
         return (; compile_options = opts)
     end
     opts isa NamedTuple || error(
@@ -1031,7 +1033,29 @@ function check_compile_options(opts)
     get(opts, :donated_args, :auto) === :auto || _refuse_donation(opts.donated_args)
     co = get(opts, :compile_options, nothing)
     co === nothing || co.donated_args === :auto || _refuse_donation(co.donated_args)
+    _check_xla_fields(opts)
+    co === nothing || _check_xla_fields(co)
     return opts
+end
+
+# Reactant copies these onto XLA protos field by field at the first compile; checked here instead.
+const _XLA_PROTOS = (
+    xla_debug_options = :DebugOptions,
+    xla_executable_build_options = :ExecutableBuildOptionsProto,
+    xla_compile_options = :CompileOptionsProto,
+)
+
+function _check_xla_fields(opts)
+    for (kw, proto) in pairs(_XLA_PROTOS)
+        hasproperty(opts, kw) || continue
+        known = fieldnames(getfield(Reactant.Proto.xla, proto))
+        unknown = [k for k in keys(getproperty(opts, kw)) if k ∉ known]
+        isempty(unknown) || error(
+            "ReactantNitro: `compile_options.$kw` field(s) $(join(unknown, ", ")) are not fields \
+             of XLA's `$proto`."
+        )
+    end
+    return nothing
 end
 
 _reactant_compile_keywords() = Tuple(
