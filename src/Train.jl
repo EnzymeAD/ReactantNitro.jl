@@ -1397,7 +1397,7 @@ function eval_metric_program(
     b = slice_last(batch, NREAL)
     return HOOK === :metrics ?
         call_hook(hook_fn(fns, :metrics, metrics), :metrics, router, b, ev, o) :
-        (; val_loss = (call_hook(hook_fn(fns, :loss, loss), :loss, router, b, ev, o), 1))
+        (; val_loss = call_hook(hook_fn(fns, :loss, loss), :loss, router, b, ev, o) => 1)
 end
 
 """
@@ -1504,7 +1504,7 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
                     slice_outputs(host_tree(outputs), n_real, nitro.batch_size)
                 )
             end
-            acc = accumulate_metrics(acc, host_metrics(m, split), split)
+            acc = accumulate_metrics(acc, host_metrics(m, split, n_real), split)
             # Freed eagerly: leaving eval outputs to the GC is what OOMs validation on this stack.
             free_device_buffers!(protected, b, outputs)
         end
@@ -1530,8 +1530,9 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
     out = with_progress_stretch("finalize metrics", 0, nitro.epoch, nitro.max_epochs) do
         # The boundary assertion on the output: `finalize_metrics` is user code and its result
         # reaches the logger, the phase monitors and the checkpoint metric.
+        reduced = reduce_metrics(acc)
         assert_host(
-            finalize_metrics(e, reduce_metrics(acc), split),
+            check_concat_reduced(acc, reduced, finalize_metrics(e, reduced, split), split),
             "the metrics `finalize_metrics` returned for the `$split` split"
         )
     end
@@ -1565,80 +1566,235 @@ end
 # ── Metric accumulation, host-side ───────────────────────────────────────────────────
 
 """
-    ReactantNitro.host_metrics(m, split) -> NamedTuple of (sum, count)
-
-Read one batch's metric result back to host values and check the metric contract: every metric is
-a `(sum, count)` pair, where `count === nothing` means accumulate by summation without dividing,
-which is what a confusion matrix needs. A bare number is refused rather than misaccumulated.
+The reduction modes a metric may name besides a count. `nothing` is the older spelling of `:sum`.
 """
-function host_metrics(m, split::Symbol)
+const METRIC_MODES = (:sum, :max, :min, :concat)
+
+"""
+    ReactantNitro.MetricEntry(value, mode)
+
+One `value => mode` of a metric, read back to the host. `mode` is a `Real` count or a `Symbol`
+from `METRIC_MODES`; `value` is a leaf or a `NamedTuple`/`Tuple` the mode covers leaf by leaf.
+"""
+struct MetricEntry{V, M}
+    value::V
+    mode::M
+end
+
+"""
+    ReactantNitro.host_metrics(m, split, n_real) -> NamedTuple of MetricEntry trees
+
+Read one batch's metric result back to host values and check the metric contract: every value is
+covered by exactly one `value => mode`, on itself or on a group above it. The older `(value, mode)`
+tuple is accepted at the top of a key. A bare number is refused rather than misaccumulated.
+"""
+function host_metrics(m, split::Symbol, n_real::Integer)
     m isa NamedTuple || error(
         """
         ReactantNitro: `metrics` returned a `$(typeof(m))` for the `$split` split; it must return a
-        NamedTuple of `(sum, count)` pairs, as in
-        `(; err = (sum_abs_err, n_items), acc = (n_correct, n_images))`."""
+        NamedTuple of `value => mode` pairs, as in
+        `(; err = sum_abs_err => n_items, cm = confusion => :sum)`."""
     )
-    return NamedTuple{keys(m)}(map(k -> _host_metric_entry(getproperty(m, k), k, split), keys(m)))
+    return NamedTuple{keys(m)}(
+        map(keys(m)) do k
+            v = getproperty(m, k)
+            # The older spelling: a 2-tuple whose second element can only be a mode.
+            v isa Tuple && length(v) == 2 && v[2] isa Union{Number, Symbol, Nothing} &&
+                (v = v[1] => v[2])
+            _parse_metric(v, string(k), split, n_real)
+        end
+    )
 end
 
-function _host_metric_entry(v, name::Symbol, split::Symbol)
-    (v isa Tuple && length(v) == 2) || error(
+function _parse_metric(x, path::String, split::Symbol, n_real::Integer)
+    if x isa Pair
+        mode = _parse_mode(x.second, path, split)
+        _has_pair(x.first) && error(
+            """
+            ReactantNitro: metric `$path` on the `$split` split has a mode, and so does a value
+            inside it. Each value takes exactly one mode: put it on the group or on its values."""
+        )
+        value = host_tree(x.first)
+        mode === :concat && _leafmap(v -> _check_concat_leaf(v, path, split, n_real), value)
+        return MetricEntry(value, mode)
+    elseif x isa NamedTuple
+        return NamedTuple{keys(x)}(map(k -> _parse_metric(x[k], "$path.$k", split, n_real), keys(x)))
+    elseif x isa Tuple
+        return ntuple(i -> _parse_metric(x[i], "$path[$i]", split, n_real), length(x))
+    end
+    error(
         """
-        ReactantNitro: metric `$name` on the `$split` split is a `$(typeof(v))`; every metric must
-        report its own numerator and denominator as a `(sum, count)` pair. The
-        framework adds the pairs up over the split and divides at the end, which is why a
-        framework-supplied sample count would be the wrong denominator: different metrics have
-        different natural ones, per sample, per image, per object.
-        Write `$name = (the sum, the count)`, or `(the sum, nothing)` to accumulate by summation
-        without dividing, which is what a confusion matrix wants."""
+        ReactantNitro: metric `$path` on the `$split` split is a `$(typeof(x))` with no mode. Write
+        `value => mode`, with a count (to divide by) or one of $(join(repr.(METRIC_MODES), ", ")),
+        on the value or on a group above it. A ternary binds looser than `=>`, so
+        `c ? a : b => :sum` gives `a` no mode; write `(c ? a : b) => :sum`."""
     )
-    s, c = v
-    # `host_tree` because a numerator may be a container of leaves, not a single one.
-    return (host_tree(s), c === nothing ? nothing : host_tree(c))
 end
 
-_host_value(x::Reactant.RNumber) = Reactant.to_number(x)
-_host_value(x::Reactant.AbstractConcreteArray) = Array(x)
-_host_value(x) = x
+_has_pair(x::Pair) = true
+_has_pair(x::Union{NamedTuple, Tuple}) = any(_has_pair, x)
+_has_pair(x) = false
+
+function _parse_mode(c, path::String, split::Symbol)
+    mode = c === nothing ? :sum : c isa Symbol ? c : host_tree(c)
+    (mode isa Real || mode in METRIC_MODES) && return mode
+    error(
+        """
+        ReactantNitro: metric `$path` on the `$split` split has the mode $(repr(mode)). A mode is a
+        count, which divides the summed value at the end, or one of
+        $(join(repr.(METRIC_MODES), ", ")). `nothing` is accepted as the older spelling of `:sum`."""
+    )
+end
+
+# Within one entry, a mode applies leaf by leaf through `NamedTuple` and `Tuple` values; `.+`
+# broadcasts over neither a `NamedTuple` nor a tuple of arrays the way a sum needs.
+_leafmap(f, x::Union{NamedTuple, Tuple}, ys...) = map((a, bs...) -> _leafmap(f, a, bs...), x, ys...)
+_leafmap(f, x, ys...) = f(x, ys...)
+
+# Walks the groups of one key down to its entries, in step with trees of the same shape above them.
+_entrymap(f, path, x::MetricEntry, ys...) = f(path, x, ys...)
+function _entrymap(f, path, x::Union{NamedTuple, Tuple}, ys...)
+    for y in ys
+        (typeof(y) <: (x isa NamedTuple ? NamedTuple{keys(x)} : Tuple) && length(y) == length(x)) ||
+            _shape_changed(path)
+    end
+    sub(i) = x isa NamedTuple ? "$path.$(keys(x)[i])" : "$path[$i]"
+    vals = ntuple(i -> _entrymap(f, sub(i), x[i], map(y -> y[i], ys)...), length(x))
+    return x isa NamedTuple ? NamedTuple{keys(x)}(vals) : vals
+end
+_entrymap(f, path, x, ys...) = _shape_changed(path)
+
+_shape_changed(path) = error(
+    """
+    ReactantNitro: metric `$path` changed shape between batches. A metric's groups, and the mode
+    of each value, must be the same on every batch."""
+)
+
+function _check_concat_leaf(x, path::String, split::Symbol, n_real::Integer)
+    (x isa AbstractArray && ndims(x) >= 1 && size(x, ndims(x)) == n_real) && return nothing
+    shape = x isa AbstractArray ? "an array of size $(size(x))" : "a `$(typeof(x))`"
+    error(
+        """
+        ReactantNitro: metric `$path` on the `$split` split is `:concat`, and one of its values is
+        $shape on a batch of $n_real samples.
+        `:concat` appends along the LAST axis, which must hold one entry per sample, so that every
+        `:concat` value lines up sample for sample. Move the sample axis last with `permutedims`,
+        or use `:sum` for a value that is not per sample."""
+    )
+end
 
 """
     ReactantNitro.accumulate_metrics(acc, m, split) -> NamedTuple
 
-Add one batch's `(sum, count)` pairs into the accumulator. The key set is fixed by the first batch:
-a metric measured on some batches and not others has no honest denominator.
+Fold one batch's entries into the accumulator. The key set is fixed by the first batch: a metric
+measured on some batches and not others has no honest denominator. `:concat` leaves are kept as a
+vector of per-batch arrays and joined once in [`reduce_metrics`](@ref).
 """
 function accumulate_metrics(acc, m::NamedTuple, split::Symbol)
-    acc === nothing && return m
+    if acc === nothing
+        return map(t -> _entrymap(_start_entry, "", t), m)
+    end
     keys(acc) === keys(m) || error(
         """
         ReactantNitro: `metrics` returned $(keys(m)) on one batch of the `$split` split and
         $(keys(acc)) on an earlier one. The metric set must be the same for every batch, because the
-        framework accumulates each metric's own (sum, count) across the split, and a
-        metric present on only some batches has no honest denominator."""
+        framework accumulates each metric across the split, and a metric present on only some
+        batches has no honest denominator."""
     )
     return NamedTuple{keys(acc)}(
-        map(keys(acc)) do k
-            (as, ac), (ms, mc) = getproperty(acc, k), getproperty(m, k)
-            (ac === nothing) == (mc === nothing) || error(
-                """
-                ReactantNitro: metric `$k` on the `$split` split reported a `count` on one batch and
-                `nothing` on another. `count === nothing` means accumulate by summation without
-                dividing, so the two cannot be mixed within one metric."""
-            )
-            (as .+ ms, ac === nothing ? nothing : ac + mc)
-        end
+        map(k -> _entrymap(_add_entry, string(k), getproperty(acc, k), getproperty(m, k)), keys(acc))
     )
+end
+
+_start_entry(path, e::MetricEntry) =
+    e.mode === :concat ? MetricEntry(_leafmap(x -> Any[x], e.value), :concat) : e
+
+function _add_entry(path, a::MetricEntry, e)
+    e isa MetricEntry || _shape_changed(path)
+    (a.mode isa Real && e.mode isa Real) || a.mode === e.mode || error(
+        """
+        ReactantNitro: metric `$path` reported $(_mode_label(a.mode)) on one batch and
+        $(_mode_label(e.mode)) on another. A value's mode decides how its batches combine, so it
+        must be the same on every batch."""
+    )
+    a.mode === :concat &&
+        return MetricEntry(_leafmap((p, x) -> _push_concat!(p, x, path), a.value, e.value), :concat)
+    f = a.mode === :max ? max : a.mode === :min ? min : +
+    return MetricEntry(_leafmap((p, x) -> f.(p, x), a.value, e.value), a.mode isa Real ? a.mode + e.mode : a.mode)
+end
+
+_mode_label(c) = c isa Real ? "a count" : repr(c)
+
+function _push_concat!(parts::Vector{Any}, x, path::String)
+    p = first(parts)
+    (ndims(x) == ndims(p) && size(x)[1:(end - 1)] == size(p)[1:(end - 1)]) || error(
+        """
+        ReactantNitro: metric `$path` is `:concat`, and a value of size $(size(x)) follows one of
+        size $(size(p)). Every axis but the last must match across batches, since the batches are
+        joined along the last."""
+    )
+    return push!(parts, x)
 end
 
 """
     ReactantNitro.reduce_metrics(acc) -> NamedTuple
 
-The divide: `sum / count`, or the bare `sum` where `count === nothing`. Runs **before**
-[`finalize_metrics`](@ref), which is what makes an `f1 = 2tp / (2tp + fp + fn)` finalizer work:
-its `tp`, `fp`, and `fn` are count-less sums and arrive at the finalizer unmodified.
+The divide: `value / count` where the mode is a count, the joined array for `:concat`, and the bare
+value otherwise. The result has the shape the hook returned, with the modes removed. Runs
+**before** [`finalize_metrics`](@ref), which is what makes an `f1 = 2tp / (2tp + fp + fn)`
+finalizer work: its `tp`, `fp`, and `fn` are `:sum` values and arrive at the finalizer unmodified.
 """
-reduce_metrics(acc::NamedTuple) =
-    NamedTuple{keys(acc)}(map(v -> v[2] === nothing ? v[1] : v[1] / v[2], values(acc)))
+reduce_metrics(acc::NamedTuple) = map(t -> _entrymap((_, e) -> _finish(e), "", t), acc)
+
+_finish(e::MetricEntry) =
+    e.mode isa Real ? _leafmap(x -> x / e.mode, e.value) :
+    e.mode === :concat ? _leafmap(_concat_last, e.value) : e.value
+
+# One allocation for the whole split, rather than `cat` over thousands of splatted arguments.
+function _concat_last(parts::Vector{Any})
+    p = first(parts)
+    N = ndims(p)
+    out = similar(
+        p, mapreduce(eltype, promote_type, parts), (size(p)[1:(N - 1)]..., sum(x -> size(x, N), parts))
+    )
+    o = 0
+    for x in parts
+        n = size(x, N)
+        selectdim(out, N, (o + 1):(o + n)) .= x
+        o += n
+    end
+    return out
+end
+
+"""
+    ReactantNitro.check_concat_reduced(acc, reduced, out, split) -> out
+
+Refuse a `:concat` array that reaches `finalize_metrics`' output unreduced. It would otherwise be
+stored in History every epoch, sent to the logger, and written into every checkpoint record. An
+identity check: it catches the default identity finalizer and plain pass-through.
+"""
+function check_concat_reduced(acc::NamedTuple, reduced::NamedTuple, out, split::Symbol)
+    joined = IdDict{Any, String}()
+    for k in keys(acc)
+        _entrymap(string(k), getproperty(acc, k), getproperty(reduced, k)) do path, e, r
+            e.mode === :concat && _leafmap(x -> (joined[x] = path; nothing), r)
+            nothing
+        end
+    end
+    isempty(joined) && return out
+    _leafmap(out) do x
+        path = get(joined, x, nothing)
+        path === nothing || error(
+            """
+            ReactantNitro: `finalize_metrics` for the `$split` split returned the `:concat` array of
+            metric `$path` unreduced. A `:concat` value holds one entry per sample of the split, so
+            it is an input to `finalize_metrics` only: reduce it there. Per-sample outputs for
+            analysis come from `predict`."""
+        )
+        nothing
+    end
+    return out
+end
 
 # ── Device OOM during validation ─────────────────────────────────────────────────────
 

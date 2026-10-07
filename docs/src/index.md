@@ -86,7 +86,7 @@ The package is meant to be driven from a REPL with Revise loaded. A `Nitro` is a
 - [Recompilation](recompilation.md): the compile cache, what is in the key, and the acceptance check.
 - [Optimization](optimization.md): parameter groups, decay, and clipping.
 - [Schedules](schedules.md): what varies with the step, and where a schedule key binds.
-- [Metrics](metrics.md): `(sum, count)` pairs, host or device residency, and `finalize_metrics`.
+- [Metrics](metrics.md): `value => mode` pairs, host or device residency, and `finalize_metrics`.
 - [Manual training](manual.md): owning the optimizer step, for GANs and other multi-optimizer algorithms.
 - [Logging](logging.md): the ten verbs, the JSON default, and the TensorBoard extension.
 - [Export](export.md): the wire contract and the ReactantServer bundle.

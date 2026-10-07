@@ -92,19 +92,31 @@ function loss end
 # ── Metrics ─────────────────────────────────────────────────────────────────────────
 
 """
-    metrics(e, outputs; <declared batch fields>) -> NamedTuple of (sum, count)
+    metrics(e, outputs; <declared batch fields>) -> NamedTuple of `value => mode`
 
-Once per eval batch. A metric reports its own numerator and denominator, and the framework adds
-them up and divides at the end, since different metrics have different natural denominators;
-`count === nothing` accumulates by summation without dividing, for a confusion matrix.
+Once per eval batch. Each metric is `value => mode`, where the mode says how batches combine:
+
+| mode | across batches | `finalize_metrics` receives |
+| --- | --- | --- |
+| a count | values and counts summed | `value / count` |
+| `:sum` (or `nothing`) | summed | the total |
+| `:max`, `:min` | elementwise max or min | the extreme |
+| `:concat` | joined along the last axis | an `(…, N)` array, to reduce there |
 
 ```julia
-metrics(e, outputs; lab) = (; err = (sum_abs_err, n_items),
-                              acc = (n_correct,   n_images))
+metrics(e, outputs; lab) = (; err = sum_abs_err => n_items,
+                              cm = confusion => :sum,
+                              ranking = (; score = p => :concat, n_pos = count(lab) => :sum))
 ```
 
+A key may be a group (`NamedTuple` or `Tuple`). A mode on a group covers every leaf below it, and
+each leaf of a group must be covered by exactly one mode. `finalize_metrics` receives the same
+shape with the modes removed. A `:concat` leaf must have one entry per sample on its last axis, and
+must not be returned from `finalize_metrics` unreduced. The tuple `(value, mode)` is the older
+spelling of `value => mode` and still works at the top of a key.
+
 `metrics` never sees padding. When the user defines none, the framework reports
-`val_loss = (loss(e, outputs; ...), 1)`, the mean over batches. The validation/testing distinction
+`val_loss = loss(e, outputs; ...) => 1`, the mean over batches. The validation/testing distinction
 lives host-side in [`finalize_metrics`](@ref), since an argument here would compile two programs.
 """
 function metrics end

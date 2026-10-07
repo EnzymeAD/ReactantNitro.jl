@@ -367,7 +367,7 @@
     ReactantNitro.metrics(::EvalBadMetric, ŷ; y) = (; mae = sum(abs, ŷ .- y))   # a bare number, not a pair
     ReactantNitro.build_data(::EvalBadMetric, dist) = (; train = TRAIN_B, val = VAL_B)
 
-    @testset "a metric that is not a `(sum, count)` pair is named, not accumulated" begin
+    @testset "a metric with no mode is named, not accumulated" begin
         n = mk(EvalBadMetric)
         err = try
             validate(n)
@@ -377,7 +377,7 @@
         end
         @test err isa ErrorException
         @test occursin("mae", err.msg)
-        @test occursin("(sum, count)", err.msg)
+        @test occursin("value => mode", err.msg)
     end
 
     # ── the host/device boundary assertion ──────────────────────────────────────────────

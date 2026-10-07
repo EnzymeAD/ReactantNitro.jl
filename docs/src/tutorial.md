@@ -203,8 +203,8 @@ possible, and why one [`forward`](@ref) serves training, validation, and inferen
 
 ## Metrics carry their own denominators
 
-A metric returns a `(sum, count)` pair. The framework sums both across the split, divides at the
-end, and hands the result to [`finalize_metrics`](@ref). It never supplies a sample count of its
+A metric is `value => count`. The framework sums both across the split, divides at the end, and
+hands the result to [`finalize_metrics`](@ref). It never supplies a sample count of its
 own, because there is no single right one:
 
 ```julia
@@ -213,11 +213,11 @@ function ReactantNitro.metrics(::MnistMLP, logits; label)
     truth = getindex.(argmax(label; dims = 1), 1)
 
     (; # per IMAGE: the denominator is the batch's real sample count
-       acc = (sum(pred .== truth), size(label, 2)),
+       acc = sum(pred .== truth) => size(label, 2),
 
-       # `count === nothing` means sum and never divide, which a confusion matrix needs. The
-       # (10, 10) value is summed across the split exactly as a scalar would be.
-       confusion = (confusion_matrix(pred, truth, 10), nothing))
+       # `:sum` means sum and never divide, which a confusion matrix needs. The (10, 10) value
+       # is summed across the split exactly as a scalar would be.
+       confusion = confusion_matrix(pred, truth, 10) => :sum)
 end
 ```
 
@@ -236,7 +236,7 @@ mean of per-batch macro recalls:
 
 ```julia
 function ReactantNitro.finalize_metrics(::MnistMLP, acc, split)
-    # Counted keys arrive already divided; `nothing`-counted keys arrive as raw totals, so
+    # Counted keys arrive already divided; `:sum` keys arrive as raw totals, so
     # `acc.confusion` is the (10, 10) matrix for the WHOLE split.
     recall = [acc.confusion[c, c] / max(sum(acc.confusion[:, c]), 1) for c in 1:10]
     # `split` is a Symbol, so branching on :val versus :test is free here. As an argument to
