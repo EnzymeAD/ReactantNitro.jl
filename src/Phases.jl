@@ -811,8 +811,9 @@ function fire_monitors(nitro::Nitro, phase::Phase; info...)
     isempty(ms) && return nothing
     # `nothing` until an epoch has begun, rather than a zero indistinguishable from a real one.
     started = nitro.epoch > 0
+    # `rank(nothing)`: one process, so rank 0 at any `n_devs`. The mesh is not a distribution.
     payload = merge(
-        (; nitro, logger = nitro.logger, is_rank0 = rank(nitro.mesh) == 0),
+        (; nitro, logger = nitro.logger, is_rank0 = rank(nothing) == 0),
         NamedTuple(info)
     )
     for m in copy(ms)

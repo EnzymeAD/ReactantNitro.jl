@@ -1301,10 +1301,18 @@ and both fall through to `to_rarray`.
 
 The device count is throughput, not a batch multiplier: `batch_size = 32` on four devices puts 8
 samples on each, with the numerics of a 32-sample batch.
+
+On a mesh every `ReactantRNG` is switched to `"PHILOX"`: XLA's GPU SPMD partitioner miscompiles the
+`"DEFAULT"` `rng_bit_generator`, and the counter-based PHILOX partitions correctly. Its seed is a
+fresh replicated buffer, never a `copyto!` into one, which would update one replica only.
 """
 place_replicated(x, ::Nothing; kwargs...) = Reactant.to_rarray(x; kwargs...)
 place_replicated(x, mesh; kwargs...) =
-    Reactant.to_rarray(x; sharding = Reactant.Sharding.Replicated(mesh), kwargs...)
+    philox(Reactant.to_rarray(x; sharding = Reactant.Sharding.Replicated(mesh), kwargs...))
+
+philox(r::Reactant.ReactantRNG) = Reactant.ReactantRNG(r.seed, "PHILOX")
+philox(x::Union{Tuple, NamedTuple}) = map(philox, x)
+philox(x) = x
 
 place_batch(x, ::Nothing) = Reactant.to_rarray(x)
 place_batch(x, mesh) = Reactant.to_rarray(
