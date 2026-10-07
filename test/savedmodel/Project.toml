@@ -1,0 +1,10 @@
+[deps]
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+ReactantNitro = "641982cc-88f5-4d80-bec4-e68c6a8af0a5"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+[sources]
+ReactantNitro = {path = "../.."}

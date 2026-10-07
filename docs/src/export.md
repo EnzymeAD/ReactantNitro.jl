@@ -43,11 +43,46 @@ Export is a single-device CPU trace, so it needs no GPU and no accelerator lease
 (config, seed, preset, framework version, and on a dirty tree a full working-tree patch) lands in
 the bundle automatically, so a served artifact can be traced back to the code that produced it.
 
+## TensorFlow SavedModel
+
+`TFSavedModel` writes a SavedModel for TF Serving and the platforms built on it (SageMaker,
+Vertex AI, KServe). Each traced program is one `XlaCallModule` op wrapping the StableHLO, the form
+JAX's native serialization produces, so this is packaging and not a conversion.
+
+```julia
+using PythonCall                            # the extension; `tensorflow` must be importable
+
+export_model(n, TFSavedModel(); dir = "export_out", name = "mnist_v1", batch_sizes = [1, 8])
+```
+
+- **One signature per batch size.** Every compiled program is static, so `batch_sizes = [1, 8]`
+  gives `serving_b1` and `serving_b8`, sharing one copy of the weights; `serving_default` is the
+  first. A client picks one with `signature_name`.
+- **Batch-first tensors.** The Julia shape `(W, H, C, N)` is the TF shape `[N, C, H, W]`. Signature
+  inputs and outputs are named by `export_inputs` and `export_outputs`.
+- **One platform.** `platform = "CUDA"` by default; the module runs only there. Use `"CPU"` for a
+  CPU server.
+- **No postprocess.** A SavedModel cannot carry `model.jl`. A model declaring
+  `export_client_outputs` is refused; any other postprocess is dropped with a warning.
+- **Provenance** is written to `assets.extra/provenance.json`, with the working-tree patch beside it,
+  which TF Serving ignores.
+
+Verified TensorFlow releases, loading and running every signature on CPU:
+
+| TF | Options |
+| --- | --- |
+| 2.17, 2.20 | the defaults, `stablehlo_version = v"1.5.0"`, `call_module_version = 9` |
+| 2.15 | `stablehlo_version = v"0.14.0"`, `call_module_version = 8` |
+
+An older `stablehlo_version` reaches older releases; a module using a newer op then fails to export
+rather than at load. A program containing a `custom_call` is refused, since `XlaCallModule` cannot
+run one portably.
+
 ## Caveats
 
 A view-shaped program output has to be `copy`ed before it leaves the traced graph, or the bundle
 carries a wrapper rather than an array. This does not apply to parameters, which the flat layout
 reconstructs through a `copy` already.
 
-The backend lives behind a weak dependency, `ReactantServerExport`, so nothing in `src/` knows the
-bundle format exists and a deployment that never exports pays nothing for it.
+Each backend lives behind a weak dependency, `ReactantServerExport` or `PythonCall`, so nothing in
+`src/` knows an artifact format and a deployment that never exports pays nothing for it.

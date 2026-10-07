@@ -1,0 +1,42 @@
+# The TFSavedModel backend's end-to-end test: export, load in TensorFlow, compare with the eager
+# program. Its own job because it installs TensorFlow through CondaPkg, and only on changes to the
+# export code. No cache, so the Python environment never evicts the other jobs' caches.
+name: SavedModel
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/Export.jl'
+      - 'ext/ReactantNitroPythonCallExt.jl'
+      - 'test/savedmodel/**'
+      - '.github/workflows/savedmodel.yml'
+  pull_request:
+    paths:
+      - 'src/Export.jl'
+      - 'ext/ReactantNitroPythonCallExt.jl'
+      - 'test/savedmodel/**'
+      - '.github/workflows/savedmodel.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: savedmodel-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: TF SavedModel export
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.13'
+      - name: Instantiate
+        run: julia --project=test/savedmodel -e 'using Pkg; Pkg.instantiate()'
+      - name: Test
+        run: julia --project=test/savedmodel test/savedmodel/runtests.jl
+        env:
+          TF_CPP_MIN_LOG_LEVEL: '3'

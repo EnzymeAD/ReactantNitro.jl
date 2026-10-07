@@ -97,7 +97,7 @@
     # Export. The hooks are here rather than in HOOKS because they are optional in a different
     # sense: an experiment that is never exported implements none of them, and the four required hooks stay four.
     const EXPORT = [
-        :ExportSpec, :ExportBackend, :ReactantServerBundle,
+        :ExportSpec, :ExportBackend, :ReactantServerBundle, :TFSavedModel,
         :export_inputs, :export_outputs, :export_preprocess, :export_postprocess,
         :export_client_outputs, :export_client_inputs,
         # The model half of provenance, as a hook rather than an argument a caller must remember

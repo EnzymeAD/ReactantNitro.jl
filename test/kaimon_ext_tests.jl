@@ -639,7 +639,7 @@
     #
     # An export whose backend's methods arrive with the backend must still export. Against the
     # pre-fix extension it fails in a way that is easy to misread: the run reaches `:failed` with
-    # "has no `site_provenance` method" and no bundle, and the identical relaunch then succeeds
+    # a missing-method error and no bundle, and the identical relaunch then succeeds
     # because the session has the method by then. Both halves of the fix are covered:
     # `nitro_export` resolves the backend before it launches, and `_launch_run!` runs the body at
     # the latest world so a method arriving later than the task still dispatches.
@@ -654,10 +654,12 @@
         ckpt = joinpath(dir, only(e.file for e in read_manifest(dir) if e.epoch == 1))
 
         EXT._register_backend!("late", define_late_methods!)
-        # Nothing has defined them yet: the erroring generic is what a call would dispatch to.
+        # Nothing has defined them yet: the erroring generic is what a call would dispatch to, and
+        # `site_provenance` would fall to the git default rather than the late method.
         @test LATE_DEFINED[] == false
         @test LATE_RECORDED[] === nothing
-        @test_throws ErrorException ReactantNitro.site_provenance(LateBundle(), dir)
+        @test_throws "no `write_export` method" ReactantNitro.write_export(LateBundle(), nothing, (;), (;), ())
+        @test get(ReactantNitro.site_provenance(LateBundle(), dir), "git_commit", nothing) != "late"
 
         x = wait_run(
             run_id(
