@@ -1,4 +1,5 @@
 Manifest.toml
+.CondaPkg/
 /runs/
 /docs/build/
 *.jls

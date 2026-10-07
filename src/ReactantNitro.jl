@@ -155,7 +155,7 @@ export history
 # Export. ReactantServerExport exports `export_bundle`, `write_bundle`, `IOSpec` and
 # `collect_provenance`, and is in scope whenever this surface is usable, so the three concepts
 # here take names that cannot clash; the exports test checks the collision set.
-export ExportSpec, ExportBackend, ReactantServerBundle
+export ExportSpec, ExportBackend, ReactantServerBundle, TFSavedModel
 export export_inputs, export_outputs, export_preprocess, export_postprocess
 export export_client_outputs, export_client_inputs, export_provenance_extra
 export export_model, export_provenance, write_export, site_provenance

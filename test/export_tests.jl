@@ -517,6 +517,15 @@
             end
             @test err isa ErrorException
             @test occursin("ReactantServerExport", err.msg)
+            @test_throws "using PythonCall" export_model(mkexp(), TFSavedModel(); dir = mktempdir(), name = "m")
+        end
+
+        @testset "TFSavedModel options are checked at construction" begin
+            b = TFSavedModel()
+            @test (b.platform, b.stablehlo_version, b.call_module_version) == ("CUDA", v"1.5.0", 9)
+            @test TFSavedModel(; platform = "cpu").platform == "CPU"
+            @test_throws "platform" TFSavedModel(; platform = "Metal")
+            @test_throws "call_module_version" TFSavedModel(; call_module_version = 4)
         end
 
         @testset "a model with a `Dropout`: the RNG in `st` is REPLACED, not passed through" begin

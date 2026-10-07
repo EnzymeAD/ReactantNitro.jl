@@ -246,6 +246,43 @@ and exported; its [`write_export`](@ref) method lives in the `ReactantServerExpo
 struct ReactantServerBundle <: ExportBackend end
 
 """
+    ReactantNitro.TFSavedModel(; platform = "CUDA", stablehlo_version = v"1.5.0",
+                               call_module_version = 9)
+
+A TensorFlow SavedModel for TF Serving and the platforms built on it. Each traced program is one
+`XlaCallModule` op, the form JAX's native serialization produces, and weights are non-trainable
+variables shared by every signature. Its [`write_export`](@ref) lives in the `PythonCall`
+extension and drives TensorFlow to write the files, so `using PythonCall` with `tensorflow`
+importable is what makes an export happen.
+
+There is one signature per entry of `batch_sizes`, `serving_b{N}`, with `serving_default` the
+first. Tensors are batch-first: the Julia shape `(W, H, C, N)` is the TF shape `[N, C, H, W]`.
+`model.jl` cannot ship, so a postprocess that changes the client contract is refused and any other
+postprocess is dropped with a warning. Provenance lands in `assets.extra/`.
+
+`platform` is the one platform the module runs on (`"CUDA"`, `"CPU"`, `"ROCM"`, `"TPU"`). The
+defaults load on TF 2.17 and later; TF 2.15 needs `stablehlo_version = v"0.14.0"` and
+`call_module_version = 8`. A module using an op newer than `stablehlo_version` fails to export.
+"""
+struct TFSavedModel <: ExportBackend
+    platform::String
+    stablehlo_version::VersionNumber
+    call_module_version::Int
+end
+
+function TFSavedModel(;
+        platform::AbstractString = "CUDA", stablehlo_version::VersionNumber = v"1.5.0",
+        call_module_version::Integer = 9
+    )
+    p = uppercase(String(platform))
+    p in ("CPU", "CUDA", "ROCM", "TPU") ||
+        error("ReactantNitro: `TFSavedModel` platform must be one of CPU, CUDA, ROCM, TPU, got $(repr(platform)).")
+    call_module_version >= 5 ||
+        error("ReactantNitro: `TFSavedModel` needs `call_module_version >= 5`.")
+    return TFSavedModel(p, stablehlo_version, Int(call_module_version))
+end
+
+"""
     write_export(backend, model, ps, st, example_inputs; kwargs...) -> String
 
 The one verb a backend implements, returning the path it wrote. `model` is a callable with the
@@ -263,6 +300,8 @@ function write_export end
 function write_export(backend::ExportBackend, args...; kwargs...)
     hint = backend isa ReactantServerBundle ?
         "`ReactantServerBundle` is provided by a package extension, so add `using ReactantServerExport` and the method appears." :
+        backend isa TFSavedModel ?
+        "`TFSavedModel` is provided by a package extension, so add `using PythonCall` and the method appears." :
         "A backend supplies its own `write_export` method; the ReactantServerExport extension is the shape of one."
     return error(
         """
@@ -286,6 +325,8 @@ function site_provenance end
 function site_provenance(backend::ExportBackend, root)
     hint = backend isa ReactantServerBundle ?
         "`ReactantServerBundle` collects it through `ReactantServerExport.collect_provenance`, so add `using ReactantServerExport` and the method appears." :
+        backend isa TFSavedModel ?
+        "`TFSavedModel` collects it in the `PythonCall` extension, so add `using PythonCall` and the method appears." :
         "A backend supplies its own `site_provenance` method; the ReactantServerExport extension is the shape of one."
     return error(
         """

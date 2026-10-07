@@ -1,0 +1,3 @@
+# Reactant's own CondaPkg.toml adds `tensorflow >= 2.17` and `jax`; this pins the release we verify.
+[pip.deps]
+tensorflow = "==2.20.*"
