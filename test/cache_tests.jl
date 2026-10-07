@@ -1239,8 +1239,9 @@
     @testset "grad's entry is guarded by objective_wrapper's closure, not its own" begin
         # The routing: `grad_program` captures `objective_wrapper` (forward, loss, traced
         # train_metrics) at the argtypes derivable from grad's own (ev, model, ps, st, batch,
-        # routers, metrics-residency Val), because plain inference cannot descend into Enzyme's
-        # backward pass (its own closure is glue-only). The stand-in used to be `fwd_program`,
+        # routers, metrics-residency Val), because plain inference of grad stops at
+        # `Enzyme.autodiff` (its own closure is glue-only; the backward pass is derived at the
+        # MLIR level and has no Julia methods). The stand-in used to be `fwd_program`,
         # which calls `forward` alone, so a helper under `loss` was invisible to the guard.
         fake_router = (;
             forward = ReactantNitro.Router{(:x,)}(), loss = nothing, metrics = nothing,

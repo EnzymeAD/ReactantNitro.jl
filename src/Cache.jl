@@ -23,9 +23,17 @@ key as [`CACHE`](@ref). [`world_closure_staleness`](@ref) re-resolves it against
 the entry points and poisons any entry whose methods moved, so a redefinition below the hooks (a
 helper `forward` calls) becomes a miss for a new `Nitro`; an existing one keeps its programs and is
 told so. The gradient program stores [`objective_wrapper`](@ref)'s closure (`forward`, `loss` and a
-traced `train_metrics`), since the backward pass runs inside Enzyme's interpreter, which inference
-cannot descend into. `LAST_WORLD_CHECKED` memoizes the
-scan on the world counter.
+traced `train_metrics`): native inference of `grad_program` stops at `Enzyme.autodiff` and never
+reaches the objective. The backward pass itself has no Julia methods to guard: Reactant traces the
+forward pass once and Enzyme-JAX derives the gradient from that MLIR, so the forward methods are the
+whole dependency set of a gradient program. `LAST_WORLD_CHECKED` memoizes the scan on the world
+counter.
+
+With the `precise_invalidation` preference set, an entry stores a `TraceHook.TraceRecord` instead:
+every specialization the trace actually went through, which also covers methods that dispatch only
+on traced types, Reactant overlays, and callees behind runtime dispatch, none of which inference on
+the concrete arguments sees. The inference closure remains the fallback whenever recording is
+unavailable.
 """
 const CACHE_CLOSURES = Dict{Any, Any}()
 const LAST_WORLD_CHECKED = Ref{UInt}(0)
@@ -73,8 +81,10 @@ include device scalars that change every step. Every included field must hash by
 harmless miss on two identical configurations and a silent hit on a value mutated in place.
 
 Not covered: constants reached from method bodies, a `const` in the user's module, a global, a
-literal changed on edit, and a custom ChainRules `rrule`. The closure guard catches a method
-redefinition below the hooks; values are the one thing that still requires a REPL restart.
+literal changed on edit. The closure guard catches a method redefinition below the hooks; values
+are the one thing that still requires a REPL restart. A custom ChainRules `rrule` is not a gap:
+Reactant differentiates at the MLIR level and never consults ChainRules, so no `rrule` is part of
+any program.
 """
 const CACHE_HITS = Ref(0)
 const CACHE_MISSES = Ref(0)
@@ -309,17 +319,21 @@ function compile_cached(
     # is a real compile, so the phase is published.
     resume_phase = nitro === nothing || phase === nothing ? nothing : nitro.phase
     resume_phase === nothing || set_phase!(nitro, phase)
-    thunk = compile_with_context(f, args; phase, compile_options = copts)
+    # With precise invalidation on, the trace itself records every specialization it went through
+    # (see `TraceHook`); otherwise, or if recording disabled itself, `rec` is `nothing`.
+    thunk, rec = TraceHook.with_trace_recording() do
+        compile_with_context(f, args; phase, compile_options = copts)
+    end
     resume_phase === nothing || set_phase!(nitro, resume_phase)
     # Capture the dependency closure for the world-closure guard. A failed capture leaves the entry
     # unguarded rather than poisoning the run, since the hook worlds are still in the key.
-    closure = try
-        cf, at = _closure_target(f, args)
-        world_closure(cf, at)
+    closure = rec !== nothing ? rec : try
+            cf, at = _closure_target(f, args)
+            world_closure(cf, at)
     catch err
-        @warn "ReactantNitro: world-closure capture failed for `$(nameof(f))`; its entry will not \
+            @warn "ReactantNitro: world-closure capture failed for `$(nameof(f))`; its entry will not \
             be guarded against downstream redefinitions" maxlog = 1 err
-        nothing
+            nothing
     end
     thunk = lock(CACHE_LOCK) do
         get!(CACHE, key, thunk)
@@ -446,12 +460,17 @@ function closure_drift(closure)
     return (; drift = !isempty(drifted), drifted)
 end
 
+# A record made by the trace itself (precise invalidation): same contract, so the scan takes either.
+closure_drift(rec::TraceHook.TraceRecord) = TraceHook.trace_drift(rec)
+
 """
     ReactantNitro._closure_target(f, args) -> (f, argtypes)
 
 Which function and argtypes an entry's closure is captured from. `grad_program` captures
-[`objective_wrapper`](@ref)'s instead of its own: the backward pass runs inside Enzyme's interpreter,
-which inference cannot descend into, so its own closure is glue with no `forward` or `loss` in it.
+[`objective_wrapper`](@ref)'s instead of its own: native inference of `grad_program` stops at
+`Enzyme.autodiff`, so its own closure is glue with no `forward` or `loss` in it. The objective's
+closure is the complete set: the backward pass is derived from the traced forward by Enzyme-JAX at
+the MLIR level and has no Julia methods of its own.
 `objective_wrapper` is the plain-Julia function that `grad_program` differentiates, `forward` then
 `loss` then a traced `train_metrics`, each through `call_hook`, so inference reaches every user
 method the objective calls. Going through `call_hook` is also what gets past the kwcall shim a hook's
