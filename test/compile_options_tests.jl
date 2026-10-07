@@ -51,6 +51,22 @@
         @test check_compile_options(Reactant.CompileOptions(; disable_slice_to_batch_passes = false)) isa NamedTuple
         @test_throws ErrorException check_compile_options(1)
 
+        # XLA proto fields are checked against Reactant's copy of each proto.
+        ok = (; xla_debug_options = (; xla_gpu_autotune_level = 0))
+        @test check_compile_options(ok) == ok
+        for bad in (
+                (; xla_debug_options = (; xla_gpu_autotune_levle = 0)),
+                (; xla_executable_build_options = (; xla_gpu_autotune_levle = 0)),
+                Reactant.CompileOptions(; xla_debug_options = (; xla_gpu_autotune_levle = 0)),
+            )
+            err = try
+                check_compile_options(bad)
+            catch ex
+                ex
+            end
+            @test err isa ErrorException && occursin("xla_gpu_autotune_levle", err.msg)
+        end
+
         # Donation is what keeps the in-place accumulator and parameters from leaking.
         for bad in (
                 (; donated_args = :none),

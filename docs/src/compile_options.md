@@ -44,6 +44,39 @@ works with no change here. Commonly useful ones:
 
 Reactant forces `raise = true` on TPU and for sharded programs, so setting it there changes nothing.
 
+## XLA options
+
+Three keywords pass fields straight to XLA's own protos. The fields are XLA's, so XLA documents
+them; this page only shows how to reach them.
+
+| Keyword | XLA proto | Reference |
+| --- | --- | --- |
+| `xla_debug_options` | `DebugOptions` | [`xla.proto`](https://github.com/openxla/xla/blob/main/xla/xla.proto), [flag guidance](https://openxla.org/xla/flags_guidance) |
+| `xla_executable_build_options` | `ExecutableBuildOptionsProto` | [`compile_options.proto`](https://github.com/openxla/xla/blob/main/xla/pjrt/proto/compile_options.proto), [effort levels](https://openxla.org/xla/effort_levels) |
+| `xla_compile_options` | `CompileOptionsProto` | [`compile_options.proto`](https://github.com/openxla/xla/blob/main/xla/pjrt/proto/compile_options.proto) |
+
+### Autotuning
+
+GPU autotuning is set through `DebugOptions`:
+
+```julia
+Nitro(e; compile_options = (; xla_debug_options = (;
+    xla_gpu_autotune_level = 0,                 # no GEMM/convolution autotuning: faster compiles
+    xla_gpu_exhaustive_tiling_search = true,    # autotune every block-level fusion: slower compiles
+)))
+```
+
+XLA's overall compile effort is a separate setting, on `ExecutableBuildOptionsProto`:
+
+```julia
+const Effort = Reactant.Proto.xla.var"ExecutionOptions.EffortLevel"
+Nitro(e; compile_options = (; xla_executable_build_options = (; optimization_level = Effort.EFFORT_O3)))
+```
+
+Reactant keeps a [persisted autotune cache](https://openxla.org/xla/persisted_autotuning) when
+its persistent compile cache is on, and a fusion found there is not autotuned again. To compare
+autotuning settings, clear it first with `Reactant.PersistentCompileCache.clear_compilation_cache!()`.
+
 ## Validation
 
 `Nitro` checks the options before the setup sequence runs, so a mistake fails in seconds rather
@@ -51,6 +84,8 @@ than at the first compile:
 
 - an unknown keyword is refused, and the error lists the accepted ones
 - a `CompileOptions` field passed as a keyword is refused, with a pointer to the `CompileOptions` form
+- an unknown field of `xla_debug_options`, `xla_executable_build_options` or `xla_compile_options`
+  is refused
 - `donated_args` other than `:auto` is refused: the parameters and the gradient accumulator are
   updated in place, and without donation every superseded buffer waits for the GC
 
