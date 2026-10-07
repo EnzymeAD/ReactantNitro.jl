@@ -60,6 +60,7 @@ makedocs(;
         "Pitfalls" => "pitfalls.md",
         "Experiments" => "experiments.md",
         "Recompilation" => "recompilation.md",
+        "Compile options" => "compile_options.md",
         "Metrics" => "metrics.md",
         "Optimization" => "optimization.md",
         "Schedules" => "schedules.md",

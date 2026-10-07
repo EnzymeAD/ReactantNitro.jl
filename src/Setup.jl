@@ -991,8 +991,8 @@ end
 """
     ReactantNitro.check_compile_options(opts) -> NamedTuple
 
-The `compile_options` keyword of [`Nitro`](@ref), normalized to the keywords every program's
-`Reactant.Compiler.compile` call receives: either a `NamedTuple` of Reactant's compile keywords
+Validate the `compile_options` keyword of [`Nitro`](@ref). It is normalized to the keywords every
+program's `Reactant.Compiler.compile` call receives: either a `NamedTuple` of Reactant's compile keywords
 (`optimize`, `cudnn_hlo_optimize`, `transpose_propagate`, `xla_debug_options`, ...) or a
 `Reactant.CompileOptions`, which becomes `(; compile_options = opts)`. The keywords are exactly
 those `Reactant.Compiler.compile` accepts; the remaining `CompileOptions` fields (the pass switches)
