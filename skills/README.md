@@ -20,7 +20,7 @@ hazard is that the value looks familiar and is not the one you had.
 | --- | --- |
 | `reactantnitro-experiment` | writing, porting, or reading an experiment: the four hooks, the three markers, the batch contract, what a hook may return |
 | `reactantnitro-accelerators` | choosing or configuring the accelerator a run executes on (CPU/GPU/TPU), pinning `n_devs`, restricting GPUs with `CUDA_VISIBLE_DEVICES`, or understanding the one-process-one-XLA model |
-| `reactantnitro-metrics` | adding, porting, or debugging a metric: `(sum, count)`, the fixed key set, `finalize_metrics`, residency |
+| `reactantnitro-metrics` | adding, porting, or debugging a metric: `value => mode`, the fixed key set, `finalize_metrics`, residency |
 | `reactantnitro-optimizer` | parameter groups and per-group learning-rate ratios, `Decay` with its `:zero` and `:w0` anchors (L2 and L2-SP), per-leaf decay exclusion, clipping, schedules, and the binding report |
 | `reactantnitro-manual` | manual training mode, where the experiment owns the step: `train_step`, `setup_optimizers`, `backward`, `step_optimizer` |
 | `reactantnitro-recompiles` | verifying no recompile, or working out why a REPL edit did nothing |

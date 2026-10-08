@@ -129,7 +129,7 @@ end
 
 That is also where `log_confusion!` belongs. **The framework never calls it**, because only the
 experiment knows both that a matrix exists and what its class labels mean: accumulate it in
-`metrics` with a `nothing` count, stash it from `finalize_metrics`, and emit it on the transition
+`metrics` with `:sum`, stash it from `finalize_metrics`, and emit it on the transition
 out of `EvalStepping`, which is exactly when a fresh one exists.
 
 One caveat if you read event files back from Julia rather than from TensorBoard:

@@ -79,16 +79,31 @@ The package is meant to be driven from a REPL with Revise loaded. A `Nitro` is a
 
 ## Start here
 
+**Getting started**
+
 - [Tutorial](tutorial.md): MNIST from configuration to prediction, with each feature explained where it appears.
 - [Binding cheat sheet](binding.md): how everything connects by name, on one page.
 - [Pitfalls](pitfalls.md): what a Reactant-first stack gets wrong silently, and what the framework does about each.
+
+**Writing an experiment**
+
 - [Experiments](experiments.md): the hook contract, the three markers, and the Revise workflow.
-- [Recompilation](recompilation.md): the compile cache, what is in the key, and the acceptance check.
+- [Metrics](metrics.md): `value => mode` pairs, host or device residency, and `finalize_metrics`.
 - [Optimization](optimization.md): parameter groups, decay, and clipping.
 - [Schedules](schedules.md): what varies with the step, and where a schedule key binds.
-- [Metrics](metrics.md): `value => mode` pairs, host or device residency, and `finalize_metrics`.
 - [Manual training](manual.md): owning the optimizer step, for GANs and other multi-optimizer algorithms.
+
+**Running**
+
+- [Devices and meshes](devices.md): the backend, `n_devs`, and what a data-parallel mesh computes.
 - [Logging](logging.md): the ten verbs, the JSON default, and the TensorBoard extension.
-- [Export](export.md): the wire contract and the ReactantServer bundle.
 - [Kaimon](kaimon.md): the `nitro_*` tools for driving runs from an agent session.
+
+**Compilation**
+
+- [Recompilation](recompilation.md): the compile cache, what is in the key, and the acceptance check.
+- [Export](export.md): the wire contract and the ReactantServer bundle.
+
+**Reference**
+
 - [API](api.md): every docstring, collected automatically.

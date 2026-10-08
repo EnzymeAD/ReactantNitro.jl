@@ -969,8 +969,8 @@ function check_control_readback(v, what::AbstractString, name::Symbol)
         The framework validates every scalar readback it branches on, because a failed device-to-host
         readback returns garbage on this stack WITHOUT raising, and a non-finite or non-numeric
         value here would either truncate a healthy run or let a diverged one continue.
-        A metric used for control flow must be a finite real number; `count === nothing` metrics that
-        accumulate an array are for reporting, not for stopping."""
+        A metric used for control flow must be a finite real number; a `:sum` or `:concat` metric
+        that accumulates an array is for reporting, not for stopping."""
     )
     return x
 end
@@ -1473,7 +1473,7 @@ loop's own per-epoch validation keeps `false`, so the validation after a request
 full.
 
 Per batch: pad to `batch_size`, transfer the routed fields, run the shared eval `forward`, compute
-the metric on the real samples, accumulate `(sum, count)` on the host, free the batch's device
+the metric on the real samples, accumulate each `value => mode` on the host, free the batch's device
 buffers. Then divide and hand the result to [`finalize_metrics`](@ref). Under `:host` residency
 (the default) the outputs are transferred and sliced and `metrics` runs in ordinary Julia on the
 split's own host batch; under `:device` the slice and the call happen inside

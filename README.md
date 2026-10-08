@@ -124,7 +124,7 @@ function ReactantNitro.loss(e::MnistMLP, logits; label)
 end
 
 function ReactantNitro.metrics(::MnistMLP, logits; label)
-    return (; acc = (sum(argmax(logits; dims = 1) .== argmax(label; dims = 1)), size(label, 2)))
+    return (; acc = sum(argmax(logits; dims = 1) .== argmax(label; dims = 1)) => size(label, 2))
 end
 
 n = Nitro(MnistMLP(); checkpointer = TopKCheckpointer(; metric = :acc, mode = :max))

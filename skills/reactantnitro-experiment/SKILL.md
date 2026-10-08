@@ -328,7 +328,7 @@ your data, so a different split silently changes the graph.
 
 ## Where to go next
 
-- `reactantnitro-metrics`: the `(sum, count)` contract, `finalize_metrics`, residency
+- `reactantnitro-metrics`: the `value => mode` contract, `finalize_metrics`, residency
 - `reactantnitro-optimizer`: parameter groups, decay, clipping, schedules
 - `reactantnitro-manual`: manual training mode, where the experiment owns the step
 - `reactantnitro-recompiles`: the compile key, `cache_stats()`, why an edit did not take effect
