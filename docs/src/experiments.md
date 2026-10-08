@@ -90,7 +90,7 @@ ReactantNitro.loss(e::Seq2Seq, out; target) =
     cross_entropy(out.logits, target) + e.aux_weight * mean(abs2, out.energy)
 
 ReactantNitro.metrics(e::Seq2Seq, out; target) =
-    (; acc = (n_correct(out.logits, target), size(target)[end]))
+    (; acc = n_correct(out.logits, target) => size(target)[end])
 ```
 
 A `Tuple` works too, and so does a nested structure: the framework walks the output tree with

@@ -61,7 +61,7 @@ both that one exists and what its labels mean. The shape that works is to accumu
 the transition out of `EvalStepping`:
 
 ```julia
-metrics(e, out; y)            = (; confusion = (confusion_matrix(out, y), nothing))
+metrics(e, out; y)            = (; confusion = confusion_matrix(out, y) => :sum)
 finalize_metrics(e, acc, spl) = (e.rt.last_confusion = acc.confusion; derived_scalars(acc))
 # then, in a phase monitor:
 log_confusion!(info.logger, e.rt.last_confusion, e.rt.class_names; epoch)

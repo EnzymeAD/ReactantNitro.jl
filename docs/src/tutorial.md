@@ -203,9 +203,10 @@ possible, and why one [`forward`](@ref) serves training, validation, and inferen
 
 ## Metrics carry their own denominators
 
-A metric is `value => count`. The framework sums both across the split, divides at the end, and
-hands the result to [`finalize_metrics`](@ref). It never supplies a sample count of its
-own, because there is no single right one:
+A metric is `value => mode`. The usual mode is a count: the framework sums both across the split,
+divides at the end, and hands the result to [`finalize_metrics`](@ref). It never supplies a sample
+count of its own, because there is no single right one. `:sum`, `:max`, `:min` and `:concat` are
+the other modes; see [Metrics](metrics.md).
 
 ```julia
 function ReactantNitro.metrics(::MnistMLP, logits; label)
