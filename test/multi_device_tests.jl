@@ -100,21 +100,16 @@ end
 
         # Four micro-batches per epoch at `accum = 2`, so two optimizer steps. Only the resume
         # registers a monitor, so the state round trip is isolated from `fire_monitors`.
-        function run!(; n_devs, epochs = 2, dir = mktempdir(), resume = false, philox = false,
-                monitor = nothing)
+        function run!(; n_devs, epochs = 2, dir = mktempdir(), resume = false, monitor = nothing)
             MASKS[] = Any[]
             n = Nitro(DropExp(); run_dir = dir, n_devs, accum = 2, max_epochs = epochs, seed = 5,
                 resume, data = DATA)
-            philox && (n.st = to_philox(n.st))
             monitor === nothing ||
                 register_phase_monitor!(n, (ph, s, ep, info) -> (monitor[] += 1; nothing))
             train!(n)
             return n, MASKS[]
         end
         distinct(ms) = length(unique(ms)) == length(ms)
-        to_philox(r::Reactant.ReactantRNG) = Reactant.ReactantRNG(r.seed, "PHILOX")
-        to_philox(x::NamedTuple) = map(to_philox, x)
-        to_philox(x) = x
 
         try
             d1, md1 = run!(; n_devs = 1)
@@ -122,7 +117,6 @@ end
             record("d1_masks", length(md1))
             record("d1_distinct", distinct(md1))
 
-            p1, mp1 = run!(; n_devs = 1, philox = true)
             m2, mm2 = run!(; n_devs = 2)
             rng = m2.st.drop.rng
             record("m2_algorithm", rng.algorithm)
@@ -132,11 +126,11 @@ end
             record("m2_distinct", distinct(mm2))
             # One global mask, not one per-device mask repeated on each shard.
             record("m2_shards_differ", all(m -> m[:, :, :, 1:4] != m[:, :, :, 5:8], mm2))
-            record("m2_masks_equal_p1", mm2 == mp1)
-            record("m2_seed_equal_p1", Array(rng.seed) == Array(p1.st.drop.rng.seed))
-            record("m2_loss_rdiff", abs(m2.history[end].loss - p1.history[end].loss) /
-                abs(p1.history[end].loss))
-            record("m2_ps_maxdiff", maxdiff(flat(parameters(m2)), flat(parameters(p1))))
+            record("m2_masks_equal_d1", mm2 == md1)
+            record("m2_seed_equal_d1", Array(rng.seed) == Array(d1.st.drop.rng.seed))
+            record("m2_loss_rdiff", abs(m2.history[end].loss - d1.history[end].loss) /
+                abs(d1.history[end].loss))
+            record("m2_ps_maxdiff", maxdiff(flat(parameters(m2)), flat(parameters(d1))))
             record("m2_ps_replicas_agree", all(agree, Functors.fleaves(parameters(m2))))
 
             # One epoch, a checkpoint, then the second epoch resumed onto the mesh: the same masks
@@ -164,7 +158,7 @@ end
     @test get(got, "dropout", "<missing>") == "ok"
 
     @testset "the mask advances every micro-batch on one device" begin
-        @test get(got, "d1_algorithm", "") == "DEFAULT"
+        @test get(got, "d1_algorithm", "") == "PHILOX"
         @test get(got, "d1_masks", "") == "8"
         @test get(got, "d1_distinct", "") == "true"
     end
@@ -176,9 +170,9 @@ end
         @test get(got, "m2_masks", "") == "8"
         @test get(got, "m2_distinct", "") == "true"
         @test get(got, "m2_shards_differ", "") == "true"
-        # Partitioned PHILOX is single-device PHILOX: the same masks, so the same run.
-        @test get(got, "m2_masks_equal_p1", "") == "true"
-        @test get(got, "m2_seed_equal_p1", "") == "true"
+        # The device count is throughput only: the same masks, so the same run.
+        @test get(got, "m2_masks_equal_d1", "") == "true"
+        @test get(got, "m2_seed_equal_d1", "") == "true"
         @test num("m2_loss_rdiff") < 1.0e-5
         @test num("m2_ps_maxdiff") < 1.0e-5
         @test get(got, "m2_ps_replicas_agree", "") == "true"

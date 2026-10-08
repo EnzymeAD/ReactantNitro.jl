@@ -76,8 +76,7 @@ the process level before any run, and a run never re-selects it.
   being asked**. If that is surprising, pin a count or set `CUDA_VISIBLE_DEVICES`.
 - The mesh runs one global program: BatchNorm statistics are over the global batch, and a
   `Dropout` mask is one global mask split across devices. Every `ReactantRNG` is placed as
-  `"PHILOX"` on a mesh, a precaution rather than a workaround for a known bug; a single-device
-  run keeps `"DEFAULT"`, so its dropout stream differs from a mesh run's.
+  `"PHILOX"` at any device count, so a mesh run draws the same masks as a single-device run.
 
 ### The pin and its precedence
 
