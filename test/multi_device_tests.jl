@@ -57,7 +57,7 @@ function run_on_two_devices(probe::AbstractString)
         got[k] = v
     end
     for (k, v) in got
-        k in ("dropout", "batchnorm") && v != "ok" && @info "multi_device: the `$k` part reported" v
+        k in ("dropout", "batchnorm", "outputs") && v != "ok" && @info "multi_device: the `$k` part reported" v
     end
     return ok, got
 end
@@ -260,4 +260,69 @@ end
     @test get(got, "bn_stats_replicas_agree", "") == "true"
     @test num("bn_val_rdiff") < 1.0e-5
     @test num("bn_eval_out_maxdiff") < 1.0e-5
+end
+
+# Reactant rebuilds a program output on a mesh with one-device types when it is an unchanged input
+# or a lazy wrapper (`reshape`, `view`); `program_out` hands back fresh arrays instead. Every case
+# leaves through `forward` outputs (eval, and train under `:host` residency) and `st_new`.
+@testitem "multi_device outputs" setup = [MultiDevice] timeout = 1200 begin
+    using Test
+
+    ok, got = run_on_two_devices(
+        raw"""
+        @experiment struct OutExp
+            max_epochs::Int = 1
+        end
+        # A layer whose state is returned unchanged, so `st_new` holds an input buffer.
+        struct Buf <: Lux.AbstractLuxLayer end
+        Lux.initialstates(::Random.AbstractRNG, ::Buf) = (; buf = ones(Float32, 4))
+        (::Buf)(x, ps, st) = (x .* st.buf, st)
+        ReactantNitro.build_model(::OutExp, rng) = (
+            m = Chain(Buf(), Dense(4 => 2));
+            (m, Lux.setup(rng, m)...)
+        )
+        function ReactantNitro.forward(::OutExp, model, ps, st; x)
+            y, st = Lux.apply(model, x, ps, st)
+            n = size(x, 2)
+            out = (; y, xin = x, xr = reshape(x, 2, 2, n), yr = reshape(y, 1, 2, n),
+                yv = view(y, 1:1, :))
+            return out, st
+        end
+        ReactantNitro.loss(::OutExp, out; y) = mean(abs2, out.y .- y)
+        ReactantNitro.metrics_residency(::OutExp, ::Symbol) = :host
+        ReactantNitro.train_metrics(::OutExp, out) = (; xin = mean(out.xin), yv = mean(out.yv))
+
+        const DATA = (; train = vectors(4; seed = 3), val = vectors(2; seed = 4))
+        const PROBE = vectors(1; seed = 6)[1]
+
+        function run!(; n_devs)
+            n = Nitro(OutExp(); run_dir = mktempdir(), n_devs, accum = 2, seed = 5, data = DATA)
+            train!(n)
+            return n
+        end
+
+        try
+            s1 = run!(; n_devs = 1)
+            s2 = run!(; n_devs = 2)
+            p1, p2 = predict(s1, PROBE), predict(s2, PROBE)
+            record("out_val_rdiff", abs(s1.last_metrics.val_loss - s2.last_metrics.val_loss) /
+                abs(s1.last_metrics.val_loss))
+            record("out_keys_maxdiff", maximum(k -> maxdiff(p1[k], p2[k]), keys(p1)))
+            record("out_xin_is_input", p2.xin == PROBE.x)
+            record("out_xr_shape", size(p2.xr) == (2, 2, 8))
+            record("out_buf_agree", agree(s2.st.layer_1.buf))
+            record("outputs", "ok")
+        catch err
+            record("outputs", firstline(err))
+        end
+        """
+    )
+    num(k) = parse(Float64, get(got, k, "NaN"))
+    @test ok
+    @test get(got, "outputs", "<missing>") == "ok"
+    @test num("out_val_rdiff") < 1.0e-5
+    @test num("out_keys_maxdiff") < 1.0e-5
+    @test get(got, "out_xin_is_input", "") == "true"
+    @test get(got, "out_xr_shape", "") == "true"
+    @test get(got, "out_buf_agree", "") == "true"
 end
