@@ -1173,14 +1173,20 @@ end
     ReactantNitro.program_out(x) -> x
     ReactantNitro.program_in(x) -> x
 
-Every `ReactantRNG` and `Pair` in a program's returned layer state or metrics to its surrogate
-([`ProgramRNG`](@ref), [`ProgramPair`](@ref)) and back. Walks tuples and named tuples, which is what
-Lux state and the metrics contract are made of. Any other struct still cannot leave a program on a
-mesh.
+Every `ReactantRNG` and `Pair` in a program's returned outputs, layer state or metrics to its
+surrogate ([`ProgramRNG`](@ref), [`ProgramPair`](@ref)) and back. Walks tuples and named tuples, which
+is what Lux state, `forward` outputs and the metrics contract are made of. Any other struct still
+cannot leave a program on a mesh.
+
+Every array leaf also leaves as a fresh buffer: a lazy wrapper (`reshape`, `view`) is materialized,
+and an `optimization_barrier` keeps a leaf that is an unchanged input from being returned as that
+input. On a mesh, PJRT rebuilds either with one-device types (EnzymeAD/Reactant.jl#2989).
 """
-program_out(r::Reactant.ReactantRNG) = ProgramRNG(r.seed, r.algorithm)
+program_out(r::Reactant.ReactantRNG) = ProgramRNG(program_out(r.seed), r.algorithm)
 program_out(p::Pair) = ProgramPair(program_out(p.first), program_out(p.second))
 program_out(x::Union{Tuple, NamedTuple}) = map(program_out, x)
+program_out(a::Reactant.AnyTracedRArray) =
+    only(Reactant.Ops.optimization_barrier(Reactant.TracedUtils.materialize_traced_array(a)))
 program_out(x) = x
 program_in(r::ProgramRNG) = Reactant.ReactantRNG(r.seed, r.algorithm)
 program_in(p::ProgramPair) = program_in(p.first) => program_in(p.second)
@@ -1419,7 +1425,7 @@ fields, so a `predict` batch without labels and a `validate` batch with them sha
 """
 function fwd_program(ev, model, ps, st, batch, fwd_router, fwd_fn = forward)
     outputs, _ = call_hook(fwd_fn, :forward, fwd_router, batch, ev, model, ps, st)
-    return outputs
+    return program_out(outputs)
 end
 
 """
@@ -1458,9 +1464,11 @@ function eval_forward(nitro::Nitro, ev, st, b, fwd_router)
         phase = EvalCompiling(), worlds = nitro.frozen.worlds_eval,
         gc_hash = nitro.frozen.graphconst_hash, nitro
     )
-    return thunk(
-        ev, nitro.model, nitro.ps, st, bf, fwd_router,
-        hook_fn(hook_fns(nitro.routing), :forward, forward)
+    return program_in(
+        thunk(
+            ev, nitro.model, nitro.ps, st, bf, fwd_router,
+            hook_fn(hook_fns(nitro.routing), :forward, forward)
+        )
     )
 end
 
