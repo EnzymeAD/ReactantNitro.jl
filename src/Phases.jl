@@ -162,6 +162,7 @@ mutable struct Nitro
     gradient_clip_norm::Any
     check_divergence::Bool
     autolog_schedules::Bool
+    log_every_n_steps::Int
     checkpointer::Any
     early_stop::Any
     # What the pure scalar run accessors returned at construction, for `fixed_config_report`. The

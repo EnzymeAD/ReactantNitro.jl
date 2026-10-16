@@ -446,7 +446,7 @@ function _train!(nitro::Nitro)
                         # select, Adam's moments would decay once per micro-batch.
                         applied = applied_hp(nitro, layout)
                         state = rebuild_rules(nitro, layout, masks, anchors, scalar_memo; applied)
-                        schedule_line_due(nitro) && write_schedule_line!(
+                        schedule_line_due(nitro, nitro.step + 1) && write_schedule_line!(
                             nitro, nitro.step + 1, schedule_log(
                                 nitro.schedules, device_raw; groups = layout.groups, applied,
                                 chains = map(leaf -> leaf.rule, state)
@@ -585,8 +585,8 @@ end
 The deferred half of one micro-batch of the automatic loop, run one micro-batch late, after the
 next micro-batch's gradient program (and its step's optimizer program) has been dispatched: read the
 loss back ([`check_finite`](@ref) under `check_divergence`, else [`read_loss`](@ref)), run a `:host`
-`train_metrics` on the transferred outputs, emit the train line if the micro-batch closed an
-optimizer step, and free its batch. Returns the host loss for the epoch mean.
+`train_metrics` on the transferred outputs and emit the train line if the micro-batch closed a
+logged optimizer step (see [`log_every_n_steps`](@ref)), and free its batch. Returns the host loss for the epoch mean.
 
 `rec` is `(; l, b, batch, aux, e, step, epoch, closes)`, captured at dispatch: `step` is the
 counter before that micro-batch's optimizer step, so the divergence error names the step it always
@@ -604,16 +604,16 @@ function complete_micro_batch!(nitro::Nitro, rec, tmv)
     # One D2H serves the divergence check, the epoch mean and the train line.
     lh = nitro.check_divergence ? check_finite(rec.l, rec.step, rec.epoch) : read_loss(rec.l)
     # The host path for `train_metrics`: `aux` is the primal, and the hook runs in ordinary Julia
-    # on it. The transfer is the cost the user chose by asking. Every micro-batch, as before, though
-    # only a step's closing one is logged.
+    # on it. The transfer is the cost the user chose by asking. Every micro-batch, as the contract
+    # says, though only a logged step's closing one is logged.
     stats = tmv isa Val{:host} ?
         call_host_hook(
             train_metrics, :train_metrics, nitro.routing.train_metrics,
             rec.batch, rec.e, host_tree(rec.aux)
         ) : rec.aux
-    # Once per optimizer step, the cadence the metrics contract names. The stats are the closing
-    # micro-batch's, unreduced. `finite_only` drops a non-finite loss when the check is off.
-    rec.closes && log_metrics!(
+    # Once per logged optimizer step, the cadence the metrics contract names. The stats are the
+    # closing micro-batch's, unreduced. `finite_only` drops a non-finite loss when the check is off.
+    rec.closes && step_line_due(nitro, rec.step + 1) && log_metrics!(
         nitro.logger, finite_only((; loss = lh, stats...));
         step = rec.step + 1, epoch = rec.epoch, context = "train"
     )
@@ -730,7 +730,7 @@ function _train_manual!(nitro::Nitro)
                     # serves every step.
                     opt_raw = opt_schedule_values(nitro.schedules, nitro.step + 1)
                     opt_state = rebuild_scheduled_rules(nitro, nitro.step + 1; raw = opt_raw)
-                    schedule_line_due(nitro) && write_schedule_line!(
+                    schedule_line_due(nitro, nitro.step) && write_schedule_line!(
                         nitro, nitro.step, schedule_log(nitro.schedules, device_raw, opt_raw)
                     )
                     thunk = compile_cached(
@@ -752,9 +752,9 @@ function _train_manual!(nitro::Nitro)
                     # Re-attach the rules the closure was handed to the states it returned. The
                     # rules are not donated, so reuse across steps is safe.
                     nitro.opt_state = merge_rules(opt_state, out.opt_state)
-                    # One train line per optimizer step, which in manual mode is one per
+                    # One train line per logged optimizer step, which in manual mode is one per
                     # batch (accum is fixed at 1 by construction).
-                    log_metrics!(
+                    step_line_due(nitro, nitro.step) && log_metrics!(
                         nitro.logger,
                         finite_only((; loss = lh, get(out, :stats, (;))...));
                         step = nitro.step, epoch = nitro.epoch, context = "train"
@@ -930,8 +930,12 @@ applied_hp(nitro::Nitro, layout::FlatLayout{G}) where {G} = ntuple(Val(G)) do gi
     hp_host(nitro.e, g, group_schedule_values(nitro.schedules, g, nitro.step + 1))
 end
 
-# One `"schedule"` line per optimizer step, at the step the train line carries.
-schedule_line_due(nitro::Nitro) = nitro.autolog_schedules && nitro.schedules !== nothing
+# Whether the per-step lines are written at the logged step `step`; see `log_every_n_steps`.
+step_line_due(nitro::Nitro, step::Integer) = step % nitro.log_every_n_steps == 0
+
+# One `"schedule"` line per logged optimizer step, at the step the train line carries.
+schedule_line_due(nitro::Nitro, step::Integer) =
+    nitro.autolog_schedules && nitro.schedules !== nothing && step_line_due(nitro, step)
 write_schedule_line!(nitro::Nitro, step, lg) = isempty(lg) ? nothing :
     log_metrics!(nitro.logger, lg; step, epoch = nitro.epoch, context = "schedule")
 

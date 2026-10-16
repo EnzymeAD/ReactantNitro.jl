@@ -132,8 +132,8 @@ e.max_epochs                # else a field of the same name, when the struct dec
 1                           # else the framework's value
 ```
 
-Twelve keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`, `schedules`,
-`gradient_clip_norm`, `check_divergence`, `autolog_schedules`, `logger`, `checkpointer`, `early_stop`. `schedules` is the one whose accessor
+Thirteen keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`, `schedules`,
+`gradient_clip_norm`, `check_divergence`, `autolog_schedules`, `log_every_n_steps`, `logger`, `checkpointer`, `early_stop`. `schedules` is the one whose accessor
 reads no field. Four keywords name a fact about this construction and have no accessor: `data`,
 `weights`, `resume`, `run_ref`. `w0`, `restore_optimizer` and `restore_best` are more of that
 kind, and `checkpoint` is the deprecated spelling of `weights = path`.

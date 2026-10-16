@@ -616,10 +616,23 @@ check_divergence(e) = _field(e, :check_divergence, true)
 """
     autolog_schedules(e) -> Bool
 
-Whether the framework logs every varying scalar schedule itself, with no code from you, once per
-optimizer step in the `"schedule"` context. Default `_field(e, :autolog_schedules, true)`; also a
-`Nitro` keyword. Logged under the `Device` field's name, and as `<group>/<field>` for a rule value, after the per-group scaling (see
+Whether the framework logs every varying scalar schedule itself, with no code from you, in the
+`"schedule"` context at each train line's step (see [`log_every_n_steps`](@ref)). Default
+`_field(e, :autolog_schedules, true)`; also a `Nitro` keyword. Logged under the `Device` field's
+name, and as `<group>/<field>` for a rule value, after the per-group scaling (see
 [Schedules](schedules.md)). Host-side only: the values are the ones the step already computed.
 """
 function autolog_schedules end
 autolog_schedules(e) = _field(e, :autolog_schedules, true)
+
+"""
+    log_every_n_steps(e) -> Int
+
+The per-step lines, `"train"` and `"schedule"`, are written on every `n`th optimizer step only, to
+keep a fast run from flooding its logger. Default `_field(e, :log_every_n_steps, 1)`; also a `Nitro`
+keyword. Only the writing is thinned: validation and the per-epoch lines are unaffected, the loss
+is still read back every micro-batch for the divergence check and `history`, and
+[`train_metrics`](@ref) still runs every micro-batch.
+"""
+function log_every_n_steps end
+log_every_n_steps(e) = _field(e, :log_every_n_steps, 1)

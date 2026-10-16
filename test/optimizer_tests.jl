@@ -721,6 +721,57 @@
         @test autolog_schedules(MomGroups()) === true
     end
 
+    @experiment struct HostEvery
+        unused::Int = 0
+        max_epochs::Host{Int} = 1
+    end
+    const HOST_CALLS = Ref(0)
+    ReactantNitro.build_model(e::HostEvery, rng) =
+        Lux.setup(rng, mlp()) |> ((ps, st),) -> (mlp(), ps, st)
+    ReactantNitro.build_data(::HostEvery, dist) = (; train = two_group_data(; n_batches = 6))
+    ReactantNitro.forward(::HostEvery, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    ReactantNitro.loss(::HostEvery, ŷ; y) = mean(abs2, ŷ .- y)
+    ReactantNitro.metrics_residency(::HostEvery, ::Symbol) = :host
+    ReactantNitro.train_metrics(::HostEvery, out) = (HOST_CALLS[] += 1; (; m = 1.0))
+
+    @testset "`log_every_n_steps` thins the per-step lines only" begin
+        lg = SchedLog([])
+        n = Nitro(
+            MomGroups(); logger = lg, log_every_n_steps = 2, checkpointer = nothing,
+            run_dir = mktempdir(), schedules = (; opt = (; eta = _ -> t -> 1.0f-3 * t))
+        )
+        @test n.log_every_n_steps == 2
+        train!(n)
+        @test [x.step for x in lines(lg, "train")] == [2, 4]
+        @test [x.step for x in lines(lg, "schedule")] == [2, 4]
+        # The per-epoch line is not thinned.
+        @test length(lines(lg, "data")) == 1
+        # Every step still trains: only the logging is thinned.
+        @test n.step == 4
+
+        # A `:host` train_metrics still runs every micro-batch; only its line is thinned.
+        HOST_CALLS[] = 0
+        lh = SchedLog([])
+        train!(
+            Nitro(
+                HostEvery(); logger = lh, log_every_n_steps = 3, checkpointer = nothing,
+                run_dir = mktempdir()
+            )
+        )
+        @test HOST_CALLS[] == 6
+        @test [x.step for x in lines(lh, "train")] == [3, 6]
+        @test all(x -> haskey(x.m, :m), lines(lh, "train"))
+
+        err = try
+            Nitro(MomGroups(); log_every_n_steps = 0, checkpointer = nothing, run_dir = mktempdir())
+            nothing
+        catch ex
+            ex
+        end
+        @test err isa ErrorException && occursin("log_every_n_steps", err.msg)
+        @test log_every_n_steps(MomGroups()) == 1
+    end
+
     # ── the composition checks ───────────────────────────────────────────────────────────
 
     @testset "a base rule declaring `lambda` is rejected at Level 1, naming the fix" begin

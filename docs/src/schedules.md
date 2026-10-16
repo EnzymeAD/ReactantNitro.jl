@@ -176,12 +176,13 @@ train!(e; schedules = merge(schedules(e), (; eta = total -> OneCycle(total, 3f-4
 
 ## Logging
 
-The framework logs every varying scalar schedule automatically, once per optimizer step, in the
-`"schedule"` context at the train line's step. A `Device` field logs under its name. A rule value logs as `<group>/<field>`,
-as applied: `eta` and `lambda` after the per-group scaling above, so `backbone/eta` is the rate the
-backbone trained at, not the curve that produced it. A group's `lambda` is logged whenever its
-`eta` varies, since decoupled decay scales with it. Manual mode logs each `opt` key's value as
-given, with the path joined by `/` (`gen/eta`).
+The framework logs every varying scalar schedule automatically, in the `"schedule"` context at each
+train line's step: every optimizer step, or every [`log_every_n_steps`](@ref). A `Device` field
+logs under its name. A rule value logs as `<group>/<field>`, as applied: `eta` and `lambda` after
+the per-group scaling above, so `backbone/eta` is the rate the backbone trained at, not the curve
+that produced it. A group's `lambda` is logged whenever its `eta` varies, since decoupled decay
+scales with it. Manual mode logs each `opt` key's value as given, with the path joined by `/`
+(`gen/eta`).
 
 Constants are left out; the binding report records them. To turn it off, pass
 `Nitro(e; autolog_schedules = false)` or define [`autolog_schedules`](@ref)`(e) = false`.
