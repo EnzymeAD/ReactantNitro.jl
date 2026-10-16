@@ -393,6 +393,8 @@ function _train!(nitro::Nitro)
                 t0 = time()
                 it = iterate(stream)
                 t_wait += time() - t0
+                # Set on a step's first micro-batch and logged on its closing one.
+                device_raw = (;)
                 while it !== nothing
                     ((batch, b), st_stream) = it
                     t_body = time()
@@ -407,8 +409,10 @@ function _train!(nitro::Nitro)
                         # program. Guarded on `micro == 0` so every micro-batch of one step sees one
                         # set of values. `step_experiment` returns `e` unchanged when nothing
                         # device-side is scheduled.
+                        device_raw = device_schedule_values(nitro.schedules, nitro.step + 1)
                         e_next = step_experiment(
-                            nitro.e, nitro.schedules, nitro.step + 1; mesh = nitro.mesh
+                            nitro.e, nitro.schedules, nitro.step + 1; mesh = nitro.mesh,
+                            raw = device_raw
                         )
                         if e_next !== nitro.e
                             nitro.e = e_next
@@ -440,7 +444,14 @@ function _train!(nitro::Nitro)
                     if rec.closes
                         # A host branch, the only construct that genuinely skips: gated by a traced
                         # select, Adam's moments would decay once per micro-batch.
-                        state = rebuild_rules(nitro, layout, masks, anchors, scalar_memo)
+                        applied = applied_hp(nitro, layout)
+                        state = rebuild_rules(nitro, layout, masks, anchors, scalar_memo; applied)
+                        schedule_line_due(nitro) && write_schedule_line!(
+                            nitro, nitro.step + 1, schedule_log(
+                                nitro.schedules, device_raw; groups = layout.groups, applied,
+                                chains = map(leaf -> leaf.rule, state)
+                            )
+                        )
                         othunk = compile_cached(
                             opt_program, ev, ev, nitro.g_accum, nitro.ps, state,
                             lref, clipv; phase = OptCompiling(),
@@ -704,8 +715,10 @@ function _train_manual!(nitro::Nitro)
                     check_batch_schema(batch, nitro.schema, :train, seen)
                     check_train_batch_shape(batch, nitro.batch_size, :train, seen, nitro.routing)
                     # Device schedules write `e`'s fields; the closure reads them as traced inputs.
+                    device_raw = device_schedule_values(nitro.schedules, nitro.step + 1)
                     e_next = step_experiment(
-                        nitro.e, nitro.schedules, nitro.step + 1; mesh = nitro.mesh
+                        nitro.e, nitro.schedules, nitro.step + 1; mesh = nitro.mesh,
+                        raw = device_raw
                     )
                     if e_next !== nitro.e
                         nitro.e = e_next
@@ -715,7 +728,11 @@ function _train_manual!(nitro::Nitro)
                     bf = NamedTuple{keys(router)}(b)
                     # The per-step host rebuild of scheduled rules, type-preserving so one program
                     # serves every step.
-                    opt_state = rebuild_scheduled_rules(nitro, nitro.step + 1)
+                    opt_raw = opt_schedule_values(nitro.schedules, nitro.step + 1)
+                    opt_state = rebuild_scheduled_rules(nitro, nitro.step + 1; raw = opt_raw)
+                    schedule_line_due(nitro) && write_schedule_line!(
+                        nitro, nitro.step, schedule_log(nitro.schedules, device_raw, opt_raw)
+                    )
                     thunk = compile_cached(
                         manual_program, ev, ev, nitro.model, nitro.ps, opt_state, st,
                         bf, router; phase = GradCompiling(), worlds, nitro
@@ -869,12 +886,11 @@ function report_data_wait!(nitro::Nitro, t_wait::Float64, t_step::Float64)
 end
 
 """
-    ReactantNitro.rebuild_rules(nitro, layout, masks, anchors, memo = nothing) -> NTuple{G}
+    ReactantNitro.rebuild_rules(nitro, layout, masks, anchors, memo = nothing; applied) -> NTuple{G}
 
-The per-optimizer-step rebuild on the optimizer side: evaluate the schedules at this step, wrap the
-results as device scalars, rebuild each group's rule chain, and put it back in its `Leaf` beside the
-state the optimizer owns. Each group's `eta_t` is its own path key if configured, else the bare
-`eta` key, else nothing; the ratio math lives in `effective_lr`.
+The per-optimizer-step rebuild on the optimizer side: wrap each group's `applied` values (from
+[`applied_hp`](@ref)) as device scalars, rebuild each group's rule chain, and put it back in its
+`Leaf` beside the state the optimizer owns.
 
 A rebuilt rule travels inside `opt_state`, which is why the optimizer program takes no separate
 `hp` argument. Rebuilding with a fresh `ConcretePJRTNumber` re-enters the same compiled thunk,
@@ -882,29 +898,42 @@ because the rule's type is unchanged; the [`ScalarMemo`](@ref) changes which buf
 carries and nothing in the cache key.
 """
 function rebuild_rules(
-        nitro::Nitro, layout::FlatLayout{G}, masks, anchors, memo = nothing
+        nitro::Nitro, layout::FlatLayout{G}, masks, anchors, memo = nothing;
+        applied = applied_hp(nitro, layout)
     ) where {G}
     sched = nitro.schedules
-    step = nitro.step + 1
     return ntuple(Val(G)) do gi
-        # The path key if configured, else the bare `eta` key, else the base rate.
-        eta_t = if sched === nothing
-            nothing
-        else
-            pk = Symbol(layout.groups[gi], ".eta")
-            haskey(sched.opt, pk) ? sched.opt[pk](step) :
-                haskey(sched.opt, :eta) ? sched.opt.eta(step) : nothing
-        end
+        g = layout.groups[gi]
+        keep_decay = sched !== nothing && any(
+            k -> _binds(sched, k, g) &&
+                last(_schedule_target(k)) === :lambda, keys(sched.opt)
+        )
         # `mesh` is required: without it the rule's scalars are placed for one device while the
         # moments are replicated across the mesh, and the program refuses to rebuild the `Leaf`.
         # Invisible on CPU, where every device count is 1.
-        hp = resolve_hp(nitro.e, layout, gi; eta_t, anchors, masks, mesh = nitro.mesh, memo)
-        Optimisers.Leaf(
-            build_chain(nitro.e, layout.groups[gi], hp),
-            nitro.opt_state[gi].state, nitro.opt_state[gi].frozen
+        hp = resolve_hp(
+            nitro.e, layout, gi; host = applied[gi], keep_decay, anchors, masks,
+            mesh = nitro.mesh, memo
         )
+        Optimisers.Leaf(build_chain(nitro.e, g, hp), nitro.opt_state[gi].state, nitro.opt_state[gi].frozen)
     end
 end
+
+"""
+    ReactantNitro.applied_hp(nitro, layout) -> NTuple{G, NamedTuple}
+
+Each group's [`hp_host`](@ref) values for the upcoming optimizer step, `nitro.step + 1`: what
+[`rebuild_rules`](@ref) applies and the schedule log reports.
+"""
+applied_hp(nitro::Nitro, layout::FlatLayout{G}) where {G} = ntuple(Val(G)) do gi
+    g = layout.groups[gi]
+    hp_host(nitro.e, g, group_schedule_values(nitro.schedules, g, nitro.step + 1))
+end
+
+# One `"schedule"` line per optimizer step, at the step the train line carries.
+schedule_line_due(nitro::Nitro) = nitro.autolog_schedules && nitro.schedules !== nothing
+write_schedule_line!(nitro::Nitro, step, lg) = isempty(lg) ? nothing :
+    log_metrics!(nitro.logger, lg; step, epoch = nitro.epoch, context = "schedule")
 
 """
     ReactantNitro.to_device_batch(batch, routing) -> NamedTuple

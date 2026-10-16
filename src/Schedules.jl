@@ -35,8 +35,14 @@ Base.isempty(r::ResolvedSchedules) = isempty(r.device) && isempty(r.opt)
 
 # A constant is a `Number` and a schedule is a `Callable`, so the per-step transfer count equals the
 # number of quantities actually being varied.
-_as_factory(x::Number) = _ -> (_ -> x)
+_as_factory(x::Number) = _ -> Constant(x)
 _as_factory(f) = f
+
+# A bare `Number` schedule, typed so the schedule log can skip it.
+struct Constant{T}
+    x::T
+end
+(c::Constant)(_) = c.x
 
 """
     ReactantNitro.HorizonGuard
@@ -333,17 +339,21 @@ before conversion, which is why this takes `fields`: a schedule written as
 value would move `typeof(compile_view(e))` and recompile the gradient program on the first
 scheduled step.
 """
-function step_aux(fields::NamedTuple, scheds::NamedTuple, step::Integer; mesh = nothing)
-    ks = keys(scheds)
-    vals = map(ks) do k
-        to_device(
-            _coerce_scheduled(getproperty(fields, k), getproperty(scheds, k)(step), k); mesh
-        )
-    end
-    return merge(fields, NamedTuple{ks}(vals))
-end
+step_aux(fields::NamedTuple, scheds::NamedTuple, step::Integer; mesh = nothing) =
+    _step_aux(fields, map(f -> f(step), scheds); mesh)
 step_aux(fields::NamedTuple, r::ResolvedSchedules, step::Integer; mesh = nothing) =
     step_aux(fields, r.device, step; mesh)
+
+# `raw` is the schedules' output at one step, before coercion.
+function _step_aux(fields::NamedTuple, raw::NamedTuple; mesh = nothing)
+    ks = keys(raw)
+    vals = map(k -> to_device(_coerce_scheduled(getproperty(fields, k), getproperty(raw, k), k); mesh), ks)
+    return merge(fields, NamedTuple{ks}(vals))
+end
+
+# The `device` schedules evaluated at `step`, uncoerced; `(;)` when none are configured.
+device_schedule_values(sched, step::Integer) =
+    sched === nothing ? (;) : map(f -> f(step), sched.device)
 
 # `eltype(ConcretePJRTNumber{Float32,1})` is the type itself (Base's non-array fallback), so the
 # scalar case converts to `typeof(old)`, which is right whether the field is already on device or
@@ -367,15 +377,18 @@ The per-step rebuild on the experiment side, the counterpart of `rebuild_rules`:
 [`Device`](@ref) fields of `e` are rebuilt through [`step_aux`](@ref), which is what makes
 `device = (; aux_weight = ...)` vary `e.aux_weight` inside `loss` and `forward`. Returns `e` itself
 when nothing device-side is scheduled. `step` is the upcoming optimizer step, `nitro.step + 1`,
-matching `rebuild_rules`. The type assertion is a backstop against a silent recompile on every
+matching `rebuild_rules`. `raw` is the step's schedule output, passed in by the loop so the
+schedule log reads the values applied here. The type assertion is a backstop against a silent recompile on every
 step, which presents as training getting mysteriously slower.
 """
-function step_experiment(e, sched, step::Integer; mesh = nothing)
+function step_experiment(
+        e, sched, step::Integer; mesh = nothing, raw = device_schedule_values(sched, step)
+    )
     (sched === nothing || isempty(sched.device)) && return e
     T = typeof(e)
     ks = keys(sched.device)
     cur = NamedTuple{ks}(map(f -> getfield(e, f), ks))
-    stepped = step_aux(cur, sched.device, step; mesh)
+    stepped = _step_aux(cur, raw; mesh)
     e_new = Base.typename(T).wrapper(
         map(f -> haskey(stepped, f) ? getproperty(stepped, f) : getfield(e, f), fieldnames(T))...
     )
@@ -588,15 +601,83 @@ The per-step host rebuild, manual mode's counterpart of `rebuild_rules`: evaluat
 schedule at `step` and rebuild the rules it names. Type-preserving, since the value is coerced to
 the field's own element type, so the closure's program re-enters the same cache entry.
 """
-function rebuild_scheduled_rules(nitro::Nitro, step::Integer)
-    sched = nitro.schedules
-    (sched === nothing || isempty(sched.opt)) && return nitro.opt_state
+function rebuild_scheduled_rules(
+        nitro::Nitro, step::Integer; raw = opt_schedule_values(nitro.schedules, step)
+    )
+    isempty(raw) && return nitro.opt_state
     opt_state = nitro.opt_state
-    for (k, f) in pairs(sched.opt)
+    for (k, v) in pairs(raw)
         path, field = _schedule_target(k)
-        opt_state = apply_schedule(opt_state, path, field, f(step))
+        opt_state = apply_schedule(opt_state, path, field, v)
     end
     return opt_state
+end
+
+# The `opt` schedules evaluated at `step`, keyed as resolved; `(;)` when none are configured.
+opt_schedule_values(sched, step::Integer) =
+    sched === nothing ? (;) : map(f -> f(step), sched.opt)
+
+"""
+    ReactantNitro.group_schedule_values(sched, group, step) -> NamedTuple
+
+The automatic loop's `opt` schedules for one parameter group at `step`, keyed by rule field. A path
+key (`backbone.eta`) overrides the bare key (`eta`) for its group.
+"""
+function group_schedule_values(sched, group::Symbol, step::Integer)
+    sched === nothing && return (;)
+    vals = Pair{Symbol, Any}[]
+    for (k, f) in pairs(sched.opt)
+        _binds(sched, k, group) && push!(vals, last(_schedule_target(k)) => f(step))
+    end
+    return (; vals...)
+end
+
+# Whether `opt` key `k` sets its field for `group`: a path key binds its group, and a bare key every
+# group without a path key for the same field.
+function _binds(sched, k::Symbol, group::Symbol)
+    path, field = _schedule_target(k)
+    return isempty(path) ? !haskey(sched.opt, Symbol(group, ".", field)) : only(path) === group
+end
+
+"""
+    ReactantNitro.schedule_log(sched, device_raw, opt_raw; groups, applied, chains) -> NamedTuple
+
+What the `"schedule"` context logs at one optimizer step. Constants and non-scalar values are left
+out, since the binding report already records the constants.
+
+- A `device` schedule logs under its field name.
+- In the automatic loop, each group logs `<group>/<field>` for every rule field a varying schedule
+  sets in its chain, as `applied` holds it: `eta` and `lambda` after the per-group scaling of
+  [`effective_lr`](@ref). `lambda` is also logged when only `eta` varies, since decoupled decay
+  scales with it.
+- In manual mode (`groups === nothing`), each `opt` key logs its value as given, with the path
+  joined by `/`.
+"""
+function schedule_log(
+        sched, device_raw::NamedTuple, opt_raw::NamedTuple = (;);
+        groups = nothing, applied = (), chains = ()
+    )
+    out = Pair{Symbol, Any}[]
+    logged(tbl, k, v) = !(tbl[k] isa Constant) && v isa Number
+    for (k, v) in pairs(device_raw)
+        logged(sched.device, k, v) && push!(out, k => v)
+    end
+    for (k, v) in pairs(opt_raw)
+        logged(sched.opt, k, v) && push!(out, Symbol(replace(string(k), "." => "/")) => v)
+    end
+    groups === nothing && return (; out...)
+    for (gi, g) in enumerate(groups)
+        fs = Symbol[
+            last(_schedule_target(k)) for (k, f) in pairs(sched.opt)
+                if !(f isa Constant) && _binds(sched, k, g)
+        ]
+        :eta in fs && !(:lambda in fs) && !iszero(applied[gi].lambda) && push!(fs, :lambda)
+        present = schedulable_fields((chains[gi],))
+        for f in fs
+            f in present && push!(out, Symbol(g, "/", f) => applied[gi][f])
+        end
+    end
+    return (; out...)
 end
 
 # `:eta` -> ((), :eta); `Symbol("gen.eta")` -> ((:gen,), :eta). Rule field names cannot contain

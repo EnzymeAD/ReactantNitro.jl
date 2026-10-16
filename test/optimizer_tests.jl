@@ -624,6 +624,103 @@
         @test err2 isa ErrorException && occursin("epsilon", err2.msg)
     end
 
+    # ── every scheduled rule field, and the schedule log ────────────────────────────────
+
+    struct SchedLog
+        lines::Vector{Any}
+    end
+    ReactantNitro.log_metrics!(l::SchedLog, m; step, epoch, context, kwargs...) =
+        push!(l.lines, (; context, step, m))
+    ReactantNitro.log_params!(::SchedLog, p) = nothing
+    ReactantNitro.log_other!(::SchedLog, k, v) = nothing
+    ReactantNitro.finish!(::SchedLog, s) = nothing
+    ReactantNitro.run_id(::SchedLog) = nothing
+    ReactantNitro.run_url(::SchedLog) = nothing
+    lines(l, ctx) = [x for x in l.lines if x.context == ctx]
+
+    @experiment struct MomGroups
+        unused::Int = 0
+        max_epochs::Host{Int} = 1
+        aux::Device{Float32} = 1.0f0
+    end
+    ReactantNitro.param_group(::MomGroups, ks) = ks[1] === :backbone ? :backbone : :default
+    ReactantNitro.learning_rate(::MomGroups) = 1.0f-3
+    ReactantNitro.learning_rate(::MomGroups, ::Val{:backbone}) = 1.0f-4
+    ReactantNitro.optimizer(::MomGroups) = Optimisers.Momentum
+    ReactantNitro.lambda(::MomGroups) = 1.0f-2
+    ReactantNitro.build_model(e::MomGroups, rng) =
+        Lux.setup(rng, mlp()) |> ((ps, st),) -> (mlp(), ps, st)
+    ReactantNitro.build_data(::MomGroups, dist) = (; train = two_group_data())
+    ReactantNitro.forward(::MomGroups, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    ReactantNitro.loss(e::MomGroups, ŷ; y) = e.aux * mean(abs2, ŷ .- y)
+
+    @testset "every scheduled rule field reaches the rule in the automatic loop" begin
+        # The regression: only `eta` was looked up per step, so `rho` and `lambda` schedules were
+        # accepted, reported as bound, and never applied.
+        cache_reset!()
+        n = Nitro(
+            MomGroups(); schedules = (; opt = (; rho = _ -> t -> 0.5f0, lambda = _ -> t -> 2.0f0)),
+            checkpointer = nothing, logger = nothing, run_dir = mktempdir()
+        )
+        train!(n)
+        rule(gi) = n.opt_state[gi].rule.opts
+        @test Float32(rule(1)[1].rho) == 0.5f0
+        @test Float32(rule(2)[1].rho) == 0.5f0
+        # lambda_g = eta_g * lambda(t): 1e-3 * 2 and 1e-4 * 2.
+        @test Float32(rule(1)[2].lambda) ≈ 2.0f-3 rtol = 1.0e-5
+        @test Float32(rule(2)[2].lambda) ≈ 2.0f-4 rtol = 1.0e-5
+        @test cache_stats().misses == 2
+
+        # A scheduled lambda that reaches zero keeps its `Decay` tail, so the chain does not change.
+        nz = Nitro(
+            MomGroups(); schedules = (; opt = (; lambda = _ -> t -> 0.0f0)),
+            checkpointer = nothing, logger = nothing, run_dir = mktempdir()
+        )
+        train!(nz)
+        @test phase(nz) isa Done
+        @test Float32(nz.opt_state[1].rule.opts[2].lambda) == 0.0f0
+    end
+
+    @testset "the schedule log reports the applied values, once per optimizer step" begin
+        lg = SchedLog([])
+        n = Nitro(
+            MomGroups(); accum = 2, logger = lg, checkpointer = nothing, run_dir = mktempdir(),
+            schedules = (;
+                device = (; aux = _ -> t -> 1.0 + t),
+                opt = (;
+                    rho = _ -> t -> 0.5f0 + 0.1f0 * t, eta = _ -> t -> 1.0f-2 * t,
+                    backbone = (; eta = 1.0f-1),
+                ),
+            )
+        )
+        train!(n)
+        sl, tl = lines(lg, "schedule"), lines(lg, "train")
+        # One line per optimizer step, at the train line's step: 4 batches / accum 2.
+        @test [x.step for x in sl] == [x.step for x in tl] == [1, 2]
+        last_m = sl[end].m
+        @test last_m.aux == 3.0
+        @test last_m[Symbol("default/eta")] ≈ 2.0f-2
+        # A varying eta moves the decay too.
+        @test last_m[Symbol("default/lambda")] ≈ 2.0f-2 * 1.0f-2
+        @test last_m[Symbol("backbone/rho")] ≈ 0.7f0
+        # The backbone's eta is a constant, so it is left out.
+        @test !haskey(last_m, Symbol("backbone/eta"))
+        # What was logged is what the rule holds after the last step.
+        @test Float32(n.opt_state[1].rule.opts[1].eta) == last_m[Symbol("default/eta")]
+        @test Float32(n.opt_state[2].rule.opts[1].rho) == last_m[Symbol("backbone/rho")]
+
+        # Off by keyword: no schedule lines, the train lines unchanged.
+        lg2 = SchedLog([])
+        n2 = Nitro(
+            MomGroups(); logger = lg2, autolog_schedules = false, checkpointer = nothing,
+            run_dir = mktempdir(), schedules = (; opt = (; eta = _ -> t -> 1.0f-3))
+        )
+        train!(n2)
+        @test isempty(lines(lg2, "schedule"))
+        @test !isempty(lines(lg2, "train"))
+        @test autolog_schedules(MomGroups()) === true
+    end
+
     # ── the composition checks ───────────────────────────────────────────────────────────
 
     @testset "a base rule declaring `lambda` is rejected at Level 1, naming the fix" begin

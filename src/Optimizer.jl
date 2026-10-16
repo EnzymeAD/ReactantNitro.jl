@@ -416,13 +416,30 @@ end
 # ── Three levels ────────────────────────────────────────────────────────────────────
 
 """
-    ReactantNitro.resolve_hp(e, layout, gi; eta_t = nothing, anchors = nothing, masks = nothing)
+    ReactantNitro.hp_host(e, group, sv = (;); elt = Float32) -> NamedTuple
+
+The host values one group's rule is built from at one step, before device conversion. `sv` is the
+group's scheduled rule fields at this step ([`group_schedule_values`](@ref)). `eta` and `lambda`
+follow [`effective_lr`](@ref); every other field in `sv` is absolute. All are converted to `elt`.
+"""
+function hp_host(e, group::Symbol, sv::NamedTuple = (;); elt::Type = Float32)
+    eta = elt(effective_lr(e, group, get(sv, :eta, nothing)))
+    lam = elt(eta * (haskey(sv, :lambda) ? sv.lambda : lambda(e, Val(group))))
+    rest = map(elt, Base.structdiff(sv, NamedTuple{(:eta, :lambda)}))
+    return (; eta, lambda = lam, rest...)
+end
+
+"""
+    ReactantNitro.resolve_hp(e, layout, gi; eta_t = nothing, host = nothing, keep_decay = false,
+                             anchors = nothing, masks = nothing)
 
 The per-group hyperparameter carrier, resolved per group per step: `eta`, `lambda`, `anchor` and
-`no_decay_mask`, plus one key per scheduled rule field. `eta` and `lambda` follow
-[`effective_lr`](@ref); `eta_t` is the `eta` schedule's value or `nothing` when none is configured.
+`no_decay_mask`, plus one key per scheduled rule field. `host` is the group's [`hp_host`](@ref)
+values; without it they are computed from `eta_t`, the `eta` schedule's value or `nothing`.
+`keep_decay` keeps a zero `lambda` as a device scalar instead of `nothing`, for a scheduled
+`lambda`: dropping the `Decay` tail when the schedule reaches zero would change the chain mid-run.
 
-Both scalars are converted to the flat buffer's element type before device conversion:
+Every scalar is converted to the flat buffer's element type before device conversion:
 `Optimisers.RAdam()` defaults `eta` to `Float64`, and a `Float32` buffer would come back `Float64`
 from `apply!` and fail the thunk guard on step 2.
 
@@ -434,15 +451,20 @@ exercises donation, so a green CPU suite says nothing about this. The saving is 
 percent of training wall time; take it for being exact rather than fast.
 """
 function resolve_hp(
-        e, layout::FlatLayout, gi::Int; eta_t = nothing, anchors = nothing,
-        masks = nothing, elt::Type = Float32, mesh = nothing, memo = nothing
+        e, layout::FlatLayout, gi::Int; eta_t = nothing, host = nothing, keep_decay = false,
+        anchors = nothing, masks = nothing, elt::Type = Float32, mesh = nothing, memo = nothing
     )
     g = layout.groups[gi]
-    eta = elt(effective_lr(e, g, eta_t))
-    lam = elt(eta * lambda(e, Val(g)))
+    h = host === nothing ? hp_host(e, g, eta_t === nothing ? (;) : (; eta = eta_t); elt) : host
+    rest = Base.structdiff(h, NamedTuple{(:eta, :lambda)})
+    eta = memo_to_device(memo, (gi, :eta), h.eta; mesh)
+    lambda = iszero(h.lambda) && !keep_decay ? nothing :
+        memo_to_device(memo, (gi, :lambda), h.lambda; mesh)
+    scheduled = NamedTuple{keys(rest)}(
+        map(k -> memo_to_device(memo, (gi, k), getproperty(rest, k); mesh), keys(rest))
+    )
     return (;
-        eta = memo_to_device(memo, (gi, :eta), eta; mesh),
-        lambda = iszero(lam) ? nothing : memo_to_device(memo, (gi, :lambda), lam; mesh),
+        eta, lambda, scheduled...,
         anchor = anchors === nothing ? nothing : anchors[gi],
         no_decay_mask = masks === nothing ? true : masks[gi],
     )

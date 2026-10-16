@@ -46,6 +46,7 @@
         # The run accessors: each one's `Nitro` keyword defaults to the accessor call, so an
         # experiment declares what it is and a caller passes only what this run changes.
         :seed, :accum, :n_devs, :checkpointer, :early_stop, :logger, :check_divergence,
+        :autolog_schedules,
     ]
     const ENTRY_POINTS = [
         :Nitro, :train!, :validate, :evaluate, :predict,

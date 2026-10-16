@@ -612,3 +612,14 @@ training continues from whatever state the divergence left. Host-side only: it c
 """
 function check_divergence end
 check_divergence(e) = _field(e, :check_divergence, true)
+
+"""
+    autolog_schedules(e) -> Bool
+
+Whether the framework logs every varying scalar schedule itself, with no code from you, once per
+optimizer step in the `"schedule"` context. Default `_field(e, :autolog_schedules, true)`; also a
+`Nitro` keyword. Logged under the `Device` field's name, and as `<group>/<field>` for a rule value, after the per-group scaling (see
+[Schedules](schedules.md)). Host-side only: the values are the ones the step already computed.
+"""
+function autolog_schedules end
+autolog_schedules(e) = _field(e, :autolog_schedules, true)

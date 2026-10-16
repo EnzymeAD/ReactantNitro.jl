@@ -6,12 +6,13 @@
 
 """
     Nitro(e; seed, resume, run_dir, data, n_devs, weights, accum, max_epochs, schedules,
-             gradient_clip_norm, check_divergence, logger, checkpointer, early_stop, run_ref,
+             gradient_clip_norm, check_divergence, autolog_schedules, logger, checkpointer,
+             early_stop, run_ref,
              w0, restore_optimizer, restore_best) -> Nitro
 
 Run the setup sequence and return the handle. No training.
 
-Eleven keywords default to an accessor of the same name (the signature of `_build_nitro` is the
+Twelve keywords default to an accessor of the same name (the signature of `_build_nitro` is the
 authority for the defaults), so the keyword replaces the accessor's value for one run and omitting
 it falls through to the experiment's own. `data`, `weights`, `resume` and `run_ref` are
 keyword-only, each naming a fact about this invocation. `early_stop` defaults to `nothing` and
@@ -158,7 +159,7 @@ end
 # heartbeat. The keyword defaults live here, on the function that reads `e`.
 function _build_nitro(
         e;
-        # Eleven keywords default to an accessor of the same name, so an experiment
+        # Twelve keywords default to an accessor of the same name, so an experiment
         # declares what it IS and a caller passes only what this run changes.
         seed::Integer = ReactantNitro.seed(e),
         run_dir::AbstractString = ReactantNitro.run_dir(e),
@@ -168,6 +169,7 @@ function _build_nitro(
         schedules = ReactantNitro.schedules(e),
         gradient_clip_norm = ReactantNitro.gradient_clip_norm(e),
         check_divergence::Bool = ReactantNitro.check_divergence(e),
+        autolog_schedules::Bool = ReactantNitro.autolog_schedules(e),
         logger = ReactantNitro.logger(e),
         checkpointer = ReactantNitro.checkpointer(e),
         early_stop = ReactantNitro.early_stop(e),
@@ -553,7 +555,7 @@ function _build_nitro(
         record === nothing ? nothing : record.run_id,
         record === nothing ? nothing : record.run_url,
         String(run_dir), Int(seed), Int(accum), Int(max_epochs), gradient_clip_norm,
-        check_divergence, checkpointer, early_stop, probe_accessors(e),
+        check_divergence, autolog_schedules, checkpointer, early_stop, probe_accessors(e),
         # The compile options ride with the dispatch freeze: both are compile-cache key components
         # fixed at construction (Cache.jl `compile_cached`).
         merge(frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state), (; compile_options)),
@@ -900,7 +902,7 @@ are not checked.
 """
 const DRIVER_ONLY_FIELDS = (
     :seed, :max_epochs, :run_dir, :n_devs, :logger, :checkpointer,
-    :early_stop, :check_divergence,
+    :early_stop, :check_divergence, :autolog_schedules,
 )
 
 function check_driver_fields(e)
@@ -1109,8 +1111,8 @@ n = Nitro(MyExp, :baseline; max_epochs = 40, aug_rotate_deg = 9.0)
 
 Keywords are split by one rule: a `Nitro` keyword goes to `Nitro`; anything else must be a field
 of `E` and goes to the recipe; a name that is both (`max_epochs`, `seed`, `run_dir`, `accum`,
-`n_devs`, `gradient_clip_norm`, `check_divergence`) is the run keyword. Anything in neither set is an error naming
-both. The keyword set is derived from the constructor's declaration, so it cannot go stale.
+`n_devs`, `gradient_clip_norm`, `check_divergence`, `autolog_schedules`) is the run keyword.
+Anything in neither set is an error naming both. The keyword set is derived from the constructor's declaration, so it cannot go stale.
 
 The longer spelling, `Nitro(from_preset(MyExp, :baseline; ...); preset = :baseline)`, still works
 and is what this is shorthand for, but it names the preset twice and nothing checks the two agree.
@@ -1499,7 +1501,10 @@ end
 # The run knobs whose accessors are pure and safe to re-probe. `logger`, `checkpointer`,
 # `early_stop` and `schedules` are constructors called exactly once at setup, so probing them would
 # fire their side effects and compare by identity anyway; a revised one is not detected here.
-const _PROBED = (:seed, :accum, :max_epochs, :gradient_clip_norm, :check_divergence, :run_dir)
+const _PROBED = (
+    :seed, :accum, :max_epochs, :gradient_clip_norm, :check_divergence, :autolog_schedules,
+    :run_dir,
+)
 
 """
     ReactantNitro.frozen_dispatch(ev, model, ps, st, routing, chains) -> NamedTuple

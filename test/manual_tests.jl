@@ -294,6 +294,35 @@
         @test device_value(n, :scale) ≈ 1.0f0    # the last step wrote 6/6
     end
 
+    struct ManualLog
+        lines::Vector{Any}
+    end
+    ReactantNitro.log_metrics!(l::ManualLog, m; step, epoch, context, kwargs...) =
+        push!(l.lines, (; context, step, m))
+    ReactantNitro.log_params!(::ManualLog, p) = nothing
+    ReactantNitro.log_other!(::ManualLog, k, v) = nothing
+    ReactantNitro.finish!(::ManualLog, s) = nothing
+    ReactantNitro.run_id(::ManualLog) = nothing
+    ReactantNitro.run_url(::ManualLog) = nothing
+
+    @testset "manual mode logs each varying schedule as given" begin
+        lg = ManualLog([])
+        n = Nitro(
+            ToyGAN(); logger = lg, checkpointer = nothing, run_dir = mktempdir(),
+            schedules = (;
+                device = (; scale = _ -> t -> Float32(t / 6)),
+                opt = (; gen = (; eta = _ -> t -> 1.0f-4 * t), disc = (; eta = 1.0f-3)),
+            )
+        )
+        train!(n)
+        sl = [x for x in lg.lines if x.context == "schedule"]
+        tl = [x for x in lg.lines if x.context == "train"]
+        @test [x.step for x in sl] == [x.step for x in tl]
+        @test sl[end].m.scale ≈ 1.0f0
+        @test sl[end].m[Symbol("gen/eta")] ≈ 6.0f-4
+        @test !haskey(sl[end].m, Symbol("disc/eta"))
+    end
+
     @testset "path-bound `opt` schedules: the key says what eta binds to" begin
         # A bare key binds EVERY rule with the field (the absolute value; manual mode has no base
         # rate and no ratios); a nested key is a PATH into the user's `opt_state` and binds the rules
