@@ -692,39 +692,6 @@ function load_checkpoint(ckpt::TopKCheckpointer, path)
 end
 
 """
-    ReactantNitro.check_resume_compatible(record, e, layout; kwargs...) -> nothing
-
-Run every check a record must pass before setup restores from it, for a resume or for
-`weights = path`. Setup calls the parts separately, at the setup step where each one's inputs
-exist; `anchors`, `logger` and `path` are passed through to them.
-
-  * Config ([`check_config_compatible`](@ref)): the `GraphConst` fields are compared, and a
-    mismatch refuses with a diff. `Host` fields are excluded, since raising `max_epochs` on resume
-    is normal; `Device` fields cannot change the compiled program, and are recorded in `devices`.
-  * Permutation ([`check_permutation_compatible`](@ref)): compared leaf by leaf, shapes included.
-  * Decay anchor ([`check_anchors_compatible`](@ref)): the model is rebuilt under the restored
-    seed, `w0` is captured, and each anchored group's checksum must match the record.
-  * Logger ([`check_logger_compatible`](@ref)): the logger type must match the one that wrote any
-    `logger_state`.
-
-`step` is restored rather than derived, so every stateless schedule resumes exactly.
-
-Accepted limitations: an adaptive schedule restarts its adaptation, the loader's sampling order is
-not restored, and an anchored run with a nondeterministic init cannot be resumed at all, which is
-the trade for not storing the anchor arrays.
-"""
-function check_resume_compatible(
-        record, e, layout; anchors = nothing, logger = nothing,
-        path = "the checkpoint"
-    )
-    check_config_compatible(record, e, path)
-    layout === nothing || check_permutation_compatible(record, layout, path)
-    anchors === nothing || check_anchors_compatible(record, layout, anchors, path)
-    check_logger_compatible(record, logger, path)
-    return nothing
-end
-
-"""
     ReactantNitro.check_config_compatible(record, e, path) -> nothing
 
 Refuse, with a diff, a record whose `GraphConst` fields differ from `e`'s. These are the fields the

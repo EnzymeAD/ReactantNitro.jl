@@ -69,10 +69,8 @@ include("IORetry.jl")     # retrying I/O
 include("Checkpoint.jl")  # checkpointing and resume
 include("History.jl")     # the per-epoch metric history a handle keeps, and its table
 include("Render.jl")      # the framed table renderer, text and HTML
-# Visualization needs `predict` and the batch routers, so it follows `Train.jl`; it is placed here
 # After `Train.jl`, since visualization needs `predict` and the batch routers.
 include("Visualize.jl")   # rendering
-# Export is last because it consumes almost everything above it: `Nitro`, the routers,
 # Last, since export consumes almost everything above it.
 include("Export.jl")      # export to a served bundle
 
@@ -88,7 +86,6 @@ export presets, from_preset
 export build_data, build_model, forward, loss
 export metrics, train_metrics, finalize_metrics, metrics_residency, derive
 export param_group, optimizer, learning_rate, lambda, decay_anchor, gradient_clip_norm
-# Manual training mode. Defining `train_step` for an experiment type is what selects
 # Manual training mode: defining `train_step` selects it, `manual_training(e) = false` declines it,
 # `setup_optimizers` supplies the user-owned optimizer states, `backward` and `step_optimizer` are
 # the helpers the closure calls.
@@ -100,7 +97,6 @@ export schedules, nonschedulable, dispatch_variant, max_epochs
 export seed, accum, n_devs, checkpointer, early_stop, logger, check_divergence, autolog_schedules,
     log_every_n_steps
 
-# Asking a run's artifacts what they are, and PUBLIC because the alternative kept being
 # Asking a run's artifacts what they are: `read_manifest(dir)` lists retained checkpoints from the
 # manifest without opening a record, and `checkpoint_info(path)` reads one record's metadata with
 # none of its weights. Public because sessions otherwise opened the JLD2 by hand.
@@ -147,11 +143,9 @@ export register_phase_monitor!, unregister_phase_monitor!, progress_counter
 export progress_note!, with_progress_note
 export request_stop!, run_dir, current_step, current_epoch, phase
 export experiment, parameters, states, EarlyStopping, should_stop
-# What the run produced, per epoch, as data that also displays as a table. A handle is not a
 # The per-epoch series a handle keeps, as data that also displays as a table.
 export history
 
-# Export. The hooks, the spec carrier, the entry point, and the backend seam.
 # Export. ReactantServerExport exports `export_bundle`, `write_bundle`, `IOSpec` and
 # `collect_provenance`, and is in scope whenever this surface is usable, so the three concepts
 # here take names that cannot clash; the exports test checks the collision set.
@@ -160,7 +154,6 @@ export export_inputs, export_outputs, export_preprocess, export_postprocess
 export export_client_outputs, export_client_inputs, export_provenance_extra
 export export_model, export_provenance, write_export, site_provenance
 
-# Visualization. `visualize` and `save_figure` are hooks with NO default method; `render` is the
 # Visualization. `visualize` and `save_figure` are hooks with no default method; `render` is the
 # driver. The framework ships no plotting backend.
 export visualize, save_figure, render
