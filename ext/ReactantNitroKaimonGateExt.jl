@@ -388,38 +388,13 @@ function _collect_run_kwargs(;
     return kwargs
 end
 
-# A checkpoint source as a string, mirroring the constructor's `run => checkpoint`: `"a => b"`,
-# spaces optional. On the left `latest` and `all` are the symbols and anything else is a run id; on
-# the right `best` and `latest`. A string with no `=>` is a path. Bare `"best"` and `"latest"` name
-# no run and are refused with the pair to use, as the constructor refuses `:best`. `:current` has
-# no string form: it needs a live handle, which a tool argument cannot carry.
-function _parse_source(s::AbstractString, kw::AbstractString)
-    t = strip(s)
-    if t in ("best", "latest")
-        error(
-            "ReactantNitro ReactantNitroKaimonGateExt: `$(kw) = \"$(t)\"` names a checkpoint and not \
-             the run it belongs to. Pass `$(kw) = \"latest => $(t)\"` for the most recent run in \
-             `run_dir`, or `\"<run id> => $(t)\"` for another (`runs(run_dir)` lists them)\
-             $(t == "best" ? ", or `\"all => best\"` for the best across every run" : "")."
-        )
-    end
-    occursin("=>", t) || return String(t)
-    left, right = strip.(split(t, "=>"; limit = 2))
-    (isempty(left) || isempty(right)) && error(
-        "ReactantNitro ReactantNitroKaimonGateExt: `$(kw) = \"$(t)\"` needs a run on the left of \
-         `=>` (`latest`, `all` or a run id) and a checkpoint on the right (`best` or `latest`)."
-    )
-    run = left == "latest" ? :latest : left == "all" ? :all : String(left)
-    which = right == "best" ? :best : right == "latest" ? :latest : error(
-            "ReactantNitro ReactantNitroKaimonGateExt: `$(kw) = \"$(t)\"` names no checkpoint of the \
-         run: `$(right)` is not `best` or `latest`."
-        )
-    return run => which
-end
+# A checkpoint source as a string: the core's grammar (`ReactantNitro.parse_source`), so the tools
+# accept exactly what the keyword does, selectors and `Average` included.
+_parse_source(s::AbstractString, kw::AbstractString) = ReactantNitro.parse_source(s; kw = Symbol(kw))
 
 # `resume`: `"auto"` (the same as `"latest => latest"`, starting fresh when there is nothing),
 # `"false"` (the default, start over), or a source as above.
-_parse_resume(s::AbstractString) = s == "auto" ? :auto : s == "false" ? false : _parse_source(s, "resume")
+_parse_resume(s::AbstractString) = _parse_source(s, "resume")
 
 # `weights`: a source as above. The tools' `checkpoint` argument is the deprecated spelling, mapped
 # here so the constructor sees `weights` alone.
@@ -741,12 +716,14 @@ experiment's own accessors for this run: `max_epochs`, `run_dir`, `seed`, `n_dev
 `latest` (the most recent run in `run_dir`), `all` (every run, only as `"all => best"`) or a run id
 (the `run` of `read_manifest`, listed by `runs(run_dir)`), and the checkpoint `best` (the best by
 the checkpointer's current metric) or `latest` (the run's newest record): `"latest => best"`,
-`"a1b2c3d4 => best"`, `"all => best"`, `"latest => latest"`. Bare `"best"` and `"latest"` are
+`"a1b2c3d4 => best"`, `"all => best"`, `"latest => latest"`. `weights` also takes an average of a
+run's checkpoints, written as in Julia: `"latest => Average(Last(10))"`,
+`"latest => Average(Best(5; among = Last(20)))"`. Bare `"best"` and `"latest"` are
 refused. `resume` also takes `"auto"` (the same as `"latest => latest"`, starting fresh when there
 is nothing to resume) and `"false"` (the default). `weights` gives the parameters alone, with a
 fresh optimizer; `restore_optimizer = true` also takes that record's optimizer state, with a fresh
 step, epoch and schedule. `restore_best = true` ends the run by loading its own best checkpoint
-into the handle, which a later `nitro_validate`/`nitro_evaluate`/`nitro_export` with this run's id
+(`restore_best = "Average(Last(10))"`: the average of its own latest 10) into the handle, which a later `nitro_validate`/`nitro_evaluate`/`nitro_export` with this run's id
 then uses. `overrides` carries experiment-field values as a comma-separated `name=value` list of
 Julia literals, e.g. `overrides="width=128, labels=[1.0,2.0]"`; an unknown field or a key given in
 both places is an error.
@@ -774,7 +751,7 @@ function nitro_train(
         weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
         restore_optimizer::Bool = false,
-        restore_best::Bool = false,
+        restore_best::Union{Bool, String, Nothing} = nothing,
         overrides::Union{String, Nothing} = nothing,
     )
     kwargs = _collect_run_kwargs(;
@@ -784,7 +761,8 @@ function nitro_train(
     w === nothing || push!(kwargs, :weights => w)
     # Passed only when set, so the constructor's own default stays the one authority.
     restore_optimizer && push!(kwargs, :restore_optimizer => true)
-    restore_best && push!(kwargs, :restore_best => true)
+    rb = restore_best === nothing ? false : ReactantNitro.parse_restore_best(restore_best)
+    rb === false || push!(kwargs, :restore_best => rb)
     state = _new_run(:train, experiment)
     _launch_run!(state) do
         _train_task(state, experiment, overrides, kwargs, preset)

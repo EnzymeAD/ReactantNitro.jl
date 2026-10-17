@@ -68,6 +68,7 @@ include("JSONLog.jl")     # the shipped JSON default logger
 include("EarlyStop.jl")   # early stopping
 include("IORetry.jl")     # retrying I/O
 include("Checkpoint.jl")  # checkpointing and resume
+include("SourceSyntax.jl") # the string form of a checkpoint source, for the gate tools
 include("History.jl")     # the per-epoch metric history a handle keeps, and its table
 include("Render.jl")      # the framed table renderer, text and HTML
 # After `Train.jl`, since visualization needs `predict` and the batch routers.

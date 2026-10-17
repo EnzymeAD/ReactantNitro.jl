@@ -171,6 +171,9 @@ Base.show(io::IO, s::Best) =
     print(io, "Best(", s.k, "; among = ", s.among, ")")
 Base.show(io::IO, s::Last) = print(io, "Last(", s.n, ")")
 Base.show(io::IO, s::Epochs) = print(io, "Epochs(", s.epochs, ")")
+# By value: `epochs` may be a vector, which the default `==` compares by identity.
+Base.:(==)(a::Epochs, b::Epochs) = a.epochs == b.epochs
+Base.:(==)(a::Best, b::Best) = a.k == b.k && a.among == b.among
 Base.show(io::IO, s::Every) = print(io, "Every(", s.n, ")")
 
 """
@@ -1466,6 +1469,7 @@ function Average(sel::Selector; weight::Symbol = :uniform, state = nothing)
     return Average(sel, weight, state)
 end
 
+Base.:(==)(a::Average, b::Average) = a.sel == b.sel && a.weight === b.weight && a.state === b.state
 Base.show(io::IO, a::Average) = print(
     io, "Average(", a.sel, a.state === nothing ? "" : "; state = " * repr(a.state), ")"
 )
