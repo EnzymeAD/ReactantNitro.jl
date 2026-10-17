@@ -71,6 +71,7 @@
     const CHECKPOINTING = [
         :Checkpointer, :TopKCheckpointer, :save_checkpoint!, :load_checkpoint, :CheckpointRecord,
         :Selector, :Best, :Last, :Epochs, :Every, :select, :admits, :Average,
+        :average_checkpoints,
         :checkpoint_filename, :read_manifest, :checkpoint_info,
         # The run ids a checkpoint source names: every run a directory holds, and a handle's own.
         :runs, :checkpoint_run,

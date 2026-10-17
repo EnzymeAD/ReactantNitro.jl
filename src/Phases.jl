@@ -216,6 +216,8 @@ mutable struct Nitro
     # and a handle holding it refuses a further `train!`.
     restore_best::Bool
     restored_best::Any
+    # What the weights average, from an averaged record (`averaged_from`), else `nothing`.
+    averaged_from::Any
 end
 
 # ── The accessors, which are reads and which everything downstream is specified in terms of.

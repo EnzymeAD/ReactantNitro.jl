@@ -601,7 +601,8 @@ function _build_nitro(
         weights === nothing ? nothing : weights_origin(weights),
         NamedTuple[],
         false,
-        restore_best, nothing
+        restore_best, nothing,
+        record !== nothing && weights_only ? record.averaged_from : nothing
     )
     # Two builds from one set of pieces: the text goes to `log_other!` so the record says where
     # every value bound, and the sections are what `show(nitro)` appends to the handle's display.

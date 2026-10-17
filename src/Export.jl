@@ -737,7 +737,8 @@ The framework's provenance entries for the handle's weights: `framework`, `react
 [`site_provenance`](@ref)'s job.
 
 `checkpoint` names the file the restore read (`Nitro.checkpoint_source`) and is omitted for fresh
-weights. `weights_from` describes a warm start from another handle (`weights = other::Nitro`): its
+weights. `averaged_from` is present for averaged weights and names what was averaged: the spec,
+run, directory, files, epochs and weights. `weights_from` describes a warm start from another handle (`weights = other::Nitro`): its
 experiment, epoch, step and run directory. `trained_run_id` and `trained_run_url` come from the
 restored record, not this handle's logger, which on a `weights = path` construction names the
 exporting process; each is omitted when unknown. The checkpoint's epoch and metric are not
@@ -755,6 +756,9 @@ function export_provenance(nitro::Nitro)
     nitro.preset === nothing || (prov["preset"] = String(nitro.preset))
     nitro.checkpoint_source === nothing ||
         (prov["checkpoint"] = String(nitro.checkpoint_source))
+    af = nitro.averaged_from
+    af === nothing ||
+        (prov["averaged_from"] = Dict{String, Any}(String(k) => v for (k, v) in pairs(af)))
     # A warm start names the handle it took its weights from, which has no path: the experiment,
     # the epoch and step it had reached, and its run directory are what a reader can chase.
     ws = nitro.weights_source

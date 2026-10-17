@@ -491,7 +491,7 @@
             rec.opt_state, moved, rec.step, rec.epoch, rec.seed, rec.config,
             rec.devices, rec.metrics, rec.run_id, rec.run_url, rec.logger_state,
             rec.logger_type, rec.anchor_checksum, rec.stop_reason, rec.preset, rec.derived,
-            rec.early_stop
+            rec.early_stop, rec.averaged_from
         )
         err = try
             check_permutation_compatible(bad, n.layout, "x")
@@ -1432,6 +1432,31 @@
             )
             @test_throws "is for loading" Checkpointer(; keep = Best(2; among = Last(3)))
             @test_throws "not supported yet" Average(Last(3); weight = :ema)
+        end
+
+        @testset "`average_checkpoints`: in memory, saved, and traced through provenance" begin
+            src = :latest => Average(Last(3))
+            mem = average_checkpoints(dir, src)
+            @test flat(mem.ps) ≈ flat(parameters(eval_nitro(src))) rtol = 1.0e-6
+            @test mem.averaged_from.epochs == [3, 4, 5]
+            @test mem.averaged_from.weights ≈ fill(1 / 3, 3)
+
+            listed = length(read_manifest(dir))
+            path = joinpath(dir, "avg-last3.jld2")
+            average_checkpoints(dir, src; save = path)
+            @test isfile(path) && length(read_manifest(dir)) == listed   # not in the manifest
+            @test checkpoint_info(path).averaged_from.epochs == [3, 4, 5]
+            @test_throws "does not overwrite" average_checkpoints(dir, src; save = path)
+
+            m = eval_nitro(path)
+            @test flat(parameters(m)) == flat(mem.ps)
+            @test m.averaged_from.epochs == [3, 4, 5]
+            prov = export_provenance(m)
+            @test prov["averaged_from"]["epochs"] == [3, 4, 5]
+            @test prov["averaged_from"]["spec"] == "Average(Last(3))"
+            # A trained record carries none.
+            @test checkpoint_info(run_file(dir, run_of(n), 5)).averaged_from === nothing
+            @test !haskey(export_provenance(eval_nitro(:latest => :latest)), "averaged_from")
         end
 
         @testset "another handle's `keep` is checked before its manifest is read" begin

@@ -32,6 +32,7 @@ Everything a checkpoint holds: the `snapshot` passed to [`save_checkpoint!`](@re
 | `preset` | optional | The preset the run was built from, `nothing` if none |
 | `derived` | optional | The keys `derive` returned, so a weights-only load restores them |
 | `early_stop` | optional | The early-stopping counters, so a resume continues its patience |
+| `averaged_from` | optional | For an averaged record, what it averages: the spec, run, directory, files, epochs, weights and the state's file |
 
 Every value is a host value; setup moves them to the device when it loads a record.
 """
@@ -59,6 +60,8 @@ struct CheckpointRecord
     derived::Any
     # `EarlyStopping`'s counters, so a resume continues its patience; `nothing` in older records.
     early_stop::Any
+    # What an averaged record averages (`average_checkpoints`); `nothing` for a trained one.
+    averaged_from::Any
 end
 
 # ── Showing a record never shows the weights ─────────────────────────────────────────
@@ -416,7 +419,8 @@ function save_checkpoint!(ckpt::Checkpointer, epoch, metrics, snapshot)
         # `nothing` for a run that named no preset, which is most of them.
         hasproperty(snapshot, :preset) ? snapshot.preset : nothing,
         hasproperty(snapshot, :derived) ? snapshot.derived : nothing,
-        hasproperty(snapshot, :early_stop) ? snapshot.early_stop : nothing
+        hasproperty(snapshot, :early_stop) ? snapshot.early_stop : nothing,
+        nothing
     )
 
     name = owned_name(
@@ -651,7 +655,7 @@ function checkpoint_info(path::AbstractString)
         epoch = r.epoch, step = r.step, seed = r.seed, preset = r.preset,
         run_id = r.run_id, run_url = r.run_url, logger_type = r.logger_type,
         stop_reason = r.stop_reason, anchor_checksum = r.anchor_checksum,
-        metrics = r.metrics,
+        metrics = r.metrics, averaged_from = r.averaged_from,
     )
 end
 
@@ -799,14 +803,14 @@ _load_record_quietly(path) = Base.CoreLogging.with_logger(
 )
 
 # Field-shape migrations: the `tunables` to `devices` rename, and the additions of `preset`,
-# `derived` and `early_stop`.
+# `derived`, `early_stop` and `averaged_from`.
 # JLD2 reconstructs an old record as a ReconstructedMutable with the on-disk field names, and the
 # rename is done here. A function because `checkpoint_info` reads the same records. FORMAT_VERSION
 # stays 1, since the semantics did not change.
 function _migrate_record(raw, path = "<record>")
     raw isa CheckpointRecord && return raw
     if hasproperty(raw, :tunables) || !hasproperty(raw, :preset) || !hasproperty(raw, :derived) ||
-            !hasproperty(raw, :early_stop)
+            !hasproperty(raw, :early_stop) || !hasproperty(raw, :averaged_from)
         return CheckpointRecord(
             raw.format_version, raw.framework_version,
             raw.ps, raw.st, raw.opt_state, raw.flat_permutation,
@@ -816,7 +820,8 @@ function _migrate_record(raw, path = "<record>")
             raw.logger_type, raw.anchor_checksum, raw.stop_reason,
             hasproperty(raw, :preset) ? raw.preset : nothing,
             hasproperty(raw, :derived) ? raw.derived : nothing,
-            hasproperty(raw, :early_stop) ? raw.early_stop : nothing
+            hasproperty(raw, :early_stop) ? raw.early_stop : nothing,
+            hasproperty(raw, :averaged_from) ? raw.averaged_from : nothing
         )
     end
     return error("ReactantNitro: `$path` does not hold a `CheckpointRecord`; it holds a \
@@ -1580,7 +1585,7 @@ end
     ReactantNitro.average_records(ckpt, src::AverageSource) -> CheckpointRecord
 
 The averaged record: `src.state_file`'s record with `ps` replaced by the uniform mean of every
-picked record's `ps`. Records are read one at a time into a `Float64` accumulator, so memory holds
+picked record's `ps`, and `averaged_from` saying what was averaged. Records are read one at a time into a `Float64` accumulator, so memory holds
 one record and the sum, not all of them. Refuses records whose parameter layouts differ.
 """
 function average_records(ckpt, src::AverageSource)
@@ -1604,9 +1609,50 @@ function average_records(ckpt, src::AverageSource)
     ps = Functors.fmap(acc, base.ps) do a, x
         a isa AbstractArray{Float64} ? convert(typeof(x), a ./ n) : x
     end
-    return CheckpointRecord(
-        map(f -> f === :ps ? ps : getfield(base, f), fieldnames(CheckpointRecord))...
+    from = (;
+        spec = string(src.spec), run = src.run, dir = src.dir, files = copy(src.files),
+        epochs = copy(src.epochs), weights = fill(1 / n, n), state_file = src.state_file,
     )
+    swap(f) = f === :ps ? ps : f === :averaged_from ? from : getfield(base, f)
+    return CheckpointRecord(map(swap, fieldnames(CheckpointRecord))...)
+end
+
+"""
+    average_checkpoints(run_dir, run => Average(sel); checkpointer = Checkpointer(), save = nothing)
+        -> CheckpointRecord
+
+The averaged record `weights = run => Average(sel)` would load, returned on the host, and written
+to `save` when one is given. The written file is an ordinary record: `weights = path` loads it,
+and its `averaged_from` field (shown by [`checkpoint_info`](@ref) and recorded in an export's
+provenance) names the files, epochs and weights it averages. It is not added to the manifest, so
+retention never ranks or deletes it. `save` refuses an existing file.
+
+```julia
+average_checkpoints("runs/MyExp", :latest => Average(Last(10)); save = "runs/MyExp/avg-last10.jld2")
+```
+"""
+function average_checkpoints(run_dir, src::Pair; checkpointer = Checkpointer(), save = nothing)
+    run, avg = src
+    avg isa Average || error(
+        "ReactantNitro: `average_checkpoints` takes `run => Average(selector)`; got \
+         `$(source_repr(src))`."
+    )
+    check_source(src, :weights)
+    what = "`average_checkpoints($(repr(String(run_dir))), $(source_repr(src)))`"
+    rec = average_records(
+        checkpointer, resolve_average_source(checkpointer, String(run_dir), run, avg; what)
+    )
+    if save !== nothing
+        path = String(save)
+        endswith(path, ".jld2") || error("ReactantNitro: `save = $(repr(path))` must end in `.jld2`.")
+        ispath(path) && error(
+            "ReactantNitro: `save = $(repr(path))` already exists, and `average_checkpoints` does \
+             not overwrite. Remove it or pick another name."
+        )
+        mkpath(dirname(abspath(path)))
+        write_record(path, rec)
+    end
+    return rec
 end
 
 """

@@ -131,7 +131,7 @@ export Decay
 # are: a model package EXTENDS it.
 export Checkpointer, TopKCheckpointer, save_checkpoint!, load_checkpoint, CheckpointRecord
 # Selectors: which checkpoints `Checkpointer(; keep)` retains and a `weights` source picks.
-export Selector, Best, Last, Epochs, Every, select, admits, Average
+export Selector, Best, Last, Epochs, Every, select, admits, Average, average_checkpoints
 export checkpoint_filename
 
 # Logging. The contract, plus the one shipped backend: the JSON default, which is what
