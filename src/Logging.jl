@@ -18,10 +18,18 @@
 """
     log_metrics!(lgr, metrics; step, epoch, context, kwargs...) -> nothing
 
-The metric channel. `context` is `"train"` (one line per optimizer step, or per
-[`log_every_n_steps`](@ref), with the schedule values under `schedule/`), `"validate"` (one per
-epoch of metrics), or `"data"` (the per-epoch `data_wait_frac`, a third context so it dilutes
-neither count). The framework drops non-finite values before calling.
+Log a `NamedTuple` of metrics. `context` is one of:
+
+  * `"train"`: one line per logged optimizer step (every [`log_every_n_steps`](@ref)th step),
+    carrying the loss, the [`train_metrics`](@ref) values and, under
+    [`autolog_schedules`](@ref), the schedule values under `schedule/` keys
+  * `"validate"`: one line per epoch with the `val` split's metrics
+  * `"data"`: one line per epoch with `data_wait_frac`, the fraction of the epoch the host spent
+    waiting on data; a separate context so it does not mix into the other two series
+
+Values arrive as host values. The framework drops non-finite `Real` values before calling and
+passes other values (arrays, tuples) through unchanged. A method must accept `kwargs...` so a
+keyword added later does not break it.
 """
 function log_metrics! end
 log_metrics!(::Nothing, metrics; kwargs...) = nothing
@@ -29,8 +37,11 @@ log_metrics!(::Nothing, metrics; kwargs...) = nothing
 """
     log_params!(lgr, params) -> nothing
 
-Hyperparameters, logged **before the first compile**, since a compile-time crash would otherwise
-lose them. Keep the key style flat: dotted keys split comparison tables under one-project-per-model.
+Log the run's hyperparameters. Setup calls this before the first compile, so a crash during
+compilation still leaves them logged. `params` is a flat `NamedTuple` of the experiment's
+configuration and the run's settings (`seed`, `accum`, `max_epochs`, the resolved prefetch
+settings), plus `preset` when the run names one. Keep keys flat: dotted keys split comparison
+tables in hosted trackers.
 """
 function log_params! end
 log_params!(::Nothing, params) = nothing
@@ -46,8 +57,8 @@ log_tags!(::Nothing, tags) = nothing
 """
     log_other!(lgr, key, value) -> nothing
 
-Free-form single values. The schedule binding report goes through here as
-`log_other!(lgr, "binding_report", str)` so it lands in the run's record.
+Log one free-form value under `key`. Setup logs the schedule binding report this way, as
+`log_other!(lgr, "binding_report", str)`.
 """
 function log_other! end
 log_other!(::Nothing, key, value) = nothing
@@ -55,11 +66,11 @@ log_other!(::Nothing, key, value) = nothing
 """
     log_confusion!(lgr, matrix, labels; epoch) -> nothing
 
-Takes a plain `Matrix{Int}`; the backend adapts it. The framework never calls this: a confusion
-matrix is a user metric accumulated with `:sum`, and only the experiment knows
-both that one exists and what its labels mean. The shape that works is to accumulate it in
-[`metrics`](@ref), stash it from [`finalize_metrics`](@ref), and emit it from a phase monitor on
-the transition out of `EvalStepping`:
+Log a confusion matrix, given as a plain `Matrix{Int}` that the backend adapts. The framework
+never calls this, since only the experiment knows whether it has a confusion matrix and what its
+labels mean. Accumulate it in [`metrics`](@ref) with `:sum`, stash it from
+[`finalize_metrics`](@ref), and emit it from a phase monitor on the transition out of
+`EvalStepping`:
 
 ```julia
 metrics(e, out; y)            = (; confusion = confusion_matrix(out, y) => :sum)
@@ -74,11 +85,11 @@ log_confusion!(::Nothing, matrix, labels; kwargs...) = nothing
 """
     finish!(lgr, status) -> nothing
 
-Finalize. `status` is `:completed`, `:early_stop`, or `:error`, matching the `stop_reason` recorded
-in the checkpoint.
+Close the run on the backend. `status` is `:completed`, `:early_stop`, `:requested` (a
+[`request_stop!`](@ref)), or `:error`, matching the `stop_reason` recorded in the checkpoint.
 
-**Do not map `Base.close` to `finish!(:completed)`**: in a `finally` it runs *after* the driver's
-`finish!(:error)` and would stamp every failed run completed.
+**Do not map `Base.close` to `finish!(:completed)`**: in a `finally` it runs after the driver's
+`finish!(:error)` and would mark every failed run completed.
 """
 function finish! end
 finish!(::Nothing, status) = nothing
@@ -86,29 +97,32 @@ finish!(::Nothing, status) = nothing
 """
     run_id(lgr) -> Any
 
-Informational, for humans and reports. Stored in the checkpoint record so a checkpoint traces back
-to its experiment.
+The backend's run identifier, for people and reports, or `nothing` if it has none (the default).
+Stored in the checkpoint record so a checkpoint traces back to its logged run. Unrelated to
+[`checkpoint_run`](@ref).
 """
 function run_id end
-run_id(::Nothing) = nothing
+run_id(lgr) = nothing
 
 """
     run_url(lgr) -> Any
 
-Informational, as [`run_id`](@ref).
+The backend's URL for the run, or `nothing` if it has none (the default). Informational like
+[`run_id`](@ref), and stored in the checkpoint record with it.
 """
 function run_url end
-run_url(::Nothing) = nothing
+run_url(lgr) = nothing
 
 """
     logger_state(lgr) -> Any
 
-Machine-readable resumption state, opaque to the framework and backend-specific: a hosted
-experiment key, a W&B run id plus project, a tracking URI. Default `nothing`, meaning no resumable
-state, in which case nothing is stored and no reattachment is attempted. It must return plain
-serializable data (`String`, `NamedTuple`, `Dict`), never the live backend object, since the record
-goes through JLD2 and outlives the process. If this returns anything but `nothing`,
-[`reattach!`](@ref) is required. Separate from [`run_id`](@ref), which is informational only.
+The state a resumed run needs to continue the same logged run, such as a hosted experiment key, a
+run id plus project, or a tracking URI. Opaque to the framework and stored in the checkpoint
+record. Default `nothing`: no resumable state, so nothing is stored and no reattachment is
+attempted. Return plain serializable data (`String`, `NamedTuple`, `Dict`), never the live backend
+object, since the record is written with JLD2 and outlives the process. A logger that returns
+anything else must define [`reattach!`](@ref). [`run_id`](@ref) is separate and informational
+only.
 """
 logger_state(lgr) = nothing
 logger_state(::Nothing) = nothing
@@ -116,9 +130,10 @@ logger_state(::Nothing) = nothing
 """
     reattach!(lgr, state) -> nothing
 
-Restore a logger onto its previous experiment, before the run starts and before any metric is
-logged. Required if and only if [`logger_state`](@ref) returns non-`nothing`, with no default
-method. Resuming into a different logger type refuses with both names.
+Point a logger back at the logged run that `state` (from [`logger_state`](@ref)) identifies.
+Setup calls it on resume, before any metric is logged. There is no default method; a logger needs
+one exactly when its `logger_state` can return something other than `nothing`. Resuming into a
+logger of a different type than the one that wrote the record is refused, naming both.
 """
 function reattach! end
 reattach!(::Nothing, state) = nothing
@@ -126,10 +141,9 @@ reattach!(::Nothing, state) = nothing
 """
     backend(lgr) -> Any
 
-Reach the native backend object. Default identity: the logger a user passes is their backend
-object, and every other client function in that package stays callable on it. This escape hatch is
-why the contract has no `log_image!`, `log_artifact!` or `log_curve!`; monitors reach the logger
-through `info.logger`.
+The native backend object, for calls the contract does not cover (images, artifacts, curves).
+The default is identity, since a logger is usually the backend object itself; a wrapper returns
+what it wraps. Phase monitors reach the logger as `info.logger`.
 
 ```julia
 backend(w::MyWrapper) = w.exp
@@ -141,11 +155,10 @@ backend(::Nothing) = nothing
 """
     logger_info(lgr) -> NamedTuple
 
-The backend's key identifying parameters, as one plain `NamedTuple`. Informational, like
-[`run_id`](@ref): an experiment key and URL, a run id and project, the shipped
-[`JSONLogger`](@ref)'s file path, which the `nitro_logger` tool renders. Default `(;)`. Plain
-serializable data only, never the live object, since the table crosses tool and report
-boundaries. Not stored in the checkpoint record.
+The parameters that identify where the backend writes, as a plain `NamedTuple`: an experiment
+key and URL, a run id and project, or for [`JSONLogger`](@ref) its file path. Informational, like
+[`run_id`](@ref); the `nitro_logger` tool renders it. Default `(;)`. Return plain data, never the
+live object, since the value is passed to tools and reports. Not stored in the checkpoint record.
 """
 logger_info(lgr) = (;)
 logger_info(::Nothing) = (;)
@@ -153,9 +166,9 @@ logger_info(::Nothing) = (;)
 """
     ReactantNitro._adopt_logger!(lgr, dir) -> lgr
 
-Internal: the logger-side half of setup's default wiring. The default [`JSONLogger`](@ref) is
-constructed without a path and adopts the run's resolved `run_dir` here, as the default
-`TopKCheckpointer` does; a wrapper over the user's logger forwards this, and the identity default
-leaves every other logger untouched.
+Called by setup to give the logger the run's resolved `run_dir`. A pathless
+[`JSONLogger`](@ref) sets its path to `metrics.jsonl` there, as the default `Checkpointer`
+adopts `run_dir`. A wrapper forwards the call to the logger it wraps; the default returns any
+other logger unchanged.
 """
 _adopt_logger!(lgr, dir) = lgr

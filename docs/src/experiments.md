@@ -2,14 +2,14 @@
 
 ## An experiment is a struct plus hooks
 
-An experiment is an ordinary Julia struct plus a handful of hook methods. The struct declares the
-knobs and their markers; the hooks define what the run does with them. The framework owns
-everything else: the compiled programs, the device transfers, the optimizer (see
-[Optimization](optimization.md)), the schedules (see [Schedules](schedules.md)), and the run's
-lifecycle. [`Nitro`](@ref)`(e)` runs setup and nothing else, so evaluation and serving never
-require a `train!` to have happened; `train!(nitro)` runs the loop.
+An experiment is an ordinary Julia struct plus hook methods. The struct declares the knobs and
+their markers; the hooks define what the run does with them. The framework owns everything else:
+the compiled programs, the device transfers, the optimizer (see [Optimization](optimization.md)),
+the schedules (see [Schedules](schedules.md)), and the run's lifecycle. [`Nitro`](@ref)`(e)` runs
+setup and nothing else, so evaluation, prediction and export work on a handle that has never
+trained; `train!(nitro)` runs the loop.
 
-Four hooks are required, and these are all of them:
+Four hooks are required:
 
 ```julia
 build_model(e, rng) -> (model, ps, st)      # standard Lux setup
@@ -18,21 +18,21 @@ forward(e, model, ps, st; <batch fields>) -> (outputs, st_new)
 loss(e, outputs; <batch fields>) -> scalar
 ```
 
-- [`build_data`](@ref) produces the data as a NamedTuple of splits, `(; train, val, test)`; `dist`
-  is the distribution handle, `nothing` in this version. It runs against the real experiment,
-  before device conversion.
+- [`build_data`](@ref) returns the data as a NamedTuple of splits, `(; train, val, test)`. `dist`
+  is the distribution handle, always `nothing` in this version. It runs against the real
+  experiment, before device conversion.
 - [`build_model`](@ref) builds the model and its initial parameters and state with the standard
   Lux setup, returning `(model, ps, st)`. It sees the experiment, so it can read structural fields
   such as widths and class counts.
-- [`forward`](@ref) is the exportable program, the one `predict` calls. It takes inputs and never
-  targets, which is why the same method serves training, validation, and inference. It returns
+- [`forward`](@ref) is the exportable program, the one `predict` calls. It takes inputs only,
+  never targets, so the same method serves training, validation, and inference. It returns
   `(outputs, st_new)`.
 - [`loss`](@ref) turns the outputs into a scalar. It sees the outputs plus the label fields, which
-  is exactly why the split exists: `forward` sees only inputs. Do not fold the loss into `forward`.
+  `forward` never sees. Do not fold the loss into `forward`, or `predict` and export would need
+  labels.
 
-Everything else has a default, and the test suite covers an experiment that defines only these
-four: it trains, validates, and checkpoints with nothing else passed. When unsure whether something
-needs a hook, check the default first.
+Every other hook has a default. An experiment that defines only these four trains, validates, and
+checkpoints.
 
 ## What each hook receives, and what it passes on
 
@@ -42,16 +42,18 @@ which [`forward`](@ref) produces and the framework hands on unchanged.
 ### The batch arrives as keywords, and only the fields you declare
 
 A batch is a `NamedTuple` of host arrays with the batch dimension last. Each hook declares the
-fields it wants as keyword arguments, and the framework resolves that once at setup and passes
-exactly that subset:
+fields it wants as keyword arguments; the framework resolves the routing once at setup and passes
+each hook only its fields:
 
 ```julia
 forward(e, model, ps, st; img)        # gets `img` only
 loss(e, outputs; label)               # gets `label` only
 ```
 
-A field no hook declares is never transferred to the device. A keyword with a default is an optional
-field. A method ending in `kwargs...` receives the whole batch, and nothing is checked for it.
+A field no hook declares is never transferred to the device. A required keyword missing from the
+batch raises; a keyword with a default is an optional field and takes its default when absent, so a
+typo in a defaulted keyword also takes the default. A method ending in `kwargs...` receives the
+whole batch, and nothing is checked for it.
 
 ### `forward` returns `(outputs, st_new)`, and the framework keeps only the first
 
@@ -59,8 +61,8 @@ field. A method ending in `kwargs...` receives the whole batch, and nothing is c
 outputs, st_new = forward(e, model, ps, st; img)
 ```
 
-The framework threads `st_new` back for you and discards it in eval mode. Everything downstream
-sees `outputs`, and sees it as **one positional argument**:
+The framework carries `st_new` into the next step in training and discards it in eval mode.
+Every downstream hook receives `outputs` as **one positional argument**:
 
 ```julia
 loss(e, outputs; label)
@@ -68,12 +70,12 @@ metrics(e, outputs; label)
 train_metrics(e, outputs; label)
 ```
 
-Nothing is splatted, unpacked, or renamed in between. Whatever `forward` put in the first slot is
-exactly what `loss` receives in its second.
+Nothing is splatted, unpacked, or renamed in between: `loss` receives, as its second argument,
+exactly what `forward` returned first.
 
-**The trap:** if `forward` returns a bare array, `first(outputs)` inside `loss` is element one of
-that array, not "the outputs". Every operation after it stays broadcast-legal, so the run trains on
-one number out of the batch and never raises. Do not unpack `outputs` a second time.
+Do not unpack `outputs` a second time. If `forward` returns a bare array, `first(outputs)` inside
+`loss` is element one of that array. Every operation after it still broadcasts, so the run trains on
+one number out of the batch and never raises.
 
 ### Multiple outputs are a `NamedTuple`
 
@@ -93,16 +95,14 @@ ReactantNitro.metrics(e::Seq2Seq, out; target) =
     (; acc = n_correct(out.logits, target) => size(target)[end])
 ```
 
-A `Tuple` works too, and so does a nested structure: the framework walks the output tree with
-`Functors`, so anything it walks is a legal shape. A `NamedTuple` is the one to prefer, because
-[`export_outputs`](@ref) names the leaves that ship by key, and because `out.logits` says what it is
-at every call site.
+A `Tuple` or a nested structure also works: the framework walks the output tree with `Functors`.
+Prefer a `NamedTuple`, because [`export_outputs`](@ref) names the leaves to export by key, and
+`out.logits` is readable at every call site.
 
-**Two rules apply to every array leaf of the output tree**, and both exist because of the short
-final batch. The batch dimension must be **last**, and the framework asserts it before slicing
-rather than slicing the wrong axis and returning the wrong samples. And a leaf must be an array:
-a scalar you already reduced over the batch has no batch dimension to slice, so reduce it in
-[`loss`](@ref) or [`metrics`](@ref) instead of returning it from `forward`.
+**Every leaf of the output tree must be an array with the batch dimension last.** A short final
+eval batch is sliced along the last dimension; the framework checks that dimension is the batch
+size and raises otherwise. A scalar already reduced over the batch has no batch dimension to slice,
+so reduce it in [`loss`](@ref) or [`metrics`](@ref) instead of returning it from `forward`.
 
 ### Where the outputs end up
 
@@ -114,14 +114,13 @@ a scalar you already reduced over the batch has no batch dimension to slice, so 
 | prediction | `forward` alone | sliced, and converted to host arrays |
 | export | `export_preprocess` then `forward` | the leaves [`export_outputs`](@ref) names, which may be a subset |
 
-The padding is the reason two of those rows differ. A short final eval batch is padded up to the
-compiled width, the program runs at that width, and the outputs are sliced back before any hook of
-yours sees them. [`metrics`](@ref) never sees a padded sample.
+Validation and prediction differ from training because of padding: a short final eval batch is
+padded up to the compiled batch size, the program runs at that size, and the outputs are sliced back
+before any of your hooks sees them. [`metrics`](@ref) never sees a padded sample.
 
 ## The three markers, and the default
 
-An experiment field is one of three categories, chosen with a marker or, for the default, with
-nothing at all:
+Each experiment field is one of three kinds, chosen with a marker; an unmarked field is `Host`:
 
 ```julia
 @experiment struct MyExp
@@ -142,44 +141,40 @@ end
 | `Device{T}` | a device-resident traced input | no, by construction | a numeric knob you might sweep or schedule |
 | unmarked, i.e. `Host{T}` | not at all | no | everything else, including anything dataset-sized |
 
-Unmarked means `Host` because it is the common case: the first real model ported to this framework
-was 83% `Host` by field count. Writing `Host{T}` explicitly is legal, and useful where a field's
-host-ness would otherwise surprise a reader.
+Unmarked means `Host` because most fields are. Writing `Host{T}` explicitly is legal, and useful
+where a reader would not expect the field to be host-only.
 
-A `GraphConst` field bakes as a trace-time constant with ordinary Julia semantics, and because it
-enters the compile cache key, changing it recompiles, which is correct: a different value is a
-different program. A `Device` field is converted to device residency at setup and reaches traced
-code as an input, so revising its value or scheduling it does not recompile.
-[Recompilation](recompilation.md) says what the key actually contains; [Schedules](schedules.md)
-owns the scheduling side.
+A `GraphConst` field bakes as a trace-time constant and is in the compile cache key, so changing it
+recompiles: a different value is a different program. A `Device` field is moved to the device at
+setup and reaches traced code as an input, so changing or scheduling its value does not recompile.
+[Recompilation](recompilation.md) lists what the key contains; [Schedules](schedules.md) covers
+scheduling.
 
-Getting it wrong is loud in both directions. Reading an unmarked field from traced code raises with
-the field named and the three fixes spelled out. Over-marking `GraphConst` costs a recompile per
-distinct value, visible in the cache counters.
+Both mistakes are visible. Using an unmarked field in traced code raises, naming the field and the
+fixes. Marking a field `GraphConst` that should be `Device` costs a recompile per distinct value,
+visible in `ReactantNitro.cache_stats()`.
 
-Keep dataset-sized state unmarked, or off the experiment entirely. The `compile_view` section below
+Keep dataset-sized state unmarked, or off the experiment entirely; the `compile_view` section below
 says why.
 
 ## Why a macro
 
-A macro rather than a helper function, because the declaration-time knowledge cannot be recovered
-later. After setup a `Device` field holds a device value, a `ConcretePJRTNumber` for a scalar or a
-`ConcretePJRTArray` for an array, not the marker type, so inspecting field types at runtime cannot
-tell which fields were marked. The macro records that knowledge as traits while the declaration is
-still in front of it.
+The markers are recorded by a macro because they cannot be recovered later. After setup a
+`Device` field holds a device value (a `ConcretePJRTNumber` for a scalar, a `ConcretePJRTArray` for
+an array), not the marker type, so the field types at runtime do not say which fields were marked.
+The macro records the markers as traits at declaration.
 
 Each `Device` and `Host` field gets its own free type parameter on the generated struct. That is
 what lets one field hold a host value before setup and a device value after, and lets a `Host`
 field hold its real value in `e` and a `ReactantNitro.StrippedHost` in `compile_view(e)`. `GraphConst` fields
 keep their declared concrete type, and the generated keyword constructor converts to it, so
-`width::GraphConst{Int}` means what it says whether or not the experiment happens to declare a
-`Device` alongside it.
+`width::GraphConst{Int}` always holds an `Int`.
 
 The recorded traits are [`device_fields`](@ref), [`host_fields`](@ref), and
-[`config_metadata`](@ref). There is deliberately no `graphconst_fields`: two traits determine three
-categories and the third is the complement, `setdiff(fieldnames, device_fields, host_fields)`. The
-macro also generates the keyword constructor and a specialized [`compile_view`](@ref) method, and it
-appends a marker table beneath the struct's docstring.
+[`config_metadata`](@ref). There is no `graphconst_fields`: the `GraphConst` fields are the rest,
+`setdiff(fieldnames(E), device_fields(E), host_fields(E))`. The macro also generates the keyword
+constructor and a specialized [`compile_view`](@ref) method, and it appends a marker table beneath
+the struct's docstring.
 
 The macro is optional. A hand-written struct plus those three trait definitions works, which is why
 the three are exported; `compile_view` and `config_metadata` have fallbacks that read the traits for
@@ -189,8 +184,8 @@ a type that never used the macro. The [API](api.md) page links each of them.
 
 While tracing, Reactant and Enzyme traverse the whole experiment, because it is an argument to
 the compiled program. A dataset-sized field reachable from it is walked element by element, on one
-thread, on every compile. The cost grows with the data, does not change the emitted graph, and does
-not raise; compile time reads like a data-loading problem and is not one.
+thread, on every compile. The cost grows with the data, does not change the emitted graph, and
+raises nothing, so it looks like slow data loading.
 
 The guard is [`compile_view`](@ref), which every trace site receives instead of `e`. It replaces
 every `Host` field with a `ReactantNitro.StrippedHost` sentinel that carries only the field's
@@ -202,16 +197,16 @@ compile_view(e).width      # 128, unchanged: a GraphConst field still bakes
 compile_view(e).smoothing  # unchanged: a Device is a traced input
 ```
 
-The real `e` runs everywhere outside the trace: `build_data`, `derive`, metric finalization,
+The real `e` is used everywhere outside the trace: `build_data`, `derive`, metric finalization,
 checkpointing, and every driver decision read `e.images` normally. Only traced code sees the
-sentinel, and reading it there raises with the field named. A sentinel rather than `nothing`
-because `nothing` passes through an `::Any` signature and survives in a returned tuple; the
-sentinel raises on arithmetic, property access, and conversion.
+sentinel, and using it there (arithmetic, indexing, property access, conversion, iteration) raises
+with the field named. A sentinel that is only stored or passed through is not detected. It is a
+sentinel rather than `nothing` because `nothing` passes through an `::Any` signature without an error.
 
-Keep dataset-sized state unmarked (`Host`), or off the experiment entirely. The second is usually
-the better fit: `build_data` hands the collection to the framework, which holds it separately from
-`e`. A field on the experiment is the case that needs the marker, and since unmarked already means
-`Host`, the case that still bites is a field someone marked `GraphConst` by hand.
+Keep dataset-sized state unmarked (`Host`), or off the experiment entirely. Off the experiment is
+usually better: `build_data` hands the collection to the framework, which holds it apart from `e`.
+Since unmarked already means `Host`, the remaining risk is a dataset-sized field marked
+`GraphConst`.
 
 ## One flat struct: no configuration struct inside a field
 
@@ -236,71 +231,71 @@ If a model builder wants a config struct as its argument, assemble one inside `b
 the flat fields, or have the builder take the experiment. Either keeps one declaration of each
 value.
 
-**The override hazard is the reason that bites first.** [`from_preset`](@ref) validates every key
-against `fieldnames(E)`, and the generated keyword constructor takes one keyword per field; neither
-reaches inside a struct. A recipe that wants one different number therefore has to name the whole
-struct, and naming the whole struct fills every field it did not name from the CONFIG's own
-defaults rather than from the experiment's default for that field:
+**Overrides replace the whole struct.** [`from_preset`](@ref) validates every key against
+`fieldnames(E)`, and the generated keyword constructor takes one keyword per field; neither reaches
+inside a struct. A recipe that changes one number has to supply the whole struct, and every field it
+does not name takes the config type's own default, not the experiment's default for that field:
 
 ```julia
-# experiment declares:  model::GraphConst{ModelCfg} = ModelCfg(width = 256, depth = 8)
-# a preset writes:      (; model = ModelCfg(width = 512))
-# and the run trains at depth = 4, the CONFIG's default. Nothing raises.
+# ModelCfg's own default:  depth = 4
+# experiment declares:     model::GraphConst{ModelCfg} = ModelCfg(width = 256, depth = 8)
+# a preset writes:         (; model = ModelCfg(width = 512))
+# and the run trains at depth = 4, ModelCfg's default. Nothing raises.
 ```
 
-A call-site override has the same shape: `MyExp(; model = ModelCfg(width = 512))` replaces the
-field rather than merging into it. The workaround people reach for is a `_with(cfg; kw...)` merge
-helper, a second mechanism to keep in sync and a second place to forget. Flat fields need none, and
-`from_preset(MyExp, :recipe; width = 512)` says exactly what it changes.
+A call-site override behaves the same: `MyExp(; model = ModelCfg(width = 512))` replaces the field
+rather than merging into it. A merge helper such as `_with(cfg; kw...)` is a second mechanism to
+keep in sync. With flat fields, `from_preset(MyExp, :recipe; width = 512)` changes exactly one
+value.
 
-The nested config is safe only by coincidence. If the experiment's default happens to be a bare
-`ModelCfg()`, the fallback lands on the same values and nothing looks wrong. That stops being true
-the day the default gains an argument, and then every partial preset silently reverts every field
-it did not name.
+The problem is hidden while the experiment's default is a bare `ModelCfg()`, because the config
+type's defaults are then the same values. Once the default gains an argument, every partial preset
+reverts every field it did not name.
 
-Three more reasons. Residency is a per-field property, so a nested struct
-takes one marker for its whole group: nothing inside a `GraphConst` struct can be `Device`, and
-`Device` is what makes a value sweepable and schedulable with no recompile. Burying a loss weight
-in a config struct decides, without meaning to, that changing it recompiles the gradient program.
+There are three more reasons. Residency is per field, so a nested struct takes one marker for its
+whole group: nothing inside a `GraphConst` struct can be `Device`, so a loss weight in a config struct
+recompiles the gradient program whenever it changes.
 
-A struct in a `GraphConst` field is a hashing hazard, and the wrapper is the whole defect. Julia's
-fallback `hash` for a struct with no method of its own hashes `objectid(x)`, and `objectid` reaches
-a mutable field such as a `Vector` by identity rather than descending into it. Two identical
-constructions then key differently, and one mutated in place keys the same, which would serve a
-program compiled for the old value. The same vector held directly as a `GraphConst{Vector{Int}}`
-field is content-hashed by Base in both directions, with nothing written by hand.
+A struct in a `GraphConst` field may hash by identity. Julia's fallback `hash` for a struct with no
+method of its own hashes `objectid(x)`, and `objectid` reaches a mutable field such as a `Vector`
+by identity rather than by content. Two identical constructions then key differently, and one
+mutated in place keys the same, which would serve a program compiled for the old value. The same
+vector held directly as a `GraphConst{Vector{Int}}` field is hashed by content.
 `ReactantNitro.assert_graphconst_hashable` refuses the struct case at setup and recommends
 flattening first.
 
-And [`config_metadata`](@ref), which feeds the logged hyperparameter table, is per field. A
-non-scalar field logs as the bare string of its type name, so a nested config contributes one
-useless entry and none of its values reach the table or any run comparison. Flat fields each log by
-name.
+The logged hyperparameters are per field too. A non-scalar `GraphConst` or `Device` field logs as
+its type name (an array as its type name and size), and a non-scalar `Host` field is not logged, so
+none of a nested config's values reach the logger or any run comparison.
 
 **What not to flatten.** A `Host` field holding dataset-sized state (samplers, in-memory frames,
-handles) stays one field: it is not a group of knobs, and the point is that `compile_view` replaces
-the whole field with a sentinel so the tracer never walks it. A config type that is some other
-function's signature stays a type, but assemble it at the call site rather than storing it. And the
-cost is asymmetric: `@experiment` generates one type parameter per `Device` and per `Host` field and
-none per `GraphConst`, so flattening an architecture config is free in that respect while
-flattening a large `Host` config is not.
+handles) stays one field: it is not a group of knobs, and `compile_view` replaces the whole field
+with a sentinel so the tracer never walks it. A config type that another function takes as its
+argument stays a type, but assemble it at the call site rather than storing it. `@experiment`
+generates one type parameter per `Device` and per `Host` field and none per `GraphConst`, so
+flattening an architecture config adds no type parameters, while flattening a large `Host` config
+adds one per field.
 
 ## derive and named configurations
 
 [`derive`](@ref)`(e, data)` returns a NamedTuple that the framework merges into the experiment, for
-anything that genuinely depends on the dataset: class weights from label counts, a normalization
-constant. It runs after `build_data` and before device conversion, so it always returns host values
-and the framework places them, and resume recomputes it rather than restoring it:
+values that depend on the dataset: class weights from label counts, a normalization constant. Every
+key must name an existing field. It runs after `build_data` and before device conversion, so it
+returns host values and the framework places them. A resume recomputes it; `weights = path`
+restores the derived values from the checkpoint instead, so an evaluation process needs no training
+data:
 
 ```julia
+# `data` is what `build_data` returned; here each training batch has integer class labels in `label`.
 function ReactantNitro.derive(e::MyExp, data)
-    counts = [count(==(c), labels) for c in 0:9]         # from the training split
-    (; class_weights = Float32.(sum(counts) ./ (10 .* counts)))
+    labels = reduce(vcat, (vec(b.label) for b in data.train))
+    counts = [count(==(c), labels) for c in 0:9]
+    return (; class_weights = Float32.(sum(counts) ./ (10 .* counts)))
 end
 ```
 
-Prefer constants for anything structural. Deriving a shape makes the compiled program a function of
-your data, so a different split silently changes the graph. And a large derived value should be
+Prefer constants for anything structural. A derived shape makes the compiled program depend on
+the data, so a different split changes the graph. And a large derived value should be
 `Device`, not `GraphConst`: a `GraphConst` array would be both baked into the graph as a constant
 and walked by the tracer on every compile, while a `Device` value is converted once and crosses as
 a single buffer.
@@ -319,23 +314,21 @@ e = from_preset(MyExp, :current)                   # the experiment, from the re
 e = from_preset(MyExp, :current; max_epochs = 40)  # overrides win over the preset
 ```
 
-Every preset key is validated against `fieldnames(E)`, and that validation is the mechanism's one
-correctness argument: an unknown key in a splatted NamedTuple would otherwise be a silent no-op. A
-preset is field values, so the marker semantics are untouched: switching presets recompiles exactly
-when the emitted graph really differs, two recipes differing only in `Host` fields share both
-compiled programs, and one that changes a class count correctly does not. A preset may set a
-`Device` field too; `derive` wins for anything it computes. `from_preset` returns a bare experiment
-and records no name; `Nitro(E, name; ...)` records which recipe produced the run. Keep the recipes
-in their own file, beside the experiment and organized by whatever they vary over.
+Every preset key is validated against `fieldnames(E)`, since an unknown key would otherwise be
+ignored. A preset is only field values, so the markers apply as usual: switching presets recompiles
+only when a `GraphConst` field differs, so two recipes differing only in `Host` or `Device` fields
+share every compiled program. A preset may set a `Device` field too; `derive` wins for anything
+it computes. `from_preset` returns a bare experiment and records no name; `Nitro(E, name; ...)`
+also logs the preset name with the run's hyperparameters. Keep the recipes in their own file,
+beside the experiment.
 
 ## The Revise workflow
 
-The reference version of the workflow the [Tutorial](tutorial.md) narrates.
+The [Tutorial](tutorial.md) walks through this workflow; this section is the reference.
 
-A `Nitro` is a fixed point. Everything that decides which compiled program runs is resolved at
-construction: the run keywords and accessor values are frozen into the handle's own fields, and
-every read afterwards goes to the field. So nothing you revise changes an existing handle, and a
-handle can never silently recompile underneath you.
+Everything that decides which compiled program a `Nitro` runs is resolved at construction: the run
+keywords, the accessor values, and the hook methods are frozen into the handle. A revision does not
+change an existing handle, and a handle never recompiles because of one.
 
 Revise, then build a new `Nitro`:
 
@@ -347,14 +340,14 @@ n = Nitro(e; data = n.data)                      # picks up the edit, reuses the
 train!(n)                                        # compiles only what actually changed
 ```
 
-A rebuild is cheap because the compile cache is module-level rather than per-`Nitro`: a fresh
-handle on the same experiment hits the entries the previous one compiled, so it recompiles only
-what the edit changed. [Recompilation](recompilation.md) covers the key mechanics. The remaining
-cost of a rebuild is setup, not compilation: device conversion, a single batch to infer routing,
-and `derive` on the resume path. Seconds, against the hundreds a recompile costs.
+A rebuild is cheap because the compile cache is module-level rather than per `Nitro`: a new
+handle on the same experiment reuses the entries the previous one compiled and recompiles only what
+the edit changed. [Recompilation](recompilation.md) covers the key. The rest of a rebuild is setup:
+device conversion, one batch to infer routing, and `derive`. That takes seconds; a recompile can
+take minutes.
 
-What does land on an existing handle is a host-side method on a stored object. Nothing is compiled
-and nothing is snapshotted except the object, so the new code simply runs next epoch, for free:
+A new method on a host-side object the handle stores does apply to an existing handle. The handle
+stores the object, not its methods, so the new code runs on the next `train!` call:
 
 ```julia
 # A `should_stop` method on your own stopper. No recompile, new behaviour.
@@ -363,8 +356,8 @@ train!(n)
 ```
 
 The one exception to freezing is a `Device` value, changed with [`set_device!`](@ref) on the live
-handle. It is exactly the thing the compile key excludes by construction, so writing one provably
-reuses the compiled programs:
+handle. `Device` fields are not in the compile key, and `set_device!` checks that the key is
+unchanged before writing, so it reuses the compiled programs:
 
 ```julia
 for t in (0.5f0, 1f0, 1.5f0, 2f0)
@@ -374,35 +367,41 @@ end
 device_value(n, :temperature)                    # reads it back as a HOST value
 ```
 
-`set_device!` refuses the cases that would break the no-recompile promise, and each error names
-its fix: a `GraphConst` field bakes, so it is genuinely a different program; a `Host` field reaches
-no trace, so writing it would change nothing compiled; a scheduled field belongs to the schedule;
-a value of a different element type or size would move the key. In every case the fix is a new
-`Nitro`.
+`set_device!` refuses, with an error naming the fix: a `GraphConst` field (a different program),
+a `Host` field (no compiled program reads it), and a scheduled field (the schedule would overwrite
+the write). For those, build a new `Nitro`. It converts the value to the field's host type, so
+`0.5` for a `Device{Float32}` is accepted, and refuses a value that does not convert. It also
+refuses an array of a different size: size is not in the key, so the old program would run and
+fail inside XLA.
 
-The handle is never silently stale. Every entry point prints what it fixed, names any hook
-redefined since construction, and flags a scalar accessor that has drifted:
+A stale handle says so. When something changed since construction, `train!`, `validate` and
+`evaluate` print a report naming any redefined hook, any compiled program whose dependency methods
+were redefined, and any scalar accessor whose value changed (`train!` checks every scalar accessor;
+`validate` and `evaluate` check `seed` and `run_dir`):
 
 ```julia
-ReactantNitro: MyExp values fixed at construction (rebuild the `Nitro` to change them)
-  seed 42   accum 2   max_epochs 20   total 5500   clip 1.0   run_dir runs/myexp
-  ! `accum(e)` was redefined: it returned 2 at construction and returns 4 now.
-  ! hooks were redefined after this `Nitro` was built. It will keep running the programs it was
-    built with; rebuild the `Nitro` to pick up the new code.
+ReactantNitro: MyExp has values fixed at construction that have since been redefined. This handle
+keeps what it froze; rebuild the `Nitro` to pick up the new ones, and see `show(nitro)` for what it
+is currently holding.
+  ! `accum(e)` was redefined: it returned 2 at construction and returns 4 now. This handle still
+uses 2; rebuild to pick up 4.
+  ! hooks were redefined after this `Nitro` was built (loss). It will keep running the programs it
+    was built with; rebuild the `Nitro` to pick up the new code. ...
 ```
 
-The comparison is against what the accessor returned at construction, so a keyword you passed is
-never mistaken for a stale accessor. The handle wins because `accum` and `max_epochs` jointly
-determine the schedule horizon `total`, and applying a revised value in isolation would leave every
-schedule resolved against a horizon that no longer exists. Silence the report in a scripted driver
-with `ReactantNitro.set_config_report!(false)`.
+Nothing is printed when nothing changed; `show(nitro)` lists the frozen values. The accessor check
+compares the accessor's value now against its value at construction, so a keyword you passed is
+not reported as stale. The handle keeps its frozen values because `accum` and `max_epochs` together
+determine the schedule horizon `total`, and applying one revised value would leave every schedule
+resolved against the old horizon. Silence the report in a scripted driver with
+`ReactantNitro.set_config_report!(false)`.
 
-Two limits. An accessor that constructs an object (`early_stop`,
-`checkpointer`, `logger`) is never flagged: probing it would fire the side effect the framework
-promises to trigger exactly once. And a `const` or global read from inside a hook body is invisible
-to the key, since the method's world only moves when the method itself is edited; edit a helper
-that `forward` calls and you get a stale program. Mid-run edits do nothing at all: a running
-`train!` is pinned to the world age it started in.
+Two limits. Only scalar accessors are compared: an accessor that constructs an object
+(`early_stop`, `checkpointer`, `logger`) is never called again, since calling it could repeat a side
+effect the framework runs exactly once. And a `const` or global value read from a hook is not in
+the key: changing it reuses the old program until the REPL restarts. A redefined helper that
+`forward` calls is caught by the dependency check. Edits made while `train!` is running do not
+affect that call: it keeps the world age it started in.
 
 Build a new `Nitro` for a new training job; reuse an existing one for more validation,
 evaluation, prediction, and `Device` sweeps.

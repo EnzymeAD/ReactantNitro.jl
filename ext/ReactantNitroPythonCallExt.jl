@@ -127,7 +127,9 @@ end
 
 Write a TensorFlow SavedModel at `joinpath(dir, name)`: `saved_model.pb`, the weights under
 `variables/`, and `assets.extra/provenance.json`, plus `assets.extra/working_tree.patch` when the
-provenance carries a `git_diff`. Refuses a non-empty target directory.
+provenance carries a `git_diff`. Raises on a non-empty target directory, duplicate `batch_sizes`,
+`client_outputs`, a program with `custom_call` targets, or a traced program whose argument count
+differs from the inputs plus weights.
 """
 function ReactantNitro.write_export(
         b::TFSavedModel, program, ps, st, example_inputs;

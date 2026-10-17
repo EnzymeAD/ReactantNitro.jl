@@ -109,8 +109,9 @@ _cwr_method() = only(methods(Reactant.call_with_reactant))
 """
     TraceHook.install!() -> Bool
 
-Wrap `call_with_reactant`'s generator. Call from `__init__`, before anything is traced. Returns
-`false`, with one warning, when Reactant's structure is not the one this file was written for.
+Replace `call_with_reactant`'s generator with a recording wrapper. Call from `__init__`, before
+anything is traced. Returns `true` when installed (or already installed), and `false`, with one
+warning, when Reactant's structure is not the one this module was written for.
 """
 function install!()
     _ORIGINAL[] === nothing || return true
@@ -183,8 +184,10 @@ end
 """
     TraceHook.with_trace_recording(f) -> (result, record)
 
-Run `f()`, typically a Reactant compile, and return what the trace went through. `record` is
-`nothing` when precise mode is unavailable, so the caller can fall back to its own closure.
+Run `f()`, typically a Reactant compile, and return its result with a `TraceRecord` of the method
+specializations the trace went through. `record` is `nothing` when precise mode is unavailable or
+a traced specialization has no matching CodeInstance, and the caller then falls back to its
+inference closure.
 """
 function with_trace_recording(f)
     precise_available() || return (f(), nothing)
@@ -273,7 +276,10 @@ end
 """
     TraceHook.trace_drift(record) -> (; drift, drifted)
 
-The same contract as `closure_drift`, so the cache's staleness scan can use either.
+Whether any method the trace went through has changed since, with the same return as
+`closure_drift` so the cache's staleness scan can use either. `drift` is `true` when something
+changed, and `drifted` names the changed methods (an inlined callee when it can be found,
+otherwise the traced specialization).
 """
 function trace_drift(rec::TraceRecord)
     world = Base.get_world_counter()

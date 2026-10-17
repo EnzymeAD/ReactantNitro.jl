@@ -35,9 +35,10 @@ _pending(lg::TBLogger) = get!(
 """
     ReactantNitro.log_metrics!(lgr::TBLogger, metrics; step, epoch, context, kwargs...) -> nothing
 
-One scalar summary per metric, tagged `<context>/<name>` at `step`, plus `<context>/epoch`. A
-non-`Real` value is an error naming the keys, since quietly dropping a metric is the lossy no-op
-the contract forbids.
+One scalar summary per metric, tagged `<context>/<name>` at `step`, plus `<context>/epoch`. The
+train line's schedule values arrive under `schedule/` keys, so they are tagged
+`train/schedule/<field>` (or `train/schedule/<group>/<field>`). A non-`Real` value raises an error
+naming the offending keys, since the logging contract does not allow dropping a metric.
 """
 function ReactantNitro.log_metrics!(lgr::TBLogger, metrics; step, epoch, context = "train", kwargs...)
     st = _pending(lgr)
@@ -72,9 +73,10 @@ end
 """
     ReactantNitro.log_params!(lgr::TBLogger, params) -> nothing
 
-Writes the parameters twice: a text summary at step 0 immediately, so a compile-time crash still
-leaves them in the event file, and a stashed HParams record that [`finish!`](@ref) writes once the
-metric tags exist. Values are coerced to the `String`, `Bool` and `Real` the plugin accepts.
+Write the parameters twice: as a text summary at step 0 immediately, so a crash during compilation
+still leaves them in the event file, and as an HParams record that [`finish!`](@ref) writes once
+the metric tags are known. Values other than `String`, `Bool` and `Real`, the types the HParams
+plugin accepts, are converted to strings.
 """
 function ReactantNitro.log_params!(lgr::TBLogger, params)
     st = _pending(lgr)
@@ -93,7 +95,7 @@ _hparam(v) = string(v)
 """
     ReactantNitro.log_tags!(lgr::TBLogger, tags) -> nothing
 
-TensorBoard has no tag concept, so tags become a text summary under `tags`.
+TensorBoard has no run tags, so tags become a text summary under `tags`, at the last logged step.
 """
 function ReactantNitro.log_tags!(lgr::TBLogger, tags::Union{NamedTuple, AbstractDict})
     log_text(lgr, "tags", _Markdown(_markdown_pairs(tags)); step = _pending(lgr).step[])
@@ -113,8 +115,8 @@ end
 """
     ReactantNitro.log_other!(lgr::TBLogger, key, value) -> nothing
 
-A scalar summary under `other/<key>` for a number, a text summary otherwise; the binding report
-renders as markdown.
+A number becomes a scalar summary under `other/<key>`, anything else a markdown text summary
+there, which is how the binding report is logged. Both use the last logged step.
 """
 function ReactantNitro.log_other!(lgr::TBLogger, key, value)
     st = _pending(lgr)
@@ -129,10 +131,10 @@ end
 """
     ReactantNitro.log_confusion!(lgr::TBLogger, matrix, labels; epoch, step, kwargs...) -> nothing
 
-A markdown table as a text summary under `confusion`, rows true and columns predicted. `step`
-defaults to the last step a metric was logged at. Built as a string here, since
-TensorBoardLogger's own 2-D path serializes a non-square matrix with its shape and contents
-disagreeing.
+A markdown table as a text summary under `confusion`, rows true and columns predicted. The matrix
+must be square with one label per class. `step` defaults to the last step a metric was logged at.
+The table is built as a string because TensorBoardLogger's own 2-D path serializes a non-square
+matrix with mismatched shape and contents.
 """
 function ReactantNitro.log_confusion!(
         lgr::TBLogger, matrix, labels; epoch, step = nothing, kwargs...
@@ -146,9 +148,9 @@ end
 """
     ReactantNitro.finish!(lgr::TBLogger, status) -> nothing
 
-Writes the stashed HParams record with the metric tags the run produced, then the status under
-`run/status`. It does not close the logger: a `TBLogger` flushes on every event, and a second
-`train!` on the same handle is legitimate.
+Write the stashed HParams record with the metric tags the run produced, then the status under
+`run/status`. The logger is not closed: a `TBLogger` flushes on every event, and a second `train!`
+on the same handle may log to it again.
 """
 function ReactantNitro.finish!(lgr::TBLogger, status)
     st = _pending(lgr)
@@ -168,19 +170,18 @@ ReactantNitro.run_url(lgr::TBLogger) = nothing
 """
     ReactantNitro.logger_state(lgr::TBLogger) -> NamedTuple
 
-The log directory. Not the "nothing to reattach" case of the shipped `JSONLogger`: `TBLogger`'s
-default init policy is `tb_increment`, which silently writes to `<logdir>_1` over an existing
-directory, splitting one run's curves across two entries on a resume. Storing the directory is
-what lets [`reattach!`](@ref) catch that.
+The log directory, stored in the checkpoint so [`reattach!`](@ref) can check that a resume writes
+to the same one. `TBLogger`'s default init policy, `tb_increment`, writes to `<logdir>_1` when the
+directory exists, which on a resume would split one run across two TensorBoard runs.
 """
 ReactantNitro.logger_state(lgr::TBLogger) = (; logdir = TensorBoardLogger.logdir(lgr))
 
 """
     ReactantNitro.reattach!(lgr::TBLogger, state) -> nothing
 
-Checks that this run writes where the checkpoint's run wrote, and refuses when it does not. It
-checks rather than relocates, since moving a live `TBLogger` means reopening event files behind its
-back; the supported way to continue a run is `TBLogger(dir, tb_append)`.
+Check that this logger writes to the directory the checkpoint's run wrote to, and raise if not. It
+does not relocate the logger, since that would mean reopening a live `TBLogger`'s event files; to
+continue a run, construct the logger as `TBLogger(dir, tb_append)`.
 """
 function ReactantNitro.reattach!(lgr::TBLogger, state)
     here = TensorBoardLogger.logdir(lgr)
@@ -194,17 +195,18 @@ function ReactantNitro.reattach!(lgr::TBLogger, state)
         so the resumed run would appear in TensorBoard as a second, separate run.
 
         The usual cause is the default init policy. `TBLogger(dir)` is `tb_increment`, which
-        quietly becomes `dir_1` when `dir` already exists, and a resume always finds it existing.
+        becomes `dir_1` when `dir` already exists, and a resume always finds it existing.
         Construct the logger with `TBLogger("$(state.logdir)", tb_append)` to extend the run, or
-        pass `resume = nothing` if a separate run is what you meant."""
+        pass `resume = false` if a separate run is what you meant."""
     )
 end
 
 """
     ReactantNitro.logger_info(lgr::TBLogger) -> NamedTuple
 
-The event directory, plus the logger's own step counter, which stays put while nothing logs
-through the stdlib `AbstractLogger` path.
+The event directory (`logdir`) and TensorBoardLogger's own step counter (`step`). That counter
+advances only on messages sent through the `AbstractLogger` interface, which this extension does
+not use, so it does not track the run's step.
 """
 ReactantNitro.logger_info(lgr::TBLogger) = (;
     logdir = TensorBoardLogger.logdir(lgr),

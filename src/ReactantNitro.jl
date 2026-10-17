@@ -1,12 +1,11 @@
 """
     ReactantNitro
 
-A general Julia training framework on Reactant.jl + Lux.jl.
+A training framework for Lux models compiled with Reactant.
 
-The central object is a [`Nitro`](@ref): `Nitro(e)` runs the setup sequence and nothing else, so
-`validate`, `evaluate`, and `predict` work with no training anywhere in the process. `train!` is a
-separate verb. A *run* is what happens when you `train!` a `Nitro`, which is why the `run_*`
-accessors keep that name while the object does not.
+The central object is a [`Nitro`](@ref). `Nitro(e)` runs setup only, so `validate`, `evaluate` and
+`predict` work without training; [`train!`](@ref) trains it. A *run* is one `train!` of a `Nitro`,
+which is what the `run_*` accessors are named for.
 """
 module ReactantNitro
 
@@ -40,9 +39,8 @@ import UUIDs
 """
     ReactantNitro._unimplemented(what, detail)
 
-Uniform body for a declared-but-unbuilt entry point. The message says the entry point is not built
-yet, so a `MethodError`-shaped hole and a not-yet-built one are distinguishable at a glance;
-`detail` is whatever identifies the missing piece to whoever is building it.
+The error body for an entry point that is declared but not built yet. The message says so, which
+tells it apart from a `MethodError`; `detail` names the missing piece.
 """
 @noinline _unimplemented(what, detail) = error(
     "ReactantNitro: `$what` is declared but not implemented yet (not yet built: $detail)."
@@ -59,6 +57,7 @@ include("Batch.jl")       # batch routing
 include("Data.jl")        # the data contract and the dataloaders
 include("Decay.jl")       # weight decay
 include("Optimizer.jl")   # optimizer construction and parameter groups
+include("GradRules.jl")   # gradient rules: SAM and the default single gradient
 include("Schedules.jl")   # schedules
 include("TraceHook.jl")   # opt-in precise invalidation: records what each trace went through
 include("Cache.jl")       # the compiled-program cache
@@ -69,12 +68,11 @@ include("JSONLog.jl")     # the shipped JSON default logger
 include("EarlyStop.jl")   # early stopping
 include("IORetry.jl")     # retrying I/O
 include("Checkpoint.jl")  # checkpointing and resume
+include("SourceSyntax.jl") # the string form of a checkpoint source, for the gate tools
 include("History.jl")     # the per-epoch metric history a handle keeps, and its table
 include("Render.jl")      # the framed table renderer, text and HTML
-# Visualization needs `predict` and the batch routers, so it follows `Train.jl`; it is placed here
 # After `Train.jl`, since visualization needs `predict` and the batch routers.
 include("Visualize.jl")   # rendering
-# Export is last because it consumes almost everything above it: `Nitro`, the routers,
 # Last, since export consumes almost everything above it.
 include("Export.jl")      # export to a served bundle
 
@@ -90,7 +88,8 @@ export presets, from_preset
 export build_data, build_model, forward, loss
 export metrics, train_metrics, finalize_metrics, metrics_residency, derive
 export param_group, optimizer, learning_rate, lambda, decay_anchor, gradient_clip_norm
-# Manual training mode. Defining `train_step` for an experiment type is what selects
+# Gradient rules: `grad_rule` picks one; `perturbation` is what a new `PerturbRule` defines.
+export grad_rule, GradRule, SingleGrad, PerturbRule, SAM, perturbation
 # Manual training mode: defining `train_step` selects it, `manual_training(e) = false` declines it,
 # `setup_optimizers` supplies the user-owned optimizer states, `backward` and `step_optimizer` are
 # the helpers the closure calls.
@@ -102,7 +101,6 @@ export schedules, nonschedulable, dispatch_variant, max_epochs
 export seed, accum, n_devs, checkpointer, early_stop, logger, check_divergence, autolog_schedules,
     log_every_n_steps
 
-# Asking a run's artifacts what they are, and PUBLIC because the alternative kept being
 # Asking a run's artifacts what they are: `read_manifest(dir)` lists retained checkpoints from the
 # manifest without opening a record, and `checkpoint_info(path)` reads one record's metadata with
 # none of its weights. Public because sessions otherwise opened the JLD2 by hand.
@@ -132,7 +130,9 @@ export Decay
 
 # Checkpointing. `checkpoint_filename` is exported for the same reason the hooks above
 # are: a model package EXTENDS it.
-export TopKCheckpointer, save_checkpoint!, load_checkpoint, CheckpointRecord
+export Checkpointer, TopKCheckpointer, save_checkpoint!, load_checkpoint, CheckpointRecord
+# Selectors: which checkpoints `Checkpointer(; keep)` retains and a `weights` source picks.
+export Selector, Best, Last, Epochs, Every, select, admits, Average, average_checkpoints
 export checkpoint_filename
 
 # Logging. The contract, plus the one shipped backend: the JSON default, which is what
@@ -149,11 +149,9 @@ export register_phase_monitor!, unregister_phase_monitor!, progress_counter
 export progress_note!, with_progress_note
 export request_stop!, run_dir, current_step, current_epoch, phase
 export experiment, parameters, states, EarlyStopping, should_stop
-# What the run produced, per epoch, as data that also displays as a table. A handle is not a
 # The per-epoch series a handle keeps, as data that also displays as a table.
 export history
 
-# Export. The hooks, the spec carrier, the entry point, and the backend seam.
 # Export. ReactantServerExport exports `export_bundle`, `write_bundle`, `IOSpec` and
 # `collect_provenance`, and is in scope whenever this surface is usable, so the three concepts
 # here take names that cannot clash; the exports test checks the collision set.
@@ -162,7 +160,6 @@ export export_inputs, export_outputs, export_preprocess, export_postprocess
 export export_client_outputs, export_client_inputs, export_provenance_extra
 export export_model, export_provenance, write_export, site_provenance
 
-# Visualization. `visualize` and `save_figure` are hooks with NO default method; `render` is the
 # Visualization. `visualize` and `save_figure` are hooks with no default method; `render` is the
 # driver. The framework ships no plotting backend.
 export visualize, save_figure, render

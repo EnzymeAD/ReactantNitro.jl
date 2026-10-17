@@ -5,20 +5,28 @@
 """
     EarlyStopping(; metric = :val_loss, mode = :min, patience = 5, min_delta = 1f-4)
 
-The stopping policy, independent of the checkpointer: the metrics can differ and the jobs differ
-(retention versus control flow). `:val_loss` is what the default `metrics` emits; an experiment
-defining its own `metrics` names one of its keys, and a metric nothing emits is a setup error.
-`patience` counts epochs without improvement and `min_delta` is absolute, matching Keras and
-Lightning. `early_stop` defaults to `nothing`, so a bare experiment does not early-stop.
+Stop training when a validation metric stops improving. Pass it as the `early_stop` keyword or
+accessor; the default `nothing` never stops early. It is configured separately from the
+checkpointer and may watch a different metric.
+
+`metric` is a key of the validation metrics: `:val_loss` when the experiment defines no `metrics`,
+otherwise one of the keys its `metrics` returns. `mode` is `:min` or `:max`. `patience` counts
+epochs without improvement, and an epoch improves when it beats the best so far by more than
+`min_delta` (absolute, as in Keras and Lightning). Setup requires a `val` split and checks `mode`,
+`patience` and, for an experiment without `metrics`, that `metric` is `:val_loss`; a key missing
+from a custom `metrics` raises at the first epoch.
 
 ```julia
 train!(e; early_stop = EarlyStopping(; metric = :val_loss, mode = :min,
                                        patience = 5, min_delta = 1f-4))
 ```
 
-Stopping is graceful (the epoch finishes, validates, checkpoints, and exits through `Done`) and
-recorded as `stop_reason` in the checkpoint record, so a resume into a stopped run says so.
-[`request_stop!`](@ref) sets the same flag imperatively.
+The stopping epoch still validates and checkpoints, then `train!` returns through `Done` with
+`stop_reason = :early_stop`, which the final checkpoint record stores. [`request_stop!`](@ref)
+stops at the same point on demand, with `stop_reason = :requested`. Setup copies the instance with
+fresh `best` and `wait` counters, so two handles never share them and the instance you passed is
+not mutated; the handle's copy is `nitro.early_stop`. The counters are stored in each checkpoint,
+and a resume that watches the same metric and mode continues from them.
 """
 mutable struct EarlyStopping
     metric::Symbol
@@ -38,9 +46,11 @@ EarlyStopping(;
 """
     should_stop(es, epoch, metrics) -> Bool
 
-The stopping policy; custom policies implement this for their own type, and the `::Nothing` method
-returns `false`. An epoch improves when it beats the best seen by more than `min_delta`. The metric
-is read through [`check_control_readback`](@ref), since it drives control flow.
+Update the policy with one epoch's validation `metrics` and return whether to stop. A custom
+policy implements this method for its own type; `should_stop(::Nothing, ...)` returns `false`. For
+[`EarlyStopping`](@ref), an epoch improves when it beats the best so far by more than `min_delta`,
+and the run stops after `patience` epochs in a row without improvement. The metric is read through
+[`check_control_readback`](@ref), which raises on a non-finite or non-real value.
 """
 function should_stop(es::EarlyStopping, epoch, metrics)
     haskey(metrics, es.metric) || error(
@@ -64,12 +74,28 @@ end
 
 should_stop(::Nothing, epoch, metrics) = false
 
+# The resumable counters the checkpoint record stores; `nothing` for a policy without any.
+early_stop_state(es) = nothing
+early_stop_state(es::EarlyStopping) = (; es.metric, es.mode, es.best, es.wait)
+
+# The handle's own copy, with fresh counters, or a resumed record's counters when it watched the
+# same metric and mode. A policy of another type is used as given.
+setup_early_stop(es, state) = es
+function setup_early_stop(es::EarlyStopping, state)
+    own = EarlyStopping(es.metric, es.mode, es.patience, es.min_delta, nothing, 0)
+    if state !== nothing && state.metric === es.metric && state.mode === es.mode
+        own.best, own.wait = state.best, state.wait
+    end
+    return own
+end
+
 """
     ReactantNitro.check_early_stop(es, collection, routing) -> nothing
 
 The setup-time early-stopping checks: `mode`, `patience`, the presence of a `val` split, and, when
-the experiment defines no `metrics` (so the only key is `:val_loss`), the metric name. Otherwise
-the keys exist only once the hook has run, and [`should_stop`](@ref) raises at the first epoch.
+the experiment defines no `metrics` (so the only key is `:val_loss`), the metric name. A custom
+`metrics` has no known keys before it runs, so [`should_stop`](@ref) checks the name at the first
+epoch.
 """
 check_early_stop(::Nothing, collection, routing) = nothing
 

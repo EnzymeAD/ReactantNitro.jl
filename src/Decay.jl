@@ -7,20 +7,22 @@
     Decay(lambda, anchor)
     Decay(lambda, anchor, no_decay_mask)
 
-Weight decay and decay toward the pretrained weights as one rule, differing only in the anchor:
+Decoupled weight decay toward an anchor: `apply!` adds `no_decay_mask * lambda * (x - anchor)` to
+the update, or `no_decay_mask * lambda * x` when `anchor === nothing`. The anchor comes from the
+group's [`decay_anchor`](@ref):
 
-| Group configured with | `anchor` | `lambda` is the strength of |
+| `decay_anchor` | `anchor` | Decays toward |
 | --- | --- | --- |
-| `decay_anchor = :zero` (default) | `nothing` | decay toward zero, i.e. ordinary weight decay |
-| `decay_anchor = :w0` | that group's `w0` slice | decay toward the pretrained weights |
-| `decay_anchor = <array>` | that array | decay toward an explicit target |
-| neither | rule omitted | nothing; no `Decay` in the chain |
+| `:zero` (default) | `nothing` | zero (ordinary weight decay) |
+| `:w0` | that group's `w0` slice | the pretrained weights (L2-SP) |
+| an array | that array | an explicit target |
 
-`anchor === nothing` is a type-level distinction, so plain decay emits no subtraction ops. There is
-deliberately no `WeightDecay` alias, which would collide with `Optimisers.WeightDecay` on the same
-concept. Decoupled only: `Decay` goes after the base rule, matching AdamW, so `lambda` arrives
-pre-multiplied by `η_g(t)`; anywhere but last in a chain is a setup error. The anchor is an explicit
-field, never captured at `init`, which on resume would capture the restored weights.
+A group whose [`lambda`](@ref) is zero gets no `Decay` in its chain. `anchor === nothing` is
+resolved by type, so plain decay emits no subtraction. `Decay` must be the last rule in a chain,
+after the base rule as in AdamW, so `lambda` arrives pre-multiplied by the group's learning rate;
+any other position is a setup error. The anchor is a field rather than state captured at `init`,
+which on a resume would capture the restored weights. There is no `WeightDecay` alias, since
+`Optimisers.WeightDecay` already uses that name.
 """
 struct Decay{L, W, M} <: Optimisers.AbstractRule
     lambda::L

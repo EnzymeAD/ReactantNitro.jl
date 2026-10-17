@@ -1,41 +1,43 @@
 # Pitfalls: what the framework takes care of
 
-A Reactant-first stack has snags that are easy to hit and hard to diagnose: a compile that
-balloons for no visible reason, an edit that reuses a stale program, a run that dies out of memory
-hours in. None of them raise; each presents as slow training or as a process that vanishes
-overnight. Each section below says what the framework does about one and points at the page that
-owns the mechanism.
+A Reactant-first stack has failures that raise no error: a compile that grows for no visible
+reason, an edit that reuses a stale program, device memory exhausted hours into a run. They show
+up as slow training or as a process that dies. Each section below says what the framework does
+about one and links the page that covers it.
 
-## Your dataset is never traced
+## Host fields are never traced
 
-Fields are [`Host`](@ref) unless marked otherwise, and the trace sees a stripped view of the
-experiment. A dataset reachable from traced code is walked element by element on every compile.
+A dataset reachable from traced code is walked element by element on every compile. Fields are
+[`Host`](@ref) unless marked otherwise, and the trace sees a view of the experiment in which every
+`Host` field is replaced by a sentinel.
 
-The three markers, and how to tell which one a field wants, are on the
-[Experiments](experiments.md) page.
+The three markers, and how to choose one, are on the [Experiments](experiments.md) page.
 
-## Beyond code changes, only a `GraphConst` change recompiles
+## What recompiles besides a code edit
 
-[`Host`](@ref) values never reach the compiled program, and a [`Device`](@ref) value changes without
-a recompile unless its shape or element type changes. Sweeping a hyperparameter, scheduling a value,
-changing the learning rate and reseeding are all free.
+[`Host`](@ref) values never reach the compiled program, and a new [`Device`](@ref) value of the
+same element type and size reuses it. Sweeping or scheduling a `Device` value, changing the learning
+rate and reseeding compile nothing. The run keywords `accum` and `gradient_clip_norm` are also in
+the key: changing `accum` recompiles the gradient program, and changing the clip recompiles the
+optimizer program.
 
-[Recompilation](recompilation.md) is the page for this, including
-`ReactantNitro.cache_stats()`, the acceptance check that a change did not recompile.
+[Recompilation](recompilation.md) covers the key, and `ReactantNitro.cache_stats()` to check that a
+change did not recompile.
 
 ## Revising a method invalidates the programs built on it
 
-The compile key carries the resolved world age of every hook, and each cached program also records
-the transitive closure of the methods it was traced against, so editing a helper `forward` calls
-several levels down is caught too. A new [`Nitro`](@ref) recompiles against the current code; an
-existing handle keeps the programs it was built with and says so.
+The compile key carries the world age of every hook, and each cached program also records the
+methods it was traced through, so an edit to a helper that `forward` calls several levels down is
+caught too. A new [`Nitro`](@ref) recompiles against the current code; an existing handle keeps the
+programs it was built with and says so. A changed `const` or global value is not caught: restart
+the REPL.
 
-The REPL and Revise workflow this exists for is on the [Experiments](experiments.md) page.
+The Revise workflow is on the [Experiments](experiments.md) page.
 
 ## Device transfers happen at known times
 
-A scheduled [`Device`](@ref) value uploads once per step; a constant one uploads once, at the start
-of training.
+A scheduled [`Device`](@ref) field uploads once per optimizer step; an unscheduled one uploads
+once, at setup.
 
 What may vary with the step, and where each schedule binds, is on the [Schedules](schedules.md)
 page.
@@ -50,11 +52,8 @@ Parameter groups, decay and clipping are on the [Optimization](optimization.md) 
 
 ## Device buffers are freed per batch
 
-The host GC runs on host pressure and cannot see the device filling, so a run that leaves batch
-buffers to the finalizer can die out of memory while the host looks idle. The loop frees each
-batch's buffers as soon as the loss readback confirms the step has finished, and the prefetch
-pipeline frees what it staged when a phase ends. Freeing nulls the buffer pointer, so a
+The host GC runs on host memory pressure and cannot see device memory, so a run that leaves batch
+buffers to the finalizer can run out of device memory while host memory use stays low. The loop
+frees each batch's buffers as soon as the loss readback confirms the step has finished, and the
+prefetch pipeline frees what it staged when a phase ends. Freeing nulls the buffer pointer, so a
 use-after-free raises on readback instead of returning stale memory.
-
-The host/device boundary, and what a model author may and may not do at it, is the subject of the
-`reactantnitro-device-boundary` skill.

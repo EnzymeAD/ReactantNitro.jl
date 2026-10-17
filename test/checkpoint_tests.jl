@@ -181,7 +181,7 @@
         # field addition, which reads like breakage at someone resuming a run that is about to work. The
         # migration above is explicit and tested, so the warning is noise, and noise trains people to
         # ignore warnings. Suppressed narrowly: this asserts no Warn-level message escapes the load.
-        @test_logs load_checkpoint(TopKCheckpointer(), path)
+        @test_logs load_checkpoint(Checkpointer(), path)
     end
 
     @testset "weights-only restores a derived `GraphConst` from the record" begin
@@ -490,7 +490,8 @@
             rec.format_version, rec.framework_version, rec.ps, rec.st,
             rec.opt_state, moved, rec.step, rec.epoch, rec.seed, rec.config,
             rec.devices, rec.metrics, rec.run_id, rec.run_url, rec.logger_state,
-            rec.logger_type, rec.anchor_checksum, rec.stop_reason, rec.preset, rec.derived
+            rec.logger_type, rec.anchor_checksum, rec.stop_reason, rec.preset, rec.derived,
+            rec.early_stop, rec.averaged_from
         )
         err = try
             check_permutation_compatible(bad, n.layout, "x")
@@ -1265,7 +1266,7 @@
     script!(v) = (SCRIPT[] = Float64.(v); SCRIPT_AT[] = 0; nothing)
     ReactantNitro.finalize_metrics(::ScriptedCkpt, acc, ::Symbol) =
         (SCRIPT_AT[] += 1; (; val_loss = SCRIPT[][SCRIPT_AT[]]))
-    drop_latest(k) = TopKCheckpointer(; k, keep_latest = false)
+    drop_latest(k) = Checkpointer(; keep = Best(k))
     epochs_of(dir, run) = Set(e.epoch for e in run_entries(dir, run))
     ckpt_files(dir) = Set(filter(f -> endswith(f, ".jld2") && f != "manifest.jld2", readdir(dir)))
 
@@ -1323,6 +1324,175 @@
         @testset "an unscored epoch cannot be kept, and says so" begin
             c = TopKCheckpointer(; k = 1, dir = mktempdir(), name = short_name, keep_latest = false)
             @test_throws "keep_latest = false" save_checkpoint!(c, 1, (;), merge(snap, (; epoch = 1)))
+        end
+    end
+
+    # ── Selectors: `Checkpointer(; keep)` retains their union ──────────────────────────
+
+    @testset "selectors, driven by hand: union retention and the write decision" begin
+        snap = snapshot(Nitro(CkptMLP(); run_dir = mktempdir(), checkpointer = nothing))
+        save!(c, epoch, v) = save_checkpoint!(c, epoch, (; val_loss = v), merge(snap, (; epoch)))
+        files(epochs) = Set("epoch-" * lpad(e, 4, '0') * ".jld2" for e in epochs)
+        scores = [5.0, 1.0, 4.0, 3.0, 6.0, 7.0, 8.0, 9.0]
+
+        @testset "`Last(n)` keeps the latest n, whatever they scored" begin
+            d = mktempdir()
+            c = Checkpointer(; keep = Last(3), dir = d, name = short_name)
+            @test all(save!(c, e, v) for (e, v) in enumerate(scores))
+            @test ckpt_files(d) == files(6:8)
+        end
+
+        @testset "`(Best(2), Last(3))` keeps the union" begin
+            d = mktempdir()
+            c = Checkpointer(; keep = (Best(2), Last(3)), dir = d, name = short_name)
+            foreach(((e, v),) -> save!(c, e, v), enumerate(scores))
+            @test ckpt_files(d) == files([2, 4, 6, 7, 8])
+        end
+
+        @testset "`Epochs` and `Every` keep by epoch, and decline the rest unwritten" begin
+            named = Int[]
+            counting(; epoch, kwargs...) = (push!(named, epoch); short_name(; epoch, kwargs...))
+            d = mktempdir()
+            c = Checkpointer(; keep = (Every(3), Epochs(7:8)), dir = d, name = counting)
+            wrote = [save!(c, e, v) for (e, v) in enumerate(scores)]
+            @test wrote == [false, false, true, false, false, true, true, true]
+            @test named == [3, 6, 7, 8]
+            @test ckpt_files(d) == files([3, 6, 7, 8])
+        end
+
+        @testset "`TopKCheckpointer` builds the equivalent `Checkpointer`, with identical files" begin
+            for kl in (true, false)
+                da, db = mktempdir(), mktempdir()
+                a = TopKCheckpointer(; k = 2, keep_latest = kl, dir = da, name = short_name)
+                b = Checkpointer(; keep = kl ? (Best(2), Last(1)) : Best(2), dir = db, name = short_name)
+                @test a.keep == b.keep && a.k == b.k == 2 && a.keep_latest == b.keep_latest == kl
+                wa = [save!(a, e, v) for (e, v) in enumerate(scores)]
+                wb = [save!(b, e, v) for (e, v) in enumerate(scores)]
+                @test wa == wb
+                @test ckpt_files(da) == ckpt_files(db)
+            end
+        end
+
+        @testset "refusals" begin
+            @test_throws "is empty" Checkpointer(; keep = ())
+            @test_throws "every entry must be a selector" Checkpointer(; keep = (Best(2), 3))
+            @test_throws "at least 1" Checkpointer(; keep = Last(0))
+            @test_throws "must be at least 1" TopKCheckpointer(; k = 0)
+        end
+    end
+
+    # ── Loading by selector, and `Average` ────────────────────────────────────────────
+
+    @testset "loading: selector sugar, `Average`, `among`, and the refusals" begin
+        dir = mktempdir()
+        script!([5.0, 1.0, 4.0, 3.0, 2.0])
+        n = train!(
+            Nitro(
+                ScriptedCkpt(; max_epochs = 5); run_dir = dir,
+                checkpointer = Checkpointer(; keep = (Best(1), Last(3)))
+            )
+        )
+        @test epochs_of(dir, run_of(n)) == Set([2, 3, 4, 5])
+        host_ps(path) = load_checkpoint(n.checkpointer, path).ps
+        flat(t) = reduce(vcat, vec.(Array.(Functors.fleaves(t))))
+        eval_nitro(w; kw...) = Nitro(ScriptedCkpt(); run_dir = dir, data = (;), weights = w, kw...)
+
+        @testset "`Best(1)` and `Last(1)` are `:best` and `:latest`" begin
+            @test flat(parameters(eval_nitro(:latest => Best(1)))) ==
+                flat(parameters(eval_nitro(:latest => :best)))
+            @test flat(parameters(eval_nitro(:latest => Last(1)))) ==
+                flat(parameters(eval_nitro(:latest => :latest)))
+        end
+
+        @testset "`Average(Last(3))` is the mean of the latest 3, state from the latest" begin
+            m = eval_nitro(:latest => Average(Last(3)))
+            want = sum(flat(host_ps(run_file(dir, run_of(n), ep))) for ep in 3:5) ./ 3
+            @test flat(parameters(m)) ≈ want rtol = 1.0e-6
+            @test occursin("epochs 3, 4, 5", m.checkpoint_source)
+        end
+
+        @testset "`Best(2; among = Last(3))` is the best 2 of the latest 3" begin
+            # Latest 3 are epochs 3, 4, 5 scoring 4, 3, 2: the best two are 4 and 5.
+            m = eval_nitro(:latest => Average(Best(2; among = Last(3))))
+            @test occursin("epochs 4, 5", m.checkpoint_source)
+            want = sum(flat(host_ps(run_file(dir, run_of(n), ep))) for ep in 4:5) ./ 2
+            @test flat(parameters(m)) ≈ want rtol = 1.0e-6
+        end
+
+        @testset "refusals" begin
+            @test_throws "holds 4 that" eval_nitro(:latest => Average(Last(5)))   # epoch 2 is kept as the best
+            @test_throws "Average them" eval_nitro(:latest => Last(3))
+            @test_throws "across runs" eval_nitro(:all => Average(Last(3)))
+            @test_throws "a resume continues one record" Nitro(
+                ScriptedCkpt(); run_dir = dir, resume = :latest => Average(Last(3))
+            )
+            @test_throws "carry no optimizer state" Nitro(
+                ScriptedCkpt(); run_dir = mktempdir(), weights = :latest => Average(Last(3)),
+                restore_optimizer = true
+            )
+            @test_throws "is for loading" Checkpointer(; keep = Best(2; among = Last(3)))
+            @test_throws "not supported yet" Average(Last(3); weight = :ema)
+        end
+
+        @testset "`average_checkpoints`: in memory, saved, and traced through provenance" begin
+            src = :latest => Average(Last(3))
+            mem = average_checkpoints(dir, src)
+            @test flat(mem.ps) ≈ flat(parameters(eval_nitro(src))) rtol = 1.0e-6
+            @test mem.averaged_from.epochs == [3, 4, 5]
+            @test mem.averaged_from.weights ≈ fill(1 / 3, 3)
+
+            listed = length(read_manifest(dir))
+            path = joinpath(dir, "avg-last3.jld2")
+            average_checkpoints(dir, src; save = path)
+            @test isfile(path) && length(read_manifest(dir)) == listed   # not in the manifest
+            @test checkpoint_info(path).averaged_from.epochs == [3, 4, 5]
+            @test_throws "does not overwrite" average_checkpoints(dir, src; save = path)
+
+            m = eval_nitro(path)
+            @test flat(parameters(m)) == flat(mem.ps)
+            @test m.averaged_from.epochs == [3, 4, 5]
+            prov = export_provenance(m)
+            @test prov["averaged_from"]["epochs"] == [3, 4, 5]
+            @test prov["averaged_from"]["spec"] == "Average(Last(3))"
+            # A trained record carries none.
+            @test checkpoint_info(run_file(dir, run_of(n), 5)).averaged_from === nothing
+            @test !haskey(export_provenance(eval_nitro(:latest => :latest)), "averaged_from")
+        end
+
+        @testset "`restore_best = Average(...)` ends `train!` holding the average" begin
+            d = mktempdir()
+            script!([5.0, 1.0, 4.0, 3.0, 2.0])
+            r = train!(
+                Nitro(
+                    ScriptedCkpt(; max_epochs = 5); run_dir = d, restore_best = Average(Last(3)),
+                    checkpointer = Checkpointer(; keep = (Best(1), Last(3)))
+                )
+            )
+            want = sum(flat(host_ps(run_file(d, run_of(r), ep))) for ep in 3:5) ./ 3
+            @test flat(parameters(r)) ≈ want rtol = 1.0e-6
+            @test r.averaged_from.epochs == [3, 4, 5]
+            @test_throws "weights = \"$(ReactantNitro.run_key(run_of(r)))\" => Average(Last(3))" train!(r)
+
+            @test_throws "cannot hold everything" Nitro(
+                ScriptedCkpt(); run_dir = mktempdir(), restore_best = Average(Last(5)),
+                checkpointer = Checkpointer(; keep = (Best(1), Last(3)))
+            )
+            @test_throws "or an `Average`" Nitro(ScriptedCkpt(); run_dir = mktempdir(), restore_best = :yes)
+
+            # A run that stops before it has enough keeps its final weights, and says so.
+            script!([3.0, 2.0])
+            short = Nitro(
+                ScriptedCkpt(; max_epochs = 2); run_dir = mktempdir(),
+                restore_best = Average(Last(5)), checkpointer = Checkpointer(; keep = Last(5))
+            )
+            @test_logs (:warn, r"cannot supply it") match_mode = :any train!(short)
+            @test short.restored_best === nothing && short.averaged_from === nothing
+        end
+
+        @testset "another handle's `keep` is checked before its manifest is read" begin
+            @test_throws "cannot hold everything" eval_nitro(n => Average(Last(5)))
+            m = eval_nitro(n => Average(Last(3)))
+            @test occursin("epochs 3, 4, 5", m.checkpoint_source)
         end
     end
 

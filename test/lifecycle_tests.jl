@@ -73,6 +73,15 @@
     ReactantNitro.reattach!(l::RecLogger, s) = (push!(l.calls, :reattach => s); nothing)
 
     kinds(l::RecLogger) = first.(l.calls)
+
+    # Only the data verbs the driver calls; no `run_id`, `run_url` or `logger_state`.
+    struct MinimalLog
+        calls::Vector{Pair{Symbol, Any}}
+    end
+    ReactantNitro.log_metrics!(l::MinimalLog, m; kwargs...) = nothing
+    ReactantNitro.log_params!(l::MinimalLog, p) = nothing
+    ReactantNitro.log_other!(l::MinimalLog, k, v) = nothing
+    ReactantNitro.finish!(l::MinimalLog, status) = (push!(l.calls, :finish => status); nothing)
     of(l::RecLogger, k::Symbol) = [v for (kk, v) in l.calls if kk === k]
 
     @testset "a ten-verb logger drives a run" begin
@@ -446,6 +455,21 @@
         @test occursin("accuracy", err2.msg) && occursin("val_loss", err2.msg)
     end
 
+    @testset "early-stopping counters belong to the handle and survive a resume" begin
+        # `min_delta` larger than any change, so only epoch 1 counts as an improvement.
+        es = EarlyStopping(; patience = 3, min_delta = 100.0)
+        dir = mktempdir()
+        n = train!(Nitro(LifeMLP(); run_dir = dir, max_epochs = 2, early_stop = es))
+        # The handle trained a copy; the caller's instance is untouched.
+        @test n.early_stop !== es && es.best === nothing && es.wait == 0
+        @test n.early_stop.wait == 1
+        # The resume continues the count: wait 2 at epoch 3, and 3 = patience at epoch 4. With
+        # fresh counters epoch 3 would be a new best and the run would reach epoch 5.
+        r = train!(Nitro(LifeMLP(); run_dir = dir, max_epochs = 5, resume = :auto, early_stop = es))
+        @test r.stop_reason === :early_stop
+        @test current_epoch(r) == 4
+    end
+
     @testset "a run that stops on patience exits through `Done`, gracefully" begin
         lg = RecLogger()
         # `min_delta` larger than any change the loss can make, so no epoch ever counts as an
@@ -474,8 +498,18 @@
         @test phase(n) isa Done
         @test current_epoch(n) == 1                                 # stopped at the first check
         @test n.stop_reason === :requested                          # and says WHY, distinctly
-        @test of(lg, :finish) == [:early_stop]
+        @test of(lg, :finish) == [:requested]                       # the logger hears the same
         @test length([v for v in of(lg, :metrics) if v.context == "validate"]) == 1
+    end
+
+    @testset "a logger without `run_id` or `run_url` can checkpoint" begin
+        # Both are informational and default to `nothing`; this used to be a `MethodError` at the
+        # first checkpoint record.
+        lg = MinimalLog(Pair{Symbol, Any}[])
+        n = train!(Nitro(LifeMLP(); logger = lg, max_epochs = 1, run_dir = mktempdir()))
+        @test phase(n) isa Done
+        @test ReactantNitro.run_id(lg) === nothing && ReactantNitro.run_url(lg) === nothing
+        @test last(lg.calls) == (:finish => :completed)
     end
 
     @testset "`request_stop!` MID-EPOCH under a horizon-dependent schedule exits through `Done`" begin

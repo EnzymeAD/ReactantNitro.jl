@@ -15,10 +15,9 @@ using ReactantServerExport: IOSpec, export_bundle, collect_provenance
 """
     ReactantNitro.site_provenance(::ReactantServerBundle, root) -> Dict{String,Any}
 
-The site half of provenance for this backend: `ReactantServerExport.collect_provenance`, which
-returns the commit, branch, dirty flag, tree hash, timestamp, remote, and `git_diff`, a full
-unified patch the writer materializes as `working_tree.patch`. That patch is multi-line, which is
-why this is reached through a root rather than a flat dictionary.
+Repository state at `root` for this backend, from `ReactantServerExport.collect_provenance`: the
+commit, branch, dirty flag, tree hash, timestamp, remote, and `git_diff`, a full unified patch the
+writer saves as `working_tree.patch`.
 """
 ReactantNitro.site_provenance(::ReactantServerBundle, root) =
     collect_provenance(String(root))
@@ -38,9 +37,9 @@ end
 Write a ReactantServer StableHLO bundle: `manifest.yaml`, `weights.safetensors`, one
 `model[.b{N}].mlir` per batch size, and the `model.jl` postprocess when the experiment ships one.
 The bundle directory is `joinpath(dir, name)`, since the format requires the basename to equal the
-name. Batch axes are passed to nobody: `export_bundle` derives each as the last axis, which
-`export_model` already verified against the traced output. Client specs are passed only when the
-experiment declares them; the server falls back to the executable specs otherwise.
+name. No batch axis is passed for the executable tensors: `export_bundle` takes the last axis,
+which `export_model` has already checked against the traced output. Client specs are passed when
+the experiment declares them; otherwise the server uses the executable specs.
 """
 function ReactantNitro.write_export(
         ::ReactantServerBundle, program, ps, st, example_inputs;

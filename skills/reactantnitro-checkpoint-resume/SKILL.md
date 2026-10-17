@@ -1,10 +1,12 @@
 ---
 name: reactantnitro-checkpoint-resume
 description: >
-  Checkpoint and resume a ReactantNitro run: `TopKCheckpointer` and the latest-plus-top-K
-  retention rule (`keep_latest`, `scope = :run | :dir`, current-metric-only selection),
-  the `run => checkpoint` source grammar shared by `weights` and `resume`, `resume = :auto`,
-  `restore_optimizer`, `restore_best`, finding run ids with `runs()` and `checkpoint_run()`,
+  Checkpoint and resume a ReactantNitro run: `Checkpointer(; keep)` and its selectors (`Best`,
+  `Last`, `Epochs`, `Every`; retention is their union), `scope = :run | :dir`, current-metric-only
+  selection, the deprecated `TopKCheckpointer`, the `run => checkpoint` source grammar shared by
+  `weights` and `resume`, checkpoint averaging (`Average`, `Best(k; among)`,
+  `average_checkpoints`, `averaged_from`), `resume = :auto`, `restore_optimizer`, `restore_best`
+  (including `restore_best = Average(...)`), finding run ids with `runs()` and `checkpoint_run()`,
   what a checkpoint record holds and why every value in it is a host value, the four
   refusals behind a resume, and what is recomputed rather than restored. Invoke when
   configuring checkpointing, resuming or continuing a run, debugging a refused or failed
@@ -33,8 +35,8 @@ Ask for it explicitly after a restart.
 ## Configuring it
 
 ```julia
-TopKCheckpointer(; k = 3, metric = :val_loss, mode = :min, dir = nothing,
-                   keep_latest = true, scope = :run)
+Checkpointer(; keep = (Best(3), Last(1)), metric = :val_loss, mode = :min, dir = nothing,
+               scope = :run)
 ```
 
 `metric` names a key your `finalize_metrics` returns (`:val_loss` is what the default `metrics`
@@ -50,20 +52,37 @@ continues rather than starting over.** That is the point of it, and it has one t
 before you opt in: a seed sweep that varies the seed and not the run directory resumes into itself
 and runs one seed N times. Vary `run_dir` too.
 
-**Retention is top-K plus a `latest` rule: never rotate out the newest, whatever it scored.** On disk
-that is K+1 files when the newest is not among the best and exactly K when it is. Resuming from the
-*best* checkpoint is not resuming from where you were, which is why both exist. That is the default,
-`TopKCheckpointer(; keep_latest = true)`.
+**Retention is the union of the selectors in `keep`.** Each selector answers "which entries of this
+run's manifest":
 
-`keep_latest = false` is the opt-in escape hatch when a record is large and the filesystem slow:
-the run keeps exactly its top K, and an epoch that cannot enter them is never written at all
-(it must beat the K-th best strictly), so there is no per-epoch write-then-delete. The final
-`stop_reason` rewrite follows the same rule. What it costs: the state training ended in is saved
-only if the last epoch was a top-K epoch, `weights = :latest => :latest` and `resume = :auto`
-resolve to the run's newest *retained* record (its most recent improvement, not where it stopped), a resume from
-it continues the same run id and retrains the epochs after it, and a crash loses every epoch since
-that improvement. Setup warns once about this for a handle that trains, and refuses the flag for a
+| Selector | Keeps |
+| --- | --- |
+| `Best(k)` | the `k` best by `metric` and `mode` (under `scope = :dir`, across every run) |
+| `Last(n)` | this run's latest `n`, whatever they scored |
+| `Epochs(r)` | this run's entries whose epoch is in `r` |
+| `Every(n)` | this run's entries whose epoch is a multiple of `n` |
+
+The default, `(Best(3), Last(1))`, is the old top-K-plus-latest rule: K+1 files when the latest is
+not among the best, K when it is. Resuming from the *best* checkpoint is not resuming from where
+you were, which is why both exist. `keep = (Best(3), Last(10))` keeps a window for averaging (next
+section); `keep = Last(5)` is a rolling window. A custom selector defines `select(sel, entries,
+ckpt)` and optionally `admits`.
+
+**An epoch is written only when some selector would keep it.** With a `Last` every epoch is
+written. Without one (`keep = Best(3)`, the escape hatch when a record is large and the filesystem
+slow) an epoch that cannot enter the top K is never written at all (it must beat the K-th best
+strictly), so there is no per-epoch write-then-delete. The final `stop_reason` rewrite follows the
+same rule. What it costs: the state training ended in is saved only if a selector keeps the last
+epoch, `weights = :latest => :latest` and `resume = :auto` resolve to the run's latest *kept*
+record (its most recent improvement, not where it stopped), a resume from it continues the same
+run id and retrains the epochs after it, and a crash loses every epoch since that improvement.
+Setup warns once about this for a handle that trains, and refuses a `keep` of only `Best` for a
 training run with no `val` split, since no epoch would have a score to be kept by.
+
+**`TopKCheckpointer(; k, keep_latest, ...)` is deprecated** (warns once per session, supported until
+at least 1.0.0). It builds `Checkpointer(; keep = (Best(k), Last(1)))`, or `keep = Best(k)` for
+`keep_latest = false`, and writes identical files. `ckpt.k` and `ckpt.keep_latest` stay readable on
+a `Checkpointer`.
 
 `latest` is a retained file, **not a symlink** into the top-K set: top-K rotation deletes its target
 during entirely normal operation, and checkpoint directories get copied between paths where tools
@@ -83,15 +102,15 @@ recorded reads as one unnamed run (`run === nothing`, listed by `runs()` as `"le
 oldest, and a new run leaves it alone. A fresh run into an occupied directory says so at setup.
 
 **`scope = :dir` is the space-saving alternative.** The whole directory keeps only its top K by the
-current metric across every run, plus this run's newest (by write time, and only under
-`keep_latest`); every other entry scored the same way is deleted, another run's and legacy ones
-included. Ranking is by score alone. With `keep_latest = false` as well, at most K such files
-remain in the directory. Names still never collide: a file another run owns gets the `-run-<id>`
+current metric across every run, plus what this run's other selectors keep (`Last` by write time
+under this scope); every other entry scored the same way is deleted, another run's and legacy ones
+included. Ranking is by score alone. With `keep = Best(k)` alone, at most K such files remain in
+the directory. Names still never collide: a file another run owns gets the `-run-<id>`
 suffix rather than being overwritten. Setup of a training handle warns how many checkpoints of
 other runs the directory already holds and that they may be deleted as this run beats them.
 
 **Selection only ever uses the CURRENT metric and mode, and never prunes the others.** Every
-selection (retention under either scope and either `keep_latest`, `:best`, `:all => :best`) ranks
+selection (retention under either scope, `:best`, `:all => :best`, `Average(Best(k))`) ranks
 the entries scored under the checkpointer's `metric` and `mode` and nothing else. Entries scored
 under another pair, written by an earlier run or by this run before a resume changed the selection,
 are disjoint: never ranked against current ones and never deleted. When the entries being
@@ -173,6 +192,10 @@ producing parameters alone for export or serving is named for weights.
 | `:best` | the run's best record by the CURRENT checkpointer's `metric` and `mode` |
 | `:latest` | the run's newest retained record |
 | `:current` | a live handle's in-memory parameters; only `weights = other => :current` |
+| `Average(sel)` | the average of the run's checkpoints `sel` picks; only for `weights` (next section) |
+
+`Best(1)` and `Last(1)` are the same as `:best` and `:latest`. Any other selector may pick several
+checkpoints, so a source refuses it outside `Average`.
 
 `weights = other` (a bare handle) is the same as `other => :current`. Bare `:best` and `:latest` are
 refused with the pair to use (`weights = :latest => :best`), `:all => :latest` is refused in favour
@@ -191,6 +214,31 @@ That is the construction for evaluation, mining and export. With the handle that
 hand, `weights = trained => :best` names the record of THAT handle's run, whatever else has written
 to its directory since. The gate tools take the same sources as strings (`weights = "latest =>
 best"`).
+
+**Averaging checkpoints.** `Average(sel; weight = :uniform, state = nothing)` averages the
+parameters of the checkpoints `sel` picks from ONE run, streamed one record at a time into a
+`Float64` accumulator:
+
+```julia
+n = Nitro(MyExp(); run_dir = "runs/my_run", weights = :latest => Average(Last(10)))
+n = Nitro(MyExp(); run_dir = "runs/my_run", weights = "a1b2c3d4" => Average(Best(5; among = Last(20))))
+average_checkpoints("runs/my_run", :latest => Average(Last(10)); save = "runs/my_run/avg10.jld2")
+```
+
+- `Best(k; among = sel)` ranks only what `sel` picks: the best 5 of the latest 20 (the LAWA-style
+  recipe). `among` is for loading only; `keep` refuses it
+- Lux state is NOT averaged: it comes from the best picked checkpoint when the selector ranks
+  (`Best`) and the latest otherwise, or as `state = :best | :latest` says. Exact without running
+  statistics; an approximation with BatchNorm
+- The run must still hold every checkpoint the selection names. Keep them while training
+  (`keep = (Best(3), Last(10))`); when it does not, the error lists the retained epochs and the
+  `keep` that would have held them. `other => Average(...)` also checks `other`'s `keep` first
+- `:uniform` is the only weighting so far. Refused: averaging across runs (`:all => Average`),
+  `Average` in `resume`, and `restore_optimizer = true` with an `Average` (no optimizer state)
+- The record carries `averaged_from` (spec, run, directory, files, epochs, weights, state file):
+  `checkpoint_info(path)` shows it, `nitro.averaged_from` holds it, and an export's provenance
+  includes it. `average_checkpoints(...; save)` writes it outside the manifest, so retention never
+  deletes it, and refuses to overwrite; `weights = path` then loads it like any record
 
 **Finding run ids.** `runs(run_dir)` lists the runs a directory's manifest holds, most recent
 first: id, checkpoints kept and their epochs, best score with its metric and mode, last write, and
@@ -224,6 +272,12 @@ error prints the three real ones, filled in with the handle's experiment, preset
 and run id (the table above, with `"<id>" => :best`). `train!(e; restore_best = true)` and the
 `nitro_train` tool's `restore_best` argument reach the same keyword.
 
+**`restore_best = Average(sel)`** ends `train!` holding the average of the run's own checkpoints
+instead, exactly as `weights = run => Average(sel)` would load them, with `averaged_from` set.
+Setup refuses a `keep` that cannot hold the selection; a run that ends before it has enough (an
+early stop) warns and keeps its final weights. A later `train!` is refused, and the error gives the
+`weights = "<id>" => Average(...)` construction. The `nitro_train` tool takes only the Bool form.
+
 ## Every value in a record is a HOST value
 
 This is a correctness requirement, not tidiness, and it is the single most expensive class of bug
@@ -245,7 +299,8 @@ normalize on the way in.**
 ## What resume restores, and what it does not
 
 Restored: parameters, layer state, optimizer state including its moments, the step and epoch counters,
-the seed, and derived-value bookkeeping. The logger reattaches so a resumed run extends one history
+the seed, derived-value bookkeeping, and the `EarlyStopping` counters when the resumed policy watches
+the same metric and mode. The logger reattaches so a resumed run extends one history
 rather than opening a second.
 
 **Recomputed, not restored:** derived values. `derive` runs again, so resuming against changed data

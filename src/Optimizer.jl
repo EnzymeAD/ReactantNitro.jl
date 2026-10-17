@@ -13,9 +13,9 @@
 """
     ReactantNitro.is_host_number(x) -> Bool
 
-A `Number` that is not device-resident. `Reactant.RNumber` is the common supertype of
-`ConcretePJRTNumber` and `TracedRNumber`, so this one predicate covers both sides of a traced
-boundary, which is what [`assert_device_state`](@ref) needs.
+Whether `x` is a `Number` that is not on the device. `Reactant.RNumber` is the common supertype of
+`ConcretePJRTNumber` and `TracedRNumber`, so the predicate holds on both sides of a traced boundary,
+as [`assert_device_state`](@ref) needs.
 """
 is_host_number(x) = x isa Number && !(x isa Reactant.RNumber)
 
@@ -48,9 +48,10 @@ end
 """
     ReactantNitro.assert_device_state(state; context) -> nothing
 
-The no-host-`Number` assertion over an optimizer STATE tree, at setup and after a restore, and the
-only thing standing between a user and the silent frozen-counter failure. A rule legitimately keeps
-host fields ([`nonschedulable`](@ref)) and is governed by [`to_device_rule`](@ref) instead.
+Error if an optimizer state tree holds a host `Number`, checked at setup and after a restore. A host
+step counter bakes into the trace as a constant and freezes, so bias correction goes wrong with no
+error; this check is what catches it. Rules are not checked, since a rule may keep
+[`nonschedulable`](@ref) fields on the host ([`to_device_rule`](@ref)).
 """
 function assert_device_state(state; context::AbstractString = "optimizer state")
     leaked = host_numbers(state)
@@ -67,10 +68,10 @@ function assert_device_state(state; context::AbstractString = "optimizer state")
 end
 
 """
-    ReactantNitro.assert_opt_state_device(opt_state; context) -> nothing
+    ReactantNitro.assert_opt_state_device(opt_state, context = "optimizer state from `setup_optimizers`") -> nothing
 
-The same assertion over a user-supplied optimizer state tree (manual mode): every `Optimisers.Leaf`
-reachable from it has its STATE asserted, never its rule.
+[`assert_device_state`](@ref) over a user-supplied optimizer state tree (manual mode): the state of
+every `Optimisers.Leaf` reachable from it is checked, never its rule.
 """
 function assert_opt_state_device(
         x, context::AbstractString = "optimizer state from `setup_optimizers`"
@@ -92,13 +93,13 @@ function assert_opt_state_device(
 end
 
 """
-    ReactantNitro.to_device_leaf(l::Optimisers.Leaf) -> Optimisers.Leaf
+    ReactantNitro.to_device_leaf(l::Optimisers.Leaf; mesh = nothing) -> Optimisers.Leaf
 
-Normalize a leaf to device residency: the rule through [`to_device_rule`](@ref) and the state
-through `to_rarray(...; track_numbers = Number)`, separately, because `Leaf.frozen` is declared
-`::Bool` and a single `to_rarray` over the leaf cannot reconstruct it. `track_numbers = Number`
-because the state must promote integers. The same normalization runs on the resume path over the
-restored `opt_state`: write host, read host, normalize on the way in.
+Move a leaf to the device: the rule through [`to_device_rule`](@ref) and the state with
+`track_numbers = Number`, so integer step counters move too. The two are converted separately
+because `Leaf.frozen` is declared `::Bool`, which a single conversion over the leaf cannot
+reconstruct. A `Tuple` or `NamedTuple` of leaves is converted elementwise. Resume runs the same
+conversion over the restored `opt_state`, which a checkpoint stores on the host.
 """
 function to_device_leaf(l::Optimisers.Leaf; mesh = nothing)
     return Optimisers.Leaf(
@@ -111,14 +112,15 @@ to_device_leaf(t::Union{Tuple, NamedTuple}; mesh = nothing) =
     map(x -> to_device_leaf(x; mesh), t)
 
 """
-    ReactantNitro.to_device_rule(r) -> rule
+    ReactantNitro.to_device_rule(r; mesh = nothing) -> rule
 
-Promote exactly the schedulable fields of a rule and leave the structural ones host. Per field, not
-by type: `ClipNorm`'s schedulable `omega` and structural `p` are both `Float64`, and promoting `p`
-breaks `_norm`'s `::Real` dispatch. The set is `fieldnames(T)` minus [`nonschedulable`](@ref)`(T)`,
-so one declaration drives scheduling and promotion. Parameter-sized fields such as [`Decay`](@ref)'s
-`anchor` are in that opt-out and pass through, already on device. Named `to_device_rule` because
-defining `promote_rule` unqualified would shadow `Base.promote_rule`.
+Move a rule's schedulable fields to the device and leave the rest on the host. The choice is per
+field, since types do not separate them: `ClipNorm`'s schedulable `omega` and structural `p` are
+both `Float64`, and moving `p` breaks `_norm`'s `::Real` dispatch. The moved set is `fieldnames(T)`
+minus [`nonschedulable`](@ref)`(T)`, so one declaration controls both scheduling and placement.
+Parameter-sized fields such as [`Decay`](@ref)'s `anchor` are in the opt-out and pass through
+unchanged, already on the device. Chains are converted rule by rule. (The name avoids
+`promote_rule`, which would shadow `Base.promote_rule`.)
 """
 function to_device_rule(r; mesh = nothing)
     T = typeof(r)
@@ -151,12 +153,16 @@ the stock host path bitwise (64-element buffer, every rule at the buffer's eleme
 | `ClipNorm(ω, p; throw = false)` | yes | yes | 0.0 |
 | `OptimiserChain(RAdam, WeightDecay)` | yes | yes | 0.0 |
 | `OptimiserChain(ClipNorm, Adam)` | yes | yes | 0.0 |
+| [`Decay`](@ref), plain and anchored | yes | yes | 0.0 |
+| `OptimiserChain(RAdam, Decay)` | yes | yes | 0.0 |
 
 `Descent`'s update `x - eta * g` is a multiply feeding a subtract, which XLA contracts into a fused
 multiply-add that rounds once; the compiled result equals host `fma.(-eta, g, x)` exactly, and the
-tests assert against that. Every other rule has a division or sqrt in between. `AccumGrad` is
-absent because it traces and is wrong (Train.jl). Layer-adaptive rules (LARS, LAMB) are rejected
-because they would compute one trust ratio per group rather than per layer.
+tests assert against that. Every other rule has a division or sqrt in between. The 0.0 entries
+were measured on x86-64; another target may contract a site differently, which the tests bound at a
+few ulps. `AccumGrad` is absent because it traces and gives wrong results (Train.jl). Layer-adaptive
+rules (LARS, LAMB) are absent because they would compute one trust ratio per group rather than per
+layer.
 """
 const ADMITTED_RULES = (
     Optimisers.Descent, Optimisers.Momentum, Optimisers.Nesterov,
@@ -168,9 +174,10 @@ const ADMITTED_RULES = (
 """
     ReactantNitro.check_allowlist(rule) -> nothing
 
-The admission check, at setup. `ClipNorm` with the default `throw = true` is rejected naming the
-flag: it reaches `if o.throw && !isfinite(nrm)`, a host branch on a traced value, and fails with a
-`TypeError` that names nothing a user could act on.
+Error at setup if `rule`, or any member of an `OptimiserChain`, is not in [`ADMITTED_RULES`](@ref).
+`ClipNorm` with the default `throw = true` is rejected with an error naming the flag: it reaches
+`if o.throw && !isfinite(nrm)`, a host branch on a traced value, and would otherwise fail with a
+`TypeError` that names neither the rule nor the flag.
 """
 function check_allowlist(c::Optimisers.OptimiserChain)
     foreach(check_allowlist, c.opts)
@@ -212,21 +219,22 @@ end
 """
     ReactantNitro.LeafRow
 
-One row of the flat permutation, a per-leaf table rather than a `Vector{Int}` over elements.
-`offset` is 0-based within the leaf's group buffer. Storing keypaths is what lets the resume check
-say which leaf moved.
+One row of the flat permutation: one row per parameter leaf, not one entry per element. `offset` is
+0-based within the leaf's group buffer. The stored keypath lets the resume check say which leaf
+moved.
 """
 const LeafRow = @NamedTuple{keypath::Tuple, group::Symbol, offset::Int, len::Int, size::Dims}
 
 """
     ReactantNitro.FlatLayout{G}
 
-The flat-to-tree correspondence, built once at setup and closed over as a host-side constant for
-the run. `G` is a type parameter because it is a trace-time constant: per-group
-arithmetic then unrolls with no traced control flow, and the per-group collections are `NTuple{G}`
-rather than `Vector`, which a thunk guard would reject on the second call for being abstractly typed.
+The mapping between the parameter tree and the per-group flat buffers, built once at setup and held
+as a host-side constant for the run. `G`, the group count, is a type parameter because it is a
+trace-time constant: per-group arithmetic unrolls with no traced control flow, and the per-group
+collections are `NTuple{G}`, since a `Vector` is abstractly typed and the thunk guard would reject
+it on the second call.
 
-`permutation` is the documented, checkpointed table; everything else is a derived lookup.
+`permutation` is the table a checkpoint stores; the other fields are lookups derived from it.
 """
 struct FlatLayout{G}
     permutation::Vector{LeafRow}
@@ -245,11 +253,11 @@ n_groups(::FlatLayout{G}) where {G} = G
 """
     ReactantNitro.LayoutRef{ID}
 
-A zero-field handle carrying a [`FlatLayout`](@ref) at the type level, as [`Router`](@ref) does its
-key set. The layout cannot ride into a traced program as a value: Reactant promotes the `Int`s
-inside a struct argument, and a promoted offset can index nothing. Carrying it at the type level
-also puts it in the compile cache key, which a `FlatLayout{G}` value would not, since two layouts
-with the same `G` share a type.
+A zero-field handle carrying a [`FlatLayout`](@ref) at the type level, as [`Router`](@ref) carries
+its key set. The layout cannot enter a traced program as a value: Reactant promotes the `Int`s
+inside a struct argument, and a promoted offset cannot index. At the type level it is also part of
+the compile cache key, which a `FlatLayout{G}` value would not be, since two layouts with the same
+`G` share a type.
 """
 struct LayoutRef{ID} end
 
@@ -259,9 +267,9 @@ const LAYOUT_REGISTRY_LOCK = ReentrantLock()
 """
     ReactantNitro.layout_ref(layout) -> LayoutRef
 
-Register `layout` under a content hash and return its type-level handle. The hash is over the
-documented `permutation` table, so two structurally identical layouts share a handle and therefore a
-compiled program, which is what lets a second `Nitro` over the same experiment reuse everything.
+Register `layout` under a hash of its `permutation` table and return its type-level handle. Two
+identical layouts share a handle and therefore compiled programs, so a second `Nitro` over the same
+experiment reuses the first one's.
 """
 function layout_ref(layout::FlatLayout)
     id = hash(layout.permutation)
@@ -276,9 +284,9 @@ end
 """
     ReactantNitro.leaf_keypaths(ps) -> Vector{Tuple}
 
-The traversal order: `Functors.fmap_with_path` over `ps`, depth-first and deterministic for a
-fixed model, which is what makes the layout reproducible across sessions and processes rather than a
-property of the framework. Verified on Functors 0.5.2 against a nested Lux `Chain`.
+The keypaths of `ps`'s array leaves in traversal order: `Functors.fmap_with_path`, depth-first and
+deterministic for a fixed model, so the layout is the same across sessions and processes (checked
+on Functors 0.5.2 with a nested Lux `Chain`).
 """
 function leaf_keypaths(ps)
     kps = Tuple[]
@@ -292,10 +300,10 @@ end
 """
     ReactantNitro.build_layout(e, ps) -> FlatLayout
 
-Setup's layout step, unconditional, including for an evaluation `Nitro`: host-side bookkeeping the
-checkpoint path validates against. A stable sort of the traversal-order leaves by group index, so
-within a group leaves keep traversal order; `:default` is group 1 and the rest follow
-first-appearance order.
+Build the [`FlatLayout`](@ref) for every handle, including an evaluation `Nitro`, since checkpoints
+are validated against it. The leaves, in traversal order, are stably sorted by group index, so
+within a group they keep traversal order. `:default` is group 1 and the rest follow
+first-appearance order. Errors if `ps` has no arrays.
 """
 function build_layout(e, ps)
     kps = leaf_keypaths(ps)
@@ -333,10 +341,11 @@ function build_layout(e, ps)
 end
 
 """
-    ReactantNitro.flatten(tree, layout) -> NTuple{G}
+    ReactantNitro.flatten(tree, layout, mesh = nothing) -> NTuple{G}
 
-Tree to G group buffers, a concatenate (a real copy). Because the permutation is one row per leaf,
-the operand order is host-known at trace time, so grouping emits no control flow.
+Concatenate a tree's leaves into `G` group buffers, a real copy. The permutation has one row per
+leaf, so the operand order is known on the host at trace time and grouping emits no control flow.
+Errors on a leaf the layout does not contain.
 """
 function flatten(tree, layout::FlatLayout{G}, mesh = nothing) where {G}
     leaves = Vector{Any}(undef, length(layout.permutation))
@@ -370,8 +379,8 @@ end
 """
     ReactantNitro.unflatten(flat::NTuple{G}, template, layout) -> tree
 
-G group buffers back to a tree shaped like `template`, a `reshape` over a contiguous slice per leaf.
-Under trace the slice and reshape fold into the consuming op, so this is free.
+Rebuild a tree shaped like `template` from `G` group buffers, one `reshape` over a contiguous slice
+per leaf. Under trace the slice and reshape fold into the consuming op, so this costs nothing.
 """
 function unflatten(flat::NTuple{G, Any}, template, layout::FlatLayout{G}) where {G}
     return Functors.fmap_with_path(template) do kp, x
@@ -392,10 +401,10 @@ unflatten(flat::Tuple, template, layout::FlatLayout) =
 """
     ReactantNitro.no_decay_masks(e, ps, layout; elt = Float32) -> NTuple{G}
 
-The per-parameter decay exclusion, as one 0/1 flat buffer per group (1 decayed, 0 excluded), from
-[`no_decay`](@ref)`(e, keypath, leaf)`. The one piece of per-parameter behavior not expressed
-through groups, since biases occur inside every group. Built once at construction and stored on the
-[`Nitro`](@ref), so a revised rule takes effect on the next handle.
+The per-leaf decay exclusion from [`no_decay`](@ref)`(e, keypath, leaf)`, as one 0/1 flat buffer
+per group (1 decayed, 0 excluded). It is per leaf because biases occur inside every group. Built
+once at construction and stored on the [`Nitro`](@ref), so a redefined `no_decay` takes effect on
+the next handle.
 """
 function no_decay_masks(e, ps, layout::FlatLayout{G}; elt::Type = Float32) where {G}
     keep = Dict{Tuple, Bool}()
@@ -419,13 +428,16 @@ end
     ReactantNitro.hp_host(e, group, sv = (;); elt = Float32) -> NamedTuple
 
 The host values one group's rule is built from at one step, before device conversion. `sv` is the
-group's scheduled rule fields at this step ([`group_schedule_values`](@ref)). `eta` and `lambda`
-follow [`effective_lr`](@ref); every other field in `sv` is absolute. All are converted to `elt`.
+group's scheduled rule fields at this step ([`group_schedule_values`](@ref)); `eta` and `lambda`
+fall back to the group's accessors when `sv` lacks them. `eta` is the group's effective rate and
+`lambda` is multiplied by it ([`effective_lr`](@ref)); every other field in `sv` is passed through
+as is, `bind` as a NamedTuple. All are converted to `elt`.
 """
 function hp_host(e, group::Symbol, sv::NamedTuple = (;); elt::Type = Float32)
     eta = elt(effective_lr(e, group, get(sv, :eta, nothing)))
     lam = elt(eta * (haskey(sv, :lambda) ? sv.lambda : lambda(e, Val(group))))
-    rest = map(elt, Base.structdiff(sv, NamedTuple{(:eta, :lambda)}))
+    conv(x) = x isa NamedTuple ? map(elt, x) : elt(x)
+    rest = map(conv, Base.structdiff(sv, NamedTuple{(:eta, :lambda)}))
     return (; eta, lambda = lam, rest...)
 end
 
@@ -437,24 +449,25 @@ setup_hp(e, layout, gi, sv::NamedTuple; kwargs...) = resolve_hp(
 
 """
     ReactantNitro.resolve_hp(e, layout, gi; eta_t = nothing, host = nothing, keep_decay = false,
-                             anchors = nothing, masks = nothing)
+                             anchors = nothing, masks = nothing, elt = Float32, mesh = nothing,
+                             memo = nothing, device = true)
 
-The per-group hyperparameter carrier, resolved per group per step: `eta`, `lambda`, `anchor` and
+Build group `gi`'s hyperparameter carrier `hp` for one step: `eta`, `lambda`, `anchor` and
 `no_decay_mask`, plus one key per scheduled rule field. `host` is the group's [`hp_host`](@ref)
-values; without it they are computed from `eta_t`, the `eta` schedule's value or `nothing`.
-`keep_decay` keeps a zero `lambda` as a device scalar instead of `nothing`, for a scheduled
-`lambda`: dropping the `Decay` tail when the schedule reaches zero would change the chain mid-run.
+values; without it they are computed from `eta_t`, the `eta` schedule's value or `nothing`. A zero
+`lambda` becomes `nothing`, which drops the `Decay` tail, unless `keep_decay` is set; a scheduled
+`lambda` sets it, so the chain does not change when the schedule reaches zero. `device = false`
+keeps host values, for the setup-time probe in [`schedule_bindings`](@ref).
 
-Every scalar is converted to the flat buffer's element type before device conversion:
+Every scalar is converted to `elt`, the flat buffer's element type, before it moves to the device:
 `Optimisers.RAdam()` defaults `eta` to `Float64`, and a `Float32` buffer would come back `Float64`
 from `apply!` and fail the thunk guard on step 2.
 
 `memo` is a [`ScalarMemo`](@ref) that skips the upload while the host value is unchanged, so a
-constant `eta` crosses once per run. Reuse is safe because the optimizer program does not donate
-the rule's scalars (measured on CUDA: `apply_group` returns the rule as a pass-through argument, so
-it is preserved; 500 steps of reuse were bit-identical to fresh uploads). The CPU backend never
-exercises donation, so a green CPU suite says nothing about this. The saving is well under one
-percent of training wall time; take it for being exact rather than fast.
+constant `eta` is uploaded once per run. Reuse is safe because the optimizer program does not
+donate the rule's scalars: `apply_group` returns the rule as a pass-through argument. This was
+checked on CUDA (500 reused steps bit-identical to fresh uploads); the CPU backend never donates,
+so the CPU suite cannot check it.
 """
 function resolve_hp(
         e, layout::FlatLayout, gi::Int; eta_t = nothing, host = nothing, keep_decay = false,
@@ -468,7 +481,13 @@ function resolve_hp(
     place(k, x) = device ? memo_to_device(memo, (gi, k), x; mesh) : x
     eta = place(:eta, h.eta)
     lambda = iszero(h.lambda) && !keep_decay ? nothing : place(:lambda, h.lambda)
-    scheduled = NamedTuple{keys(rest)}(map(k -> place(k, getproperty(rest, k)), keys(rest)))
+    function place_any(k, x)
+        x isa NamedTuple || return place(k, x)
+        return NamedTuple{keys(x)}(
+            map(k2 -> place(Symbol(k, ".", k2), getproperty(x, k2)), keys(x))
+        )
+    end
+    scheduled = NamedTuple{keys(rest)}(map(k -> place_any(k, getproperty(rest, k)), keys(rest)))
     return (;
         eta, lambda, scheduled...,
         anchor = anchors === nothing ? nothing : anchors[gi],
@@ -481,9 +500,10 @@ end
 """
     ReactantNitro.ScalarMemo() -> ScalarMemo
 
-One slot per `(group, key)`, holding the host value last uploaded and the device scalar it
-produced. One slot, not a table, since a scheduled `eta` differs on most steps and a keyed cache
-would grow without hitting. Scoped to a `train!` call, so `mesh` is an invariant rather than a key.
+A cache of uploaded scalars with one slot per `(group, key)`, holding the host value last uploaded
+and the device scalar it produced. A slot keeps only the latest value, since a scheduled `eta`
+differs on most steps and a cache keyed by value would grow without hits. It lives for one
+`train!` call, so `mesh` is fixed and not part of the key.
 """
 struct ScalarMemo
     slots::Dict{Tuple{Int, Symbol}, Tuple{Any, Any}}
@@ -493,12 +513,11 @@ ScalarMemo() = ScalarMemo(Dict{Tuple{Int, Symbol}, Tuple{Any, Any}}())
 """
     ReactantNitro.memo_to_device(memo, key, x; mesh = nothing) -> device scalar
 
-[`to_device`](@ref) with a one-slot memo in front; `memo === nothing` is the unmemoized path. Reuse
-requires the host value to be `===` the one that produced the cached scalar (bitwise on a
-`Float32`, so `-0.0` and a `Float64` spelling never conflate) and the cached scalar not to be marked
-donated; a type with no `donated` field is refused too. `donated` is Reactant's own record, not an
-outside check, so the CUDA measurement in [`resolve_hp`](@ref) is what stands behind this and has to
-be re-run on a Reactant bump.
+[`to_device`](@ref) through the memo slot at `key`; `memo === nothing` always uploads. The cached
+scalar is reused only if the host value is `===` the one that produced it (bitwise, so `-0.0` and a
+`Float64` value never match a `Float32` `0.0`) and the cached scalar is not marked `donated`; a type
+with no `donated` field is never reused. The `donated` flag is Reactant's own record, so the CUDA
+check described in [`resolve_hp`](@ref) should be repeated after a Reactant upgrade.
 """
 memo_to_device(::Nothing, key, x; mesh = nothing) = to_device(x; mesh)
 
@@ -520,11 +539,12 @@ reuse_refused(x) = !hasfield(typeof(x), :donated) || getfield(x, :donated)
 """
     ReactantNitro.build_chain(e, group::Symbol, hp) -> Optimisers.AbstractRule
 
-The three configuration levels resolved into one chain per group. At Levels 0 and 1 the framework
-constructs the rule from its type by field name; at Level 2 the user's factory constructs it, and
-setup records where each `hp` value lands ([`schedule_bindings`](@ref)), so two rules may share a
-field name. Two setup errors: a base rule declaring its own `lambda` at Level 1 (it would decay
-twice), and `Decay` anywhere but last (anything after it would produce coupled L2).
+Build group `group`'s chain through [`optimizer`](@ref)`(e, group, hp)` and check it. At Levels 0
+and 1 the framework constructs the rule from its type by field name ([`level1_chain`](@ref)); at
+Level 2 the user's factory constructs it, and setup records where each `hp` value lands
+([`schedule_bindings`](@ref)), so two rules may share a field name. Errors on a rule outside
+[`ADMITTED_RULES`](@ref), on a Level 1 rule declaring its own `lambda` (it would decay twice), and
+on `Decay` anywhere but last (it would be coupled L2).
 """
 function build_chain(e, group::Symbol, hp)
     chain = optimizer(e, group, hp)
@@ -536,8 +556,10 @@ end
 """
     ReactantNitro.level1_chain(e, group, hp) -> Optimisers.AbstractRule
 
-The default method behind `optimizer(e, group, hp)`: [`optimizer`](@ref)`(e, Val(group))` composed
-with the [`Decay`](@ref) tail, which is omitted when the group's `lambda` is zero.
+The default method behind `optimizer(e, group, hp)`: the rule type [`optimizer`](@ref)`(e, Val(group))`,
+constructed from `hp` by [`construct_rule`](@ref), followed by a
+[`Decay`](@ref)`(hp.lambda, hp.anchor, hp.no_decay_mask)` tail. The tail is omitted when
+`hp.lambda` is `nothing`, that is, when the group's `lambda` is zero and not scheduled.
 """
 function level1_chain(e, group::Symbol, hp)
     R = optimizer(e, Val(group))
@@ -568,9 +590,8 @@ end
 """
     ReactantNitro.construct_rule(R::Type, hp) -> rule
 
-Build rule type `R` by splatting `hp`'s values in **by field name**, falling back to
-`R()`'s own defaults for fields `hp` does not carry. Matching names make this one line with no
-per-rule knowledge, which is what lets a rule the framework has never heard of work unchanged.
+Build rule type `R` from `hp` by field name, using `R()`'s defaults for fields `hp` does not carry.
+Matching by name needs no per-rule code.
 """
 function construct_rule(R::Type, hp)
     proto = R()
@@ -586,9 +607,9 @@ _rules_of(r) = (r,)
 """
     ReactantNitro.check_decay_last(chain) -> nothing
 
-`Decay` after the base rule is decoupled, matching AdamW. `Decay` **before** the base rule would
-feed the decay term through moment estimation, producing coupled L2, which the framework does not
-support, so `Decay` anywhere but last is an error.
+Error if [`Decay`](@ref) is anywhere but last in `chain`. After the base rule, decay is decoupled,
+matching AdamW. Before it, the decay term would pass through moment estimation, which is coupled L2
+and is not supported.
 """
 function check_decay_last(chain)
     rules = _rules_of(chain)
@@ -610,13 +631,14 @@ end
 # ── Building the optimizer state ────────────────────────────────────────────────────
 
 """
-    ReactantNitro.build_opt_state(e, flat::NTuple{G}, layout; kwargs...) -> NTuple{G}
+    ReactantNitro.build_opt_state(e, flat::NTuple{G}, layout; svs, kwargs...) -> NTuple{G}
 
-Setup's optimizer-state step, training only: build each group's chain, `Optimisers.setup` it
-against the group's flat buffer, normalize through [`to_device_leaf`](@ref), and assert no host
-`Number` survives. `apply!` is array-level, so a flat group slice skips the tree walk. The
-collection is an `NTuple{G}`, never a `Vector`, which would infer abstractly and fail the thunk
-guard. Bias correction lives in the state, so resume restores it with the state.
+Build the optimizer state at setup, for training only: for each group, build its chain from
+`setup_hp` with `svs[gi]` ([`setup_schedule_values`](@ref)), call `Optimisers.setup` on the group's
+flat buffer, move it to the device with [`to_device_leaf`](@ref), and assert no host `Number`
+remains. `apply!` works on arrays, so a flat buffer needs no tree walk. The result is an
+`NTuple{G}`, since a `Vector` would infer abstractly and fail the thunk guard. Bias correction lives
+in the state, so resume restores it with the state.
 """
 function build_opt_state(
         e, flat::NTuple{G, Any}, layout::FlatLayout{G}; svs = ntuple(_ -> (;), Val(G)), kwargs...
@@ -638,10 +660,10 @@ end
 """
     ReactantNitro.apply_group(leaf, x, g) -> (leaf_new, x_new)
 
-One group's optimizer update, the array-level call the flat layout makes possible. The subtraction
-mirrors `Optimisers.subtract!` in preserving `eltype(x)`; a bare `x .- dx` promotes the parameter
-buffer whenever a rule hyperparameter is wider than it, which the thunk guard then rejects on the
-second call.
+Apply one group's optimizer update to its flat buffer `x` with gradient `g`. Like
+`Optimisers.subtract!`, the subtraction keeps `eltype(x)`; a bare `x .- dx` would widen the buffer
+whenever a rule hyperparameter is wider than it, and the thunk guard would reject it on the second
+call.
 """
 function apply_group(leaf::Optimisers.Leaf, x, g)
     st_new, dx = Optimisers.apply!(leaf.rule, leaf.state, x, g)
@@ -653,10 +675,10 @@ end
 """
     step_optimizer(opt_state, ps, grads) -> (states, ps_new)
 
-One tree-level optimizer step for use inside a [`train_step`](@ref) closure: `Optimisers.update`
-under trace, returning the new parameter tree and the new optimizer STATES. The rules are stripped
-because a replicated scalar cannot leave a compiled program on a mesh; the driver re-attaches them.
-Call it once per network or group, passing that subtree:
+Run one optimizer step on a parameter tree inside a [`train_step`](@ref) closure. It calls
+`Optimisers.update` and returns the new optimizer states, without their rules, and the new
+parameters. The rules are removed because a replicated scalar cannot leave a compiled program on a
+mesh; the driver re-attaches them after the step. Call it once per network, passing that subtree:
 
 ```julia
 st_g, ps_g = ReactantNitro.step_optimizer(opt_state.gen, ps.gen, g_g)
@@ -670,9 +692,9 @@ end
 """
     ReactantNitro.strip_rules(opt_state) -> states
 
-Replace every `Optimisers.Leaf` in a user's optimizer state tree with its STATE, preserving
-structure; the traced half of the "rules in, states out" contract. The mirror of
-[`merge_rules`](@ref).
+Replace every `Optimisers.Leaf` in an optimizer state tree with its state, keeping the structure.
+This is the traced half of the manual-mode contract, rules in and states out; [`merge_rules`](@ref)
+reverses it.
 """
 function strip_rules(x)
     if x isa Optimisers.Leaf
@@ -695,9 +717,9 @@ end
 """
     ReactantNitro.merge_rules(combined, states) -> opt_state
 
-Re-attach the rules of the `opt_state` handed in to the states the closure returned, rebuilding
+Re-attach the rules of the `opt_state` passed to the closure to the states it returned, rebuilding
 each `Leaf(input.rule, returned_state, input.frozen)`. A structure mismatch is a framework bug and
-surfaces here rather than inside a trace.
+fails here, outside the trace.
 """
 function merge_rules(combined, states)
     if combined isa Optimisers.Leaf
@@ -726,19 +748,18 @@ end
 """
     ReactantNitro.global_grad_norm(g_accum::NTuple{G}) -> scalar
 
-The global L2 norm over every group at once. Global norm is the mode the flat representation
-expresses exactly, and is impossible per-leaf over a parameter tree.
+The L2 norm of the gradient over all groups' flat buffers together.
 """
 global_grad_norm(g_accum::Tuple) = sqrt(sum(gi -> sum(abs2, gi), g_accum))
 
 """
     ReactantNitro.clip_by_global_norm(g_accum::NTuple{G}, threshold) -> NTuple{G}
 
-The framework's clip, at the top of the optimizer program on the fully accumulated gradient. The
-threshold is a trace-time host constant, so `threshold <= 0` returns the accumulator untouched and
-emits nothing; a device-resident `0` would scale the gradient to `NaN`. The scale is
-`threshold / max(norm, threshold)`, so a gradient over the threshold comes out at exactly the
-threshold.
+Scale the fully accumulated gradient to a global norm of at most `threshold`, at the top of the
+optimizer program. The scale is `threshold / max(norm, threshold)`, so a gradient over the
+threshold comes out with norm exactly `threshold`. The threshold is a trace-time host constant, so
+`threshold <= 0` returns `g_accum` unchanged and emits no ops; a device-resident `0` would give
+`0/0 = NaN` on an all-zero gradient.
 """
 function clip_by_global_norm(g_accum::Tuple, threshold::Real)
     threshold > 0 || return g_accum          # HOST branch: emits no ops at all

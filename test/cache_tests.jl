@@ -220,11 +220,12 @@
             # mode itself, the closure program's worlds, and `setup_optimizers`' staleness-only world.
             # For an automatic experiment they resolve to the defaults, `false` and `()`, but they are
             # still frozen dispatch, resolved once. `compile_options` rides along: not dispatch,
-            # but the other construction-time component of the key.
+            # but the other construction-time component of the key. `grad_rule_type` picks the
+            # driver path rather than a key component, and is checked again every step.
             @test keys(n.frozen) == (
                 :worlds_train, :worlds_opt, :worlds_eval,
                 :tm_residency, :metrics_residency, :graphconst_hash,
-                :manual, :worlds_manual, :worlds_setup, :compile_options,
+                :manual, :worlds_manual, :worlds_setup, :compile_options, :grad_rule_type,
             )
             @test n.frozen.manual === false
             @test n.frozen.worlds_manual == ()
@@ -843,6 +844,7 @@
                 Symbol("backbone.eta") => _ -> t -> 1.0f-3,
                 Symbol("default.eta") => _ -> t -> 1.0f-3,
             ),
+            (;), (;),
             Dict(Symbol("opt.backbone.eta") => :accessor, Symbol("opt.default.eta") => :keyword),
             Symbol[], true
         )

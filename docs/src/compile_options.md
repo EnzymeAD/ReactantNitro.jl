@@ -38,16 +38,15 @@ works with no change here. Commonly useful ones:
 | `raise_first` | raise before the main optimization passes rather than after |
 | `optimize` | `false` skips the optimization passes, or a `Symbol`/`String` picks a pipeline |
 | `cudnn_hlo_optimize` | enables the cuDNN HLO rewrites |
-| `transpose_propagate`, `reshape_propagate` | `:up`, `:down` or `:none` |
+| `transpose_propagate`, `reshape_propagate` | `:up` (the default), `:down` or `:none` |
 | `no_nan`, `all_finite` | let the optimizer assume finite values |
 | `xla_debug_options` | XLA debug flags, as a `NamedTuple` |
 
-Reactant forces `raise = true` on TPU and for sharded programs, so setting it there changes nothing.
+Reactant forces `raise = true` on TPU and for sharded programs, so setting it there has no effect.
 
 ## XLA options
 
-Three keywords pass fields straight to XLA's own protos. The fields are XLA's, so XLA documents
-them; this page only shows how to reach them.
+Three keywords set fields of XLA's own protos, which XLA documents:
 
 | Keyword | XLA proto | Reference |
 | --- | --- | --- |
@@ -79,8 +78,8 @@ autotuning settings, clear it first with `Reactant.PersistentCompileCache.clear_
 
 ## Validation
 
-`Nitro` checks the options before the setup sequence runs, so a mistake fails in seconds rather
-than at the first compile:
+`Nitro` checks the options before the setup sequence runs, so a mistake fails at once instead of
+at the first compile:
 
 - an unknown keyword is refused, and the error lists the accepted ones
 - a `CompileOptions` field passed as a keyword is refused, with a pointer to the `CompileOptions` form

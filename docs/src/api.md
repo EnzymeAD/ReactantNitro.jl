@@ -1,9 +1,9 @@
 # API reference
 
-Every exported name that carries a docstring appears below, collected automatically. The docstrings
-are the contract, and the guide pages give the worked context: [Tutorial](tutorial.md),
-[Experiments](experiments.md), [Recompilation](recompilation.md), [Compile options](compile_options.md),
-[Optimization](optimization.md), and [Schedules](schedules.md).
+Every exported name that carries a docstring appears below. The guide pages give worked examples:
+[Tutorial](tutorial.md), [Experiments](experiments.md), [Recompilation](recompilation.md),
+[Compile options](compile_options.md), [Optimization](optimization.md), and
+[Schedules](schedules.md).
 
 ```@autodocs
 Modules = [ReactantNitro]
@@ -13,8 +13,8 @@ Private = false
 
 ## Compile cache internals
 
-`cache_stats` and `cache_reset!` are deliberately unexported (the guides reach for them from the
-REPL as `ReactantNitro.cache_stats`), and they are documented here so their refs resolve.
+`cache_stats` and `cache_reset!` are unexported; call them qualified, as
+`ReactantNitro.cache_stats()`.
 
 ```@docs
 ReactantNitro.cache_stats
@@ -41,8 +41,8 @@ ReactantNitro.release!
 
 ## Progress reporting
 
-`progress_note!` and `with_progress_note` are exported and appear above. The reporter contract it feeds is extended
-qualified, as `ReactantNitro.progress_reporter!(f)`.
+`progress_note!` and `with_progress_note` are exported and appear above. The reporter contract
+they feed is called qualified, as `ReactantNitro.progress_reporter!(f)`.
 
 ```@docs
 ReactantNitro.progress_reporter!
@@ -53,8 +53,7 @@ ReactantNitro.progress_log_reporter
 
 ## Internals referenced by the docstrings
 
-Several docstrings of the public surface point at internal helpers that carry their own docstrings.
-They are collected here so those links resolve; they are implementation details and may change
+Internal helpers that public docstrings link to. They are implementation details and may change
 without a breaking release.
 
 ```@docs

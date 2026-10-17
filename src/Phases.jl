@@ -11,36 +11,40 @@
 """
     Phase
 
-Root of the run-phase tree. The framework publishes phase transitions through
-[`register_phase_monitor!`](@ref) so an external heartbeat, watchdog or dashboard can be written
-without the framework shipping one. Phases differ in duration by orders of magnitude (a compile
-takes minutes, a step milliseconds), so a watchdog needs the signal; what counts as too long is
-site policy and no timeout table ships here.
+Root of the run-phase tree. The framework publishes phase transitions to the monitors registered
+with [`register_phase_monitor!`](@ref), so a heartbeat, watchdog or dashboard can be written outside
+the framework. Phase durations differ by orders of magnitude (a compile takes minutes, a step
+milliseconds), so a watchdog needs to know the phase; the framework ships no timeouts.
 """
 abstract type Phase end
 
 """
     Repl <: Phase
 
-The caller has control and no framework work is in flight: a REPL prompt between calls, or the
-moment after any public entry point returns. Without it a monitor cannot tell a finished run from
-a process wedged in teardown.
+The caller has control and no framework work is in flight, as after any public entry point
+returns. It lets a monitor tell a finished run from a process stuck in teardown.
 
-Published but never recorded: `Repl` is a property of the process, not of the run, so
-[`phase`](@ref) keeps answering how the run ended (`Done` or `Failed`). Published only by the
-outermost entry point, through a process-level depth counter ([`work_in_flight`](@ref)), so
-`train!` calling `validate` each epoch does not announce an idle session mid-run.
+Published but never recorded: `Repl` describes the process, not the run, so [`phase`](@ref) still
+reports how the run ended (`Done` or `Failed`). Only the outermost entry point publishes it, tracked
+by a process-level depth counter ([`work_in_flight`](@ref)), so `train!` calling `validate` each
+epoch does not announce an idle session mid-run.
 """
 struct Repl <: Phase end
 
-"Setup is running: the setup sequence, before the first compile."
+"""
+    Starting <: Phase
+
+Work has started and has not yet reached a compile or a step. Published when `Nitro(e)` begins
+setup and when an outermost entry point starts; a new handle's [`phase`](@ref) is `Starting` until
+its first transition.
+"""
 struct Starting <: Phase end
 
 """
     Compiling <: Phase
 
-Supertype of the four compile phases, which are **slow by design**. Subscribe here rather than to
-a leaf so that adding a leaf stays non-breaking.
+Supertype of the four compile phases, which normally take minutes. Test `phase isa Compiling`
+rather than a leaf type, so a monitor keeps working when a compile phase is added.
 """
 abstract type Compiling <: Phase end
 
@@ -56,9 +60,9 @@ struct EvalCompiling <: Compiling end
 """
     ExportCompiling <: Compiling
 
-Tracing and compiling the export program, published once per `export_model` call around the
-backend's `write_export`, since export never touches the compile cache. The previous phase is
-restored when the bundle is written or the call fails.
+Tracing and compiling the export program. Set once per `export_model` call, around the backend's
+`write_export`, which compiles outside the compile cache. The previous phase is restored when the
+bundle is written or the call fails.
 """
 struct ExportCompiling <: Compiling end
 
@@ -85,15 +89,19 @@ struct Checkpointing <: Phase end
 """
     Terminal <: Phase
 
-Supertype of the two end states. `p isa Terminal` is the one query a monitor needs in order to
-close itself.
+Supertype of the two end states. A monitor tests `p isa Terminal` to know when to close.
 """
 abstract type Terminal <: Phase end
 
-"The run finished, whether by reaching `max_epochs` or by stopping early."
+"""
+    Done <: Terminal
+
+The run finished: it reached `max_epochs`, stopped early, or stopped on
+[`request_stop!`](@ref). The handle's `stop_reason` says which.
+"""
 struct Done <: Terminal end
 
-"The run raised."
+"The run raised an exception."
 struct Failed <: Terminal end
 
 # ── The `Nitro` handle ─────────────────────────────────────────────────────────────
@@ -101,13 +109,14 @@ struct Failed <: Terminal end
 """
     Nitro(e; kwargs...) -> Nitro
 
-The run's materialized state. `Nitro(e)` executes the setup sequence and nothing else, so
-[`validate`](@ref), [`evaluate`](@ref) and [`predict`](@ref) work with no training anywhere in the
-process; `train!(e)` is sugar for `train!(Nitro(e))`, and every keyword belongs here.
+The state of a run: model, weights, optimizer, data and counters. `Nitro(e)` runs the setup
+sequence and nothing else, so [`validate`](@ref), [`evaluate`](@ref) and [`predict`](@ref) work
+without training in the process. `train!(e; kwargs...)` is shorthand for
+`train!(Nitro(e; kwargs...))`, so every run keyword is a `Nitro` keyword.
 
 ```julia
 nitro = Nitro(e)                                  # fresh weights from build_model
-nitro = Nitro(e; weights = "runs/x/latest")    # trained weights, no training this process
+nitro = Nitro(e; weights = :latest => :best)      # best weights of the newest run in run_dir
 nitro = Nitro(e; data = (; test = loader))        # supply data directly, skip build_data
 nitro = Nitro(e; compile_options = (; cudnn_hlo_optimize = true,    # Reactant compile keywords,
     xla_debug_options = (; xla_gpu_exhaustive_tiling_search = true))) # XLA flags among them
@@ -116,11 +125,10 @@ nitro = Nitro(e; compile_options = (; cudnn_hlo_optimize = true,    # Reactant c
 `compile_options` applies to every program the handle compiles and is part of each program's
 compile-cache key; see [`ReactantNitro.check_compile_options`](@ref).
 
-Opaque, with accessors: [`experiment`](@ref), [`parameters`](@ref), [`states`](@ref),
+Read it through accessors: [`experiment`](@ref), [`parameters`](@ref), [`states`](@ref),
 [`run_dir`](@ref), [`current_step`](@ref), [`current_epoch`](@ref), [`phase`](@ref),
-[`history`](@ref), and [`request_stop!`](@ref) to write. The object is a `Nitro`; a run is what
-happens when you `train!` one, which is why `run_dir`, `run_id` and the run phases keep the word.
-It deliberately holds no Enzyme shadow `dps`; that lives inside the gradient program.
+[`history`](@ref) and [`logger_info`](@ref); [`request_stop!`](@ref) is the one write. It holds no
+Enzyme shadow `dps`, which exists only inside the gradient program.
 """
 mutable struct Nitro
     # Setup products, in the order the setup sequence produces them.
@@ -206,8 +214,11 @@ mutable struct Nitro
     # `restore_best = true`: `train!` ends by loading this run's selected checkpoint into `ps` and
     # `st`. `restored_best` is that checkpoint, `(; path, epoch, metric, score, run)`, once it has,
     # and a handle holding it refuses a further `train!`.
-    restore_best::Bool
+    # `false`, `true` (the best checkpoint) or an `Average` of the run's own checkpoints.
+    restore_best::Any
     restored_best::Any
+    # What the weights average, from an averaged record (`averaged_from`), else `nothing`.
+    averaged_from::Any
 end
 
 # ── The accessors, which are reads and which everything downstream is specified in terms of.
@@ -216,8 +227,8 @@ end
 """
     experiment(nitro) -> e
 
-The **post-conversion** experiment, which is what every hook except `build_data` and
-`derive` sees. Its `Device` fields hold device values.
+The experiment after device conversion, which every hook except `build_data` and `derive` sees.
+Its `Device` fields hold device values.
 """
 experiment(nitro::Nitro) = nitro.e
 
@@ -232,25 +243,24 @@ parameters(nitro::Nitro) = nitro.ps
 """
     states(nitro) -> st
 
-The layer state, including running statistics. Plural because `state` reads as the handle's
-own state, which is the whole `Nitro`.
+The layer state, including running statistics. Plural so it is not read as the state of the
+whole handle.
 """
 states(nitro::Nitro) = nitro.st
 
 """
     run_dir(nitro) -> String
 
-The run's output directory: checkpoints, the manifest, and `resume = :auto` all resolve against
-it. It is the one path concept in the framework, and defaults to
-`joinpath("runs", string(nameof(typeof(e))))`.
+The run's output directory, against which checkpoints, the manifest and `resume = :auto` resolve.
+Defaults to `joinpath("runs", string(nameof(typeof(e))))`.
 """
 run_dir(nitro::Nitro) = nitro.run_dir
 
 """
     current_step(nitro) -> Int
 
-The **optimizer** step, not the micro-batch. With `accum = N` the two differ by a factor of
-N, and confusing them shifts the whole learning-rate curve by N.
+The number of optimizer steps taken. With `accum = N` each optimizer step consumes N micro-batches,
+so this count is a factor of N below the micro-batch count. Schedules are indexed by it.
 """
 current_step(nitro::Nitro) = nitro.step
 
@@ -264,20 +274,17 @@ current_epoch(nitro::Nitro) = nitro.epoch
 """
     phase(nitro) -> Phase
 
-The run's current phase. Phase *transitions* also reach the monitor registry; this reads
-the latest one.
+The run's current phase: the latest transition, which monitors also receive.
 """
 phase(nitro::Nitro) = nitro.phase
 
 """
     request_stop!(nitro) -> nothing
 
-Ask the run to stop, from a REPL or from a phase monitor. It sets the same flag
-[`EarlyStopping`](@ref) sets, checked once per epoch after validation.
-
-**Stopping is graceful:** the run finishes the epoch, validates, checkpoints, finalizes the logger,
-and exits through the normal [`Done`](@ref) path. Aborting mid-epoch would skip exactly the steps
-that make the run useful.
+Ask the run to stop, from a REPL or from a phase monitor. The stop is graceful: training leaves the
+step loop at the next step boundary, then validates, writes the checkpoint, finalizes the logger
+and exits through [`Done`](@ref) with `stop_reason = :requested`. A standalone
+[`validate`](@ref) or [`evaluate`](@ref) stops at the next batch.
 """
 function request_stop!(nitro::Nitro)
     nitro.stop_requested = true
@@ -287,10 +294,9 @@ end
 """
     logger_info(nitro) -> NamedTuple
 
-The run's logger's key identifying parameters, read straight off a running experiment:
-[`logger_info`](@ref)`(nitro.logger)`. The shipped default [`JSONLogger`](@ref) reports its
-`path`; a hosted backend reports its URL, experiment key, workspace, and whatever else it
-extends the verb with. The ReactantNitroKaimonGateExt `nitro_logger` tool renders exactly this table.
+The identifying fields of the run's logger, `logger_info(nitro.logger)`, readable while the run
+trains. The default [`JSONLogger`](@ref) reports its `path`; a hosted backend reports fields such
+as its URL, experiment key and workspace. The Kaimon `nitro_logger` tool renders this.
 """
 logger_info(nitro::Nitro) = logger_info(nitro.logger)
 
@@ -315,7 +321,7 @@ const _TABLE_RENDERER = Ref{Any}(nothing)
     ReactantNitro.TableRows
 
 The row type every renderer receives, `Vector{Vector{String}}`: one inner vector per row, already
-rendered to strings. Spelled as an alias so a renderer states the same type.
+rendered to strings. An alias so a renderer can name the type.
 """
 const TableRows = Vector{Vector{String}}
 
@@ -330,12 +336,11 @@ const CellStyles = Dict{Tuple{Int, Int}, Symbol}
 """
     ReactantNitro.TableSection(title, header, rows[, styles])
 
-One labelled band of a table. `title` is drawn full-width above the section, or `""` for none
-(the leading section, whose label would repeat the table title). `header` is the column header; an
-all-empty vector means a label-and-value band. `styles` maps a `(row, column)` to a ROLE (`:good`,
-`:busy`, `:warn`, `:bad`, `:muted`, `:accent`), never a colour, so the same rows can be rendered
-into the logged report's plain string and a destination that cannot colour ignores the map. Short
-rows are read as having empty cells.
+One labelled band of a table. `title` is drawn full-width above the section, or `""` for none, as
+in the leading section, whose label would repeat the table title. `header` is the column header; an
+empty vector means a label-and-value band. `styles` maps a `(row, column)` to a role (`:good`,
+`:busy`, `:warn`, `:bad`, `:muted`, `:accent`), not a colour, so a destination that cannot colour,
+such as the logged plain-text report, ignores it. Missing trailing cells in a row are empty.
 """
 struct TableSection
     title::String
@@ -352,9 +357,9 @@ TableSection(title, header, rows) = TableSection(title, header, rows, CellStyles
 Set the renderer every long `show` goes through, and return the previous one. `f` is called as
 `f(io::IO, mime::MIME, title::AbstractString, sections::Vector{TableSection},
 note::Union{AbstractString, Nothing})`, with `mime` either `MIME"text/plain"` or
-`MIME"text/html"`; write those types out, since it is reached through a `Ref{Any}`. `nothing`
-switches the table off, leaving the title, the note, and one line saying so. The framed
-PrettyTables renderer is installed at definition and is the only one shipped.
+`MIME"text/html"`, so `f` must handle both. `nothing` switches the table off, leaving the title,
+the note, and one line saying so. The framed PrettyTables renderer is installed at load and is the
+only one shipped.
 """
 function table_renderer!(f)
     prev = _TABLE_RENDERER[]
@@ -450,8 +455,13 @@ end
 # wordings share a shape: an origin, and `trained here` in front of it when this handle trained.
 function _nitro_weights(nitro::Nitro)
     rb = nitro.restored_best
-    rb === nothing || return "trained here, then restored to the best checkpoint, epoch " *
-        string(rb.epoch) * " (`restore_best`)"
+    rb === nothing || return (
+        haskey(rb, :average) ?
+            "trained here, then restored to " * string(rb.average) * ", epochs " *
+            join(rb.epochs, ", ") * " (`restore_best`)" :
+            "trained here, then restored to the best checkpoint, epoch " * string(rb.epoch) *
+            " (`restore_best`)"
+    )
     src = nitro.checkpoint_source
     ws = nitro.weights_source
     origin = ws !== nothing ?
@@ -525,7 +535,7 @@ function _show_nitro(io::IO, mime::MIME, nitro::Nitro)
     push!(
         state, [
             "run_dir",
-            nitro.run_dir * (nitro.checkpointer isa TopKCheckpointer ? "   run " * run_key(ck_run) : ""),
+            nitro.run_dir * (nitro.checkpointer isa Checkpointer ? "   run " * run_key(ck_run) : ""),
         ]
     )
     push!(state, ["seed", string(nitro.seed, "   accum ", nitro.accum)])
@@ -552,7 +562,8 @@ function _show_nitro(io::IO, mime::MIME, nitro::Nitro)
                         string(
                             "epoch ", bc.epoch, ", ", bc.metric, " ", _shown(bc.score),
                             hasproperty(bc, :run) ? ", run " * run_key(bc.run) : "",
-                            nitro.restored_best === nothing ? "" : "  (the handle holds these weights)",
+                            nitro.restored_best === nothing || haskey(nitro.restored_best, :average) ? "" :
+                                "  (the handle holds these weights)",
                         ),
                     ],
                     ["path", _nitro_relpath(bc.path)],
@@ -604,8 +615,8 @@ end
 """
     ReactantNitro.RegisteredMonitor
 
-One entry in a phase registry: the function, an id, and whether it has already been warned about,
-which is what makes error isolation once per monitor rather than once per event.
+One entry in a phase registry: an id, the function, and whether it has already been warned about,
+so a throwing monitor is warned about once rather than on every event.
 """
 mutable struct RegisteredMonitor
     id::Int
@@ -638,13 +649,13 @@ end
     register_phase_monitor!(f) -> handle
     register_phase_monitor!(nitro, f) -> handle
 
-Register `f` as an observer of phase transitions. The module-level form applies to future runs; the
-`nitro` form targets the live per-run copy and is effective immediately. This is the hook a
-heartbeat or a watchdog is written against; the framework ships neither, since what counts as "too
-long" is site policy.
+Register `f` to be called on every phase transition. The module-level form is copied into each
+handle at its next entry point, including handles already built; the `nitro` form adds `f` to that
+handle's own registry and takes effect immediately. Heartbeats and watchdogs are written against
+this; the framework ships neither.
 
-The signature is `f(phase, step, epoch, info)` with `info::NamedTuple`, not keyword arguments,
-because `do`-block functions cannot take keywords:
+`f` is called as `f(phase, step, epoch, info)` with `info::NamedTuple`, since `do`-block functions
+cannot take keyword arguments:
 
 ```julia
 register_phase_monitor!() do phase, step, epoch, info
@@ -654,14 +665,15 @@ end
 ```
 
 `step` and `epoch` are `nothing` until the first epoch begins. `info` carries at least
-`(; nitro, logger, is_rank0)`, plus `metrics` on the transition out of [`EvalStepping`](@ref). A
-throwing monitor never kills a run: it is caught and warned about once per monitor. Module-level
-monitors fire in registration order, then the run's own. The per-run copy is a snapshot taken at
-`train!`, so unregistering a module-level handle mid-run takes effect on the next `train!`.
+`(; nitro, logger, is_rank0)`, plus `metrics` on the transition out of [`EvalStepping`](@ref);
+during `Nitro(e)` construction, before a handle exists, `nitro` and `logger` are `nothing`. An
+exception thrown by a monitor is caught and warned about once per monitor, and the run continues.
+Module-level monitors fire in registration order, then the handle's own. Unregistering a
+module-level monitor does not remove it from handles that have already copied it.
 
-The framework fires on transition only. A compile is a blocking foreign call, so nothing can emit
-from inside it; a monitor that must prove liveness needs its own task on the `:interactive` pool,
-and [`Compiling`](@ref) is published so it can widen its patience.
+Monitors fire on transitions only. A compile is a blocking foreign call that emits nothing, so a
+monitor that must prove liveness needs its own task on the `:interactive` pool, and can extend its
+timeout while the phase is a [`Compiling`](@ref).
 """
 function register_phase_monitor!(f)
     m = RegisteredMonitor(next_monitor_id(), f, false)
@@ -682,9 +694,8 @@ end
 """
     unregister_phase_monitor!(handle) -> nothing
 
-Remove a monitor registered by [`register_phase_monitor!`](@ref), by the handle it returned. The
-handle carries the registry it was added to, so one verb removes from either without the caller
-having to say which, and removing an already-removed monitor is a no-op rather than an error.
+Remove a monitor by the handle [`register_phase_monitor!`](@ref) returned. The handle records which
+registry it was added to, so this works for both forms. Removing a monitor twice is a no-op.
 """
 function unregister_phase_monitor!(handle::MonitorHandle)
     lock(MONITOR_LOCK) do
@@ -697,10 +708,10 @@ end
 """
     ReactantNitro.adopt_monitors!(nitro) -> nothing
 
-The per-run copy of the module-level registry, taken on the way into every entry point and again
-inside `train!`. Entries are copied, so "warn once per monitor" means once per run. Monitors
-registered directly on the `Nitro` are kept and fire after the module-level ones; re-adopting is
-idempotent.
+Copy the module-level monitors that `nitro` does not yet hold into its registry, ahead of its own.
+Called at construction, on entry to every entry point and inside `train!`; repeated calls add
+nothing new. Entries are copied, so "warned once" is per handle. Monitors registered on the `Nitro`
+itself are kept and fire after the module-level ones.
 """
 function adopt_monitors!(nitro::Nitro)
     lock(MONITOR_LOCK) do
@@ -717,9 +728,10 @@ end
 """
     ReactantNitro.set_phase!(nitro, phase; info...) -> nothing
 
-Move the run to `phase` and publish the transition, as one operation and from the only writer.
-Fires on transition only, so re-entering the current phase is a no-op. Extra keywords are merged
-into `info`, which is how the transition out of [`EvalStepping`](@ref) carries `metrics`.
+Record `phase` on the handle and publish the transition; the only writer of `nitro.phase`. Setting
+the current phase again is a no-op. Extra keywords are merged into `info`, which is how the
+transition out of [`EvalStepping`](@ref) carries `metrics`. Entering a [`Terminal`](@ref) phase
+also releases the handle's data sources, after the monitors run.
 """
 function set_phase!(nitro::Nitro, phase::Phase; info...)
     nitro.phase === phase && return nothing
@@ -744,11 +756,11 @@ _compiling_label(p::Compiling) = "compiling " * string(nameof(typeof(p)))
 """
     ReactantNitro.publish_phase(nitro, phase; info...) -> nothing
 
-Fire the monitor registry for `phase` without recording it on the handle. Exists for
-[`Repl`](@ref), which is a property of the process rather than of the run: writing it into
-`nitro.phase` would erase how the run ended, while a heartbeat still needs the event. No transition
-guard, since there is no stored phase to compare against; the depth counter keeps this to one
-event per outermost call.
+Fire the handle's monitors for `phase` without recording it on the handle. Used for
+[`Repl`](@ref) and [`Starting`](@ref), which describe the process rather than the run: recording
+`Repl` in `nitro.phase` would erase how the run ended. There is no repeat guard, since there is no
+stored phase to compare against; the depth counter limits this to one event per outermost call. A
+[`Terminal`](@ref) phase also releases the handle's data sources.
 """
 function publish_phase(nitro::Nitro, phase::Phase; info...)
     fire_monitors(nitro, phase; info...)
@@ -760,10 +772,10 @@ end
     ReactantNitro.release!(nitro) -> nothing
 
 Release every split of the handle's data collection through the source trait's
-[`release!`](@ref) method, once per handle. `train!` does this itself at `Done` or `Failed`; call
-it for a handle that only validated, predicted or exported, whose sources would otherwise stay
-open. A split that raises is warned about and never takes the others, or the run's result, with
-it. After this the handle cannot iterate a released source again.
+[`release!`](@ref) method, once per handle. `train!` does this itself on reaching `Done` or
+`Failed`; call it for a handle that only validated, predicted or exported, whose sources would
+otherwise stay open. A split whose `release!` throws is warned about, and the other splits are
+still released. The handle cannot iterate a released source again.
 """
 release!(nitro::Nitro) = release_sources!(nitro)
 
@@ -785,9 +797,9 @@ end
 """
     ReactantNitro.publish_phase(phase::Phase; info...) -> nothing
 
-Publish through the module-level monitors, for the window in which there is no handle: `Nitro(e)`
-itself, where `build_data` may start and compile a data server. A monitor adopted into the run
-later is the same object, so the events arrive in order.
+Fire the module-level monitors for `phase` while no handle exists yet, during `Nitro(e)`, where
+`build_data` may start and compile a data server. `step`, `epoch`, `info.nitro` and `info.logger`
+are `nothing`. The handle later adopts the same functions, so one monitor sees the events in order.
 """
 function publish_phase(phase::Phase; info...)
     ms = lock(() -> copy(MONITORS), MONITOR_LOCK)
@@ -848,10 +860,9 @@ const REPL_DEPTH = Ref(0)
 """
     ReactantNitro.work_in_flight() -> Bool
 
-Whether any public entry point is currently executing in this process; `false` is what
-[`Repl`](@ref) announces. A monitor needs this as well as the transition, because an entry point
-that throws before it has a `Nitro` leaves the last published phase in place, and an interval
-monitor can reconcile against this predicate.
+Whether any public entry point is executing in this process; `false` is the state [`Repl`](@ref)
+announces. An entry point that throws before it has a `Nitro` publishes no `Repl` and leaves the
+last published phase in place, so a monitor polling on an interval should check this as well.
 """
 work_in_flight() = lock(MONITOR_LOCK) do
     REPL_DEPTH[] > 0
@@ -868,11 +879,10 @@ const PROGRESS = Threads.Atomic{Int}(0)
     ReactantNitro.progress_counter() -> Int
 
 A monotonic count of units of work this process has completed: one per optimizer step in
-training, one per batch in evaluation. Only its change is meaningful. A stall watchdog needs this
-because a phase deadline measures from the transition, and a run stays in `TrainStepping` for a
-whole epoch; comparing this across two observations turns the same budget into "time since the
-last completed unit". It covers evaluation because nothing on the handle advances during an eval
-loop.
+training, one per batch in evaluation. Only changes in it are meaningful. A run stays in
+`TrainStepping` for a whole epoch, so a stall watchdog compares this count across two observations
+to measure time since the last completed unit. It counts evaluation batches because nothing on the
+handle advances during an eval loop.
 """
 progress_counter() = PROGRESS[]
 
@@ -902,8 +912,7 @@ default is [`default_progress_reporter`](@ref). `f` is called as
     [`with_progress_note`](@ref) changes; `label` is the note, `""` when there is none. A new
     `:phase` or `:begin` clears it.
 
-A reporter that throws is switched off rather than propagated: losing GPU hours to a broken
-progress bar is not a trade this framework makes.
+A reporter that throws is switched off with a warning, and the run continues.
 """
 function progress_reporter!(f)
     prev = _PROGRESS_REPORTER[]
@@ -937,8 +946,9 @@ end
     ReactantNitro.progress_begin!(label, total, epoch, max_epochs) -> nothing
     ReactantNitro.progress_end!() -> nothing
 
-Open and close one stretch of reported work. Both are no-ops with no reporter installed, which is
-the default. `total = 0` means the length is not known ahead of time.
+Open and close one stretch of reported work. Both are no-ops when the reporter is `nothing`.
+`total = 0` means the length is not known ahead of time. Opening a stretch clears every progress
+note.
 """
 progress_begin!(label::AbstractString, total::Integer, epoch::Integer, max_epochs::Integer) =
     lock(_PROGRESS_LOCK) do
@@ -978,8 +988,8 @@ progress_done!(label::AbstractString = "") = _progress_report(:done, String(labe
     ReactantNitro.progress_phase!(label) -> nothing
 
 Tell the reporter what the current stretch is doing while its counter is not moving, or `""` when
-it is back to ordinary work. A compile emits no units, so without this a bar stalls at zero for the
-length of an XLA compile with nothing to say why.
+it is back to ordinary work. A compile emits no units, so this is what explains a bar standing
+still. A changed label clears every progress note.
 """
 progress_phase!(label::AbstractString) = lock(_PROGRESS_LOCK) do
     label == _NOTE_PHASE[] || _clear_notes!(String(label))
@@ -1340,20 +1350,20 @@ end
 """
     ReactantNitro.with_repl(f, nitro; spawn = true, on_interrupt = nothing) -> f()
 
-Run `f`, then publish [`Repl`](@ref) through `nitro` if this was the outermost entry point. The
-wrapper every public entry point goes through.
+The wrapper every public entry point goes through. If this is the outermost entry point, it adopts
+the module-level monitors and publishes [`Starting`](@ref) before running `f`, and publishes
+[`Repl`](@ref) after.
 
-Long loops leave the interactive thread: a compile or execute there starves every other task on
-it, including logger tasks and a Kaimon gate's message loop. When the caller is on an interactive
-thread and a default pool exists, `f` runs on a default-pool worker and the caller parks in
-`fetch`; single-threaded Julia and worker-thread callers run inline. `spawn = false` forces inline,
-for rendering hooks that need the main thread.
+A compile or execute on the interactive thread starves every other task there, including logger
+tasks and a Kaimon gate's message loop. So when the caller is on an interactive thread and the
+default pool has threads, `f` runs on a default-pool thread and the caller waits in `fetch`;
+otherwise, as in single-threaded Julia or on a worker thread, `f` runs inline. `spawn = false`
+forces inline, for rendering hooks that need the main thread.
 
-Ctrl+C interrupts the parked wait, not the run, and `on_interrupt` decides what it means; the
-default rethrows. A failed run surfaces its own exception, unwrapped from `TaskFailedException`.
-The depth decrement and the `Repl` publish happen in a `finally`, so a failed run still hands
-control back and a supervised session does not stay alive on a stale counter; `Failed` is published
-first.
+Ctrl+C interrupts the wait, not `f`, and `on_interrupt(task, nitro)` decides what happens; the
+default rethrows. An exception from `f` is rethrown unwrapped from `TaskFailedException`. The depth
+decrement and the `Repl` publish run in a `finally`, so they happen after a failure too, after `f`
+has published `Failed`.
 """
 function with_repl(f, nitro; spawn::Bool = true, on_interrupt = nothing)
     # `Starting` on the way in, outermost only, so the stretch before a verb's first compile is
@@ -1387,10 +1397,10 @@ end
 
 Run `f` off the interactive thread under [`with_repl`](@ref)'s spawn policy, for `Nitro(e)`, which
 `with_repl` cannot wrap because there is no handle until the constructor returns. Construction
-blocks the calling thread for a minute or more (PJRT init, `build_model`, the device conversion),
-and from the main task under `julia -t N,1` that thread is the interactive one, so an external
-supervisor's heartbeat stopped and the session was reclaimed before the first step. No
-`on_interrupt`: a ^C during construction has nothing graceful to stop.
+can block for a minute or more (PJRT init, `build_model`, the device conversion), and under
+`julia -t N,1` the main task runs on the interactive thread, where that would stall an external
+supervisor's heartbeat. There is no `on_interrupt`: a ^C during construction has nothing to stop
+gracefully.
 """
 function _off_interactive(f)
     _should_spawn() || return f()
@@ -1416,9 +1426,9 @@ end
 """
     ReactantNitro.with_repl_result(f) -> f()
 
-The `Repl` wrapper for an entry point that has no `Nitro` until it returns one. Nothing is
-published when `f` throws, since there is no handle; the counter is still released, and
-[`work_in_flight`](@ref) is how an interval monitor corrects.
+The `Repl` wrapper for an entry point that has no `Nitro` until `f` returns one, such as
+`train!(e)`. Nothing is published when `f` throws, since there is no handle; the depth counter is
+still released, and an interval monitor sees that through [`work_in_flight`](@ref).
 """
 function with_repl_result(f)
     repl_enter!()

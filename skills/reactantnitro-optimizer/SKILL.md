@@ -3,8 +3,8 @@ name: reactantnitro-optimizer
 description: >
   Configure a ReactantNitro optimizer: parameter groups and per-group learning-rate
   ratios, `Decay` with its `:zero` and `:w0` anchors (L2 and L2-SP), per-leaf decay
-  exclusion through `no_decay` and `default_no_decay`, global-norm gradient clipping, and
-  schedules with their two namespaces. Also covers the binding report, which is how you
+  exclusion through `no_decay` and `default_no_decay`, global-norm gradient clipping, SAM
+  through `grad_rule`, and schedules with their two namespaces. Also covers the binding report, which is how you
   check what your config actually resolved to. Invoke when setting up or debugging an
   optimizer, a learning-rate schedule, weight decay, or a fine-tuning setup that treats a
   backbone differently from a head.
@@ -120,6 +120,19 @@ splitting a group to exclude them would also split the learning-rate ratio.
 schedulable, and it is a **trace-time host constant**: a disabled clip emits no operations at all
 rather than multiplying by infinity every step. The price is that changing it recompiles the
 optimizer program, and only the optimizer program, which is the cheap one.
+
+## SAM: `grad_rule`
+
+`grad_rule(::MyExp) = SAM(0.05f0)` turns on sharpness-aware minimization; the default is
+`SingleGrad()`. The driver runs the SAME compiled gradient program
+twice per micro-batch, at `ps` and at `ps + ε`, so SAM costs 2x forward and backward but no new
+gradient compile, and the optimizer program (RAdam included) is unchanged. `rho` is a host number placed on the
+device, so changing it never recompiles. Schedule it as `rho = ...` when nothing else is named
+`rho`, else `grad = (; rho = ...)`; a `Device` field inside the rule is refused. An ambiguous
+unqualified key is always refused. To avoid name binding entirely, use `bind = (; my_name = ...)`
+and read `hp.bind.my_name` in a Level 2 `optimizer(e, group, hp)` or in `grad_rule(e, hp)`; setup
+probes where each `bind` key lands and refuses one that lands nowhere. `ε` is per micro-batch and skips `no_decay` leaves. The logged loss
+is the unperturbed one; `sam/gap` on the train line is pass 2 minus pass 1. Manual mode refuses it.
 
 ## Schedules
 

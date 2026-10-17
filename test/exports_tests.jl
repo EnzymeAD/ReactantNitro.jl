@@ -37,6 +37,7 @@
         # alongside the hook so a user can extend the built-ins rather than replace them.
         :no_decay, :default_no_decay,
         :gradient_clip_norm, :schedules, :nonschedulable, :dispatch_variant,
+        :grad_rule, :GradRule, :SingleGrad, :PerturbRule, :SAM, :perturbation,
         :max_epochs,
         # Manual training mode. Defining `train_step` for an experiment type is what selects
         # manual mode; `manual_training(e) = false` declines it while keeping the method;
@@ -68,7 +69,9 @@
     # its own transcript. A run directory's contents come from the manifest, opening no record at
     # all; one record's metadata comes from `checkpoint_info`, which returns none of its weights.
     const CHECKPOINTING = [
-        :TopKCheckpointer, :save_checkpoint!, :load_checkpoint, :CheckpointRecord,
+        :Checkpointer, :TopKCheckpointer, :save_checkpoint!, :load_checkpoint, :CheckpointRecord,
+        :Selector, :Best, :Last, :Epochs, :Every, :select, :admits, :Average,
+        :average_checkpoints,
         :checkpoint_filename, :read_manifest, :checkpoint_info,
         # The run ids a checkpoint source names: every run a directory holds, and a handle's own.
         :runs, :checkpoint_run,

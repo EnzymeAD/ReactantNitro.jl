@@ -30,7 +30,7 @@ features:
     link: /experiments/
   - icon: 🚀
     title: Compile only when the graph changes
-    details: Programs are keyed on the GraphConst fields and the hook code, nothing else. Sweeps, schedules, seeds and longer runs reuse the programs. A width change or a code edit recompiles exactly what moved.
+    details: Programs are keyed on argument shapes, the GraphConst fields and the hook code. Sweeps of Device values, schedules, seeds and longer runs reuse the programs. A width change or a code edit recompiles only the programs it affects.
     link: /recompilation/
   - icon: 🧹
     title: Device memory freed per batch
@@ -46,7 +46,7 @@ features:
     link: /optimization/
   - icon: 🤖
     title: Kaimon in the loop
-    details: The KaimonGate extension registers nitro_* tools with your session. An agent starts training, validation, evaluation, prediction and export as background runs, so no tool call blocks on a deadline.
+    details: The KaimonGate extension registers nitro_* tools with your session. An agent starts training, validation, evaluation, prediction and export as background runs, so no tool call waits for a run to finish.
     link: /kaimon/
 ---
 ```
@@ -61,21 +61,21 @@ Every field on the experiment is one of three kinds. A [`GraphConst`](@ref) fiel
 
 ## Why ReactantNitro?
 
-Lux has a training loop. A Reactant-first stack needs four things a training loop does not provide.
+Lux provides the training step. A Reactant-first stack needs four more things.
 
-**Precision over when to compile.** A gradient program has been measured at eight minutes to compile, and an unintended recompile presents as slow training, never as an error. Every program is keyed on the `GraphConst` fields and the method world of each hook, and on nothing else. Sweeping a hyperparameter, scheduling a value, changing the seed or training longer compiles nothing. Changing a layer width or editing `forward` compiles the programs that changed and reuses the rest. `ReactantNitro.cache_stats()` is the check. See [Recompilation](recompilation.md).
+**Control over when to compile.** A gradient program can take minutes to compile, and an unintended recompile shows up as slow training, not as an error. Besides argument types and shapes, every program is keyed on the `GraphConst` fields and on the hook methods and the methods they call. Sweeping or scheduling a `Device` value, changing the seed or training longer compiles nothing. Changing a layer width or editing `forward` recompiles the programs that changed and reuses the rest. `ReactantNitro.cache_stats()` shows the hit and miss counts. See [Recompilation](recompilation.md).
 
-**Control over what gets traced.** Reactant and Enzyme walk every argument of a compiled program, and the experiment is one of them. A dataset held on the experiment is walked element by element on every compile, on one thread, and the symptom is compile time that grows with the data. The trace receives a stripped view of the experiment in which every `Host` field is a sentinel. `Device` fields cross as single buffers. Only `GraphConst` fields bake. You pick, per field. See [Experiments](experiments.md).
+**Control over what gets traced.** Reactant and Enzyme walk every argument of a compiled program, and the experiment is one of them. A dataset held on the experiment is walked element by element on every compile, on one thread, so compile time grows with the data. The trace receives a stripped view of the experiment in which every `Host` field is a sentinel, `Device` fields cross as single buffers, and only `GraphConst` fields bake. The marker is chosen per field. See [Experiments](experiments.md).
 
-**Device memory freed per batch.** The host GC runs on host pressure and cannot see the accelerator filling, so a run that leaves batch buffers to the finalizer can die out of memory hours in while the host looks idle. The loop frees each batch's device buffers as soon as the loss readback confirms the step has finished, and the prefetch pipeline frees what it staged when a phase ends. See [Pitfalls](pitfalls.md).
+**Device memory freed per batch.** The host GC runs on host memory pressure and cannot see device memory, so a run that leaves batch buffers to the finalizer can run out of device memory hours in. The loop frees each batch's device buffers as soon as the loss readback confirms the step has finished, and the prefetch pipeline frees what it staged when a phase ends. See [Pitfalls](pitfalls.md).
 
-**Binding instead of wiring.** A hook declares the batch fields it wants as keywords, and the framework routes exactly those from whatever the loader yields. A schedule key names an optimizer rule field such as `eta` or a `Device` field on the experiment, and resolves to one of them. Ten run keywords default to an accessor of the same name, and most accessors fall back to a field of the same name. An `MLUtils.DataLoader` gets multi-threaded prefetching with nothing declared. The binding report prints where every value came from. See the [Binding cheat sheet](binding.md).
+**Binding instead of wiring.** A hook declares the batch fields it wants as keywords, and the framework routes exactly those from whatever the loader yields. A schedule key names an optimizer rule field such as `eta` or a `Device` field on the experiment, and resolves to one of them. Thirteen run keywords default to an accessor of the same name, and every accessor except `schedules` falls back to a field of the same name. An `MLUtils.DataLoader` gets multi-threaded prefetching with nothing declared. The binding report prints where every value came from. See the [Binding cheat sheet](binding.md).
 
-On top of those it is the loop Lux does not ship: gradient accumulation, phases, checkpoint and resume, early stopping, schedules, logging, and export to a servable bundle.
+It also supplies the loop around the step: gradient accumulation, phases, checkpoint and resume, early stopping, schedules, logging, and export to a servable bundle.
 
 ## Working from the REPL
 
-The package is meant to be driven from a REPL with Revise loaded. A `Nitro` is a fixed point: revise a hook, build a new handle, and the module-level compile cache recompiles only the programs the edit touched. A stale handle says so on every entry point. The one value that changes on a live handle is a `Device` field, through [`set_device!`](@ref), which never recompiles. `Nitro(e; weights = n)` starts a new run from a trained handle's weights, and [`history`](@ref)`(n)` is the finished run as a table that indexes by epoch and metric, and as a Makie figure with `plot(n)` when a backend is loaded.
+The package is meant to be driven from a REPL with Revise loaded. A `Nitro` freezes its configuration and hook code at construction: revise a hook, build a new handle, and the module-level compile cache recompiles only the programs the edit touched. A stale handle says so when you train, validate or evaluate with it. The one value that changes on a live handle is a `Device` field, through [`set_device!`](@ref), which never recompiles. `Nitro(e; weights = n)` starts a new run from a trained handle's weights. [`history`](@ref)`(n)` returns the handle's per-epoch metrics as a table indexed by epoch and metric; `plot(n)` draws it when a Makie backend is loaded.
 
 ## Start here
 
@@ -83,7 +83,7 @@ The package is meant to be driven from a REPL with Revise loaded. A `Nitro` is a
 
 - [Tutorial](tutorial.md): MNIST from configuration to prediction, with each feature explained where it appears.
 - [Binding cheat sheet](binding.md): how everything connects by name, on one page.
-- [Pitfalls](pitfalls.md): what a Reactant-first stack gets wrong silently, and what the framework does about each.
+- [Pitfalls](pitfalls.md): failures of a Reactant-first stack that raise no error, and what the framework does about each.
 
 **Writing an experiment**
 

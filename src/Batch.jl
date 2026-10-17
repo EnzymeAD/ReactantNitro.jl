@@ -7,11 +7,11 @@
 """
     ReactantNitro.Router{K}
 
-A callable whose key set is a type parameter, built once at setup and captured as a trace-time
-constant: `Router{(:img,)}()(batch) == (; img = batch.img)`. The selection resolves at trace time,
-so the traced graph sees only the selected fields and passing the whole batch as one `Const` is
-free. The routers are closure captures, which is correct because they are genuine trace-time
-constants the cache key already covers.
+A callable that selects the batch fields in its type parameter `K`:
+`Router{(:img,)}()(batch) == (; img = batch.img)`. Built once at setup. Because `K` is in the type,
+the selection resolves at trace time, so the traced graph sees only the selected fields and passing
+the whole batch as one `Const` costs nothing. Capturing routers in a closure is safe, since their
+type is part of the cache key.
 """
 struct Router{K} end
 
@@ -22,20 +22,20 @@ Base.keys(::Router{K}) where {K} = K
 """
     ReactantNitro.KWARG_SINK
 
-The literal `Symbol("kwargs...")` that `Base.kwarg_decl` returns as the **last** entry for a method
-ending in a keyword sink. That is how routing rule 3 detects one; verified on Julia 1.12.6.
+The `Symbol("kwargs...")` that `Base.kwarg_decl` returns as the last entry for a method ending in a
+keyword sink; routing rule 3 detects a sink by it. Verified on Julia 1.12.6.
 """
 const KWARG_SINK = Symbol("kwargs...")
 
 """
-    ReactantNitro.declared(f, argtypes) -> Vector{Symbol}
+    ReactantNitro.declared(f, argtypes) -> Union{Vector{Symbol}, Nothing}
 
-`Base.kwarg_decl(which(f, argtypes))`: the keywords the resolved method declares, with
-[`KWARG_SINK`](@ref) last for a method ending in `kwargs...`. An internal, which is one reason the
-Julia floor is 1.12. It returns names only, so a required keyword and a defaulted one are
-indistinguishable, which is why routing rule 2 is what it is. A hook with no method returns
-`nothing` (checked with `hasmethod`, since `which` throws two different things), which is the
-normal case for `metrics` and `train_metrics`.
+The keywords declared by the method of `f` that `argtypes` resolves to, as
+`Base.kwarg_decl(which(f, argtypes))`, with [`KWARG_SINK`](@ref) last for a method ending in
+`kwargs...`. `kwarg_decl` is a Base internal, one reason the Julia floor is 1.12. It returns names
+only, so a required keyword and a defaulted one look the same; routing rule 2 follows from that.
+Returns `nothing` when `f` has no method for `argtypes`, the normal case for `metrics` and
+`train_metrics`; checked with `hasmethod`, since `which` can throw two different errors.
 """
 function declared(f, argtypes)
     hasmethod(f, argtypes) || return nothing
@@ -45,21 +45,21 @@ end
 """
     ReactantNitro.has_sink(decl) -> Bool
 
-Routing rule 3: a hook whose declaration ends in `kwargs...` receives the **whole batch**, and
-nothing is checked for that hook, which is the trade for the flexibility.
+Whether a declaration ends in `kwargs...`. Routing rule 3: such a hook receives the whole batch,
+and none of its keywords are checked.
 """
 has_sink(decl::AbstractVector{Symbol}) = !isempty(decl) && last(decl) === KWARG_SINK
 has_sink(::Nothing) = false
 
 """
-    ReactantNitro.route_keys(decl, batch_keys, hook) -> Tuple{Vararg{Symbol}}
+    ReactantNitro.route_keys(decl, batch_keys, hook) -> Union{Tuple{Vararg{Symbol}}, Nothing}
 
-Routing rules 1 to 3 reduced to a key set. Rule 1: a hook receives the intersection of the fields
-it declares and the fields the batch has; a field no hook declares reaches nobody and is not an
-error. Rule 2: a declared keyword absent from the batch is left to Julia, so a required one raises
-`UndefKeywordError` (re-raised with context by [`call_hook`](@ref)) and a defaulted one takes its
-default, which is how optional batch fields work. Rule 3: a sink receives the whole batch. A typo
-in a defaulted keyword silently takes the default, which is inherent to Julia.
+The batch fields a hook receives, by routing rules 1 to 3; `nothing` when `decl` is. Rule 1: a hook
+receives the fields that both it declares and the batch has; a field no hook declares reaches no
+hook and is not an error. Rule 2: a declared keyword missing from the batch is left to Julia, so a
+required one raises `UndefKeywordError` (re-raised with context by [`call_hook`](@ref)) and a
+defaulted one takes its default, which is how optional batch fields work. Rule 3: a sink receives
+the whole batch. A misspelled defaulted keyword therefore takes its default without an error.
 """
 function route_keys(decl, batch_keys::Tuple{Vararg{Symbol}}, hook::Symbol)
     decl === nothing && return nothing
@@ -68,13 +68,15 @@ function route_keys(decl, batch_keys::Tuple{Vararg{Symbol}}, hook::Symbol)
 end
 
 """
-    ReactantNitro.resolve_routing(ev, batch; model = Any, ps = Any, st = Any) -> NamedTuple
+    ReactantNitro.resolve_routing(ev, batch; model = Any, ps = Any, st = Any,
+                                  hooks = (;)) -> NamedTuple
 
-Resolve one [`Router`](@ref) per routed hook (`forward`, `loss`, `metrics`, `train_metrics`), once
-per run at setup, always against `typeof(compile_view(e))`, the type the trace site calls with. A
-hook with no method gets `nothing`, the signal the missing-`metrics` substitution keys off. Routing
-is resolved from the first batch's schema, and [`check_batch_schema`](@ref) holds later batches to
-it.
+Resolve one [`Router`](@ref) per routed hook (`forward`, `loss`, `metrics`, `train_metrics`). Called
+once per run at setup, with `ev = compile_view(e)` (or its type), the type the traced call sites
+use. A hook with no method gets `nothing`, which triggers the substitution for a missing `metrics`.
+A function in `hooks` is resolved in place of the method, and the hook functions are returned
+under `fns`. Routing is resolved from the first batch's schema, and [`check_batch_schema`](@ref)
+holds later batches to it.
 """
 function resolve_routing(ev, batch::NamedTuple; model = Any, ps = Any, st = Any, hooks = (;))
     E = ev isa Type ? ev : typeof(ev)
@@ -101,8 +103,8 @@ end
 """
     ReactantNitro.call_hook(f, hook::Symbol, router, batch, args...)
 
-Invoke a routed hook, turning rule 2's `UndefKeywordError` into a message naming the hook, the
-keyword and the batch's fields.
+Call a hook with its routed batch fields as keywords, turning rule 2's `UndefKeywordError` into an
+error naming the hook, the keyword and the batch's fields.
 """
 function call_hook(f, hook::Symbol, router::Router, batch::NamedTuple, args...)
     try
@@ -116,12 +118,12 @@ end
 """
     ReactantNitro.call_host_hook(f, hook::Symbol, router, batch, e, outputs)
 
-[`call_hook`](@ref) for a hook the framework promised host values to (`:host` residency). Both
-sides of the call are converted, the outputs and the routed batch fields, since a loader may hand
-over a device `y` beside a host `logits` and the hook would raise on a GPU and pass on CPU; then
-[`assert_host`](@ref) runs on each side separately so the message says which. `e` is exempt, since
-its `Device` fields are device-resident by design. The transfer is free for a loader already
-yielding host arrays.
+[`call_hook`](@ref) for a `:host` residency hook, which must receive host values. The caller converts
+`outputs`; this converts the routed batch fields, since a loader may yield a device `y` beside host
+`logits` and the hook would then fail on a GPU and pass on CPU. [`assert_host`](@ref) then checks
+the batch fields and the outputs separately, so the error says which one held a device array. `e`
+is exempt, since its `Device` fields are on the device by design. The conversion costs nothing for
+a loader that already yields host arrays.
 """
 function call_host_hook(f, hook::Symbol, router::Router, batch::NamedTuple, e, outputs)
     kw = host_tree(router(batch))
@@ -151,10 +153,11 @@ end
 """
     ReactantNitro.validate_batch(batch, routing) -> nothing
 
-Every routed field must be a concretely-typed array. A `Vector{NamedTuple}` field fails inside the
-tracer with `FieldError: type UnionAll has no field parameters`, naming nothing, and a host scalar
-in a batch bakes as a constant. Only routed fields are validated, which is what makes a
-`Vector{String}` of case ids in the batch legal: it reaches nobody and is never transferred.
+Require every routed field (every field when `routing` is `nothing`) to be an array with a
+concrete element type. Otherwise a `Vector{NamedTuple}` field fails inside the tracer with
+`FieldError: type UnionAll has no field parameters`, which names no field, and a host scalar is
+baked in as a constant. Unrouted fields are not checked, so a `Vector{String}` of case ids can ride
+in the batch; it reaches no hook and is never transferred.
 """
 function validate_batch(batch::NamedTuple, routing = nothing)
     checked = routing === nothing ? keys(batch) : routed_fields(routing)
@@ -189,8 +192,8 @@ end
 """
     ReactantNitro.routed_fields(routing) -> Tuple{Vararg{Symbol}}
 
-The union of every hook's routed keys: exactly the fields the framework transfers to device and
-validates. Everything else in the batch belongs to the user's loader alone.
+The union of every hook's routed keys: the fields the framework validates and transfers to the
+device. The framework ignores every other batch field.
 """
 function routed_fields(routing::NamedTuple)
     ks = Symbol[]
@@ -207,10 +210,10 @@ end
 """
     ReactantNitro.check_batch_schema(batch, expected::Tuple, split, idx) -> nothing
 
-Routing rule 4. **Keep the batch schema uniform across batches**: a different field set is a
-different `NamedTuple` type, hence a different cache key, hence a recompile, and it invalidates the
-routing resolved at setup. The framework checks each batch's field names against the first and
-errors on a change, naming what appeared and what went missing.
+Require batch `idx` of `split` to have the field names `expected`, those of the first batch
+(routing rule 4). A different field set is a different `NamedTuple` type, so it would recompile and
+would invalidate the routing resolved at setup. The error names the fields that appeared and the
+ones that went missing.
 """
 function check_batch_schema(batch::NamedTuple, expected::Tuple, split::Symbol, idx::Integer)
     got = keys(batch)

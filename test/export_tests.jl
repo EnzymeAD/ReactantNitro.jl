@@ -109,6 +109,20 @@
         ExportSpec("mask"; from = :mask),
     ]
 
+    # An echo whose name `forward` also returns: the echo would replace the model's output.
+    @experiment struct ExportClash
+        width::GraphConst{Int} = 5
+    end
+    ReactantNitro.build_model(::ExportClash, rng) = (m = Lux.Dense(4 => 3); (m, Lux.setup(rng, m)...))
+    function ReactantNitro.forward(::ExportClash, model, ps, st; x, mask)
+        y, st2 = Lux.apply(model, x, ps, st)
+        return (; g_pred = y, mask = y .* mask), st2
+    end
+    ReactantNitro.loss(::ExportClash, o; y) = sum(abs2, o.g_pred)
+    ReactantNitro.export_inputs(::ExportClash) =
+        [ExportSpec("x", XV, [4, 1]), ExportSpec("mask", XV, [1, 1])]
+    ReactantNitro.export_outputs(::ExportClash) = [ExportSpec("mask"; from = :mask)]
+
     # A model whose output is batch-FIRST, which is the disagreement the batch-last verification
     # exists to catch.
     @experiment struct ExportBatchFirst
@@ -796,6 +810,20 @@
             @test r.selected[2] == r.example_inputs[2]
             # `energy` is still not shipped: naming a subset keeps working alongside `from`.
             @test keys(r.raw) == (:g_pred, :energy, :mask)
+        end
+
+        @testset "an echo that would replace a `forward` output is refused" begin
+            err = try
+                export_model(
+                    mkexp(ExportClash), FakeBundle(); dir = mktempdir(), name = "m",
+                    batch_sizes = [2]
+                )
+                nothing
+            catch ex
+                ex
+            end
+            @test err isa ErrorException
+            @test occursin("`mask`", err.msg) && occursin("also returns", err.msg)
         end
 
         @testset "an echo must say so, rather than being inferred from a name" begin

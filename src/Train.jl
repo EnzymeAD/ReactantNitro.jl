@@ -17,14 +17,14 @@
 # ── The two programs ────────────────────────────────────────────────────────────────
 
 """
-    ReactantNitro.grad_program(ev, model, ps, st, batch, g_accum::NTuple{G}, is_first, inv_n)
-        -> (loss, g_accum_new::NTuple{G}, st_new, stats)
+    ReactantNitro.grad_program(ev, model, ps, st, batch, g_accum::NTuple{G}, is_first, inv_n,
+                               routers, lref, ::Val{TM}) -> (loss, g_accum::NTuple{G}, st_new, aux)
 
-One per run, invoked once per micro-batch.
+The gradient program: compiled once per run, invoked once per micro-batch. It writes the scaled
+gradient into `g_accum` in place and returns it.
 
-`ps` crosses as the Lux tree `build_model` returned; the gradient accumulator and `opt_state`
-cross flat, as `NTuple{G}` of per-group buffers, flattened on entry and unflattened on exit inside
-the trace. `ev` is `compile_view(e)`, never `e`: Enzyme walks the whole `Const` argument, so a
+`ps` crosses as the Lux tree `build_model` returned; the gradient accumulator crosses flat, as an
+`NTuple{G}` of per-group buffers, and the gradient is flattened into it inside the trace. `ev` is `compile_view(e)`, never `e`: Enzyme walks the whole `Const` argument, so a
 dataset reachable from `e` would be traversed element-wise at every compile.
 
 The accumulator reset is a broadcast select,
@@ -40,9 +40,9 @@ argument, output or field of `Nitro`: Enzyme reverse accumulates into the shadow
 hoisted `dps` would add every past micro-batch's gradient to the current one with no error. Under
 trace `make_zero` folds to a constant, so the allocation costs nothing at runtime.
 
-The fourth result is `stats` under `:device` metrics residency and the raw `outputs` under `:host`,
-where the driver calls `train_metrics` on the transferred outputs. `TM` is type-level, so the two
-are separate programs and cache entries.
+`aux` is the `train_metrics` result when `TM === :device` and the raw `outputs` when
+`TM === :host`, where the driver calls `train_metrics` on the transferred outputs. `TM` is
+type-level, so the two are separate programs and cache entries.
 """
 function grad_program(
         ev, model, ps, st, batch, g_accum, is_first, inv_n, routers, lref,
@@ -69,18 +69,71 @@ function grad_program(
     return l, g_accum, program_out(st_new), program_out(aux)
 end
 
+# ── Gradient rules in the driver ───────────────────────────────────────────────────
+
 """
-    ReactantNitro.opt_program(ev, g_accum::NTuple{G}, ps, opt_state::NTuple{G}, hp)
-        -> (ps_new, states_new::NTuple{G})
+    ReactantNitro.micro_grad!(rule, nitro, gctx, ev, st, b, flag) -> (l, st_out, aux, extra)
 
-One per run, invoked only on the last micro-step from the driver's host branch, which is what makes
-it genuinely skipped rather than merely discarded.
+One micro-batch's gradient into `nitro.g_accum` under `rule`. `extra` is what the deferred half
+needs beyond the loss: empty for [`SingleGrad`](@ref), `(; l2, ps_adv)` for a
+[`PerturbRule`](@ref).
+"""
+function micro_grad!(::SingleGrad, nitro, gctx, ev, st, b, flag)
+    l, nitro.g_accum, st_out, aux = grad_call(nitro, gctx, ev, nitro.ps, st, b, nitro.g_accum, flag)
+    return l, st_out, aux, (;)
+end
 
-Clipping runs first, on the fully accumulated `g_accum`, at [`gradient_clip_norm`](@ref)`(ev)`; the
-threshold is type-level, so at its default `0` it emits no ops. `ev` is taken even though nothing is
-differentiated here, so every trace site sees the stripped view.
+function micro_grad!(rule::PerturbRule, nitro, gctx, ev, st, b, flag)
+    # Pass 1 overwrites the scratch; its loss, state and outputs are the micro-batch's.
+    l, gctx.scratch[], st_out, aux =
+        grad_call(nitro, gctx, ev, nitro.ps, st, b, gctx.scratch[], gctx.is_first)
+    ps_adv = compile_cached(
+        eps_program, ev, rule, nitro.ps, gctx.scratch[], gctx.masks, gctx.lref;
+        phase = GradCompiling(), nitro,
+        worlds = (method_world(perturbation, Tuple{typeof(rule), Any, Any, Any}),)
+    )(rule, nitro.ps, gctx.scratch[], gctx.masks, gctx.lref)
+    # The same input `st`: the gradient program does not donate it, and reusing it gives pass 2
+    # the same RNG key, so dropout draws the same masks.
+    l2, nitro.g_accum, _, _ = grad_call(nitro, gctx, ev, ps_adv, st, b, nitro.g_accum, flag)
+    return l, st_out, aux, (; l2, ps_adv)
+end
 
-Returns the per-group optimizer STATE, not the `Leaf`: a `Leaf` carries its rule, whose
+function grad_call(nitro, gctx, ev, ps, st, b, acc, flag)
+    thunk = compile_cached(
+        grad_program, ev, ev, nitro.model, ps, st, b, acc, gctx.is_first, gctx.inv_n,
+        nitro.routing, gctx.lref, gctx.tmv; phase = GradCompiling(), worlds = gctx.worlds, nitro,
+        baked = (; accum = nitro.accum)
+    )
+    return thunk(
+        ev, nitro.model, ps, st, b, acc, flag, gctx.inv_n, nitro.routing, gctx.lref, gctx.tmv
+    )
+end
+
+# This step's rule on the device, refused if its type moved since construction.
+function step_grad_rule(nitro, grad_raw, bind_raw, memo)
+    r = build_grad_rule(nitro.e, grad_hp(grad_raw, bind_raw))
+    typeof(r) == nitro.frozen.grad_rule_type || error(
+        "ReactantNitro: `grad_rule` now returns a `$(typeof(r))`, but this handle was built \
+         with a `$(nitro.frozen.grad_rule_type)`. The rule's type is fixed: vary its values only, \
+         or construct a new `Nitro` to change the rule."
+    )
+    return place_grad_rule(r, memo; mesh = nitro.mesh)
+end
+
+"""
+    ReactantNitro.opt_program(ev, g_accum::NTuple{G}, ps, opt_state::NTuple{G}, lref, ::Val{CLIP})
+        -> (ps, states::NTuple{G})
+
+The optimizer program: compiled once per run and called from a host branch on the last
+micro-batch of each step only, so the other micro-batches never run it. The step's
+hyperparameters travel inside the rules in `opt_state` (see [`rebuild_rules`](@ref)).
+
+Clipping runs first, on the fully accumulated `g_accum`, at the global norm `CLIP`
+([`gradient_clip_norm`](@ref)); the threshold is type-level, so at its default `0` it emits no ops.
+`ev` is passed although nothing is differentiated, so every trace site sees the stripped view.
+The new parameters are written into `ps` in place.
+
+Returns the per-group optimizer state without its `Leaf`: a `Leaf` carries its rule, whose
 hyperparameters are device scalars, and a replicated scalar cannot leave a compiled program on a
 multi-device mesh. The driver re-attaches the rules it passed in.
 """
@@ -104,20 +157,20 @@ function opt_program(ev, g_accum, ps, opt_state, lref, ::Val{CLIP}) where {CLIP}
 end
 
 """
-    ReactantNitro.objective_wrapper(ev, model, ps, st, batch)
+    ReactantNitro.objective_wrapper(ev, model, ps, st, batch, routers, ::Val{TM} = Val(:device))
 
-The differentiated wrapper: `forward`, then `loss`, then `train_metrics`, returning
-`(l, ignore_derivatives(st_new), ignore_derivatives(stats))`.
+The differentiated function: `forward`, then `loss`, then (when `TM === :device`) `train_metrics`,
+returning `(l, ignore_derivatives(st_new), ignore_derivatives(aux))`. Under `TM === :host`, `aux`
+is the raw `outputs`.
 
-The return activity is `Enzyme.Duplicated` rather than `Active`, with
-`set_abi(ReverseWithPrimal, ReactantABI)`, and every non-loss element is wrapped in
-`EnzymeCore.ignore_derivatives`. That wrapper is load-bearing: Reactant seeds every `OUT` result
-with ones, which is the correct `dL/dL = 1` for the loss and gradient corruption for anything else,
-with no error. (`ignore_derivatives` is not exported from Reactant, so it is qualified. A `Ref`
-stash for aux values fails silently under tracing.)
+The return activity is `Enzyme.Duplicated` with `set_abi(ReverseWithPrimal, ReactantABI)`, and
+every element but the loss is wrapped in `EnzymeCore.ignore_derivatives`. Reactant seeds every
+`OUT` result with ones, which is the correct `dL/dL = 1` for the loss; without the wrapper the
+seed on any other result corrupts the gradient with no error. A `Ref` stash for aux values does
+not work under tracing either.
 
-`ev` is a `Const` argument rather than a closure capture so its `Device` fields are traced inputs;
-the routers are captures because they are genuine trace-time constants the cache key already covers.
+`ev` is a `Const` argument rather than a closure capture so its `Device` fields are traced inputs.
+The routers are trace-time constants that the cache key already covers.
 """
 function objective_wrapper(ev, model, ps, st, batch, routers, ::Val{TM} = Val(:device)) where {TM}
     fns = hook_fns(routers)
@@ -163,13 +216,12 @@ One reverse-mode pass over an objective with respect to one parameter subtree, f
 `ps_sub`, and everything in `consts...` is `Const`, so no gradient flows into it.
 
 Every traced value the objective reads must be an argument, never a closure capture: a captured
-parameter subtree silently zeroes the gradient while the primal loss stays correct. A struct holding
-no arrays, such as the model, is safe to capture.
+parameter subtree gets a zero gradient with no error, while the loss is still correct. A struct
+holding no arrays, such as the model, is safe to capture.
 
-The non-saturating GAN formulation falls out of the activities: with the discriminator's parameters
-in `consts...`, the generator's loss adjoint flows through the discriminator as a function of the
-fake data and never into its parameters. The shadow is allocated per call, never hoisted, as in the
-gradient program.
+For a GAN generator step, pass the discriminator's parameters in `consts...`: the generator's
+gradient flows through the discriminator as a function of the fake data and never into its
+parameters. The gradient buffer is allocated per call, as in the gradient program.
 """
 function backward(f, ps_sub, consts...)
     dps = Enzyme.make_zero(ps_sub)
@@ -193,23 +245,30 @@ end
     train!(nitro) -> Nitro
     train!(e; kwargs...) -> Nitro
 
-Train. Blocks and returns the [`Nitro`](@ref).
+Run the training loop until `max_epochs`, an early stop or a requested stop, and return the
+[`Nitro`](@ref). The call blocks.
 
 `train!(nitro)` takes no keywords; every keyword belongs to the `Nitro` constructor, and
 `train!(e; kwargs...)` is sugar for `train!(Nitro(e; kwargs...))`. The handle is also reachable
 through `run_ref::Ref{Nitro}`, filled before the loop starts, and as `info.nitro` in a phase
-monitor. Re-training under a different stopping rule means constructing another `Nitro`; the
-compile cache is module-level, so it reuses every compiled program.
+monitor. To retrain with a different stopping rule, construct another `Nitro`; the compile cache
+is module-level, so the new handle reuses every compiled program.
 
-There is no non-finite rollback: a non-finite loss stops the run with an error naming step and
-epoch, and recovery is a resume from the last checkpoint at a lower learning rate. The loss is read
-back one micro-batch late, so that the device runs the next micro-batch while the host waits, which
-means the error is raised after at most one further micro-batch (and, at a step's last micro-batch,
-its optimizer step) has been dispatched; it still names the step the loss belonged to.
-[`check_divergence`](@ref)` = false` turns the stop off: the loss is logged and training continues.
-Every scalar the framework branches on (the loss, the checkpoint metric, the early-stopping metric)
-is validated on readback, because a failed `BufferToHost` on this stack returns garbage without
-raising; purely-logged metrics are not, and neither is the loss under `check_divergence = false`.
+A non-finite loss stops the run with an error naming step and epoch; there is no rollback, and
+recovery is a resume from the last checkpoint at a lower learning rate. The automatic loop reads
+the loss back one micro-batch late, so the device runs the next micro-batch while the host waits;
+the error is therefore raised after at most one more micro-batch (and, at a step's last
+micro-batch, its optimizer step) has been dispatched, and still names the step the loss belonged
+to. [`check_divergence`](@ref)` = false` turns the stop off: the loss is logged and training
+continues. Every scalar the framework branches on (the loss, the checkpoint metric, the
+early-stopping metric) is validated on readback, because a failed `BufferToHost` on this stack
+returns garbage without raising; metrics that are only logged are not, nor is the loss under
+`check_divergence = false`.
+
+The train line is written every [`log_every_n_steps`](@ref) optimizer steps and carries the loss,
+the `train_metrics` of the step's last micro-batch and, under [`autolog_schedules`](@ref), each
+varying scalar schedule under a `schedule/` key. At the end, `stop_reason` is `:completed`,
+`:early_stop`, `:requested` or, if the loop threw, `:error`.
 
 Ctrl+C is a graceful stop: the loop runs on a worker thread, ^C becomes [`request_stop!`](@ref),
 the step loop breaks at its next boundary, validation and the checkpoint still run, and the call
@@ -217,10 +276,10 @@ returns with `stop_reason = :requested`.
 
 A handle built with `restore_best = true` ends every `train!` that did not fail (completion, early
 stop, a requested stop) by loading its own run's selected checkpoint into `ps` and `st`; step,
-epoch, `history` and the last metrics stay as training ended. It then refuses a further `train!`,
-since those weights with the optimizer state and step training ended in are no state any run was
-in; the error shows the constructions that are. With no scored checkpoint it warns and keeps the
-final weights.
+epoch, `history` and the last metrics stay as training ended. A further `train!` on that handle
+is refused, since those weights beside the final optimizer state and step match no state any run
+was in; the error lists the constructions that do. With no scored checkpoint it warns and keeps
+the final weights.
 """
 function train!(nitro::Nitro)
     check_trainable_after_restore(nitro)
@@ -230,10 +289,10 @@ end
 """
     ReactantNitro.check_trainable_after_restore(nitro) -> nothing
 
-The refusal of `train!` on a handle whose weights `restore_best` replaced: the best epoch's
-parameters beside the optimizer state, step and schedule position training ENDED in would train
-from a state no run was ever in. The message names the three states that are real, as code with
-this handle's experiment, preset, run directory and run id filled in.
+Refuse `train!` on a handle whose weights `restore_best` replaced: the best epoch's parameters
+beside the final optimizer state, step and schedule position would train from a state no run was
+ever in. The error gives the three valid constructions as code, with this handle's experiment,
+preset, run directory and run id filled in.
 """
 function check_trainable_after_restore(nitro::Nitro)
     rb = nitro.restored_best
@@ -242,6 +301,15 @@ function check_trainable_after_restore(nitro::Nitro)
     head = nitro.preset === nothing ? "$(T)()" : "$(T), :$(nitro.preset)"
     id = run_key(rb.run)
     dir = repr(nitro.run_dir)
+    haskey(rb, :average) && return error(
+        """
+        ReactantNitro: this handle's weights were replaced at the end of `train!` by
+        `restore_best = $(rb.average)`: epochs $(join(rb.epochs, ", ")) of run `$(id)`, averaged.
+        It cannot train again: averaged weights beside the optimizer state, step and schedule
+        position training ended in are not a training state any run was ever in.
+        For the averaged weights with a fresh optimizer (a new run):
+            Nitro($(head); run_dir = $(dir), weights = "$(id)" => $(rb.average))"""
+    )
     return error(
         """
         ReactantNitro: this handle's weights were replaced at the end of `train!` by its best
@@ -263,13 +331,14 @@ end
 """
     ReactantNitro.restore_best!(nitro) -> nothing
 
-`restore_best = true`'s last step of `train!`: `ps` and `st` from this run's selected checkpoint,
-`nitro.best_checkpoint`, which is scoped to the handle's own run and the checkpointer's current
-metric. `checkpoint_source` becomes that file, so export provenance names it, and
+The last step of `train!` under `restore_best = true`: load `ps` and `st` from this run's selected
+checkpoint, `nitro.best_checkpoint`, which is scoped to the handle's own run and the
+checkpointer's current metric. `checkpoint_source` becomes that file, so export provenance names it, and
 `restored_best` records it for `show` and for the refusal of a further `train!`. A run that saved
 no scored checkpoint warns and keeps its final weights.
 """
 function restore_best!(nitro::Nitro)
+    nitro.restore_best isa Average && return restore_average!(nitro, nitro.restore_best)
     nitro.restore_best || return nothing
     bc = nitro.best_checkpoint
     if bc === nothing
@@ -289,6 +358,31 @@ function restore_best!(nitro::Nitro)
     @info "ReactantNitro: `restore_best = true`: the handle now holds the weights of its best \
            checkpoint, epoch $(bc.epoch) ($(bc.metric) $(_shown(bc.score))), `$(bc.path)`; step and \
            epoch stay at $(nitro.step) and $(nitro.epoch)."
+    return nothing
+end
+
+# `restore_best = Average(sel)`: the run's own checkpoints, averaged as `weights` would load them.
+function restore_average!(nitro::Nitro, avg)
+    ck = nitro.checkpointer
+    what = "`restore_best = $(avg)`"
+    src = try
+        resolve_average(ck, nitro.run_dir, run_key(ck.run), avg; what)
+    catch err
+        @warn "ReactantNitro: $(what), and this run cannot supply it, so the handle keeps the \
+               weights training ended with. $(first(split(sprint(showerror, err), '\n')))"
+        return nothing
+    end
+    record = average_records(ck, src)
+    nitro.ps = place_replicated(from_host(to_host(record.ps)), nitro.mesh)
+    nitro.st = place_replicated(from_host(to_host(record.st)), nitro.mesh)
+    nitro.checkpoint_source = describe(src)
+    nitro.averaged_from = record.averaged_from
+    nitro.restored_best = (;
+        path = describe(src), epoch = maximum(src.epochs), average = avg, epochs = src.epochs,
+        run = ck.run,
+    )
+    @info "ReactantNitro: $(what): the handle now holds $(describe(src)); step and epoch stay at \
+           $(nitro.step) and $(nitro.epoch)."
     return nothing
 end
 
@@ -349,6 +443,14 @@ function _train!(nitro::Nitro)
     # An experiment with no `train_metrics` stays on the `:device` program whatever the residency
     # says; there is nothing to move to the host.
     tmv = Val(nitro.frozen.tm_residency)
+    rule = step_grad_rule(
+        nitro, grad_schedule_values(nitro.schedules, nitro.step + 1),
+        bind_schedule_values(nitro.schedules, nitro.step + 1), scalar_memo
+    )
+    gctx = (;
+        is_first, inv_n, lref, tmv, worlds, masks,
+        scratch = Ref{Any}(rule isa PerturbRule ? map(zero, nitro.g_accum) : nothing),
+    )
     # The per-run copy of the module-level registry, taken here rather than at construction, so
     # that a monitor registered between `Nitro(e)` and `train!` is in this run.
     adopt_monitors!(nitro)
@@ -394,7 +496,7 @@ function _train!(nitro::Nitro)
                 it = iterate(stream)
                 t_wait += time() - t0
                 # Set on a step's first micro-batch and logged on its closing one.
-                device_raw = (;)
+                device_raw = grad_raw = bind_raw = (;)
                 while it !== nothing
                     ((batch, b), st_stream) = it
                     t_body = time()
@@ -418,18 +520,12 @@ function _train!(nitro::Nitro)
                             nitro.e = e_next
                             ev = compile_view(e_next)
                         end
+                        grad_raw = grad_schedule_values(nitro.schedules, nitro.step + 1)
+                        bind_raw = bind_schedule_values(nitro.schedules, nitro.step + 1)
+                        rule = step_grad_rule(nitro, grad_raw, bind_raw, scalar_memo)
                     end
-                    gthunk = compile_cached(
-                        grad_program, ev, ev, nitro.model, nitro.ps, st, b,
-                        nitro.g_accum, is_first, inv_n, nitro.routing, lref,
-                        tmv; phase = GradCompiling(), worlds, nitro,
-                        baked = (; accum = nitro.accum)
-                    )
-                    l, nitro.g_accum, st_out, aux = gthunk(
-                        ev, nitro.model, nitro.ps, st, b,
-                        nitro.g_accum,
-                        micro == 0 ? is_first : is_next, inv_n,
-                        nitro.routing, lref, tmv
+                    l, st_out, aux, extra = micro_grad!(
+                        rule, nitro, gctx, ev, st, b, micro == 0 ? is_first : is_next
                     )
                     st, aux = program_in(st_out), program_in(aux)
                     # What this micro-batch's deferred half needs, captured now: the step it
@@ -440,7 +536,7 @@ function _train!(nitro::Nitro)
                     # micro-batch and written with its train line.
                     rec = (;
                         l, b, batch, aux, e = nitro.e, step = nitro.step, epoch = nitro.epoch,
-                        closes = micro == nitro.accum - 1, sched = (;),
+                        closes = micro == nitro.accum - 1, sched = (;), extra,
                     )
 
                     if rec.closes
@@ -453,7 +549,8 @@ function _train!(nitro::Nitro)
                                 rec, (;
                                     sched = schedule_log(
                                         nitro.schedules, device_raw; groups = layout.groups,
-                                        applied, fields = nitro.bindings.fields
+                                        applied, fields = nitro.bindings.fields, grad_raw,
+                                        bind_raw
                                     ),
                                 )
                             )
@@ -485,7 +582,7 @@ function _train!(nitro::Nitro)
                     end
                     pending = rec
                     # The step half ends after the readback, which is where the device is awaited;
-                    # timing `gthunk` alone would report a near-zero step. Lagged, it awaits the
+                    # timing the dispatch alone would report a near-zero step. Lagged, it awaits the
                     # previous micro-batch, so over an epoch it still sums the device time the host
                     # waited through. Micro-batch 1 is excluded from both halves because it
                     # carries the fan-out's spin-up.
@@ -581,7 +678,7 @@ function _train!(nitro::Nitro)
     # Before `Done`, so a Terminal monitor (an export, say) sees the weights the handle will hold.
     restore_best!(nitro)
     set_phase!(nitro, Done())
-    finish!(nitro.logger, nitro.stop_reason === :completed ? :completed : :early_stop)
+    finish!(nitro.logger, nitro.stop_reason)
     return nitro
 end
 
@@ -591,24 +688,34 @@ end
 The deferred half of one micro-batch of the automatic loop, run one micro-batch late, after the
 next micro-batch's gradient program (and its step's optimizer program) has been dispatched: read the
 loss back ([`check_finite`](@ref) under `check_divergence`, else [`read_loss`](@ref)), run a `:host`
-`train_metrics` on the transferred outputs and emit the train line if the micro-batch closed a
-logged optimizer step (see [`log_every_n_steps`](@ref)), and free its batch. Returns the host loss for the epoch mean.
+`train_metrics` on the transferred outputs, emit the train line if the micro-batch closed a
+logged optimizer step (see [`log_every_n_steps`](@ref)), and free its batch. Returns the host
+loss, for the epoch mean.
 
-`rec` is `(; l, b, batch, aux, e, step, epoch, closes)`, captured at dispatch: `step` is the
-counter before that micro-batch's optimizer step, so the divergence error names the step it always
-named and the train line carries `step + 1`, the step the micro-batch belonged to, whatever the
-counter reads by now.
+`rec` is `(; l, b, batch, aux, e, step, epoch, closes, sched, extra)`, captured at dispatch.
+`step` is the counter before that micro-batch's optimizer step: the divergence error names it, and
+the train line is logged at `step + 1`, the step the micro-batch belonged to, whatever the counter
+reads by now. `sched` holds the step's `schedule/` values when the line is due, else `(;)`.
+`extra` is [`micro_grad!`](@ref)'s: under a [`PerturbRule`](@ref), reading pass 2's loss awaits
+pass 2 before `b` and `ps_adv` are freed, and `sam/gap`, pass 2's loss minus pass 1's, joins the
+train line.
 
-The free is last and is safe: the loss readback awaited the record's program, and no later program
-reads its batch. `aux` is safe to hold across the later dispatches because no later program takes
-it: the gradient program donates only `g_accum`, which the objective never reads, and the optimizer
-program `ps` and the optimizer state. The one way to break that is a `forward` or `train_metrics`
-returning a parameter array unchanged, which Reactant may hand back as the input itself; the
-synchronous loop already read such stats after the optimizer step, so this is not new.
+Freeing the batch last is safe: the loss readback awaited the record's program, and no later
+program reads its batch. Holding `aux` across the later dispatches is safe because no later program
+donates it: the gradient program donates only `g_accum`, which the objective never reads, and the
+optimizer program donates `ps` and the optimizer state. The exception is a `forward` or
+`train_metrics` that returns a parameter array unchanged, which Reactant may hand back as the
+input buffer itself.
 """
 function complete_micro_batch!(nitro::Nitro, rec, tmv)
     # One D2H serves the divergence check, the epoch mean and the train line.
     lh = nitro.check_divergence ? check_finite(rec.l, rec.step, rec.epoch) : read_loss(rec.l)
+    # A perturbation rule's pass 2 also reads `b` and `ps_adv`; this readback awaits it.
+    gap = (;)
+    if haskey(rec.extra, :l2)
+        gap = NamedTuple{(Symbol("sam/gap"),)}((read_loss(rec.extra.l2) - lh,))
+        free_batch!(rec.extra.ps_adv)
+    end
     # The host path for `train_metrics`: `aux` is the primal, and the hook runs in ordinary Julia
     # on it. The transfer is the cost the user chose by asking. Every micro-batch, as the contract
     # says, though only a logged step's closing one is logged.
@@ -620,7 +727,7 @@ function complete_micro_batch!(nitro::Nitro, rec, tmv)
     # Once per logged optimizer step, the cadence the metrics contract names. The stats are the
     # closing micro-batch's, unreduced. `finite_only` drops a non-finite loss when the check is off.
     rec.closes && step_line_due(nitro, rec.step + 1) && log_metrics!(
-        nitro.logger, finite_only((; loss = lh, stats..., rec.sched...));
+        nitro.logger, finite_only((; loss = lh, gap..., stats..., rec.sched...));
         step = rec.step + 1, epoch = rec.epoch, context = "train"
     )
     # Freed here, not when the compiled call returns: XLA is asynchronous and the executable holds
@@ -673,12 +780,15 @@ end
 """
     ReactantNitro._train_manual!(nitro) -> Nitro
 
-Manual mode's driver: the automatic loop's epoch skeleton (prefetch, checks, device schedules,
-the finite check under `check_divergence`, logging, `data_wait_frac`, validation, checkpointing,
-early stopping, phases, `request_stop!`) with the step body replaced by one call to the user's
-[`train_step`](@ref) closure, compiled once per run. Its loss readback is synchronous, not lagged. The driver checks the closure's return, validates `loss`, stores
-`ps` and `st`, and re-attaches the rules it handed in via `merge_rules`, since a `Leaf` cannot
-leave a compiled program on a mesh.
+Manual mode's driver. It shares the automatic loop's epoch skeleton (prefetch, checks, device
+schedules, the finite check under `check_divergence`, logging, `data_wait_frac`, validation,
+checkpointing, early stopping, phases, `request_stop!`) and replaces the step body with one call
+to the user's [`train_step`](@ref) closure, compiled once per run. Each batch is one optimizer
+step. The loss readback is synchronous, since the closure's `stats` may alias buffers the next
+call donates. The driver rebuilds the scheduled rules before each call, checks the closure's
+return, validates `loss`, stores `ps` and `st`, and re-attaches the rules it handed in via
+`merge_rules`, since a `Leaf` cannot leave a compiled program on a mesh. A due train line carries
+each varying `opt` and device schedule under `schedule/`.
 """
 function _train_manual!(nitro::Nitro)
     world_closure_staleness()
@@ -835,7 +945,7 @@ function _train_manual!(nitro::Nitro)
     # Before `Done`, so a Terminal monitor (an export, say) sees the weights the handle will hold.
     restore_best!(nitro)
     set_phase!(nitro, Done())
-    finish!(nitro.logger, nitro.stop_reason === :completed ? :completed : :early_stop)
+    finish!(nitro.logger, nitro.stop_reason)
     return nitro
 end
 
@@ -846,25 +956,23 @@ train!(e; kwargs...) = with_repl_result(() -> train!(Nitro(e; kwargs...)))
 """
     ReactantNitro.DATA_WAIT_WARN
 
-The `data_wait_frac` above which [`report_data_wait!`](@ref) warns. Below a quarter the loader is
-comfortably ahead of the device; above it the run is paying for host work.
+The `data_wait_frac` above which [`report_data_wait!`](@ref) warns: `0.25`.
 """
 const DATA_WAIT_WARN = 0.25
 
 """
     ReactantNitro.report_data_wait!(nitro, t_wait, t_step) -> nothing
 
-The per-epoch host-wait fraction `t_wait / (t_wait + t_step)`, logged as `data_wait_frac` under
-`context = "data"` and warned on (once per process) past [`DATA_WAIT_WARN`](@ref).
+Log the epoch's host-wait fraction `t_wait / (t_wait + t_step)` as `data_wait_frac` under
+`context = "data"`, and warn (once per process) when it reaches [`DATA_WAIT_WARN`](@ref).
 
-This is the generic guard: every other data-path check targets a specific mistake, while this one
-measures the outcome, so it catches a source that is simply too slow, a cache cap, or a contended
-sample server. `t_wait` is time blocked pulling from the stream; `t_step` is the rest of the
-micro-batch body through the loss readback, where the device work is awaited, plus the epoch-end
-drain of the last readback. Both exclude each epoch's first micro-batch. The readback lags one
-micro-batch, so the device is running micro-batch k while the host pulls k+1: the fraction is the
-host's time blocked on data, an upper bound on the device's idle time rather than equal to it. A third context because the `"train"` and `"validate"` cadences are
-asserted by the suite.
+Other data-path checks catch specific mistakes; this one measures the result, so it also catches a
+source that is too slow, a cache cap or a contended sample server. `t_wait` is the time blocked
+pulling from the stream; `t_step` is the rest of the micro-batch body through the loss readback,
+where the device work is awaited, plus the epoch-end drain. Both exclude each epoch's first
+micro-batch. Since the device runs micro-batch k while the host pulls k+1, the fraction is an
+upper bound on device idle time. It has its own context so the `"train"` and `"validate"` lines
+keep their cadence.
 """
 function report_data_wait!(nitro::Nitro, t_wait::Float64, t_step::Float64)
     total = t_wait + t_step
@@ -893,14 +1001,15 @@ end
 """
     ReactantNitro.rebuild_rules(nitro, layout, masks, anchors, memo = nothing; applied) -> NTuple{G}
 
-The per-optimizer-step rebuild on the optimizer side: wrap each group's `applied` values (from
-[`applied_hp`](@ref)) as device scalars, rebuild each group's rule chain, and put it back in its
-`Leaf` beside the state the optimizer owns.
+Rebuild every group's rule chain for the next optimizer step. Each group's `applied` values (from
+[`applied_hp`](@ref)) become device scalars in its `hp`, `build_chain` calls the factory, and
+[`place_slots`](@ref) moves any value the factory computed from `hp` (a slot recorded by
+[`schedule_bindings`](@ref)) back onto the device. Each chain goes into a `Leaf` beside the state
+the optimizer owns.
 
-A rebuilt rule travels inside `opt_state`, which is why the optimizer program takes no separate
-`hp` argument. Rebuilding with a fresh `ConcretePJRTNumber` re-enters the same compiled thunk,
-because the rule's type is unchanged; the [`ScalarMemo`](@ref) changes which buffer the rule
-carries and nothing in the cache key.
+The rules travel inside `opt_state`, so the optimizer program takes no separate `hp` argument. A
+rule rebuilt with a fresh `ConcretePJRTNumber` has the same type and so re-enters the same compiled
+thunk; the [`ScalarMemo`](@ref) avoids re-uploading a value that has not changed.
 """
 function rebuild_rules(
         nitro::Nitro, layout::FlatLayout{G}, masks, anchors, memo = nothing;
@@ -945,7 +1054,7 @@ step_line_due(nitro::Nitro, step::Integer) = step % nitro.log_every_n_steps == 0
 logs_schedules(nitro::Nitro) = nitro.autolog_schedules && nitro.schedules !== nothing
 
 """
-    ReactantNitro.to_device_batch(batch, routing) -> NamedTuple
+    ReactantNitro.to_device_batch(batch, routing, mesh = nothing) -> NamedTuple
 
 Transfer only the routed fields to device. A field no hook declares reaches nobody, and a
 bookkeeping field such as a `case_id` could not be transferred at all.
@@ -961,12 +1070,11 @@ to_device_batch(batch::NamedTuple, routing, mesh = nothing) =
 """
     ReactantNitro.check_finite(l, step, epoch) -> Float64
 
-No non-finite rollback: a non-finite loss stops the run with an error naming step and epoch, and
-recovery is a resume at a lower learning rate. The readback itself is validated because a failed
-`BufferToHost` on this stack returns garbage without raising. Called only under
+Read the loss back and raise, naming step and epoch, if it is not finite. There is no rollback;
+recovery is a resume at a lower learning rate. The check also catches a failed `BufferToHost`,
+which on this stack returns garbage without raising. Called only under
 [`check_divergence`](@ref); the automatic loop calls it one micro-batch late (see
-[`complete_micro_batch!`](@ref)), with the step and epoch captured when the micro-batch was
-dispatched.
+[`complete_micro_batch!`](@ref)), with the step and epoch captured at dispatch.
 """
 function check_finite(l, step, epoch)
     v = read_loss(l)
@@ -995,8 +1103,9 @@ read_loss(l) = l isa Number ? Float64(l) : Float64(only(Array(l)))
     ReactantNitro.check_control_readback(v, what, name) -> Float64
 
 The validated readback for scalars the framework branches on (the early-stopping metric and the
-checkpoint selection metric). A logged `NaN` costs a missing point on a chart; acting on one
-truncates a healthy run or lets a stalled one continue.
+checkpoint selection metric): returns `Float64(v)` and raises if `v` is not a finite real. A
+logged `NaN` costs a missing point on a chart; acting on one could stop a healthy run or keep a
+stalled one going.
 """
 function check_control_readback(v, what::AbstractString, name::Symbol)
     x = v isa Real ? Float64(v) : nothing
@@ -1016,10 +1125,9 @@ end
 """
     ReactantNitro.finite_only(metrics) -> NamedTuple
 
-The logging contract's "the framework drops non-finite values before calling". Values are read
-back to host here, so a backend receives host numbers. Dropped rather than zeroed or passed
-through: a `NaN` at a backend is rejected or plotted as a gap, and the framework cannot tell a
-diverged metric from a failed readback at this point.
+Read `metrics` back to host values and drop every non-finite real, as the logging contract
+promises backends. Dropped rather than zeroed or passed through: backends reject a `NaN` or plot
+it as a gap, and at this point the framework cannot tell a diverged metric from a failed readback.
 """
 function finite_only(metrics::NamedTuple)
     ks = Symbol[]
@@ -1038,13 +1146,13 @@ function finite_only(metrics::NamedTuple)
 end
 
 """
-    ReactantNitro.save_checkpoint_reported!(nitro, epoch, metrics) -> nothing
+    ReactantNitro.save_checkpoint_reported!(nitro, epoch, metrics)
 
-[`save_checkpoint!`](@ref) as one reported stretch, so a watcher can tell a slow write to a remote
-filesystem from an epoch that finished and hung. Nothing is reported without a checkpointer, since
-`save_checkpoint!(::Nothing, ...)` is a no-op. Every write gets the one label `"checkpoint"`,
-including the final rewrite; a watcher has nothing to do differently about which is in flight.
-Returns what `save_checkpoint!` returned, so `false` still means the epoch was declined.
+[`save_checkpoint!`](@ref) as one reported progress stretch, so a watcher can tell a slow write to
+a remote filesystem from a hang. Nothing is reported without a checkpointer, since
+`save_checkpoint!(::Nothing, ...)` is a no-op. Every write, the final rewrite included, uses the
+label `"checkpoint"`. Returns what `save_checkpoint!` returned, so `false` means the epoch was
+declined.
 """
 function save_checkpoint_reported!(nitro::Nitro, epoch, metrics)
     write() = save_checkpoint!(nitro.checkpointer, epoch, metrics, snapshot(nitro))
@@ -1095,6 +1203,7 @@ function snapshot(nitro::Nitro)
         stop_reason = nitro.stop_reason,
         preset = nitro.preset,                  # the named configuration, if any
         derived = nitro.derived,
+        early_stop = early_stop_state(nitro.early_stop),
     )
     # A structural walk over leaves, not elements: about a hundred checks per epoch.
     assert_host_record(snap)
@@ -1104,9 +1213,10 @@ end
 """
     ReactantNitro.check_logger_state_serializable(state, lgr) -> nothing
 
-`logger_state` must return plain serializable data (a `String`, `NamedTuple` or `Dict`), never the
-live backend object: the record goes through JLD2 and outlives the process. Checked here rather
-than failing on the resume in another process.
+Check that `logger_state` returned plain serializable data (a string, `NamedTuple`, `Dict`,
+number, `Symbol` or `Tuple`), never the live backend object: the record goes through JLD2 and
+outlives the process. Checked when the record is built, rather than failing at a resume in another
+process.
 """
 function check_logger_state_serializable(state, lgr)
     state isa Union{AbstractString, NamedTuple, AbstractDict, Number, Symbol, Tuple} && return nothing
@@ -1124,10 +1234,9 @@ end
 """
     ReactantNitro.HostRNG
 
-A host surrogate for `Reactant.ReactantRNG`, whose type parameter forbids host contents, so there
-is no host-resident `ReactantRNG` to rebuild. A value whose type cannot hold host data cannot
-round-trip through a record as itself; the record stores a surrogate and [`from_host`](@ref) turns
-it back on the way in. Found as `st.<layer>.rng.seed` on any Lux model carrying a `Dropout`.
+The checkpoint-record surrogate for a `Reactant.ReactantRNG`, whose type parameter forbids host
+contents. [`to_host`](@ref) stores the seed and algorithm here and [`from_host`](@ref) rebuilds the
+RNG on restore. Lux layer state holds one at `st.<layer>.rng` for any `Dropout`.
 """
 struct HostRNG
     seed::Vector{UInt64}
@@ -1149,10 +1258,11 @@ end
 """
     ReactantNitro.to_host(x)
 
-The generic fallback: walk any struct's fields, not only the containers, reconstructing only when
-something actually moved so structs with inner constructors are never rebuilt needlessly. A struct
-that holds a device value and cannot be rebuilt raises here, in the writing process. Types that
-cannot be rebuilt from host values at all get a surrogate (see [`HostRNG`](@ref)).
+Convert every device value in `x` to a host value, for a checkpoint record. The generic method
+walks any struct's fields, not only containers, and rebuilds a struct only when a field changed,
+so structs with inner constructors are left alone when they hold nothing on device. A struct that
+holds a device value and cannot be rebuilt raises here, in the writing process. Types that cannot
+hold host values at all get a surrogate (see [`HostRNG`](@ref)).
 """
 function to_host(x)
     T = typeof(x)
@@ -1167,9 +1277,9 @@ end
 """
     ReactantNitro.from_host(x)
 
-The mirror of [`to_host`](@ref) on the restore path: every surrogate back into the device-resident
-value it stood for, everything else left for `to_rarray`. A general walk so the next surrogate
-needs a method rather than a mechanism.
+The inverse of [`to_host`](@ref) on the restore path: turn every surrogate back into the value it
+stands for and leave everything else for `to_rarray`. A new surrogate needs only a `from_host`
+method.
 """
 from_host(h::HostRNG) = Reactant.ReactantRNG(Reactant.to_rarray(h.seed), h.algorithm)
 
@@ -1234,9 +1344,9 @@ program_in(x) = x
 """
     ReactantNitro.device_paths(x, path = "") -> Vector{String}
 
-Every device-resident value reachable from `x`, as `path :: Type` strings, which is exactly what
-neither JLD2 nor the eventual `AssertionError` will tell you. The sibling of
-[`assert_device_state`](@ref), pointed the other way.
+Every device-resident value reachable from `x`, as `path :: Type` strings, for the errors of
+[`assert_host`](@ref) and [`assert_host_record`](@ref). The inverse check of
+[`assert_device_state`](@ref).
 """
 function device_paths(x, path::AbstractString = "", out::Vector{String} = String[])
     if x isa Reactant.RNumber || x isa Reactant.AbstractConcreteArray
@@ -1272,11 +1382,11 @@ end
 The host/device boundary assertion. The framework converts every value it hands to host-side user
 code; this asserts the conversion was total and names the path of anything that survived.
 
-It exists because on a CPU backend a "device" array is host memory and scalar indexing into one is
-legal, so a residency mistake is nearly unobservable there and a green CPU suite proves nothing
-about it. Reaching this assertion means the conversion has a gap, not that the user forgot an
-`Array(...)`. The cost is a walk over leaves, not elements. [`assert_host_record`](@ref) is the same
-idea at the checkpoint boundary; both share [`device_paths`](@ref).
+On a CPU backend a "device" array is host memory and scalar indexing into one is legal, so a
+residency mistake does not show up in a CPU test without this check. A failure means the
+framework's conversion has a gap, not that the user forgot an `Array(...)`. It walks leaves, not
+elements. [`assert_host_record`](@ref) is the same check at the checkpoint boundary; both use
+[`device_paths`](@ref).
 """
 function assert_host(x, what::AbstractString)
     leaked = device_paths(x, "")
@@ -1299,10 +1409,9 @@ end
 """
     ReactantNitro.assert_host_record(snap) -> nothing
 
-"Every record value is a host value", asserted when the record is built, the one moment the
-failure is cheap. Without it a device value is written and read back by JLD2 without complaint and
-kills a fresh process on `AssertionError: buffer.buffer !== C_NULL`, naming neither the field nor
-serialization.
+Assert that every value in a checkpoint record is a host value, when the record is built. JLD2
+writes and reads a device value without complaint, and the failure surfaces later, in another
+process, as `AssertionError: buffer.buffer !== C_NULL`, naming neither the field nor serialization.
 """
 function assert_host_record(snap)
     leaked = String[]
@@ -1328,9 +1437,9 @@ end
 """
     ReactantNitro.to_host_rule(r) -> r
 
-The mirror of [`to_device_rule`](@ref). An optimizer rule is a struct, not a container, so before
-`to_host` walked structs a rule reached the record still holding the `ConcretePJRTNumber` the
-per-step rebuild put there.
+The inverse of [`to_device_rule`](@ref): rebuild an optimizer rule, or each rule of a chain, with
+its fields converted by [`to_host`](@ref), so the record does not hold the `ConcretePJRTNumber`s
+the per-step rebuild put there.
 """
 function to_host_rule(r)
     T = typeof(r)
@@ -1343,8 +1452,8 @@ to_host_rule(x::Union{Tuple, NamedTuple}) = map(to_host_rule, x)
 """
     validate(nitro) -> NamedTuple
 
-Run the `:val` split and return the finalized metrics. This is what the training loop calls each
-epoch, and it works on a `Nitro` that has never trained. Eval mode throughout; `st_new` is
+Run the `:val` split and return the finalized metrics. The training loop runs the same pass each
+epoch, and `validate` also works on a `Nitro` that has never trained. Eval mode throughout; `st_new` is
 discarded, and each batch's device buffers are freed explicitly rather than left to the GC, which
 is the documented cause of device OOM during validation on this stack. Runs on a worker thread;
 Ctrl+C stops at the next batch boundary.
@@ -1454,7 +1563,7 @@ end
 # ── The eval programs, and the pad-and-slice around them ────────────────────────────
 
 """
-    ReactantNitro.fwd_program(ev, model, ps, st, batch, routers) -> outputs
+    ReactantNitro.fwd_program(ev, model, ps, st, batch, fwd_router, fwd_fn = forward) -> outputs
 
 The eval-mode forward shared by `predict`, `validate` and `evaluate`. It always runs at
 `batch_size`, since the framework pads before and slices after, so it compiles once. `st_new` is
@@ -1467,7 +1576,7 @@ function fwd_program(ev, model, ps, st, batch, fwd_router, fwd_fn = forward)
 end
 
 """
-    ReactantNitro.eval_metric_program(ev, outputs, batch, router, ::Val{NREAL}, ::Val{HOOK})
+    ReactantNitro.eval_metric_program(ev, outputs, batch, router, ::Val{NREAL}, ::Val{HOOK}, fns = (;))
 
 The traced metric path: `metrics` compiled as its own program on outputs and batch fields sliced to
 `NREAL` inside the trace. `NREAL` is type-level because a traced length cannot slice, which also
@@ -1489,8 +1598,8 @@ end
 """
     ReactantNitro.eval_forward(nitro, ev, st, b, fwd_router) -> outputs
 
-Compile-or-reuse and invoke [`fwd_program`](@ref): the one place `predict` and the metric loop share
-the entry, with the one narrowing of the batch that makes the sharing survive a label-free batch.
+Compile or reuse [`fwd_program`](@ref) and call it, for both `predict` and the eval loop. The batch
+is narrowed to `forward`'s fields, so a batch without labels hits the same cache entry.
 """
 function eval_forward(nitro::Nitro, ev, st, b, fwd_router)
     bf = NamedTuple{keys(fwd_router)}(b)
@@ -1776,8 +1885,8 @@ end
 """
     ReactantNitro.accumulate_metrics(acc, m, split) -> NamedTuple
 
-Fold one batch's entries into the accumulator. The key set is fixed by the first batch: a metric
-measured on some batches and not others has no honest denominator. `:concat` leaves are kept as a
+Fold one batch's entries into the accumulator. The first batch fixes the key set, since a metric
+reported on only some batches has no consistent denominator. `:concat` leaves are kept as a
 vector of per-batch arrays and joined once in [`reduce_metrics`](@ref).
 """
 function accumulate_metrics(acc, m::NamedTuple, split::Symbol)
@@ -1830,9 +1939,9 @@ end
     ReactantNitro.reduce_metrics(acc) -> NamedTuple
 
 The divide: `value / count` where the mode is a count, the joined array for `:concat`, and the bare
-value otherwise. The result has the shape the hook returned, with the modes removed. Runs
-**before** [`finalize_metrics`](@ref), which is what makes an `f1 = 2tp / (2tp + fp + fn)`
-finalizer work: its `tp`, `fp`, and `fn` are `:sum` values and arrive at the finalizer unmodified.
+value otherwise. The result has the shape the hook returned, with the modes removed. It runs
+before [`finalize_metrics`](@ref), so a finalizer such as `f1 = 2tp / (2tp + fp + fn)` receives
+its `:sum` values `tp`, `fp` and `fn` as split totals.
 """
 reduce_metrics(acc::NamedTuple) = map(t -> _entrymap((_, e) -> _finish(e), "", t), acc)
 
@@ -1980,10 +2089,9 @@ end
 Every device leaf of a tree read back to host values, structure preserved. This is what a `:host`
 metric hook and `predict` receive.
 
-It walks structs as well as containers: the earlier `Functors.fmap` form treated an unregistered
-struct as a leaf, so a device array inside a plain struct came back unconverted on the path feeding
-every `:host` metric hook. Identity is preserved, so a subtree with nothing device-resident comes
-back `===` what it was. Unlike [`to_host`](@ref) it has no surrogate types: a hook wants the value.
+It walks plain structs as well as containers, and a subtree with nothing on device comes back
+`===` what it was. Unlike [`to_host`](@ref) it uses no surrogate types, since a hook wants the
+value; a `ReactantRNG` passes through unchanged.
 """
 host_tree(x::Reactant.RNumber) = Reactant.to_number(x)
 host_tree(x::Reactant.AbstractConcreteArray) = Array(x)

@@ -4,41 +4,37 @@ ReactantNitro ships a KaimonGate extension that registers a set of `nitro_*` too
 running Kaimon gate, so an agent can start and watch training, validation, evaluation,
 prediction, and export from the session where the model code is loaded.
 
-The extension is a dev tool: nothing in `src/` knows it exists, it costs nothing until KaimonGate
-is loaded, and the tools are a thin interface over entry points the framework already ships.
+The extension is a development tool. Nothing in `src/` depends on it, it costs nothing until
+KaimonGate is loaded, and each tool calls an entry point the framework already ships.
 
 ## When the tools appear
 
 The extension activates when KaimonGate and ReactantNitro are both loaded in one process.
 
-**`using ReactantNitro` is the first step of any session.** Kaimon's `start_session` boots the
-gate but does not load your model code; the extension registers its tools the moment the model
-package's `using ReactantNitro` runs. After that, the `nitro_*` tools appear in the session's
+**Load your model package first in every session.** Kaimon's `start_session` boots the gate but does
+not load your model code; the extension registers its tools when the model package's
+`using ReactantNitro` runs. After that, the `nitro_*` tools appear in the session's
 tool list, namespaced by the project (e.g. `reactantnitro.nitro_train`).
 
-If the tools ever go missing, `Base.get_extension(ReactantNitro, :ReactantNitroKaimonGateExt).reinstall_kaimon_tools()`
+If the tools go missing, `Base.get_extension(ReactantNitro, :ReactantNitroKaimonGateExt).reinstall_kaimon_tools()`
 registers them again; it also starts a gate if none is running.
 
 ## Why runs are background tasks
 
-Kaimon's agent-side tool calls carry a hard deadline, and its eval path fails after ten minutes
-without output. A training run lasts hours. So **no tool call ever blocks until the work
-finishes**. Every launching tool does the same two things:
-
-1. Starts the work on a background task in the session and returns a run id immediately.
-2. Lets the agent poll `nitro_status` or `nitro_runs`, each a fast call, until the run
-   completes.
-
-A run id comes back in the launching tool's reply, and `nitro_runs()` lists every run the
-session knows about:
+A Kaimon session tool call fails after five minutes of continuous silence and after one hour in
+any case (`KAIMON_SESSION_TOOL_TIMEOUT` and `KAIMON_SESSION_TOOL_MAX` change both), and its eval
+path has a ten-minute hard timeout. A training run lasts hours. So **no tool call blocks until the work
+finishes**. Every launching tool starts the work on a background task in the session and returns a
+run id immediately; the agent then polls `nitro_status` or `nitro_runs`, both fast calls, until the
+run completes. `nitro_runs()` lists every run the session knows about:
 
 ```
 a1b2c3d4  kind=train  status=completed  phase=Repl  epoch=40  step=1600  loss=0.021
 ```
 
-Runs are process-local. A session restart starts with an empty registry, which is fine because
-the framework's checkpoint machinery is the restart story: `resume = :auto` finds the latest
-checkpoint in a run's directory and continues it, exactly as it does without the tools.
+Runs are process-local, so a session restart starts with an empty registry. To continue a run
+after a restart, launch it again with `resume = "auto"`, which finds the latest checkpoint in its
+`run_dir` and continues it, as `resume = :auto` does without the tools.
 
 ## The tools
 
@@ -58,14 +54,14 @@ checkpoint in a run's directory and continues it, exactly as it does without the
 ### Configuring the accelerator first
 
 `nitro_setup(; backend, n_devs)` configures the session's accelerator before any run, or reports
-the current configuration with no arguments. It is a **thin wrapper over
-[`ReactantNitro.setup_devices!`](@ref)**, the same function a REPL session calls, so a REPL
-workflow and a Kaimon workflow configure identically, and calling it is optional: a session
-that never does runs on Reactant's default backend with `n_devs` = every visible device.
+the current configuration with no arguments. It calls [`ReactantNitro.setup_devices!`](@ref),
+the same function a REPL session calls. Calling it is optional: a session that never does runs on
+Reactant's default backend with `n_devs` equal to the number of visible devices.
 
 `backend` names a Reactant backend: `"cpu"`, `"gpu"`, `"cuda"`, `"rocm"`, `"tpu"`. `n_devs`
-pins how many visible devices runs shard over; the pin wins over an experiment's declared
-`n_devs`, and an explicit `n_devs` keyword on `nitro_train` wins for that run. One Julia
+pins how many visible devices runs shard over; the pin wins over an experiment's `n_devs` field,
+and an explicit `n_devs` keyword on `nitro_train` wins for that run (see
+[Devices and meshes](devices.md) for the full order). One Julia
 process initializes XLA once, so to restrict which GPUs the session sees, set
 `CUDA_VISIBLE_DEVICES` at session start.
 
@@ -86,22 +82,22 @@ that made the tools appear.
 
 The typed keywords (`max_epochs`, `run_dir`, `seed`, `n_devs`, `accum`, `gradient_clip_norm`,
 `preset`, `resume`, `weights`, and on `nitro_train` the booleans `restore_optimizer` and
-`restore_best`) are run knobs passed to `Nitro`, where a keyword beats the experiment's own
-accessor for this run (the same rule the framework documents). `weights` and `resume` take a
+`restore_best`) are run knobs passed to `Nitro`, where a keyword overrides the experiment's own
+accessor for this run. `weights` and `resume` take a
 checkpoint source as a string: a path, or `"run => checkpoint"` with the run `latest`, `all` or a
 run id and the checkpoint `best` or `latest`, spaces optional (`"latest => best"`,
 `"a1b2c3d4 => latest"`, `"all => best"`); `resume` also takes `"auto"` and `"false"`. Bare
-`"best"` and `"latest"` are refused, naming the pair to write. Experiment
-fields are per-model and cannot be in the schema, so they arrive through `overrides`, a
-comma-separated `name=value` list of Julia literals:
+`"best"` and `"latest"` are refused, and the error names the pair to write. Experiment fields
+differ per model and cannot be in the tool schema, so they are passed through `overrides`, a
+comma-separated `name=value` list of Julia literals, each converted to the field's declared type:
 
 ```julia
 nitro_train(experiment="MyModels.MnistMLP", max_epochs=40,
             run_dir="runs/mnist_v1", overrides="width=128, smoothing=0.05, labels=[1.0,2.0]")
 ```
 
-An override key that is not a field of the experiment is a loud error, and a key passed both as
-a run keyword and in `overrides` is an ambiguity error. `preset` selects a named configuration
+An override key that is not a field of the experiment is an error, and so is a key passed both as
+a run keyword and in `overrides`. `preset` selects a named configuration
 from `presets(MyExp)`, and `overrides` may add field values on top of it.
 
 ### Reusing a trained run
@@ -125,12 +121,11 @@ defaults `batch_sizes` to `[1]`, and uses the `reactant_server` backend, loaded 
 backend named for the session can be registered instead. Export is a single-device CPU trace,
 so a fresh construction from `experiment` forces `n_devs = 1`.
 
-**An `experiment` export does not build the training data.** Setup for an export reads weights
-and traces a graph, and the data is part of neither, so the construction is the same
-`Nitro(e; weights = path, data = (;))` that [`export_model`](@ref) documents. It is what
-makes a model whose exportable handle is a *different build* from its trainable one exportable
-through the tool at all: name the flag in `overrides`, and the handle is built with it without
-a `build_data` that refuses an inference configuration ever running.
+**An `experiment` export does not build the training data.** An export reads weights and traces a
+graph, and needs no data, so the construction is the `Nitro(e; weights = path, data = (;))` that
+[`export_model`](@ref) documents. This also lets you export a model whose export build differs from
+its training build: set the flag in `overrides`, and `build_data`, which may refuse that
+configuration, never runs.
 
 ```julia
 nitro_export(experiment="MyModels.MyExperiment", preset="current",
@@ -138,9 +133,9 @@ nitro_export(experiment="MyModels.MyExperiment", preset="current",
              dir="runs/export_out", name="my_model", provenance_root="/path/to/model/repo")
 ```
 
-`data="build"` calls `build_data` anyway, for the one case that needs it: [`derive`](@ref) is
-skipped on a `checkpoint =` construction, but an export from an `experiment` with no checkpoint
-recomputes the derived values, so a model whose `derive` reads its data has to build. With
+`data="build"` calls `build_data` anyway. It is needed only when there are no `weights`:
+[`derive`](@ref) is skipped when `weights` names a checkpoint record, whose derived values are
+restored, but without one `derive` runs, and a `derive` that reads the data needs it built. With
 `run_id` the keyword is refused, since that handle is already built.
 
 ### Status, stop, and the numbers
@@ -150,22 +145,22 @@ and validation metrics, the run directory, the result summary on completion, or 
 on failure. Every launch kind drives the phase monitor: an export run reports
 `ExportCompiling` while the trace is in flight (the framework publishes it around the backend
 call), a predict run reports `EvalCompiling` when its `forward` has to compile, and a completed
-run's phase reads `Repl`. The loss and metrics come from a recording logger the tools install for each run, which tees to
-the experiment's own logger. A run that names no logger gets the framework's JSON default, which writes
-`metrics.jsonl` into the run's directory, and `nitro_status` carries a one-line logger summary.
+run's phase reads `Repl`. The loss and metrics come from a recording logger the tools install
+for each run, which forwards every call to the experiment's own logger. A run that names no logger
+gets the JSON default, which writes `metrics.jsonl` into the run's directory. `nitro_status` also
+carries a one-line logger summary.
 
-**`nitro_logger` reports the logger itself.** For any run, it names the backend's type and the
-key identifying parameters its [`logger_info`](@ref) exposes, read live off the run's handle:
-the metrics file path of the JSON default, or the URL, experiment key, and workspace of a hosted
-tracker. The same table is on the `Nitro` itself, as `logger_info(nitro)`, so an agent driving a
-session has a direct answer to "which experiment did this run attach to, and where is it".
+`nitro_logger` reports the logger itself: the backend's type and the identifying parameters its
+[`logger_info`](@ref) returns, read from the run's live handle, such as the JSON default's metrics
+file path or a hosted tracker's URL and experiment key. The same table is available in the REPL as
+`logger_info(nitro)`.
 
 `nitro_stop` requests a graceful stop: the epoch finishes, validation runs, the checkpoint is
-written, and the run exits through the normal `Done` path with `stop_reason = requested`.
+written, and the run exits through the normal `Done` path with `stop_reason = :requested`.
 
 ## What the tools do not do
 
 The tools are the agent's interface to `train!`, `validate`, `evaluate`, `predict`, and
-`export_model`; anything those entry points cannot do, the tools cannot do. They do not manage
-checkpoints or resumes beyond passing the knobs through: a `run_dir` is trained fresh unless
-`resume = "auto"` asks for the latest checkpoint in it, the same default as `Nitro`.
+`export_model`, and can do nothing those entry points cannot. They do not manage checkpoints or
+resumes beyond passing the keywords through: a `run_dir` is trained fresh unless `resume = "auto"`
+asks for its latest checkpoint, as with `Nitro`, whose default is `resume = false`.

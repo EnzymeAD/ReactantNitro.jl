@@ -4,24 +4,34 @@
 # sequence is written out in `_build_nitro` itself, since a description kept apart from the code
 # it orders drifts from it.
 
+# `Starting` is published before the build, through the module-level monitors, because `build_data`
+# can start and compile a data server and this was the longest undeclared stretch there was.
+# Construction counts as work in flight, so an idle reconciler does not rewrite `Starting` to `Repl`
+# mid-build. It publishes no `Repl` on exit: the verb that usually follows declares its own phases.
 """
     Nitro(e; seed, resume, run_dir, data, n_devs, weights, accum, max_epochs, schedules,
              gradient_clip_norm, check_divergence, autolog_schedules, log_every_n_steps, logger,
-             checkpointer, early_stop, run_ref, w0, restore_optimizer, restore_best) -> Nitro
+             checkpointer, early_stop, run_ref, w0, restore_optimizer, restore_best,
+             compile_options) -> Nitro
 
-Run the setup sequence and return the handle. No training.
+Build a handle for experiment `e` by running the setup sequence below. Nothing is trained or
+compiled.
 
-Thirteen keywords default to an accessor of the same name (the signature of `_build_nitro` is the
-authority for the defaults), so the keyword replaces the accessor's value for one run and omitting
-it falls through to the experiment's own. `data`, `weights`, `resume` and `run_ref` are
-keyword-only, each naming a fact about this invocation. `early_stop` defaults to `nothing` and
-`max_epochs` to `1`.
+Thirteen keywords default to the accessor of the same name: [`seed`](@ref), [`run_dir`](@ref),
+[`n_devs`](@ref), [`accum`](@ref), [`max_epochs`](@ref), [`schedules`](@ref),
+[`gradient_clip_norm`](@ref), [`check_divergence`](@ref), [`autolog_schedules`](@ref),
+[`log_every_n_steps`](@ref), [`logger`](@ref), [`checkpointer`](@ref) and [`early_stop`](@ref).
+Passing one replaces the accessor's value for this run; omitting it calls the accessor, before
+step 1. `data`, `weights`, `resume` and `run_ref` have no accessor, since each names a fact about
+this construction: `data` supplies the collection and skips `build_data`, and `run_ref`, a `Ref`,
+receives the handle when construction finishes. `compile_options` passes Reactant compile keywords
+to every program the handle compiles (see [`ReactantNitro.check_compile_options`](@ref)).
 
 ## The fresh sequence
 
 | # | Step | Why here |
 | --- | --- | --- |
-| 1 | Validate config: markers, optimizer allowlist, decay settings | Cheapest failures first |
+| 1 | Validate config: `accum` and `log_every_n_steps` ranges, driver-only field markers, `learning_rate(e) != 0`, the clip type, metric residencies | Cheapest failures first |
 | 2 | Seed the global rng | Before anything that draws (3 and 6) |
 | 3 | `build_data(e, dist)` | `derive` needs data |
 | 4 | `derive(e, data)`, merged into `e` | Returns host values, so before conversion; may change the architecture, so before `build_model` |
@@ -33,21 +43,21 @@ keyword-only, each naming a fact about this invocation. `early_stop` defaults to
 | 9 | **Training only.** Flatten `ps`, build optimizer state, normalize it to device residency | Needs the layout |
 | 10 | Resolve routing against `typeof(compile_view(e))` from the first batch | Needs the batch schema and the hooks |
 | 11 | **Training only.** Check `length(train) % accum == 0`; resolve the horizon and call each schedule factory once | Needs `length(train)`, `accum`, `max_epochs` |
-| 12 | Construct the logger, log parameters and the seed | Before the first compile, which can crash |
+| 12 | Reattach the logger on resume; log the parameters and the seed | Before the first compile, which can crash |
 
-Nothing is compiled here. Each program is traced and compiled, against `compile_view(e)`, by the
-first verb that runs it.
+Steps 9 and 11 run after step 10. Each program is traced and compiled, against `compile_view(e)`,
+by the first verb that runs it.
 
 `build_data` and `derive` see the pre-conversion experiment, where `Device` fields hold host values;
 every other hook sees the post-conversion one.
 
-**Resume** adds three steps: between 1 and 2, locate the checkpoint, check config compatibility,
-and restore `seed` from the record with a warning if it differs (a silent override turns a seed
-sweep that forgot to vary `run_dir` into N identical runs); after 7, restore `ps`, `st`,
-`opt_state`, `step` and `epoch`, with `w0` the fresh capture verified against the record's
-`anchor_checksum`; after 8, refuse a flat permutation that differs; after 9, re-normalize the
-restored `opt_state` to device residency, without which a resumed run trains at the wrong point of
-its optimizer's bias correction with no error.
+**Resume** adds steps: before 1, locate and load the checkpoint; at 2, take `seed` from the
+record, with a warning if it differs, since a seed sweep sharing one `run_dir` would otherwise
+become N identical runs without notice; after 4, check config compatibility; after 7, restore `ps`
+and `st`, keeping the fresh `w0` capture to verify against the record's `anchor_checksum`; after 8,
+refuse a flat permutation or anchor checksum that differs; at 9, restore `opt_state` and
+re-normalize it to device residency, without which a resumed run trains at the wrong point of its
+optimizer's bias correction with no error. `step` and `epoch` come from the record.
 
 **Checkpoint sources.** `weights` and `resume` name a checkpoint the same way: a path, or
 `run => checkpoint`, resolved to a file through the manifest ([`resolve_source`](@ref)).
@@ -61,9 +71,13 @@ its optimizer's bias correction with no error.
 
 | Checkpoint (right) | Means |
 | --- | --- |
-| `:best` | the run's best record by the CURRENT checkpointer's `metric` and `mode` (for `other`, its checkpointer's) |
+| `:best` | the run's best record by the current checkpointer's `metric` and `mode` (for `other`, its checkpointer's) |
 | `:latest` | the run's newest retained record |
 | `:current` | a live handle's in-memory state; only as `weights = other => :current` |
+| `Average(sel)` | the run's checkpoints [`Average`](@ref) picks, averaged; only for `weights` |
+
+`Best(1)` and `Last(1)` are the same as `:best` and `:latest`; any other [`Selector`](@ref) may pick
+several checkpoints, so a source takes it only inside `Average`.
 
 Bare `:best` and `:latest` are refused, naming the pair to use (`weights = :latest => :best`), as
 is `:all => :latest`, which is `:latest => :latest`. A source that cannot be found raises, naming
@@ -76,18 +90,19 @@ and schedule position, under the compatibility checks. It is `false` (the defaul
 `run => :latest | :best` with any run above including `other`, or `:auto`, which is exactly
 `:latest => :latest` and logs what it resolved to, except that a directory with nothing to resume
 starts a fresh run with a warning (`:latest => :latest` raises there). One `run_dir` can hold
-several runs, each with its own id in the manifest; see [`TopKCheckpointer`](@ref). Resuming a
+several runs, each with its own id in the manifest; see [`Checkpointer`](@ref). Resuming a
 run's newest record continues that run: its id is adopted and later checkpoints join it. Resuming
 anything else (an earlier record such as `:best`, `:all => :best`, or a file this directory's
 manifest does not list) branches into a new run, so the original run's later epochs are never
-overwritten, and says so. Under a checkpointer with `keep_latest = false` a run's newest record is
-its most recent top-K epoch, not where it stopped, and the epochs after it are trained again.
+overwritten, and logs that it does. Under a checkpointer with no [`Last`](@ref) in `keep` (what
+`keep_latest = false` builds) a run's latest record is its most recent kept epoch rather than
+where it stopped, and the epochs after it are trained again.
 `resume = other` and `other => :current`, a continuation from the handle's in-memory state, are
 not supported yet; `weights = other` takes the parameters.
 
-**`weights`** names where the initial parameters come from, and takes nothing of a trajectory:
-no step, no epoch, no schedule position, and no optimizer state unless `restore_optimizer` asks.
-Either way, a run that trains is a new run in `run_dir`, and a directory already holding
+**`weights`** names where the initial parameters come from, and takes no training position: no
+step, no epoch, no schedule position, and no optimizer state unless `restore_optimizer` asks. A
+handle built this way that trains is a new run in `run_dir`, and a directory already holding
 checkpoints keeps them (under the default retention `scope = :run`).
 
 - `weights = path` or `run => :best | :latest` restores `ps` and `st` from a checkpoint record, and
@@ -100,13 +115,17 @@ checkpoints keeps them (under the default retention `scope = :run`).
   n = Nitro(MyExp, :baseline; run_dir = "runs/my_run", weights = :latest => :best, logger = nothing)
   ```
 
+- `weights = run => Average(sel)` restores the average of the run's checkpoints `sel` picks, with
+  `st` and the derived values from one of them (see [`Average`](@ref)), and records what it
+  averaged in `averaged_from`. [`average_checkpoints`](@ref) writes the same record to a file.
+
 - `weights = other::Nitro`, or `other => :current`, is a warm start from a handle in this process:
   `ps` and `st` are taken after step 7, through host memory, and otherwise the fresh sequence runs.
   The trees must match leaf for leaf.
 
 **`restore_optimizer = true`** also restores the optimizer state of a `weights` record (a path or
 any `run => :best | :latest`), normalized to device residency as a resume normalizes it and checked
-against the optimizer this run builds (rule and group layout; a mismatch refuses), while step, epoch
+against the optimizer this run builds (rule and group layout; a mismatch is refused), while step, epoch
 and the schedule start fresh: a new run with a new schedule and `max_epochs`. It refuses a source
 that is not a record (none, a bare `Nitro`, `other => :current`: restoring a live handle's
 optimizer is not supported yet), refuses alongside `resume`, which restores the optimizer anyway,
@@ -118,6 +137,11 @@ requested stop) by loading this run's own best checkpoint, under the current met
 becomes that file, so export provenance names it, and `show` says the handle holds it. With no
 scored checkpoint it warns and keeps the final weights. A handle restored this way refuses a later
 `train!`, and the error shows the three constructions that continue from the best checkpoint.
+
+**`restore_best = Average(sel)`** ends `train!` holding the average of the run's own checkpoints
+that `sel` picks instead, exactly as `weights = run => Average(sel)` would load them. Setup refuses
+a checkpointer whose `keep` cannot hold that selection; a run that ends before it has enough
+(an early stop, say) warns and keeps its final weights.
 
 `w0` says what `decay_anchor = :w0` anchors to: `:build_model` (the default), `:weights` (the
 transferred parameters, for L2-SP fine-tuning), or a parameter tree.
@@ -132,10 +156,6 @@ whichever split exists; with no split at all it is deferred to the first `predic
 step as its phase (`setup [building data]`), closing as `setup done`. See
 [`progress_reporter!`](@ref).
 """
-# `Starting` is published before the build, through the module-level monitors, because `build_data`
-# can start and compile a data server and this was the longest undeclared stretch there was.
-# Construction counts as work in flight, so an idle reconciler does not rewrite `Starting` to `Repl`
-# mid-build. It publishes no `Repl` on exit: the verb that usually follows declares its own phases.
 Nitro(e; kwargs...) = _off_interactive() do
     repl_enter!()
     return try
@@ -187,7 +207,7 @@ function _build_nitro(
         # Whether a `weights` record's optimizer state comes with its parameters.
         restore_optimizer::Bool = false,
         # Whether `train!` ends by loading this run's best checkpoint into the handle.
-        restore_best::Bool = false,
+        restore_best = false,
         # DEPRECATED spelling of `weights = path`; removed in 0.2.0.
         checkpoint = nothing,
         # PROTOTYPE: hooks supplied as values shadow the method of the same name (Hooks.jl).
@@ -208,16 +228,17 @@ function _build_nitro(
         weights, checkpoint = checkpoint, nothing
     end
     check_weights_kwargs(weights, w0; resume, restore_optimizer)
+    check_restore_average(restore_best, checkpointer)
 
     # ── before step 2: locate a checkpoint (the resume path) ───────────────────────
     # `run_dir` is the one path concept in the framework, so a checkpointer constructed without an
     # explicit `dir` adopts it here. An explicit `dir` pins it and is never overwritten.
-    checkpointer isa TopKCheckpointer && checkpointer.dir === nothing &&
+    checkpointer isa Checkpointer && checkpointer.dir === nothing &&
         (checkpointer.dir = String(run_dir))
     # The filename hook is bound here too, as a closure calling the generic function, so
     # `save_checkpoint!` never receives `e` (an object full of device leaves handed to the
     # serializer) and a revised `checkpoint_filename` takes effect on the next write.
-    checkpointer isa TopKCheckpointer && checkpointer.name === nothing &&
+    checkpointer isa Checkpointer && checkpointer.name === nothing &&
         (checkpointer.name = (; kwargs...) -> ReactantNitro.checkpoint_filename(e; kwargs...))
     # The default logger adopts the run directory the same way; a wrapper around it (the gate
     # extension's RecordingLogger) forwards the pin, and a user's own logger is untouched.
@@ -229,12 +250,15 @@ function _build_nitro(
     # the actual file. `other => :current` is the bare `other`, a `Nitro` source that stays in
     # `weights` and is transferred after step 7.
     weights = resolve_source(checkpointer, run_dir, weights, :weights)
-    weights_file = nothing
+    weights_file = averaged = nothing
     if weights isa AbstractString
         weights_file, weights = String(weights), nothing
+    elseif weights isa AverageSource
+        averaged, weights = weights, nothing
     end
     resume_file = resume_path(resume, checkpointer, run_dir)
-    (weights_file !== nothing || resume_file !== nothing) && progress_phase!("loading checkpoint")
+    (weights_file !== nothing || resume_file !== nothing || averaged !== nothing) &&
+        progress_phase!("loading checkpoint")
     record, source = nothing, nothing
     if weights_file !== nothing
         # `load_checkpoint` dispatches on the checkpointer, so `checkpointer = nothing` has no
@@ -246,23 +270,25 @@ function _build_nitro(
             `checkpointer = nothing` has no loader, since `load_checkpoint` dispatches on the
             checkpointer rather than on the path.
             Pass the checkpointer that wrote it, or leave the keyword off to take the default
-            `TopKCheckpointer`, which reads the format the framework writes. Disabling checkpointing
+            `Checkpointer`, which reads the format the framework writes. Disabling checkpointing
             is about WRITING; nothing is written by a `Nitro` that is never trained."""
         )
         record, source = load_checkpoint(checkpointer, weights_file), weights_file
+    elseif averaged !== nothing
+        record, source = average_records(checkpointer, averaged), describe(averaged)
     elseif resume_file !== nothing
         record, source = load_checkpoint(checkpointer, resume_file), resume_file
     end
     # Two restores, one compatibility check: `weights = path` takes the derived values from the
     # record (an evaluation process may lack the training data), `resume` recomputes them.
-    weights_only = record !== nothing && weights_file !== nothing
+    weights_only = record !== nothing && (weights_file !== nothing || averaged !== nothing)
 
     # This run's identity in the manifest, assigned every time, even to a checkpointer object the
     # caller reuses: retention, top-K and the handle's own selection are all per run. A resume
     # continues the run whose newest record it restores and branches from anything else
     # (`resumed_run`); everything else, a weights-only start included, is a new run.
     occupied = false
-    if checkpointer isa TopKCheckpointer
+    if checkpointer isa Checkpointer
         if record !== nothing && !weights_only
             id = resumed_run(checkpointer, source)
             if id.from !== nothing
@@ -285,6 +311,11 @@ function _build_nitro(
     # Manual mode is selected by a `train_step` method and frozen into the handle; flipping it on
     # an existing handle is reported by `fixed_config_report` rather than applied.
     manual = manual_training(e)
+    manual && (grad_level2(e) || !(grad_rule(e) isa SingleGrad)) && error(
+        "ReactantNitro: manual mode (`train_step` defined) supports `grad_rule(e) = SingleGrad()` \
+         only, and this experiment defines another gradient rule. The closure owns its own \
+         backward passes and can run them at perturbed parameters itself."
+    )
     if manual && accum > 1
         error(
             """
@@ -456,6 +487,9 @@ function _build_nitro(
     # Here because both need the split collection and the resolved routing: a policy with no `val`
     # split, or naming a metric the experiment cannot emit, is a configuration error.
     check_early_stop(early_stop, collection, routing)
+    early_stop = setup_early_stop(
+        early_stop, record !== nothing && !weights_only ? record.early_stop : nothing
+    )
     check_checkpointer(checkpointer, collection, routing)
     training && warn_keep_latest(checkpointer, resume)
     training && warn_retention_scope(checkpointer)
@@ -470,6 +504,8 @@ function _build_nitro(
     # whose rules enter the compile key through `worlds_manual` instead.
     chains = ()
     bindings = (; fields = (), slots = (), level2 = ())
+    # The automatic loop's rule type, checked again at every step; `nothing` without training.
+    grad_rule_type = nothing
     # Resolved once, here: `no_decay` is a user hook, and recomputing it at `train!` would let a
     # revision take effect on a frozen handle. Training-only and skipped in manual mode.
     masks = training && !manual ? map(m -> place_replicated(m, mesh), no_decay_masks(e, ps, layout)) : nothing
@@ -510,12 +546,16 @@ function _build_nitro(
             )
             # `rebuild_rules` moves only the VALUES each step; the rule types, and so the `apply!`
             # methods, are these, so resolving the rule worlds here covers the whole run.
+            rule0 = build_grad_rule(e, grad_setup_hp(schedules))
+            grad_rule_type = typeof(rule0)
             resolved = resolve_schedules(
                 e, schedules, total;
                 chains, accessor = ReactantNitro.schedules(e),
-                groups = layout.groups
+                groups = layout.groups, grad_fields = schedulable_grad_fields(rule0)
             )
             bindings = schedule_bindings(e, layout, resolved, chains; anchors, masks)
+            landed = check_grad_bindings(e, resolved, bindings.landed)
+            bindings = merge(bindings, (; landed))
         end
     end
 
@@ -563,7 +603,10 @@ function _build_nitro(
         probe_accessors(e),
         # The compile options ride with the dispatch freeze: both are compile-cache key components
         # fixed at construction (Cache.jl `compile_cached`).
-        merge(frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state), (; compile_options)),
+        merge(
+            frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state),
+            (; compile_options, grad_rule_type)
+        ),
         (; masks, anchors), bindings,
         map(zero, flat), RegisteredMonitor[], Int(step0), Int(epoch0), Starting(),
         false, nothing,
@@ -572,7 +615,8 @@ function _build_nitro(
         weights === nothing ? nothing : weights_origin(weights),
         NamedTuple[],
         false,
-        restore_best, nothing
+        restore_best, nothing,
+        record !== nothing && weights_only ? record.averaged_from : nothing
     )
     # Two builds from one set of pieces: the text goes to `log_other!` so the record says where
     # every value bound, and the sections are what `show(nitro)` appends to the handle's display.
@@ -595,8 +639,8 @@ end
 
 The weight-source keywords, validated before anything is built. `weights` and `resume` are each a
 checkpoint source ([`check_source`](@ref)); `weights` may also be a `Nitro` and `resume` also
-`false` or `:auto`. They are two answers to one question, so at most one is given.
-`restore_optimizer` needs a checkpoint RECORD in `weights`, a path or `run => :best | :latest`,
+`false` or `:auto`. At most one of the two may be given.
+`restore_optimizer` needs a checkpoint record in `weights`, a path or `run => :best | :latest`,
 and is meaningless with `resume`, which always restores the optimizer. `w0` is `:build_model`,
 `:weights`, or a parameter tree, and `:weights` needs a `weights` to point at.
 """
@@ -617,8 +661,12 @@ function check_weights_kwargs(weights, w0; resume, restore_optimizer::Bool = fal
              Drop `restore_optimizer`, or use `weights = <source>, restore_optimizer = true` for a \
              record's parameters and optimizer state under a fresh schedule."
         )
+        weights isa Pair && last(weights) isa Average && error(
+            "ReactantNitro: `restore_optimizer = true` with `weights = $(source_repr(weights))`: \
+             averaged parameters carry no optimizer state. Drop `restore_optimizer`."
+        )
         record = weights isa AbstractString ||
-            (weights isa Pair && last(weights) in (:best, :latest))
+            (weights isa Pair && source_sugar(last(weights)) in (:best, :latest))
         record || error(
             "ReactantNitro: `restore_optimizer = true` restores the optimizer state of a checkpoint \
              RECORD, so it needs `weights` to name one: a path, or `run => :best | :latest` \
@@ -640,6 +688,26 @@ function check_weights_kwargs(weights, w0; resume, restore_optimizer::Bool = fal
     return nothing
 end
 
+# `restore_best = Average(sel)` reads the run's own manifest, so the checkpointer must keep `sel`.
+function check_restore_average(rb, ckpt)
+    rb isa Bool && return nothing
+    rb isa Average || error(
+        "ReactantNitro: `restore_best` is `true`, `false`, or an `Average` of the run's own \
+         checkpoints (`restore_best = Average(Last(10))`); got a `$(typeof(rb))`."
+    )
+    ckpt isa Checkpointer || error(
+        "ReactantNitro: `restore_best = $(rb)` averages this run's checkpoints, and \
+         $(ckpt === nothing ? "`checkpointer = nothing` writes none" : "a `$(typeof(ckpt))` records no manifest")."
+    )
+    need = rb.sel isa Best && rb.sel.among !== nothing ? rb.sel.among : rb.sel
+    covers(ckpt.keep, rb.sel) === false && error(
+        "ReactantNitro: `restore_best = $(rb)`, and the checkpointer keeps \
+         $(join(map(repr, ckpt.keep), ", ")), which cannot hold everything `$(rb.sel)` picks. \
+         Keep it: `Checkpointer(; keep = (Best(3), $(need)))`."
+    )
+    return nothing
+end
+
 # How a source is named in a message: the handle as `other`, everything else as written.
 source_repr(src::Pair) = _source_side(first(src)) * " => " * repr(last(src))
 source_repr(src) = _source_side(src)
@@ -649,9 +717,14 @@ _source_side(x) = repr(x)
 # The grammar, once, for the messages that teach it.
 const SOURCE_FORMS = "a checkpoint path, or `run => checkpoint`: the run is `:latest` (the most \
     recent run in `run_dir`), a run id string (`runs(run_dir)` lists them), `:all` (every run, \
-    with `:best`) or another `Nitro` (its own run), and the checkpoint is `:best` (the best by the \
-    checkpointer's current metric), `:latest` (the run's newest record) or, for a `Nitro`, \
-    `:current` (its parameters now, in memory)"
+    with `:best`) or another `Nitro` (its own run), and the checkpoint is `:best` or `Best(1)` (the \
+    best by the checkpointer's current metric), `:latest` or `Last(1)` (the run's latest record), \
+    for `weights` an `Average` of several (`Average(Last(10))`) or, for a `Nitro`, `:current` (its \
+    parameters now, in memory)"
+
+# `Best(1)` and `Last(1)` name the same record as `:best` and `:latest`.
+source_sugar(w) = w isa Best && w.k == 1 && w.among === nothing ? :best :
+    w isa Last && w.n == 1 ? :latest : w
 
 """
     ReactantNitro.check_source(src, kw) -> nothing
@@ -660,7 +733,7 @@ The shape of a checkpoint source, checked before anything is built, for `kw` in 
 `:resume`: `nothing`, a path, or `run => checkpoint`. The run is `:latest`, `:all`, a run id, or a
 `Nitro`; the checkpoint is `:best`, `:latest`, or `:current` (a `Nitro`'s in-memory state).
 `weights` also takes a bare `Nitro` (the same as `other => :current`), and `resume` takes `false`
-and `:auto`. Refused with the form to use instead: bare `:best` and `:latest` (which run?),
+and `:auto`. Refused with the form to use instead: bare `:best` and `:latest` (no run named),
 `:all => :latest` (that is `:latest => :latest`), `:current` without a `Nitro`, and for `resume` a
 bare `Nitro` and `other => :current`, a continuation from memory, which is not supported yet.
 """
@@ -693,6 +766,25 @@ function check_source(src, kw::Symbol)
     (run isa Union{Nitro, AbstractString} || run === :latest || run === :all) || error(
         "ReactantNitro: `$(kw) = $(source_repr(src))` names no run: $(repr(run)) is not `:latest`, \
          `:all`, a run id string or a `Nitro`. $(takes)."
+    )
+    which = source_sugar(which)
+    if which isa Average
+        kw === :resume && error(
+            "ReactantNitro: `resume = $(source_repr(src))`: a resume continues one record, optimizer \
+             and step included, and an average has neither. Use `weights = $(source_repr(src))` for \
+             the averaged parameters with a fresh optimizer."
+        )
+        run === :all && error(
+            "ReactantNitro: `$(kw) = $(source_repr(src))` averages across every run in the \
+             directory. Averaging across runs (model soups) is planned and not supported yet: it \
+             needs a shared initialization and a layout check across runs. Name one run."
+        )
+        return nothing
+    end
+    which isa Selector && error(
+        "ReactantNitro: `$(kw) = $(source_repr(src))`: `$(which)` may pick several checkpoints, \
+         and a source names one record. Average them, `$(kw) = $(repr(run)) => \
+         Average($(which))`, or pick one with `Best(1)` or `Last(1)`."
     )
     which in (:best, :latest, :current) || error(
         "ReactantNitro: `$(kw) = $(source_repr(src))` names no checkpoint of the run: \
@@ -728,7 +820,7 @@ other `run => checkpoint` names a record, resolved to its file through the manif
 [`resolve_checkpoint`](@ref). `run` is `:latest`, `:all` or a run id of `run_dir` read by this
 run's checkpointer, whose current metric decides `:best`; `other::Nitro` is that handle's own run,
 read in its own run directory through its own checkpointer, whatever else has written there since.
-Raises when a record cannot be found, so nothing asked for is silently replaced by fresh weights.
+Raises when a record cannot be found, rather than falling back to fresh weights.
 `resume = :auto` is resolved by [`resume_path`](@ref), not here.
 """
 function resolve_source(ckpt, run_dir, src, kw::Symbol)
@@ -736,17 +828,45 @@ function resolve_source(ckpt, run_dir, src, kw::Symbol)
     src isa AbstractString && return String(src)
     src isa Nitro && return src
     run, which = src
+    which = source_sugar(which)
     which === :current && return run
     what = "`$(kw) = $(source_repr(src))`"
+    which isa Average && return resolve_average_source(ckpt, run_dir, run, which; what)
     run isa Nitro || return resolve_checkpoint(ckpt, run_dir, run, which; what).path
     ck = run.checkpointer
     has = ck === nothing ? "`checkpointer = nothing`" : "a `$(typeof(ck))`"
-    ck isa TopKCheckpointer || error(
+    ck isa Checkpointer || error(
         "ReactantNitro: $(what) names one of `other`'s checkpoint records, and `other` has no \
          checkpointer whose manifest can be read ($(has)), so there is no record to name. \
          `weights = other` takes its parameters from memory."
     )
     return resolve_checkpoint(ck, run.run_dir, run_key(ck.run), which; what).path
+end
+
+# An `Average` source: the run's own checkpointer for another handle, which also lets setup check
+# its `keep` can supply the selection before reading the manifest.
+function resolve_average_source(ckpt, run_dir, run, avg; what)
+    if run isa Nitro
+        ck = run.checkpointer
+        ck isa Checkpointer || error(
+            "ReactantNitro: $(what) averages `other`'s checkpoint records, and `other` has no \
+             `Checkpointer` whose manifest can be read."
+        )
+        need = avg.sel isa Best && avg.sel.among !== nothing ? avg.sel.among : avg.sel
+        covers(ck.keep, avg.sel) === false && error(
+            "ReactantNitro: $(what): `other`'s checkpointer keeps \
+             $(join(map(repr, ck.keep), ", ")), which cannot hold everything `$(avg.sel)` \
+             picks. Keep it while training, for example \
+             `Checkpointer(; keep = (Best(3), $(need)))`."
+        )
+        return resolve_average(ck, run.run_dir, run_key(ck.run), avg; what)
+    end
+    has = ckpt === nothing ? "`checkpointer = nothing` has none" : "a `$(typeof(ckpt))` records none"
+    ckpt isa Checkpointer || error(
+        "ReactantNitro: $(what) is looked up through the checkpointer's manifest, and $(has). \
+         Leave `checkpointer` at its default to read the run directory the framework writes."
+    )
+    return resolve_average(ckpt, run_dir, run, avg; what)
 end
 
 """
@@ -756,14 +876,14 @@ The checkpoint `resume` names, or `nothing` for a fresh start. `false` (and `not
 nothing; a path is itself; `run => :latest | :best` is resolved by [`resolve_source`](@ref).
 `:auto` is exactly `:latest => :latest`, the newest record of the directory's most recent run,
 announced with an `@info` naming the run and epoch it continues, except that a directory with
-nothing to resume in it is a fresh run with a `@warn` rather than an error, which is what makes it
-usable as a standing setting in a harness that may be starting or recovering. Which run the resumed
-handle then belongs to is `resumed_run`'s question.
+nothing to resume in it is a fresh run with a `@warn` rather than an error, so `:auto` can stay
+set in a script that both starts and restarts runs. `resumed_run` decides which run the resumed
+handle joins.
 """
 function resume_path(resume, ckpt, run_dir)
     (resume === false || resume === nothing) && return nothing
     resume === :auto || return resolve_source(ckpt, run_dir, resume, :resume)
-    if ckpt isa TopKCheckpointer
+    if ckpt isa Checkpointer
         dir = lookup_dir(ckpt, run_dir)
         if isempty(isdir(dir) ? read_manifest(dir) : ManifestEntry[])
             @warn "ReactantNitro: `resume = :auto` found nothing to resume in `$(dir)`, so this \
@@ -811,8 +931,8 @@ weights_origin(src::Nitro) = (;
     ReactantNitro.check_weights_compatible(source::Nitro, layout::FlatLayout) -> nothing
 
 Refuse a warm start whose parameter tree does not fit this model, with a diff by keypath. Only
-the keypaths and sizes are compared: the group a leaf belongs to is this experiment's
-`param_group`'s business and may legitimately differ from the source's.
+the keypaths and sizes are compared: the group a leaf belongs to is decided by this experiment's
+`param_group` and may differ from the source's.
 """
 function check_weights_compatible(source::Nitro, layout::FlatLayout)
     return _check_tree_fits(source.layout.permutation, layout.permutation) do diff
@@ -867,10 +987,10 @@ end
     ReactantNitro.warn_no_concurrency(train_split) -> nothing
 
 One `@warn` at setup when the training split resolved to no host-side concurrency, naming what to
-implement. It exists because a model once trained 4x slow for weeks with nothing saying so.
+implement, since a single producer can starve the device with no other sign.
 
-A warning, not an error: a single producer trains correctly, some sources cannot be indexed, and
-`NoPrefetch` is a legitimate choice. `:fanout`, `:fanout_unordered` and `:materialized` (a `Vector`
+It warns rather than raises: a single producer trains correctly, some sources cannot be indexed,
+and `NoPrefetch` is a legitimate choice. `:fanout`, `:fanout_unordered` and `:materialized` (a `Vector`
 of already-built batches, so no host work to spread) say nothing.
 """
 function warn_no_concurrency(train_split)
@@ -896,20 +1016,20 @@ function warn_no_concurrency(train_split)
     return nothing
 end
 
-"""
-    ReactantNitro.check_driver_fields(e) -> nothing
-
-A driver-only value (`seed`, `max_epochs`, `run_dir`, ...) declared as a `GraphConst` field is a
-setup error. A `GraphConst` bakes as a trace-time constant and enters the compile cache key, so a
-`GraphConst` `seed` recompiles per seed and defeats the sweep the seeding rule exists for. Unmarked
-is right: an unmarked field is [`Host`](@ref). `accum` and `gradient_clip_norm` genuinely bake and
-are not checked.
-"""
 const DRIVER_ONLY_FIELDS = (
     :seed, :max_epochs, :run_dir, :n_devs, :logger, :checkpointer,
     :early_stop, :check_divergence, :autolog_schedules, :log_every_n_steps,
 )
 
+"""
+    ReactantNitro.check_driver_fields(e) -> nothing
+
+A driver-only value (`seed`, `max_epochs`, `run_dir`, ...) declared as a `GraphConst` field is a
+setup error. A `GraphConst` bakes as a trace-time constant and enters the compile cache key, so a
+`GraphConst` `seed` would recompile per seed and a seed sweep could not share one program. Leave
+these fields unmarked, which makes them [`Host`](@ref). `accum` and `gradient_clip_norm` do bake
+and are not checked.
+"""
 function check_driver_fields(e)
     T = typeof(e)
     df, hf = device_fields(T), host_fields(T)
@@ -938,13 +1058,13 @@ end
 """
     ReactantNitro.config_params(e; kwargs...) -> NamedTuple
 
-The flat hyperparameter table setup step 12 logs: the experiment's actual configured values plus
-the run keywords that are hyperparameters in their own right. Values, not declaration metadata,
-since logging the defaults would report the same `width` for every run of a sweep.
+The flat hyperparameter table setup step 12 logs: the experiment's configured values plus the run
+keywords that are hyperparameters (`seed`, `accum`, ...). It logs values rather than declared
+defaults, which would be the same for every run of a sweep.
 
 `Device` fields are read back to host numbers; anything not scalar-ish is logged as a descriptor
 rather than splatted into the flat table; `Host` fields are included only when scalar-ish, because
-a `Host` field may be a materialized dataset. `seed` is here because it is a hyperparameter.
+a `Host` field may be a materialized dataset.
 """
 function config_params(e; kwargs...)
     T = typeof(e)
@@ -968,14 +1088,14 @@ param_value(x) = string(nameof(typeof(x)))
 """
     ReactantNitro.default_run_dir(e) -> String
 
-`joinpath("runs", string(nameof(typeof(e))))`, relative to the working directory. It is the
-one path concept in the framework: checkpoints, the manifest, and `resume = :auto` all resolve
-against it.
+`joinpath("runs", string(nameof(typeof(e))))`, relative to the working directory: the default
+[`run_dir`](@ref). Checkpoints, the manifest and `resume = :auto` all resolve against the run
+directory.
 """
 default_run_dir(e) = joinpath("runs", string(nameof(typeof(e))))
 
 """
-    ReactantNitro.decay_anchors(e, w0, layout) -> NTuple{G} or nothing
+    ReactantNitro.decay_anchors(e, w0, layout, mesh = nothing) -> NTuple{G} or nothing
 
 The per-group decay anchor as a flat device slice, or `nothing` for a group decaying toward zero.
 `nothing` is type-level, so a `:zero` group's chain emits no subtraction and carries no buffer.
@@ -1081,9 +1201,9 @@ _refuse_donation(d) = error(
 """
     ReactantNitro.validate_config(e; kwargs...) -> nothing
 
-Setup step 1, cheapest failures first, before any allocation: marker legality, optimizer allowlist
-membership, mutually exclusive decay settings, `learning_rate(e) != 0`, and the parameter-group name
-checks.
+Setup step 1, the cheapest checks, run before anything is built: `accum >= 1`,
+`log_every_n_steps >= 1`, no driver-only field marked `GraphConst` (`check_driver_fields`),
+`learning_rate(e) != 0`, a real `gradient_clip_norm`, and both [`metrics_residency`](@ref) values.
 """
 function validate_config(e; accum = 1, gradient_clip_norm = 0.0f0, log_every_n_steps = 1)
     accum >= 1 || error("ReactantNitro: `accum` must be at least 1, and is $accum.")
@@ -1116,13 +1236,14 @@ n = Nitro(MyExp, :baseline; max_epochs = 40, aug_rotate_deg = 9.0)
 #                              ^ run keyword    ^ field, so it overrides the recipe
 ```
 
-Keywords are split by one rule: a `Nitro` keyword goes to `Nitro`; anything else must be a field
-of `E` and goes to the recipe; a name that is both (`max_epochs`, `seed`, `run_dir`, `accum`,
-`n_devs`, `gradient_clip_norm`, `check_divergence`, `autolog_schedules`, `log_every_n_steps`) is
-the run keyword. Anything in neither set is an error naming both. The keyword set is derived from the constructor's declaration, so it cannot go stale.
+Keywords are split by one rule: a `Nitro` keyword goes to `Nitro`, and anything else must be a
+field of `E` and goes to the recipe. A name that is both, such as `max_epochs` or `seed`, is the run
+keyword. A name that is neither is an error listing both sets. `data` is refused in this form,
+since the collection would come from a different instance than the one built here; use the longer
+spelling below.
 
-The longer spelling, `Nitro(from_preset(MyExp, :baseline; ...); preset = :baseline)`, still works
-and is what this is shorthand for, but it names the preset twice and nothing checks the two agree.
+This is shorthand for `Nitro(from_preset(MyExp, :baseline; ...); preset = :baseline)`, which still
+works but names the preset twice, and nothing checks that the two agree.
 """
 function Nitro(E::Type, preset::Symbol; kwargs...)
     nitro_kw, field_kw = _split_preset_kwargs(E, preset, kwargs)
@@ -1132,9 +1253,9 @@ end
 """
     ReactantNitro._split_preset_kwargs(E, preset, kwargs) -> (nitro_kw, field_kw)
 
-The preset routing rule, extracted so it is testable without constructing a `Nitro`: **a `Nitro`
-keyword goes to `Nitro`, anything else must be a field of `E` and goes to the recipe.** A name that
-is both goes to `Nitro`, which preserves the collision resolution exactly.
+The preset keyword routing, separate so it is testable without constructing a `Nitro`. A `Nitro`
+keyword goes to `Nitro`, and anything else must be a field of `E` and goes to the recipe; a name
+that is both goes to `Nitro`. `preset` as a keyword and `data` are refused.
 """
 function _split_preset_kwargs(E::Type, preset::Symbol, kwargs)
     nkw, fields = _nitro_keywords(), fieldnames(E)
@@ -1216,9 +1337,10 @@ devices, sharding the batch along it and replicating everything else (see
 [`place_replicated`](@ref) and [`place_batch`](@ref)). `n_devs == 1` skips the mesh entirely, since
 a one-device mesh is a no-op Reactant warns about.
 
-The scope is single node, one process, one or more devices; XLA partitions one compiled program
-over the mesh, which does not compose with MPI or NCCL. `n_devs` counts VISIBLE devices, so
-`CUDA_VISIBLE_DEVICES` is the supported way to restrict a run, and asking for more is an error.
+The scope is one node and one process with one or more devices: XLA partitions one compiled
+program over the mesh, which does not compose with MPI or NCCL. `n_devs` counts visible devices, so
+`CUDA_VISIBLE_DEVICES` is the way to restrict a run, and asking for more than are visible is an
+error.
 """
 function setup_devices(n_devs::Integer)
     n_devs >= 1 || error("ReactantNitro: `n_devs` must be at least 1, and is $n_devs.")
@@ -1251,8 +1373,8 @@ every visible device. `backend` passes through to `Reactant.set_default_backend`
 against the visible devices; the pin beats an experiment's declared `n_devs`, and an explicit
 `n_devs` keyword on `Nitro` still wins for that one run.
 
-One process, one XLA: the client is initialized once and `n_devs` only slices the visible device
-set, so to restrict which GPUs a session sees, set `CUDA_VISIBLE_DEVICES` before starting the
+The XLA client is initialized once per process and `n_devs` only takes a prefix of the visible
+devices, so to choose which GPUs a session sees, set `CUDA_VISIBLE_DEVICES` before starting the
 process. The batch size is global and is split across the mesh, so adding devices buys throughput
 without changing the effective batch. Called with no arguments, this only reports.
 
@@ -1304,11 +1426,10 @@ end
     ReactantNitro.place_batch(x, mesh) -> x_device
 
 The two placements: everything is replicated except the batch, which is sharded on its last
-dimension along the `:data` axis. The sample axis is last by the batch contract, which is why
-routing transfers only the fields a hook declares. `mesh === nothing` is the single-device path
-and both fall through to `to_rarray`.
+dimension along the `:data` axis; the batch contract puts the sample axis last. `mesh === nothing`
+is the single-device path, where both fall through to `to_rarray`.
 
-The device count is throughput, not a batch multiplier: `batch_size = 32` on four devices puts 8
+Adding devices adds throughput without changing the batch: `batch_size = 32` on four devices puts 8
 samples on each, with the numerics of a 32-sample batch.
 
 Every `ReactantRNG` is switched to `"PHILOX"`, at any device count, so one seed draws the same
@@ -1335,8 +1456,8 @@ place_batch(x, mesh) = Reactant.to_rarray(
 """
     ReactantNitro.check_shardable_batch(batch_size, n_devs) -> nothing
 
-A batch sharded on the `:data` axis must divide evenly across the mesh. XLA would pad or refuse
-without naming the batch size, so the framework checks first.
+Raise unless the global batch size divides evenly across `n_devs` devices. XLA would otherwise pad
+or refuse without naming the batch size.
 """
 function check_shardable_batch(batch_size::Integer, n_devs::Integer)
     n_devs == 1 && return nothing
@@ -1353,7 +1474,7 @@ function check_shardable_batch(batch_size::Integer, n_devs::Integer)
 end
 
 """
-    ReactantNitro.to_device_config(e) -> e_converted
+    ReactantNitro.to_device_config(e, mesh = nothing) -> e_converted
 
 Setup step 5: convert every [`Device`](@ref) leaf through [`to_device`](@ref) and rebuild the
 experiment, which changes its type. Conversion happens here and, per optimizer step, for the
@@ -1389,21 +1510,21 @@ end
     set_device!(nitro, name, value) -> nitro
     set_device!(nitro; name = value, ...) -> nitro
 
-Write a new value into a [`Device`](@ref) field of a live handle without recompiling: this is how a
-device sweep or a changed inference threshold reuses the programs already in the compile cache.
+Write a new value into a [`Device`](@ref) field of a live handle without recompiling, so a sweep
+over a device value or a changed inference threshold reuses the compiled programs.
 
-The guarantee is structural. The cache key skips `device_fields` when hashing and seeds on the
-type name rather than the parameterized type, so a new device value leaves every key component
-untouched; the function asserts both before committing. Refused: a field that is not `Device` (a
-`GraphConst` is genuinely a different program, a `Host` field reaches no trace), a value of a
-different element type or size (the type would move the key; the size would not and would fail
-inside XLA instead), and a scheduled field (the per-step rebuild would overwrite the write).
+The cache key skips `device_fields` when hashing and seeds on the type name rather than the
+parameterized type, so a new device value leaves every key component unchanged; the function
+asserts both before committing. Refused: a field that is not `Device` (a `GraphConst` change is a
+different program, and a `Host` field reaches no trace), a value of a different element type or
+size (the type would move the key; the size would not, and would fail inside XLA instead), and a
+scheduled field (the per-step rebuild would overwrite the write).
 
 ```julia
 n = Nitro(e; weights = "runs/MyExp/best.jld2")      # weights-only, skips `derive`
 for thr in (0.3f0, 0.5f0, 0.7f0)
     set_device!(n; threshold = thr)
-    out = predict(n, batch)                         # no compile, any iteration
+    out = predict(n, batch)                         # no recompile
 end
 ```
 """
@@ -1567,9 +1688,9 @@ end
     ReactantNitro.stale_hooks(nitro) -> Vector{Symbol}
 
 Which frozen world tuples no longer match live dispatch, as [`fixed_config_report`](@ref) prints
-them. Empty is the normal case. This is the whole safety story for freezing dispatch: the handle
-keeps its programs, and this removes the silence about it, at the cost of a few `which` calls per
-entry-point call. A new `Nitro` always resolves current dispatch.
+them; usually empty. A handle keeps its programs after a redefinition, and this is how it reports
+that they are stale, at the cost of a few `which` calls per entry-point call. A new `Nitro` always
+resolves current dispatch.
 """
 function stale_hooks(nitro::Nitro)
     f = nitro.frozen
@@ -1593,8 +1714,8 @@ frozen_chains(nitro::Nitro) =
     ReactantNitro.probe_accessors(e) -> NamedTuple
 
 What each of `_PROBED`'s accessors returns right now. Captured once at construction into
-`nitro.accessors_at_setup` so [`fixed_config_report`](@ref) can compare accessor-THEN against
-accessor-NOW, which is the only comparison that separates a redefinition from a keyword override.
+`nitro.accessors_at_setup` so [`fixed_config_report`](@ref) can compare the accessor's value then
+and now, which is the only comparison that tells a redefinition from a keyword override.
 An accessor that throws records `nothing` and is simply not probed later.
 """
 probe_accessors(e) = NamedTuple{_PROBED}(
@@ -1616,8 +1737,8 @@ values; `show(nitro)` does that.
 
 Setup resolves the accessor-defaulted keywords once into the handle's fields, so revising
 `accum(::MyExp)` and calling `train!` on an existing handle changes nothing, and this report is what
-says so. The handle always wins: `accum` and `max_epochs` are entangled with the schedule horizon,
-so applying one in isolation would leave the schedules resolved against a horizon that no longer
+says so. The handle's values always apply: `accum` and `max_epochs` determine the schedule horizon,
+so applying one alone would leave the schedules resolved against a horizon that no longer
 exists. The fix is a rebuild, which reuses every compiled program the change does not invalidate.
 `entry` selects the relevant set, since `validate` and `predict` read neither `accum` nor the clip.
 """

@@ -388,38 +388,13 @@ function _collect_run_kwargs(;
     return kwargs
 end
 
-# A checkpoint source as a string, mirroring the constructor's `run => checkpoint`: `"a => b"`,
-# spaces optional. On the left `latest` and `all` are the symbols and anything else is a run id; on
-# the right `best` and `latest`. A string with no `=>` is a path. Bare `"best"` and `"latest"` name
-# no run and are refused with the pair to use, as the constructor refuses `:best`. `:current` has
-# no string form: it needs a live handle, which a tool argument cannot carry.
-function _parse_source(s::AbstractString, kw::AbstractString)
-    t = strip(s)
-    if t in ("best", "latest")
-        error(
-            "ReactantNitro ReactantNitroKaimonGateExt: `$(kw) = \"$(t)\"` names a checkpoint and not \
-             the run it belongs to. Pass `$(kw) = \"latest => $(t)\"` for the most recent run in \
-             `run_dir`, or `\"<run id> => $(t)\"` for another (`runs(run_dir)` lists them)\
-             $(t == "best" ? ", or `\"all => best\"` for the best across every run" : "")."
-        )
-    end
-    occursin("=>", t) || return String(t)
-    left, right = strip.(split(t, "=>"; limit = 2))
-    (isempty(left) || isempty(right)) && error(
-        "ReactantNitro ReactantNitroKaimonGateExt: `$(kw) = \"$(t)\"` needs a run on the left of \
-         `=>` (`latest`, `all` or a run id) and a checkpoint on the right (`best` or `latest`)."
-    )
-    run = left == "latest" ? :latest : left == "all" ? :all : String(left)
-    which = right == "best" ? :best : right == "latest" ? :latest : error(
-            "ReactantNitro ReactantNitroKaimonGateExt: `$(kw) = \"$(t)\"` names no checkpoint of the \
-         run: `$(right)` is not `best` or `latest`."
-        )
-    return run => which
-end
+# A checkpoint source as a string: the core's grammar (`ReactantNitro.parse_source`), so the tools
+# accept exactly what the keyword does, selectors and `Average` included.
+_parse_source(s::AbstractString, kw::AbstractString) = ReactantNitro.parse_source(s; kw = Symbol(kw))
 
 # `resume`: `"auto"` (the same as `"latest => latest"`, starting fresh when there is nothing),
 # `"false"` (the default, start over), or a source as above.
-_parse_resume(s::AbstractString) = s == "auto" ? :auto : s == "false" ? false : _parse_source(s, "resume")
+_parse_resume(s::AbstractString) = _parse_source(s, "resume")
 
 # `weights`: a source as above. The tools' `checkpoint` argument is the deprecated spelling, mapped
 # here so the constructor sees `weights` alone.
@@ -732,27 +707,30 @@ end
 
 Start training an experiment in the background and return the run id immediately.
 
-`experiment` is a module-qualified type string for an `@experiment` struct loaded in this session,
-e.g. `MyModels.MnistMLP`. The typed keywords are run knobs passed to `Nitro`, beating the
-experiment's own accessor for this run: `max_epochs`, `run_dir`, `seed`, `n_devs`, `accum`,
+`experiment` is the module-qualified name of an `@experiment` type loaded in this session, e.g.
+`MyModels.MnistMLP`. The typed keywords are run settings passed to `Nitro`, overriding the
+experiment's own accessors for this run: `max_epochs`, `run_dir`, `seed`, `n_devs`, `accum`,
 `gradient_clip_norm`, `preset` (a name from `presets(MyExp)`), `resume` and `weights`.
 
 `weights` and `resume` take a checkpoint source: a path, or `"run => checkpoint"` with the run
 `latest` (the most recent run in `run_dir`), `all` (every run, only as `"all => best"`) or a run id
 (the `run` of `read_manifest`, listed by `runs(run_dir)`), and the checkpoint `best` (the best by
 the checkpointer's current metric) or `latest` (the run's newest record): `"latest => best"`,
-`"a1b2c3d4 => best"`, `"all => best"`, `"latest => latest"`. Bare `"best"` and `"latest"` are
+`"a1b2c3d4 => best"`, `"all => best"`, `"latest => latest"`. `weights` also takes an average of a
+run's checkpoints, written as in Julia: `"latest => Average(Last(10))"`,
+`"latest => Average(Best(5; among = Last(20)))"`. Bare `"best"` and `"latest"` are
 refused. `resume` also takes `"auto"` (the same as `"latest => latest"`, starting fresh when there
 is nothing to resume) and `"false"` (the default). `weights` gives the parameters alone, with a
 fresh optimizer; `restore_optimizer = true` also takes that record's optimizer state, with a fresh
 step, epoch and schedule. `restore_best = true` ends the run by loading its own best checkpoint
-into the handle, which a later `nitro_validate`/`nitro_evaluate`/`nitro_export` with this run's id
+(`restore_best = "Average(Last(10))"`: the average of its own latest 10) into the handle, which a later `nitro_validate`/`nitro_evaluate`/`nitro_export` with this run's id
 then uses. `overrides` carries experiment-field values as a comma-separated `name=value` list of
 Julia literals, e.g. `overrides="width=128, labels=[1.0,2.0]"`; an unknown field or a key given in
 both places is an error.
 
 Poll `nitro_status(run_id=...)` until the run completes; `nitro_runs()` lists all runs.
-`nitro_stop(run_id=...)` stops gracefully after the current epoch's validation and checkpoint.
+`nitro_stop(run_id=...)` stops it at the next step boundary; validation and the checkpoint still
+run.
 
 ```julia
 nitro_train(experiment="MyModels.MnistMLP", max_epochs=40, run_dir="runs/mnist_v1")
@@ -773,7 +751,7 @@ function nitro_train(
         weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
         restore_optimizer::Bool = false,
-        restore_best::Bool = false,
+        restore_best::Union{Bool, String, Nothing} = nothing,
         overrides::Union{String, Nothing} = nothing,
     )
     kwargs = _collect_run_kwargs(;
@@ -783,7 +761,8 @@ function nitro_train(
     w === nothing || push!(kwargs, :weights => w)
     # Passed only when set, so the constructor's own default stays the one authority.
     restore_optimizer && push!(kwargs, :restore_optimizer => true)
-    restore_best && push!(kwargs, :restore_best => true)
+    rb = restore_best === nothing ? false : ReactantNitro.parse_restore_best(restore_best)
+    rb === false || push!(kwargs, :restore_best => rb)
     state = _new_run(:train, experiment)
     _launch_run!(state) do
         _train_task(state, experiment, overrides, kwargs, preset)
@@ -796,12 +775,12 @@ end
 """
     nitro_validate(; run_id, experiment, weights, overrides, ...) -> String
 
-Run the `val` split over a `Nitro` in the background and return the run id immediately. Pass
-exactly one of `run_id` (a completed train run in this session, whose trained `Nitro` is reused)
-or `experiment` (a type string; `weights` loads trained weights: a path, or a source such as
-`"latest => best"` or `"<run id> => best"`, as for `nitro_train`). The remaining typed keywords are run knobs for the `experiment`
-construction; `overrides` has `nitro_train`'s format. Poll `nitro_status(run_id=...)` for the
-finalized metrics.
+Run the `val` split in the background and return the run id immediately. Pass exactly one of
+`run_id` (a finished run in this session, whose `Nitro` is reused) or `experiment` (a type name;
+`weights` loads trained weights from a path or a source such as `"latest => best"` or
+`"<run id> => best"`, as for `nitro_train`). The other typed keywords are run settings for the
+`experiment` construction; `overrides` has `nitro_train`'s format. Poll `nitro_status(run_id=...)`
+for the finalized metrics.
 """
 function nitro_validate(
         ;
@@ -837,9 +816,9 @@ end
 """
     nitro_evaluate(; run_id, experiment, split="test", weights, overrides, ...) -> String
 
-Run one split (default `"test"`) over a `Nitro` in the background and return the run id
-immediately. Otherwise identical to `nitro_validate`: pass `run_id` or `experiment` (plus
-`weights` for trained weights), and poll `nitro_status(run_id=...)` for the metrics.
+Run one split (default `"test"`) in the background and return the run id immediately. Otherwise
+the same as `nitro_validate`: pass `run_id` or `experiment` (plus `weights` for trained weights),
+and poll `nitro_status(run_id=...)` for the metrics.
 
 ```julia
 nitro_evaluate(run_id="a1b2c3d4")
@@ -886,11 +865,11 @@ end
 Run `predict` on one batch in the background and return the run id immediately.
 
 `inputs` is the batch as `name=value` literals, one per field `forward` declares, e.g.
-`inputs="x=[1.0,2.0,3.0]"` or `inputs="x=[1.0 2.0 3.0; 4.0 5.0 6.0]"`. The batch axis is
-LAST, exactly as the framework asserts on every batch. Arrays are converted to Float32. The
-result carries each output's shape and the first few values, never the full arrays.
+`inputs="x=[1.0,2.0,3.0]"` or `inputs="x=[1.0 2.0 3.0; 4.0 5.0 6.0]"`. The batch axis is last.
+Numeric arrays are converted to Float32. The result gives each output's shape and first five
+values, not the full arrays.
 
-Pass `run_id` (a completed train run) or `experiment` plus `weights` for trained weights.
+Pass `run_id` (a finished run in this session) or `experiment` plus `weights` for trained weights.
 """
 function nitro_predict(
         ;
@@ -927,26 +906,26 @@ end
 """
     nitro_export(; run_id, experiment, dir, name, backend="reactant_server",
                  batch_sizes="[1]", provenance_root, provenance, weights,
-                 overrides, ...) -> String
+                 overrides, data="none", ...) -> String
 
 Export a trained model in the background and return the run id immediately.
 
-`dir` and `name` are required; the artifact lands in `dir/name`. `backend` is
-`"reactant_server"` (the shipped StableHLO bundle backend, loaded on demand) or a backend
+`dir` and `name` are required; the artifact is written to `dir/name`. `backend` is
+`"reactant_server"` (the StableHLO bundle backend, whose package is loaded on demand) or a backend
 registered for this session. `batch_sizes` is a vector literal, e.g. `"[1, 8]"`. Pass `run_id` (a
-completed train run) or `experiment` plus `weights`; export asserts a single-device handle.
+finished run in this session) or `experiment` plus `weights`. Export needs a single-device handle,
+so an `experiment` export defaults to `n_devs = 1` and refuses any other value.
 
-`provenance_root` is the repository root to collect repository state from: the git commit, tree
-hash and, on a dirty tree, the `working_tree.patch` that ties the artifact to the code that produced
-it. Omitted, the export succeeds, every check passes, and the bundle cannot say which code built it;
-fine for a throwaway export and wrong for anything that gets registered. `provenance` is a
-`name=value` list merged last, for one-off scalars; a model's own facts belong in its
-`export_provenance_extra` hook.
+`provenance_root` is the repository to record in the provenance: the git commit, tree hash and, on
+a dirty tree, the `working_tree.patch`. Without it the export succeeds, but the bundle cannot say
+which code built it; pass it for any export you will keep. `provenance` is a `name=value` list
+merged last, for one-off values; a model's own facts belong in its `export_provenance_extra` hook.
 
-An `experiment` export does not build the training data (the `Nitro(e; weights, data = (;))`
-construction `export_model` prescribes), so a model whose exportable handle differs from its
-trainable one is exportable by putting the flag in `overrides`. `data = "build"` calls `build_data`
-anyway, for a model whose `derive` reads its data on an export with no checkpoint.
+An `experiment` export builds no data by default (`data = "none"`, which constructs
+`Nitro(e; weights, data = (;))`), so a model with an export-only setting can be exported by setting
+it in `overrides`. `data = "build"` calls `build_data`, for a model whose `derive` needs its data when
+there is no checkpoint; `data` is accepted only with `experiment`. A handle built for the export is
+finished with `Done` afterwards, so its monitors and data sources shut down.
 
 ```julia
 nitro_export(run_id="a1b2c3d4", dir="export_out", name="mnist_v1",
@@ -1055,9 +1034,9 @@ end
 """
     nitro_runs() -> String
 
-List every run this session's registry knows about: id, kind, status, phase, epoch, step,
-latest loss, and run_dir. Runs are process-local, so a session restart starts with an empty
-list; checkpoints are the restart story.
+List the runs in this session's registry, newest first: id, kind, status, phase, epoch, step and
+latest loss. Only the 20 most recent finished runs are kept. The registry is process-local, so a
+session restart empties it; checkpoints are what survive a restart.
 """
 function nitro_runs()
     return lock(RUNS_LOCK) do
@@ -1080,10 +1059,9 @@ end
 """
     nitro_status(run_id) -> String
 
-Report one run: status, current phase, epoch and step (while running), the latest train loss
-and validation metrics, run_dir, the result summary on completion, or the error text on
-failure. A run id comes from `nitro_train`/`nitro_validate`/`nitro_evaluate`/`nitro_predict`/
-`nitro_export` or from `nitro_runs()`.
+Report one run: status; phase, epoch and step while running; the latest train loss and validation
+metrics; run_dir; the logger; and the result summary on completion or the error text on failure.
+Run ids come from the tool that started the run, or from `nitro_runs()`.
 """
 function nitro_status(run_id::AbstractString)
     state = _get_run(run_id)
@@ -1097,8 +1075,8 @@ end
 """
     ReactantNitro.run_state(run_id) -> NamedTuple
 
-The registry's answer for `ReactantNitro.run_state`: the same facts `nitro_status` renders, as data.
-Documented on the stub in `src/Runs.jl`; this is the method.
+The method behind `ReactantNitro.run_state`, which is documented in `src/Runs.jl`: the facts
+`nitro_status` renders, as a `NamedTuple`, plus `elapsed_s`.
 """
 function ReactantNitro.run_state(run_id::AbstractString)
     state = _get_run(run_id)
@@ -1119,10 +1097,10 @@ end
 """
     nitro_logger(run_id) -> String
 
-Report the run's logger: the backend's type and the key identifying parameters its
-`logger_info` exposes, e.g. a hosted tracker's experiment key and URL, a W&B run id and project,
-or the shipped JSON logger's metrics file path. Reads the live logger off the run's `Nitro`, so
-the answer is current even while the run trains.
+Report the run's logger: the backend's type and the identifying fields its `logger_info` returns,
+e.g. a hosted tracker's experiment key and URL, a W&B run id and project, or the default JSON
+logger's file path. It reads the live logger on the run's `Nitro`, so it works while the run
+trains.
 
 ```julia
 nitro_logger(run_id="a1b2c3d4")
@@ -1164,9 +1142,9 @@ end
 """
     nitro_stop(run_id) -> String
 
-Request a graceful stop of a running train or eval run: the epoch finishes, validation runs,
-the checkpoint is written, and the run exits through the normal `Done` path. Poll
-`nitro_status(run_id=...)` to watch it wind down.
+Request a graceful stop of a running train or eval run. Training stops at the next step boundary,
+then validates, writes the checkpoint and exits through `Done`; an eval run stops at the next batch.
+Poll `nitro_status(run_id=...)` to see it finish.
 """
 function nitro_stop(run_id::AbstractString)
     state = _get_run(run_id)
@@ -1179,8 +1157,8 @@ function nitro_stop(run_id::AbstractString)
         "ReactantNitro ReactantNitroKaimonGateExt: run `$(run_id)` has no live `Nitro` to stop."
     )
     ReactantNitro.request_stop!(state.nitro)
-    return "stop requested for run $(run_id); it will finish the current epoch, validate, and \
-            checkpoint before exiting. Poll `nitro_status(run_id=\"$(run_id)\")`."
+    return "stop requested for run $(run_id); it stops at the next step boundary, then validates \
+            and checkpoints before exiting. Poll `nitro_status(run_id=\"$(run_id)\")`."
 end
 
 """
@@ -1190,8 +1168,8 @@ Configure this session's accelerator for every subsequent run, or report the cur
 configuration with no arguments. The tool form of `ReactantNitro.setup_devices!`. `backend` is
 `"cpu"`, `"gpu"`, `"cuda"`, `"rocm"` or `"tpu"`; omit it for Reactant's default. `n_devs` pins how
 many visible devices runs shard over; visibility is fixed for the process, so restrict GPUs with
-`CUDA_VISIBLE_DEVICES` at session start. The pin beats an experiment's `n_devs`; an explicit
-keyword on `nitro_train` still wins for that run.
+`CUDA_VISIBLE_DEVICES` at session start. The pin overrides an experiment's `n_devs`; an explicit
+`n_devs` on `nitro_train` still overrides the pin for that run.
 
 ```julia
 nitro_setup(backend="cpu")            # run everything on CPU
@@ -1292,10 +1270,10 @@ end
 """
     reinstall_kaimon_tools() -> Bool
 
-Register the `nitro_*` GateTools with the Kaimon gate, unconditionally, starting a gate if none is
-running. Called automatically on load; call it again after a manual `KaimonGate.stop()`/`serve()`
-cycle or when another extension's `serve(tools=...)` replaced this session's tools, as
-`Base.get_extension(ReactantNitro, :ReactantNitroKaimonGateExt).reinstall_kaimon_tools()`.
+Register the `nitro_*` GateTools with the Kaimon gate, starting a gate if none is running, and
+return whether it succeeded. The extension registers on load; call this after a manual
+`KaimonGate.stop()`/`serve()` cycle, or when another `serve(tools=...)` replaced this session's
+tools, as `Base.get_extension(ReactantNitro, :ReactantNitroKaimonGateExt).reinstall_kaimon_tools()`.
 """
 function reinstall_kaimon_tools()
     return _install_tools()

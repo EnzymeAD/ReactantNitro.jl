@@ -223,7 +223,7 @@
         @test dat["required"] == false
         @test dat["is_kwarg"] == true
         @test dat["type_meta"]["kind"] == "string"
-        @test occursin("does not build the training data", xmeta["description"])
+        @test occursin("builds no data by default", xmeta["description"])
     end
 
     @testset "nitro_setup / setup_devices!" begin
@@ -327,6 +327,8 @@
         @test got == ("a1b2c3d4" => :latest) && first(got) isa String
         @test EXT._parse_weights("a1b2c3d4 => best") == ("a1b2c3d4" => :best)
         @test EXT._parse_weights("runs/x/epoch-0003.jld2") == "runs/x/epoch-0003.jld2"
+        # The core grammar: selectors and averages as written in Julia.
+        @test EXT._parse_weights("latest => Average(Last(10))") == (:latest => Average(Last(10)))
         @test EXT._parse_resume("latest => latest") == (:latest => :latest)
         @test EXT._parse_resume("a1b2c3d4 => best") == ("a1b2c3d4" => :best)
         @test EXT._parse_resume("all => best") == (:all => :best)

@@ -15,20 +15,20 @@
     ExportSpec(name; from = nothing)
     ExportSpec(name, dtype, shape; batch_axis = length(shape), axis_letters = nothing, from = nothing)
 
-One tensor's declaration, in the framework's vocabulary; a backend translates it. `shape` is the
+One tensor's declaration for export, which a backend translates into its own format. `shape` is the
 Julia shape and `batch_axis` a 1-based Julia axis. Which fields are required depends on the hook:
 
 | hook | `dtype`/`shape` | `batch_axis` | `axis_letters`, `-1` |
 | --- | --- | --- | --- |
-| [`export_inputs`](@ref) | **required**, the framework builds example arrays from them | must be last | rejected |
-| [`export_outputs`](@ref) | optional, derived from the trace and verified if given | must be last | rejected |
-| [`export_client_outputs`](@ref) | **required**, a postprocess is opaque Julia | free | allowed |
+| [`export_inputs`](@ref) | required; the framework builds example arrays from them | must be last | rejected |
+| [`export_outputs`](@ref) | optional; derived from the trace, and checked against it if given | must be last | rejected |
+| [`export_client_outputs`](@ref), [`export_client_inputs`](@ref) | required; the framework never runs the postprocess | free | allowed |
 
-The executable side is traced, so its shapes are facts and batch-last is enforced; the client side
-is the output of a `model.jl` the framework never runs, so it declares everything. `axis_letters`
-names the non-batch axes in `shape` order, e.g. `['w', 'h']`; a `-1` in `shape` marks a variable
-non-batch axis. `from` names the source of an output separately from what the bundle calls it, and
-is meaningful only on [`export_outputs`](@ref).
+The executable side is traced, so its shapes are known and batch-last is enforced. The client side
+is what a `model.jl` the framework never runs produces or receives, so it must be declared in full.
+`axis_letters` names the non-batch axes in `shape` order, e.g. `['w', 'h']`; a `-1` in `shape`
+marks a variable non-batch axis. `from` gives an output a source other than its own name, and is
+accepted only on [`export_outputs`](@ref).
 """
 struct ExportSpec
     name::String
@@ -78,7 +78,7 @@ spec_names(specs::AbstractVector{ExportSpec}) = Tuple(Symbol(s.name) for s in sp
 """
     ReactantNitro.spec_sources(specs) -> Tuple{Vararg{Symbol}}
 
-Where each output spec's data comes from: its `from` when it declares one, else its own name.
+The source of each output spec: its `from` when it declares one, else its own name.
 """
 spec_sources(specs::AbstractVector{ExportSpec}) =
     Tuple(s.from === nothing ? Symbol(s.name) : s.from for s in specs)
@@ -88,11 +88,11 @@ spec_sources(specs::AbstractVector{ExportSpec}) =
 """
     export_inputs(e) -> Vector{ExportSpec}
 
-Required. The wire contract: what a client sends, in the order it sends it. The order fixes the
-positional order the program is traced with and the tensor names in the bundle, so reordering
-changes the wire contract silently. Each spec needs a `dtype` and a `shape`, since the framework
-builds the example arrays it traces from them, and the batch axis must be last; its size is a
-placeholder overwritten by each of `export_model`'s `batch_sizes`.
+Required. The tensors a client sends, in the order it sends them. The order fixes the positional
+order the program is traced with and the tensor names in the bundle, so reordering the specs
+changes the wire contract. Each spec needs a `dtype` and a `shape`, from which the framework builds
+the example arrays it traces, and the batch axis must be last; its size is a placeholder replaced by
+each of `export_model`'s `batch_sizes`.
 
 ```julia
 export_inputs(e::CropClassifier) = [ExportSpec("img", UInt8, [e.sz, e.sz, 1, 1])]
@@ -103,42 +103,41 @@ function export_inputs end
 """
     export_outputs(e) -> Vector{ExportSpec}
 
-Required. Which leaves of `forward`'s output tree ship, and what they are called. `forward` returns
-what training needs, routinely more than a client wants, and naming a subset needs no second
-program. Each name must be a key of the `NamedTuple` `forward` returns, or the single spec naming a
-bare array return. `dtype` and `shape` are derived from the trace; supplying them makes them
-assertions.
+Required. Which leaves of `forward`'s output ship, and under what names. `forward` often returns
+more than a client needs, and selecting a subset here needs no second program. Each spec's source
+(its `from`, else its name) must be a key of the `NamedTuple` `forward` returns or a wire input;
+when `forward` returns a bare array, there must be exactly one spec. `dtype` and `shape` are derived
+from the trace; if given, they are checked against it, excluding the batch axis.
 
-`from` separates a bundle's tensor name from the leaf that produced it, so an export concern never
-rewrites the trained program: a rename (`state_out` from `forward`'s `g_pred`) and an echo (a wire
-input a serve-time postprocess needs back, since it receives outputs only) would otherwise both
-require `forward` to return an extra leaf and recompile the gradient program.
+`from` lets a bundle's tensor name differ from its source, so export needs no change to `forward`
+and no recompile of the training program. It covers a rename (`state_out` from `forward`'s
+`g_pred`) and an echo: a wire input returned as an output, because a serve-time postprocess
+receives only outputs.
 
 ```julia
 export_outputs(e::Refiner) = [
     ExportSpec("state_out"; from = :g_pred),   # rename: a leaf `forward` returns
-    ExportSpec("path_len"),                    # the ordinary case, name IS the source
+    ExportSpec("path_len"),                    # the usual case: the name is the source
     ExportSpec("valid"; from = :valid),        # echo: a wire input, returned to the client
 ]
 ```
 
-An echo must say so: a spec whose name matches a wire input is refused without an explicit `from`.
-The value echoed is the wire value, not the preprocessed one.
+An echo must declare `from`: a spec whose source is a wire input is refused without one. The echoed
+value is the wire value, not the preprocessed one.
 """
 function export_outputs end
 
 """
     export_preprocess(e, wire...) -> NamedTuple
 
-Optional, and traced: the seam between the wire and the batch. It receives one positional argument
-per [`export_inputs`](@ref) spec and returns the `NamedTuple` batch `forward` declares its keywords
-against, inside the compiled program. With no method, each wire input maps to a batch field of the
-same name. It obeys every rule a traced hook obeys.
+Optional and traced. Converts the wire inputs into the batch `forward` takes, inside the compiled
+program. It receives one positional argument per [`export_inputs`](@ref) spec and returns the
+`NamedTuple` batch `forward` declares its keywords against. With no method, each wire input becomes
+the batch field of the same name. It follows the same rules as any traced hook.
 
-It is also called eagerly, on host arrays, by `export_model`'s verification probe and the backend's
-shape discovery, so it has to work in both modes, and the most common thing it does works in only
-one: `Float32.(img)` has no traced broadcast method for an integer array. The wire conversion needs
-two methods:
+It is also called eagerly on host arrays, by `export_model`'s routing and verification probe and by
+the backend's shape discovery, so it must work in both modes. The usual conversion does not:
+`Float32.(img)` has no traced broadcast method for an integer array, so it needs two methods:
 
 ```julia
 _wire_to_f32(x::AbstractArray) = Float32.(x) ./ 255.0f0
@@ -151,23 +150,24 @@ export_preprocess(e::CropClassifier, img) = (; img = _wire_to_f32(img))
 function export_preprocess end
 
 """
-    export_postprocess(e) -> String
+    export_postprocess(e) -> Union{String,Nothing}
 
 Optional. The source of the `model.jl` that ships in the bundle, for work that does not belong in
-a compiled graph: a softmax, a decode. The framework never runs it. Returning a source string
-commits you to [`export_client_outputs`](@ref) or [`export_client_inputs`](@ref) when the
-postprocess changes what a client receives; `nothing` (the default) commits you to neither.
+a compiled graph, such as a softmax or a decode. The framework never runs it. The default is
+`nothing`, which ships no `model.jl`. When the postprocess changes what a client receives, declare
+that with [`export_client_outputs`](@ref) or [`export_client_inputs`](@ref); both are refused
+without a postprocess.
 """
 export_postprocess(e) = nothing
 
 """
-    export_client_outputs(e) -> Vector{ExportSpec}
+    export_client_outputs(e) -> Union{Vector{ExportSpec},Nothing}
 
 Optional. What a client receives after [`export_postprocess`](@ref) has run, when that differs from
-what the executable emits; refused without a postprocess, since the server would reject the bundle.
-The framework cannot derive these, so `dtype` and `shape` are required, `batch_axis` is
-unconstrained (unenforceable rather than encouraged; batch-last remains the convention), and
-`axis_letters` and `-1` axes are available.
+what the executable emits. Refused without a postprocess, since the server would reject the bundle.
+The framework cannot derive these, so `dtype` and `shape` are required. `batch_axis` is not checked,
+though batch-last is still the convention, and `axis_letters` and `-1` axes are allowed. The default
+is `nothing`.
 
 ```julia
 export_client_outputs(e::CropClassifier) = [
@@ -179,12 +179,12 @@ export_client_outputs(e::CropClassifier) = [
 export_client_outputs(e) = nothing
 
 """
-    export_client_inputs(e) -> Vector{ExportSpec}
+    export_client_inputs(e) -> Union{Vector{ExportSpec},Nothing}
 
-Optional. The client-facing spec of the inputs, for the one thing not derivable about them:
-`axis_letters`. The executable inputs already are the wire inputs, so with no method the server
-falls back to them; the tracer cannot carry letters, so a model that wants `"whcn"` in its manifest
-says so here. Requires [`export_postprocess`](@ref), as [`export_client_outputs`](@ref) does.
+Optional. Client-facing input specs, used to put `axis_letters` (e.g. `"whcn"`) in the manifest,
+which the traced specs cannot carry. Each spec needs a `dtype` and a `shape`. With no method (the
+default, `nothing`) the server uses the executable input specs, which are the wire inputs. Requires
+[`export_postprocess`](@ref), as [`export_client_outputs`](@ref) does.
 
 ```julia
 export_client_inputs(e::Refiner) = [
@@ -198,15 +198,14 @@ export_client_inputs(e) = nothing
 """
     export_provenance_extra(e; checkpoint = nothing) -> Dict{String,Any}
 
-The model's half of a bundle's provenance, merged on top of the framework's and the site's; the
-default is empty. It carries what a consumer of this particular model needs and no tensor shape
-reveals: the labeling variant, the class names in order, the crop geometry. A hook rather than a
-caller-merged dictionary because omitting the argument produced a bundle that looked complete and
-was untraceable.
+The model's own provenance entries, merged over the framework's and the site's; the default is
+empty. Use it for facts a consumer of this model needs and no tensor shape shows: the labeling
+variant, the class names in order, the crop geometry. It is a hook so that every export includes
+it without the caller having to pass it.
 
-`checkpoint` is the file the weights came from, or `nothing` for fresh weights, passed from
-`Nitro.checkpoint_source`; a model asserting anything about its training data should report those
-fields as unverifiable when there is no checkpoint behind them.
+`checkpoint` is the file the weights came from (`Nitro.checkpoint_source`), or `nothing` for fresh
+weights. With no checkpoint, a model should report any claim about its training data as
+unverifiable.
 
 ```julia
 function ReactantNitro.export_provenance_extra(e::MyExp; checkpoint = nothing)
@@ -220,8 +219,8 @@ function ReactantNitro.export_provenance_extra(e::MyExp; checkpoint = nothing)
 end
 ```
 
-This half wins over the framework's and the site's keys; the explicit `provenance` argument wins
-over it.
+These keys override the framework's and the site's; `export_model`'s `provenance` argument
+overrides them.
 """
 export_provenance_extra(e; checkpoint = nothing) = Dict{String, Any}()
 
@@ -230,18 +229,18 @@ export_provenance_extra(e; checkpoint = nothing) = Dict{String, Any}()
 """
     ReactantNitro.ExportBackend
 
-The supertype of an export target. One verb, [`write_export`](@ref), dispatches on the backend
-value. The framework ships no method for any backend; `ReactantServerBundle`'s lives in a package
-extension, so this package depends on no artifact format.
+The supertype of an export target. A backend implements one method, [`write_export`](@ref). The
+methods for [`ReactantServerBundle`](@ref) and [`TFSavedModel`](@ref) live in package extensions,
+so this package depends on no artifact format.
 """
 abstract type ExportBackend end
 
 """
     ReactantNitro.ReactantServerBundle()
 
-The StableHLO bundle target consumed by ReactantServer. The type is declared here so it can be named
-and exported; its [`write_export`](@ref) method lives in the `ReactantServerExport` extension, so
-`using ReactantServerExport` is what makes an export actually happen.
+The StableHLO bundle format served by ReactantServer. The type is defined here so it can be named;
+its [`write_export`](@ref) method lives in the `ReactantServerExport` extension, so an export needs
+`using ReactantServerExport`.
 """
 struct ReactantServerBundle <: ExportBackend end
 
@@ -252,15 +251,15 @@ struct ReactantServerBundle <: ExportBackend end
 A TensorFlow SavedModel for TF Serving and the platforms built on it. Each traced program is one
 `XlaCallModule` op, the form JAX's native serialization produces, and weights are non-trainable
 variables shared by every signature. Its [`write_export`](@ref) lives in the `PythonCall`
-extension and drives TensorFlow to write the files, so `using PythonCall` with `tensorflow`
-importable is what makes an export happen.
+extension, which drives TensorFlow to write the files, so an export needs `using PythonCall` and an
+importable `tensorflow`.
 
 There is one signature per entry of `batch_sizes`, `serving_b{N}`, with `serving_default` the
 first. Tensors are batch-first: the Julia shape `(W, H, C, N)` is the TF shape `[N, C, H, W]`.
-`model.jl` cannot ship, so a postprocess that changes the client contract is refused and any other
-postprocess is dropped with a warning. Provenance lands in `assets.extra/`.
+`model.jl` cannot ship, so [`export_client_outputs`](@ref) is refused and any postprocess is
+dropped with a warning. Provenance is written to `assets.extra/`.
 
-`platform` is the one platform the module runs on (`"CUDA"`, `"CPU"`, `"ROCM"`, `"TPU"`). The
+`platform` is the single platform the module runs on (`"CUDA"`, `"CPU"`, `"ROCM"`, `"TPU"`). The
 defaults load on TF 2.17 and later; TF 2.15 needs `stablehlo_version = v"0.14.0"` and
 `call_module_version = 8`. A module using an op newer than `stablehlo_version` fails to export.
 """
@@ -285,13 +284,15 @@ end
 """
     write_export(backend, model, ps, st, example_inputs; kwargs...) -> String
 
-The one verb a backend implements, returning the path it wrote. `model` is a callable with the
-`model(inputs, ps, st) -> (outputs, st)` shape a Lux-style tracer expects, already carrying
-`compile_view(e)`, the routing, the traced preprocess and the output selection. Keywords, all
-supplied by [`export_model`](@ref): `dir`, `name`; `input_names` and `output_names` in program
-order; `output_select`, mapping the raw `forward` return to the ordered tuple that ships;
-`client_inputs`, `client_outputs`, `postprocess` (`nothing` or the client-side pieces);
-`batch_sizes`, each a separately compiled program; `provenance`, already merged.
+Write the artifact for `backend` and return the path written; the one method a backend implements.
+`model` is a callable `model(inputs, ps, st) -> (outputs, st)`, the form a Lux-style tracer
+expects, that carries [`export_view`](@ref)`(e)`, the routing, the preprocess and any echoes, and
+returns `forward`'s full output. `ps` and `st` are host trees, `st` in test mode, and
+`example_inputs` is a tuple of host wire arrays at the first batch size. Keywords, all supplied by
+[`export_model`](@ref): `dir`, `name`; `input_names` and `output_names` in program order;
+`output_select`, mapping `model`'s output to the ordered tuple that ships; `client_inputs`,
+`client_outputs`, `postprocess` (each `nothing` or the hook's value); `batch_sizes`, each a
+separately compiled program; `provenance`, already merged.
 """
 function write_export end
 
@@ -313,11 +314,12 @@ end
 """
     site_provenance(backend, root) -> Dict{String,Any}
 
-The site's half of a bundle's provenance: repository state collected at `root`, which the caller
-names so nothing is guessed. The default is [`git_provenance`](@ref)`(root)`. A verb on the backend
-so a format with its own collector can use it: `ReactantServerBundle` answers with
-`ReactantServerExport.collect_provenance`. A `git_diff` entry is a full patch, which the backend
-writes beside the artifact rather than into its metadata.
+Repository state for a bundle's provenance, collected at `root` (`export_model`'s
+`provenance_root`; nothing is collected without one). The default is
+[`git_provenance`](@ref)`(root)`. It dispatches on the backend so a format can use its own
+collector: `ReactantServerBundle` uses `ReactantServerExport.collect_provenance`. A `git_diff`
+entry is a full patch, which the backend writes as a file beside the artifact rather than into its
+metadata.
 """
 site_provenance(::ExportBackend, root) = git_provenance(root)
 
@@ -336,8 +338,8 @@ end
 Repository state at `root`: `git_commit`, `git_tree_sha1`, `git_branch`, `git_dirty`,
 `repo_remote`, and on a dirty tree `git_diff`, the full `git diff --binary HEAD`, so the commit
 plus the patch reconstructs the exported code (untracked files are not captured). Also
-`exported_at` (UTC) and `julia_version`. A field git cannot answer is omitted, and a `root` outside
-a work tree warns and omits them all.
+`exported_at` (UTC) and `julia_version`. A field git cannot answer is omitted; a `root` outside a
+work tree warns and omits every git field.
 """
 function git_provenance(root)
     root = String(root)
@@ -396,9 +398,18 @@ function (f::ExportForward{K, ECHO})(a, ps, st) where {K, ECHO}
     )
     outputs, st_new = call_hook(forward, :forward, f.router, batch, f.ev, f.inner, ps, st)
     # The echo: a wire tensor the postprocess needs back, merged here rather than asked of `forward`
-    # so an export concern stays out of the trained program. The WIRE value is echoed. Merged after
-    # `forward`, so a name it returned is not overwritten; `check_export_sources` refuses that.
+    # so an export concern stays out of the trained program. The WIRE value is echoed. `merge` would
+    # let it replace an output `forward` returned under the same name, so that is refused.
     isempty(ECHO) && return outputs, st_new
+    if outputs isa NamedTuple
+        clash = filter(k -> haskey(outputs, k), ECHO)
+        isempty(clash) || error(
+            """
+            ReactantNitro: `export_outputs` echoes the wire input$(length(clash) == 1 ? "" : "s")
+            $(join(("`$k`" for k in clash), ", ")), and `forward` also returns an output of that name.
+            The echo would replace the model's output in the bundle. Rename the input or the output."""
+        )
+    end
     wired = NamedTuple{K}(wire)
     return merge(outputs, NamedTuple{ECHO}(map(k -> getfield(wired, k), ECHO))), st_new
 end
@@ -446,29 +457,29 @@ end
 """
     export_view(e) -> e_export
 
-The view of an experiment a frozen trace sees: [`compile_view`](@ref)'s stripping of every `Host`
-field, then every surviving device-resident value read back to the host.
+The experiment as an exported trace sees it: [`compile_view`](@ref)`(e)`, which drops every `Host`
+field, with every remaining device-resident value copied to the host.
 
-A [`Device`](@ref) field is a traced input while the framework owns both ends of the call. An
-exported bundle is `executable(inputs..., weights...)` and nothing more, and Reactant lifts every
-device-resident value reachable from a traced closure into an argument the bundle has no name for,
-so the artifact fails every inference with `Execution supplied N+1 arguments but compiled program
-expected N+4`. So the export view freezes: a `Device` field `forward` never reads becomes a host
-value nothing reads, and one it does read bakes into the graph as the value it held. Filtering
-could not work, since nothing declares which fields `forward` reads. A large frozen array costs
-artifact size once per batch size; an experiment carrying one should override this method.
+In training, a [`Device`](@ref) field is a traced input. An exported bundle is called as
+`executable(inputs..., weights...)`, and Reactant lifts every device-resident value a traced
+closure reaches into an extra argument the bundle cannot supply, so the bundle would fail every
+inference with an argument-count mismatch. Copying to the host avoids that: a `Device` field
+`forward` reads is baked into the graph at its current value, and one it does not read is unused.
+The view cannot drop the unread fields instead, since nothing declares which fields `forward`
+reads. A large baked-in array is stored once per batch size; an experiment holding one should
+override this method.
 """
 export_view(e) = host_tree(compile_view(e))
 
 """
     ReactantNitro.host_rngs(x) -> x
 
-Every `AbstractRNG` in a tree replaced by a host RNG, on the parameters and layer state on the way
-to a backend. This closes [`host_tree`](@ref)'s one deliberate blind spot: `Reactant.ReactantRNG`
-passes through it unchanged, and at export the state is traced, so a device-resident seed is lifted
-into an MLIR argument exactly as a `Device` field is. Replaced rather than removed, since a
-testmode `Dropout` still dispatches on the RNG's type. This assumes the exported program never
-draws from an RNG; a layer that samples at inference would bake one fixed draw.
+Replace every `AbstractRNG` in a tree with a host RNG (`Xoshiro(0)`); applied to the parameters
+and layer state before export. [`host_tree`](@ref) passes a `Reactant.ReactantRNG` through
+unchanged, and a device-resident seed in the traced state would be lifted into an MLIR argument, as
+a `Device` field would. The RNG is replaced rather than removed because a test-mode `Dropout` still
+dispatches on its type. This assumes the exported program never draws from an RNG; a layer that
+samples at inference would bake in one fixed draw.
 """
 host_rngs(::Random.AbstractRNG) = Random.Xoshiro(0)
 
@@ -493,11 +504,11 @@ end
 """
     ReactantNitro.check_export_residency(program, ps, st) -> nothing
 
-The export view's invariant, asserted before the trace: nothing reachable from the traced closure
-is device-resident. The same fault otherwise costs a compile, a write, a deploy and a serve-time
-round trip to surface as an argument-count mismatch. It walks `program` rather than converting it,
-since `ExportForward` carries its names as type parameters; the pieces are converted and the whole
-is asserted, so a device value baked into the model by `build_model` is named here.
+Raise, naming each path, if anything reachable from the traced closure (`program`, `ps`, `st`) is
+device-resident. Checked before the trace, since otherwise the fault first shows at serve time as
+an argument-count mismatch. It checks `program` rather than converting it, since `ExportForward`
+carries its names as type parameters; the experiment, `ps` and `st` are converted beforehand, so a
+hit here is typically a device value `build_model` stored in the model itself.
 """
 function check_export_residency(program, ps, st)
     leaked = String[]
@@ -601,9 +612,9 @@ end
 """
     ReactantNitro.check_export_sources(specs, sources, in_names) -> Tuple{Vararg{Symbol}}
 
-Split `export_outputs`'s sources into the ones `forward` produces and the ones that are ECHOES of wire
-inputs, returning the second set. Refuses the one combination that would be silently wrong: a source
-that is both a wire input and something `forward` returns, where merging could shadow either.
+Return the sources of `export_outputs` that are wire inputs (echoes), in spec order. A spec whose
+source is a wire input must declare `from` explicitly; one that does not is refused, since a name
+that merely coincides with an input is more likely a mistake than an echo.
 """
 function check_export_sources(specs::AbstractVector{ExportSpec}, sources::Tuple, in_names::Tuple)
     echoes = Symbol[]
@@ -721,15 +732,17 @@ end
 """
     export_provenance(nitro) -> Dict{String,Any}
 
-What the framework knows about how these weights came to exist: the flat config, the preset name,
-this package's version, the seed and the run directory. It does not guess at repository state,
-which is [`site_provenance`](@ref)'s job.
+The framework's provenance entries for the handle's weights: `framework`, `reactantnitro_version`,
+`seed`, `run_dir`, the flat `config`, and `preset` when there is one. Repository state is
+[`site_provenance`](@ref)'s job.
 
-It stamps `checkpoint` when the handle restored from one, naming the file the restore actually
-read (`Nitro.checkpoint_source`), and omits the key for fresh weights. It stamps the training run's
-`trained_run_id` and `trained_run_url` from the restored record rather than this handle's logger,
-which on a `weights = path` construction is a fresh one naming the exporting process. The
-checkpoint's epoch and metric are not carried; the record has them if that is ever wanted.
+`checkpoint` names the file the restore read (`Nitro.checkpoint_source`) and is omitted for fresh
+weights. `averaged_from` is present for averaged weights and names what was averaged: the spec,
+run, directory, files, epochs and weights. `weights_from` describes a warm start from another handle (`weights = other::Nitro`): its
+experiment, epoch, step and run directory. `trained_run_id` and `trained_run_url` come from the
+restored record, not this handle's logger, which on a `weights = path` construction names the
+exporting process; each is omitted when unknown. The checkpoint's epoch and metric are not
+included.
 """
 function export_provenance(nitro::Nitro)
     cfg = config_params(nitro.e; seed = nitro.seed)
@@ -743,6 +756,9 @@ function export_provenance(nitro::Nitro)
     nitro.preset === nothing || (prov["preset"] = String(nitro.preset))
     nitro.checkpoint_source === nothing ||
         (prov["checkpoint"] = String(nitro.checkpoint_source))
+    af = nitro.averaged_from
+    af === nothing ||
+        (prov["averaged_from"] = Dict{String, Any}(String(k) => v for (k, v) in pairs(af)))
     # A warm start names the handle it took its weights from, which has no path: the experiment,
     # the epoch and step it had reached, and its run directory are what a reader can chase.
     ws = nitro.weights_source
@@ -777,22 +793,22 @@ _prov_dict(d) = Dict{String, Any}(string(k) => v for (k, v) in pairs(d))
     export_model(nitro, backend; dir, name, batch_sizes = [1],
                 provenance_root = nothing, provenance = Dict()) -> String
 
-Export a trained model to `backend`, and return the path written. It takes a `Nitro`, not a path:
-the handle carries the restored weights, the experiment, the preset and the seed, so no model's
-export code loads a checkpoint.
+Export a trained model to `backend` and return the path written. It takes a `Nitro` rather than a
+checkpoint path, since the handle already carries the restored weights, the experiment, the preset
+and the seed.
 
 ```julia
 using ReactantServerExport                       # the extension that provides the backend
 
-nitro = Nitro(e; weights = "runs/x/best.jld2", data = (;))
+nitro = Nitro(e; weights = :latest => :best, data = (;))
 export_model(nitro, ReactantServerBundle(); dir = "export_out", name = "my_model_v1")
 ```
 
-`data = (;)` is not a workaround: export reads weights and traces a graph. Each entry of
-`batch_sizes` is a separately compiled program. Export is a CPU trace and requires a single-device
-handle.
+`data = (;)` skips `build_data`, which export does not need: it reads weights and traces a graph.
+Each entry of `batch_sizes` is a separately compiled program. Export is a CPU trace and requires a
+single-device handle.
 
-Provenance is assembled from four sources, lowest precedence first:
+Provenance is merged from five layers, lowest precedence first:
 
 | Layer | Source | Reaches the bundle when |
 | --- | --- | --- |
@@ -802,14 +818,14 @@ Provenance is assembled from four sources, lowest precedence first:
 | model | [`export_provenance_extra`](@ref)`(e; checkpoint)` | the experiment implements it |
 | explicit | this call's `provenance` | always, and it wins |
 
-Without `provenance_root` the bundle carries no commit, tree hash or working-tree patch, and says
-so by omitting the keys: an export with no root succeeds and cannot say which code produced it.
+Without `provenance_root` the export still succeeds, but the bundle omits the commit, tree hash and
+working-tree patch, so it cannot say which code produced it.
 
 In order: check the hooks against each other and the batch-last rule, build example wire arrays,
-run the program eagerly once to derive and verify the output shapes, resolve the provenance, and
-hand everything to [`write_export`](@ref), published as [`ExportCompiling`](@ref). Like every entry
-point it runs on a worker thread; ^C aborts the wait and the export completes in the background,
-since a partial bundle is worse than a late one.
+check that nothing traced is device-resident, run the program eagerly once to verify the output
+shapes, merge the provenance, and call [`write_export`](@ref) under the [`ExportCompiling`](@ref)
+phase. Like every entry point it runs off the interactive thread when it can; ^C stops the wait,
+and the export finishes in the background rather than leave a partial bundle.
 """
 function export_model(
         nitro::Nitro, backend::ExportBackend;

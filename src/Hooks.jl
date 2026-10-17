@@ -14,16 +14,17 @@
 """
     ReactantNitro.hook_fn(hooks, name, fallback) -> Function
 
-The hook map's lookup: the supplied function for `name`, or the dispatch-based `fallback`. One
-funnel, so "a map entry shadows the method" is stated once rather than at every call site.
+Look up hook `name`: the function in `hooks` if present, otherwise `fallback`, the generic
+function that dispatches to methods. Every call site goes through this, so a map entry always takes
+precedence over the method.
 """
 hook_fn(hooks, name::Symbol, fallback) = get(hooks, name, fallback)
 
 """
     ReactantNitro.hook_fns(routing) -> NamedTuple
 
-The hook map carried by a routing, or `(;)` when there is none; guarded because the eval path can
-carry `nothing` and the suite hand-builds routing tuples.
+The hook map stored in a routing under `fns`, or `(;)` when there is none, as for a `nothing`
+routing on the eval path or a routing tuple the test suite builds by hand.
 """
 hook_fns(routing::NamedTuple) = haskey(routing, :fns) ? routing.fns : (;)
 hook_fns(::Any) = (;)
@@ -31,8 +32,9 @@ hook_fns(::Any) = (;)
 """
     ReactantNitro.check_hooks(hooks) -> hooks
 
-Refuse a hook map that cannot be keyed: a non-function entry, or a closure that captures, which
-would be invisible to the compile-cache key and therefore a silent wrong-program hazard.
+Return `hooks` after rejecting a map the compile cache cannot key: one that is not a `NamedTuple`,
+has a non-function entry, or has a closure that captures. A captured value does not enter the cache
+key, so the cache could serve a program compiled for a different value.
 """
 function check_hooks(hooks)
     hooks isa NamedTuple || error(
@@ -72,8 +74,9 @@ end
 """
     ReactantNitro.hook_predicate_available() -> Bool
 
-Whether `Base.issingletontype` still separates a keyword-lowered hook from a capturing one. A Base
-internal, so it gets a named check with a test, as `primary_world_available` does.
+Whether `Base.issingletontype` still tells a non-capturing keyword hook from a capturing one. The
+predicate relies on how Base lowers closures, so it has a named check with a test, as
+`primary_world_available` does.
 """
 function hook_predicate_available()
     kw = let
@@ -87,28 +90,6 @@ function hook_predicate_available()
     return Base.issingletontype(typeof(kw)) && !Base.issingletontype(typeof(cap))
 end
 
-"""
-    ReactantNitro.@hooks begin ... end -> NamedTuple
-
-Build a hook map from ordinary function definitions.
-
-```julia
-base = @hooks begin
-    forward(e, model, ps, st; x) = Lux.apply(model, x, ps, st)
-    loss(e, pred; y) = sum(abs2, pred .- y) / size(y, 2)
-end
-
-tweaked = merge(base, @hooks begin
-    loss(e, pred; y) = sum(abs, pred .- y) / size(y, 2)
-end)
-```
-
-Each definition becomes a value rather than a method: the body is wrapped in a `let`, so nothing is
-added to any method table and the result is a singleton function type. A group is the unit of
-invalidation, so [`check_hook_grouping`](@ref) refuses one mixing a traced hook with a host hook,
-and warns about the residency a group assumes for `metrics` or `train_metrics`. A global reference
-from a definition is fine; a capture is refused at [`check_hooks`](@ref).
-"""
 # ── The grouping rules ──────────────────────────────────────────────────────────────
 #
 # Re-evaluating a group mints a fresh type for every hook in it, so a group is only as cheap to
@@ -132,11 +113,12 @@ const SUPPORTED_HOOKS = (TRACED_HOOKS..., RESIDENCY_HOOKS..., HOST_HOOKS...)
 """
     ReactantNitro.check_hook_grouping(names) -> nothing
 
-Enforce the group layout, at macro expansion, from the hook names alone.
+Check one `@hooks` group's hook names at macro expansion.
 
-Refuses a group mixing a traced hook with a host one, and reports the residency a group ASSUMES
-for `metrics` or `train_metrics`. Also refuses a name the map does not carry, which would
-otherwise sit in the NamedTuple doing nothing while the method quietly served every call.
+Errors on a name the map does not support, which would sit in the map unused while the method
+served every call, and on a group mixing a traced hook (`forward`, `loss`) with a host one
+(`build_model`, `build_data`, `finalize_metrics`). For `metrics` or `train_metrics`, warns which
+residency the grouping assumes, since `metrics_residency` is only known at run time.
 """
 function check_hook_grouping(names)
     unknown = filter(n -> !(n in SUPPORTED_HOOKS), names)
@@ -176,6 +158,30 @@ function check_hook_grouping(names)
     return nothing
 end
 
+"""
+    ReactantNitro.@hooks begin ... end -> NamedTuple
+
+Build a hook map from ordinary function definitions.
+
+```julia
+base = @hooks begin
+    forward(e, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    loss(e, pred; y) = sum(abs2, pred .- y) / size(y, 2)
+end
+
+tweaked = merge(base, @hooks begin
+    loss(e, pred; y) = sum(abs, pred .- y) / size(y, 2)
+end)
+```
+
+Each definition becomes a value rather than a method: it is wrapped in a `let`, so nothing is
+added to any method table and each hook has a singleton function type. Supported names are
+`forward`, `loss`, `metrics`, `train_metrics`, `build_model`, `build_data` and `finalize_metrics`.
+Re-evaluating a group gives every hook in it a new type, so [`check_hook_grouping`](@ref) refuses a
+group mixing a traced hook with a host hook, and warns about the residency a group assumes for
+`metrics` or `train_metrics`. A definition may reference globals; one that captures a local is
+refused by [`check_hooks`](@ref).
+"""
 macro hooks(block)
     Meta.isexpr(block, :block) || (block = Expr(:block, block))
     entries = Any[]

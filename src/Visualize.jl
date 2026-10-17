@@ -15,30 +15,30 @@
 """
     visualize(e, outputs; <declared batch fields>) -> figure
 
-Draw one sample. Shaped like [`metrics`](@ref): positional experiment, positional outputs, batch
-fields by keyword, routed to what the method declares. Called once per SAMPLE with the batch
-dimension already dropped; a rank-1 field yields its element, so a `Vector{String}` of case ids
-arrives as a `String`. `outputs` is `nothing` in data mode, and `nothing` is dispatchable, so one
-generic method covers both modes or two methods split them:
+Draw one sample. The signature follows [`metrics`](@ref): the experiment and the outputs
+positionally, and the batch fields the method declares as keywords. It is called once per sample
+with the batch dimension dropped, so a rank-1 field yields its element: a `Vector{String}` of case
+ids arrives as a `String`. `outputs` is `nothing` in data mode (`predictions = false`), so one
+generic method can cover both modes, or two methods can split them:
 
 ```julia
 visualize(::MyExp, ::Nothing; img, y) = data_panel(img, y)
 visualize(::MyExp, outputs; img, y)   = pred_panel(img, y, outputs)
 ```
 
-There is no default method: a missing one is an error naming the experiment and the mode. The
-return value is whatever [`save_figure`](@ref) knows how to write.
+There is no default method; a missing one is an error naming the experiment and the mode. Return
+anything [`save_figure`](@ref) can write.
 """
 function visualize end
 
 """
     save_figure(e, fig, stem) -> path
 
-Write what [`visualize`](@ref) returned and return the path actually written. `e` is in the
-signature so the method a model package writes is a specialization on a type it owns rather than
-type piracy on `Makie.Figure`. `stem` carries no extension, since the framework has no opinion
-about formats. The return value is what [`render`](@ref) reports, so a backend writing a video or a
-directory of frames says so.
+Write what [`visualize`](@ref) returned and return the path written, as a string. `e` is in the
+signature so a model package's method dispatches on a type it owns instead of pirating
+`Makie.Figure`. `stem` is a path without an extension; the method chooses the format and appends
+it. [`render`](@ref) returns these paths, so a method that writes a video or a directory of frames
+returns that path. There is no default method.
 
 ```julia
 function ReactantNitro.save_figure(::MyExp, fig::Makie.Figure, stem::AbstractString)
@@ -56,11 +56,21 @@ function save_figure end
     render(nitro; split = :val, batches = 1, predictions = false, out_dir, tag) -> Vector{String}
     render(nitro, batch; predictions = false, out_dir, tag = "") -> Vector{String}
 
-Render a few examples from the real pipeline, and return the paths written. `predictions` defaults
-to `false`, the data gate: no forward pass, so no compile. `batches` counts batches, not samples,
-so at `batch_size = 64` one batch writes 64 figures; pass the batch form a narrower batch if that
-is too many. Batches are taken from the head of the split in the loader's own order, so validation
-renders diff cleanly only if the validation loader is deterministic.
+Write one figure per sample of real batches, through [`visualize`](@ref) and
+[`save_figure`](@ref), and return the paths written. The first form takes the first `batches`
+batches of `split` in the loader's order; the second renders the `batch` given.
+
+With `predictions = false`, the default, `visualize` gets `outputs = nothing` and nothing is
+compiled or run on the device, which makes it the check of the data itself. With
+`predictions = true` it gets the outputs of [`predict`](@ref) for the batch. `batches` counts
+batches, not samples: at `batch_size = 64` one batch writes 64 figures, so pass a smaller batch to
+the second form to write fewer. Renders of the same split compare across runs only if its loader is
+deterministic.
+
+Figures go to `out_dir`, default `joinpath(run_dir(nitro), "viz")`, under the stem `<tag>_<i>`,
+where `i` is the sample's index zero-padded to three digits and counted across batches. `tag`
+defaults to the split name in the first form; in the second it defaults to `""`, giving the stem
+`<i>`.
 
 ```julia
 render(Nitro(e); split = :val)                                        # the data gate
@@ -146,11 +156,11 @@ end
 """
     ReactantNitro.viz_router(e, batch, outputs) -> Router
 
-Per-mode routing for `visualize`, resolved here and never merged into `nitro.routing`, and against
-`typeof(e)` rather than the compile view, since the hook is host-only. The mode is carried in the
-second argument type: `Nothing` selects a `::Nothing` method or falls through to a generic one,
-and `Any` selects the generic method only, so an experiment defining only the data-mode method
-gets a named error under `predictions = true`.
+The router for one mode of `visualize`: which batch fields the matching method declares. Resolved
+against `typeof(e)`, since the hook runs on the host, and kept out of `nitro.routing`. The mode is
+the second argument type: `Nothing` matches a `::Nothing` method or else a generic one, and `Any`
+matches only a generic method, so an experiment with only the data-mode method gets a named error
+under `predictions = true`.
 """
 function viz_router(e, batch::NamedTuple, outputs)
     O = outputs === nothing ? Nothing : Any
@@ -172,8 +182,9 @@ end
 """
     ReactantNitro.check_save_figure(e, fig) -> nothing
 
-The missing-method check for the backend verb, once per `render` call against the figure the
-experiment actually produced, so the error says this is a hook to implement.
+Error when no [`save_figure`](@ref) method accepts the figure `visualize` returned, naming the
+method to define instead of raising a bare `MethodError`. Checked on the first figure of each
+batch.
 """
 function check_save_figure(e, fig)
     hasmethod(save_figure, Tuple{typeof(e), typeof(fig), String}) && return nothing
@@ -225,9 +236,9 @@ end
 """
     ReactantNitro._sample_tree(tree, i) -> tree
 
-Take sample `i` out of every array leaf, dropping the batch dimension. A scalar `selectdim` drops
-the dimension directly, and a `Vector` yields its element rather than a zero-dimensional array. A
-`copy` rather than a view, so user code never holds a view onto a buffer the framework may free.
+Take sample `i` out of every array leaf along the last (batch) dimension, dropping it: a `Vector`
+yields its element, a zero-dimensional array and a non-array leaf pass through unchanged. The
+slice is a `copy`, so user code never holds a view onto a buffer the framework may free.
 """
 _sample_tree(tree, i::Integer) = _map_array_leaves(x -> _sample_leaf(x, i), tree)
 

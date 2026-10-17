@@ -19,9 +19,10 @@ using MLUtils: BatchView, DataLoader, ObsView, getobs, numobs, shuffleobs
 """
     ReactantNitro.begin_epoch!(dl::MLUtils.DataLoader) -> plan
 
-This epoch's plan: an `ObsView`, permuted when `shuffle = true` from the loader's own `rng` as
-`DataLoader`'s `iterate` does at the top of each pass, wrapped in a `BatchView` when the loader
-batches. Returned rather than stored, since `DataLoader` is immutable.
+Build this epoch's plan: an `ObsView` of the data, shuffled from the loader's own `rng` when
+`shuffle = true` (as `DataLoader`'s `iterate` does at the start of each pass), and wrapped in a
+`BatchView` when `batchsize > 0`. The plan is returned rather than stored, since `DataLoader` is
+immutable.
 """
 function ReactantNitro.begin_epoch!(dl::DataLoader)
     obs = ObsView(dl.data, collect(1:numobs(dl.data)))
@@ -33,7 +34,7 @@ end
 """
     ReactantNitro.batch_at(dl::MLUtils.DataLoader, i::Integer, plan) -> batch
 
-Batch `i` of this epoch's plan through MLUtils' own `getobs`. `plan` is untyped on purpose, since
+Batch `i` of this epoch's plan, read with MLUtils' `getobs`. `plan` is untyped because
 [`ReactantNitro.fanout_capable`](@ref) detects the three-argument method by asking whether it
 accepts any plan.
 """
@@ -42,18 +43,22 @@ ReactantNitro.batch_at(dl::DataLoader, i::Integer, plan) = getobs(plan, i)
 """
     ReactantNitro.check_source_options(dl::MLUtils.DataLoader, name::Symbol, cfg) -> nothing
 
-`partial` on both kinds of split, plus `buffer` and `parallel` judged against the path the split
-resolved to. Both of those live inside `DataLoader`'s `iterate`, which the fan-out never calls, so
-on the fan-out path they are inert (and `buffer = true` is said to be); on the single-producer
-path they are live. `buffer = true` is refused there, since the framework reads ahead and the
-loader would refill its one batch while the previous is still queued for transfer, silently;
-`parallel = true` warns, since MLUtils documents that it breaks ordering.
+Check a `DataLoader`'s `partial`, `buffer` and `parallel` options for split `name` before anything
+compiles.
 
-`partial = true` on the `train` split is refused here, before anything compiles, rather than at the
-last batch of the first epoch, and only when the observation count does not divide by the batch
-size. `partial = false` on an eval split warns: the framework pads and slices, so dropping silently
-shrinks the set a metric is computed over. It stays legal for a deliberately truncated set or a
-model that mixes across the batch axis in test mode.
+`partial` is checked on every split, and only when the observation count does not divide by
+`batchsize`. `partial = true` on `train` is an error, since the compiled program has a fixed shape
+and training cannot pad. `partial = false` on an eval split warns, since the framework pads and
+slices a short final batch, so dropping it only shrinks the set a metric is computed over. Dropping
+is still allowed, for a deliberately truncated set or a model that mixes across the batch axis in
+test mode.
+
+`buffer` and `parallel` act inside `DataLoader`'s `iterate`, so they are judged against the path
+the split resolved to (`cfg.path`). On the fan-out paths, which index the loader and never call
+`iterate`, `buffer = true` has no effect and warns. On the single-producer path, `buffer = true` is
+an error, because the loader reuses one batch buffer while the framework reads ahead, so a batch
+would be overwritten before its transfer; `parallel = true` warns, since MLUtils documents that it
+breaks ordering. On the `:inline` path only `partial` is checked.
 """
 function ReactantNitro.check_source_options(dl::DataLoader, name::Symbol, cfg)
     _check_partial(dl, name)
