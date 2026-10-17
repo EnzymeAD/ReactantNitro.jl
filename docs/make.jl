@@ -69,6 +69,7 @@ makedocs(;
         ],
         "Running" => [
             "Devices and meshes" => "devices.md",
+            "Checkpoints" => "checkpoints.md",
             "Logging" => "logging.md",
             "Kaimon" => "kaimon.md",
         ],
