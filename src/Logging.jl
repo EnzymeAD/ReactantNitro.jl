@@ -167,7 +167,7 @@ logger_info(::Nothing) = (;)
     ReactantNitro._adopt_logger!(lgr, dir) -> lgr
 
 Called by setup to give the logger the run's resolved `run_dir`. A pathless
-[`JSONLogger`](@ref) sets its path to `metrics.jsonl` there, as the default `TopKCheckpointer`
+[`JSONLogger`](@ref) sets its path to `metrics.jsonl` there, as the default `Checkpointer`
 adopts `run_dir`. A wrapper forwards the call to the logger it wraps; the default returns any
 other logger unchanged.
 """

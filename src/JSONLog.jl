@@ -1,6 +1,6 @@
 # JSONLog.jl
 #
-# The shipped JSON default logger, the framework's own backend, exactly as `TopKCheckpointer` is
+# The shipped JSON default logger, the framework's own backend, exactly as `Checkpointer` is
 # the shipped checkpointer. JSON Lines, one object per line with a `"type"` discriminator, every
 # write flushed, opened in append mode so a resumed run extends the same file (which is why
 # `logger_state` is `nothing`). The lazy handle is load-bearing: the default accessor constructs a

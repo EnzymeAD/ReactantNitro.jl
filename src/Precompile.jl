@@ -31,8 +31,8 @@ using PrecompileTools: @setup_workload, @compile_workload
         dir = mktempdir()
         try
             # The default filename method, which nearly every run uses.
-            ckpt = TopKCheckpointer(;
-                k = 1, metric = :val_loss, mode = :min, dir,
+            ckpt = Checkpointer(;
+                keep = Best(1), metric = :val_loss, mode = :min, dir,
                 name = (; kwargs...) -> checkpoint_filename(nothing; kwargs...)
             )
             # Two writes: the second exercises retention, and carried its own seconds.

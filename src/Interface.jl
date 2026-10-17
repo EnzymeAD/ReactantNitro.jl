@@ -616,7 +616,7 @@ end
 """
     checkpointer(e)
 
-The run's checkpointer. Default `_field(e, :checkpointer, TopKCheckpointer())`; also a `Nitro`
+The run's checkpointer. Default `_field(e, :checkpointer, Checkpointer())`; also a `Nitro`
 keyword. `nothing` disables checkpointing. Called once per construction, and not at all when the
 keyword is given.
 
@@ -624,11 +624,11 @@ To rank checkpoints by one of the experiment's own `metrics` keys instead of `:v
 this accessor, so every run ranks the same way:
 
 ```julia
-ReactantNitro.checkpointer(::MyExp) = TopKCheckpointer(metric = :f1, mode = :max)
+ReactantNitro.checkpointer(::MyExp) = Checkpointer(metric = :f1, mode = :max)
 ```
 """
 function checkpointer end
-checkpointer(e) = _field(e, :checkpointer, TopKCheckpointer())
+checkpointer(e) = _field(e, :checkpointer, Checkpointer())
 
 """
     early_stop(e)

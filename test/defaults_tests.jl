@@ -173,7 +173,7 @@
             @test n.logger.path == joinpath(BARE_DIR, "metrics.jsonl")
             @test n.early_stop === nothing
             @test isempty(n.schedules)                 # `schedules(e)` is `(;)`, so nothing varies
-            @test n.checkpointer isa TopKCheckpointer
+            @test n.checkpointer isa Checkpointer
             @test (n.checkpointer.k, n.checkpointer.metric, n.checkpointer.mode) == (3, :val_loss, :min)
             # By default, `n_devs = 1` skips the mesh entirely rather than building a one-device
             # one.

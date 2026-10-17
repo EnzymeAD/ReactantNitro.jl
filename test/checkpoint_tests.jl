@@ -181,7 +181,7 @@
         # field addition, which reads like breakage at someone resuming a run that is about to work. The
         # migration above is explicit and tested, so the warning is noise, and noise trains people to
         # ignore warnings. Suppressed narrowly: this asserts no Warn-level message escapes the load.
-        @test_logs load_checkpoint(TopKCheckpointer(), path)
+        @test_logs load_checkpoint(Checkpointer(), path)
     end
 
     @testset "weights-only restores a derived `GraphConst` from the record" begin
@@ -1266,7 +1266,7 @@
     script!(v) = (SCRIPT[] = Float64.(v); SCRIPT_AT[] = 0; nothing)
     ReactantNitro.finalize_metrics(::ScriptedCkpt, acc, ::Symbol) =
         (SCRIPT_AT[] += 1; (; val_loss = SCRIPT[][SCRIPT_AT[]]))
-    drop_latest(k) = TopKCheckpointer(; k, keep_latest = false)
+    drop_latest(k) = Checkpointer(; keep = Best(k))
     epochs_of(dir, run) = Set(e.epoch for e in run_entries(dir, run))
     ckpt_files(dir) = Set(filter(f -> endswith(f, ".jld2") && f != "manifest.jld2", readdir(dir)))
 
@@ -1324,6 +1324,60 @@
         @testset "an unscored epoch cannot be kept, and says so" begin
             c = TopKCheckpointer(; k = 1, dir = mktempdir(), name = short_name, keep_latest = false)
             @test_throws "keep_latest = false" save_checkpoint!(c, 1, (;), merge(snap, (; epoch = 1)))
+        end
+    end
+
+    # ── Selectors: `Checkpointer(; keep)` retains their union ──────────────────────────
+
+    @testset "selectors, driven by hand: union retention and the write decision" begin
+        snap = snapshot(Nitro(CkptMLP(); run_dir = mktempdir(), checkpointer = nothing))
+        save!(c, epoch, v) = save_checkpoint!(c, epoch, (; val_loss = v), merge(snap, (; epoch)))
+        files(epochs) = Set("epoch-" * lpad(e, 4, '0') * ".jld2" for e in epochs)
+        scores = [5.0, 1.0, 4.0, 3.0, 6.0, 7.0, 8.0, 9.0]
+
+        @testset "`Last(n)` keeps the latest n, whatever they scored" begin
+            d = mktempdir()
+            c = Checkpointer(; keep = Last(3), dir = d, name = short_name)
+            @test all(save!(c, e, v) for (e, v) in enumerate(scores))
+            @test ckpt_files(d) == files(6:8)
+        end
+
+        @testset "`(Best(2), Last(3))` keeps the union" begin
+            d = mktempdir()
+            c = Checkpointer(; keep = (Best(2), Last(3)), dir = d, name = short_name)
+            foreach(((e, v),) -> save!(c, e, v), enumerate(scores))
+            @test ckpt_files(d) == files([2, 4, 6, 7, 8])
+        end
+
+        @testset "`Epochs` and `Every` keep by epoch, and decline the rest unwritten" begin
+            named = Int[]
+            counting(; epoch, kwargs...) = (push!(named, epoch); short_name(; epoch, kwargs...))
+            d = mktempdir()
+            c = Checkpointer(; keep = (Every(3), Epochs(7:8)), dir = d, name = counting)
+            wrote = [save!(c, e, v) for (e, v) in enumerate(scores)]
+            @test wrote == [false, false, true, false, false, true, true, true]
+            @test named == [3, 6, 7, 8]
+            @test ckpt_files(d) == files([3, 6, 7, 8])
+        end
+
+        @testset "`TopKCheckpointer` builds the equivalent `Checkpointer`, with identical files" begin
+            for kl in (true, false)
+                da, db = mktempdir(), mktempdir()
+                a = TopKCheckpointer(; k = 2, keep_latest = kl, dir = da, name = short_name)
+                b = Checkpointer(; keep = kl ? (Best(2), Last(1)) : Best(2), dir = db, name = short_name)
+                @test a.keep == b.keep && a.k == b.k == 2 && a.keep_latest == b.keep_latest == kl
+                wa = [save!(a, e, v) for (e, v) in enumerate(scores)]
+                wb = [save!(b, e, v) for (e, v) in enumerate(scores)]
+                @test wa == wb
+                @test ckpt_files(da) == ckpt_files(db)
+            end
+        end
+
+        @testset "refusals" begin
+            @test_throws "is empty" Checkpointer(; keep = ())
+            @test_throws "every entry must be a selector" Checkpointer(; keep = (Best(2), 3))
+            @test_throws "at least 1" Checkpointer(; keep = Last(0))
+            @test_throws "must be at least 1" TopKCheckpointer(; k = 0)
         end
     end
 

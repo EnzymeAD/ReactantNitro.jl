@@ -527,7 +527,7 @@ function _show_nitro(io::IO, mime::MIME, nitro::Nitro)
     push!(
         state, [
             "run_dir",
-            nitro.run_dir * (nitro.checkpointer isa TopKCheckpointer ? "   run " * run_key(ck_run) : ""),
+            nitro.run_dir * (nitro.checkpointer isa Checkpointer ? "   run " * run_key(ck_run) : ""),
         ]
     )
     push!(state, ["seed", string(nitro.seed, "   accum ", nitro.accum)])

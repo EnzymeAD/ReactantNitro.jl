@@ -62,7 +62,7 @@ with any logger backend or none.
 function history(nitro::Nitro)
     rows = nitro.history
     ck = nitro.checkpointer
-    sel = ck isa TopKCheckpointer ? (ck.metric, ck.mode) : nothing
+    sel = ck isa Checkpointer ? (ck.metric, ck.mode) : nothing
     scalar, hidden = Symbol[], Pair{Symbol, String}[]
     for r in rows, (k, v) in pairs(r)
         k in (:epoch, :step, :loss) && continue

@@ -69,7 +69,8 @@
     # its own transcript. A run directory's contents come from the manifest, opening no record at
     # all; one record's metadata comes from `checkpoint_info`, which returns none of its weights.
     const CHECKPOINTING = [
-        :TopKCheckpointer, :save_checkpoint!, :load_checkpoint, :CheckpointRecord,
+        :Checkpointer, :TopKCheckpointer, :save_checkpoint!, :load_checkpoint, :CheckpointRecord,
+        :Selector, :Best, :Last, :Epochs, :Every, :select, :admits,
         :checkpoint_filename, :read_manifest, :checkpoint_info,
         # The run ids a checkpoint source names: every run a directory holds, and a handle's own.
         :runs, :checkpoint_run,

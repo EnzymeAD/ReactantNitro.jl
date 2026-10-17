@@ -86,7 +86,7 @@ and schedule position, under the compatibility checks. It is `false` (the defaul
 `run => :latest | :best` with any run above including `other`, or `:auto`, which is exactly
 `:latest => :latest` and logs what it resolved to, except that a directory with nothing to resume
 starts a fresh run with a warning (`:latest => :latest` raises there). One `run_dir` can hold
-several runs, each with its own id in the manifest; see [`TopKCheckpointer`](@ref). Resuming a
+several runs, each with its own id in the manifest; see [`Checkpointer`](@ref). Resuming a
 run's newest record continues that run: its id is adopted and later checkpoints join it. Resuming
 anything else (an earlier record such as `:best`, `:all => :best`, or a file this directory's
 manifest does not list) branches into a new run, so the original run's later epochs are never
@@ -219,12 +219,12 @@ function _build_nitro(
     # ── before step 2: locate a checkpoint (the resume path) ───────────────────────
     # `run_dir` is the one path concept in the framework, so a checkpointer constructed without an
     # explicit `dir` adopts it here. An explicit `dir` pins it and is never overwritten.
-    checkpointer isa TopKCheckpointer && checkpointer.dir === nothing &&
+    checkpointer isa Checkpointer && checkpointer.dir === nothing &&
         (checkpointer.dir = String(run_dir))
     # The filename hook is bound here too, as a closure calling the generic function, so
     # `save_checkpoint!` never receives `e` (an object full of device leaves handed to the
     # serializer) and a revised `checkpoint_filename` takes effect on the next write.
-    checkpointer isa TopKCheckpointer && checkpointer.name === nothing &&
+    checkpointer isa Checkpointer && checkpointer.name === nothing &&
         (checkpointer.name = (; kwargs...) -> ReactantNitro.checkpoint_filename(e; kwargs...))
     # The default logger adopts the run directory the same way; a wrapper around it (the gate
     # extension's RecordingLogger) forwards the pin, and a user's own logger is untouched.
@@ -253,7 +253,7 @@ function _build_nitro(
             `checkpointer = nothing` has no loader, since `load_checkpoint` dispatches on the
             checkpointer rather than on the path.
             Pass the checkpointer that wrote it, or leave the keyword off to take the default
-            `TopKCheckpointer`, which reads the format the framework writes. Disabling checkpointing
+            `Checkpointer`, which reads the format the framework writes. Disabling checkpointing
             is about WRITING; nothing is written by a `Nitro` that is never trained."""
         )
         record, source = load_checkpoint(checkpointer, weights_file), weights_file
@@ -269,7 +269,7 @@ function _build_nitro(
     # continues the run whose newest record it restores and branches from anything else
     # (`resumed_run`); everything else, a weights-only start included, is a new run.
     occupied = false
-    if checkpointer isa TopKCheckpointer
+    if checkpointer isa Checkpointer
         if record !== nothing && !weights_only
             id = resumed_run(checkpointer, source)
             if id.from !== nothing
@@ -765,7 +765,7 @@ function resolve_source(ckpt, run_dir, src, kw::Symbol)
     run isa Nitro || return resolve_checkpoint(ckpt, run_dir, run, which; what).path
     ck = run.checkpointer
     has = ck === nothing ? "`checkpointer = nothing`" : "a `$(typeof(ck))`"
-    ck isa TopKCheckpointer || error(
+    ck isa Checkpointer || error(
         "ReactantNitro: $(what) names one of `other`'s checkpoint records, and `other` has no \
          checkpointer whose manifest can be read ($(has)), so there is no record to name. \
          `weights = other` takes its parameters from memory."
@@ -787,7 +787,7 @@ handle joins.
 function resume_path(resume, ckpt, run_dir)
     (resume === false || resume === nothing) && return nothing
     resume === :auto || return resolve_source(ckpt, run_dir, resume, :resume)
-    if ckpt isa TopKCheckpointer
+    if ckpt isa Checkpointer
         dir = lookup_dir(ckpt, run_dir)
         if isempty(isdir(dir) ? read_manifest(dir) : ManifestEntry[])
             @warn "ReactantNitro: `resume = :auto` found nothing to resume in `$(dir)`, so this \
