@@ -1179,8 +1179,8 @@ function nitro_stop(run_id::AbstractString)
         "ReactantNitro ReactantNitroKaimonGateExt: run `$(run_id)` has no live `Nitro` to stop."
     )
     ReactantNitro.request_stop!(state.nitro)
-    return "stop requested for run $(run_id); it will finish the current epoch, validate, and \
-            checkpoint before exiting. Poll `nitro_status(run_id=\"$(run_id)\")`."
+    return "stop requested for run $(run_id); it stops at the next step boundary, then validates \
+            and checkpoints before exiting. Poll `nitro_status(run_id=\"$(run_id)\")`."
 end
 
 """

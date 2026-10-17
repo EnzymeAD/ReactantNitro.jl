@@ -195,9 +195,9 @@ function ReactantNitro.reattach!(lgr::TBLogger, state)
         so the resumed run would appear in TensorBoard as a second, separate run.
 
         The usual cause is the default init policy. `TBLogger(dir)` is `tb_increment`, which
-        quietly becomes `dir_1` when `dir` already exists, and a resume always finds it existing.
+        becomes `dir_1` when `dir` already exists, and a resume always finds it existing.
         Construct the logger with `TBLogger("$(state.logdir)", tb_append)` to extend the run, or
-        pass `resume = nothing` if a separate run is what you meant."""
+        pass `resume = false` if a separate run is what you meant."""
     )
 end
 

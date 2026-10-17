@@ -398,9 +398,18 @@ function (f::ExportForward{K, ECHO})(a, ps, st) where {K, ECHO}
     )
     outputs, st_new = call_hook(forward, :forward, f.router, batch, f.ev, f.inner, ps, st)
     # The echo: a wire tensor the postprocess needs back, merged here rather than asked of `forward`
-    # so an export concern stays out of the trained program. The WIRE value is echoed. Merged after
-    # `forward`, so a name it returned is not overwritten; `check_export_sources` refuses that.
+    # so an export concern stays out of the trained program. The WIRE value is echoed. `merge` would
+    # let it replace an output `forward` returned under the same name, so that is refused.
     isempty(ECHO) && return outputs, st_new
+    if outputs isa NamedTuple
+        clash = filter(k -> haskey(outputs, k), ECHO)
+        isempty(clash) || error(
+            """
+            ReactantNitro: `export_outputs` echoes the wire input$(length(clash) == 1 ? "" : "s")
+            $(join(("`$k`" for k in clash), ", ")), and `forward` also returns an output of that name.
+            The echo would replace the model's output in the bundle. Rename the input or the output."""
+        )
+    end
     wired = NamedTuple{K}(wire)
     return merge(outputs, NamedTuple{ECHO}(map(k -> getfield(wired, k), ECHO))), st_new
 end
