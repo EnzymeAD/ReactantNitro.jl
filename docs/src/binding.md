@@ -1,9 +1,9 @@
 # Binding cheat sheet
 
-Everything in ReactantNitro connects by **name**. A batch field reaches the hook that declares a
+ReactantNitro connects its pieces by **name**. A batch field reaches the hook that declares a
 keyword of that name. A schedule key names the slot it drives. A run keyword names the accessor it
-overrides, which names the field it reads. This page is every one of those connections on one
-screen, drawn once, with the rule under each drawing.
+overrides, which names the field it reads. This page lists each of those connections with its
+rule.
 
 ## The three markers: where a field goes
 
@@ -42,7 +42,7 @@ metrics(e, outputs; label)           # the same
 
 - A hook's keyword arguments are the batch fields it wants, by name. The framework resolves the
   method once at setup and passes exactly that subset.
-- Only declared fields are transferred to the device. A field nobody declares rides along for free.
+- Only declared fields are transferred to the device. A field no hook declares stays on the host.
 - A required keyword the batch lacks raises on the hook's first call, naming both sides. A keyword
   with a default is optional. A method ending in `kwargs...` receives the whole batch.
 - `forward` declares inputs and never targets, which is why `predict` works on a batch with no
@@ -64,8 +64,8 @@ one positional argument**:
 - Whatever `forward` puts in the first slot is what `loss` receives in its second. Nothing is
   splatted, unpacked, or renamed in between.
 - **Do not unpack `outputs` a second time.** If `forward` returns a bare array, `first(outputs)`
-  is element one of it, every later operation stays broadcast-legal, and the run trains on one
-  number without raising.
+  is its first element, every later operation still broadcasts, and the run trains on one number
+  without an error.
 - Several outputs: return a `NamedTuple` and destructure by name downstream. Every array leaf keeps
   the batch dimension last, and nothing already reduced over the batch belongs in `outputs`.
 
@@ -92,7 +92,7 @@ count of 1.
 
 ```julia
 schedules(e) = (;
-    eta = total -> OneCycle(total, 1f-3),   # a rule field: every group's `eta`, ratio-scaled
+    eta = total -> OneCycle(total, 1f-3),   # a rule field: `eta` of every group without a path key
     smoothing = _ -> t -> 0.1f0 * t / 5000, # a Device field: e.smoothing, written each step
     opt = (; encoder = (; eta = ...)),      # path-bound: the :encoder group's chain only
     device = (; lambda = _ -> t -> 0.5f0),  # qualified: e.lambda; `lambda` is a rule field too
@@ -106,8 +106,10 @@ schedules(e) = (;
   per step with the upcoming step, counting from 1. A bare `Number` is a constant.
 - A `GraphConst` cannot be scheduled: its value is the program. A `Host` field is in neither
   namespace.
-- `opt.eta` scales every group by that group's ratio, `learning_rate(e, Val(g)) / learning_rate(e)`,
-  so one curve moves the groups together.
+- For each group, a path key (`opt.encoder.eta`) overrides the bare key (`eta` or `opt.eta`), and
+  a group with neither uses its `learning_rate` accessor. Either key's `eta` is multiplied by the
+  group's ratio, `learning_rate(e, Val(g)) / learning_rate(e)`, so one bare curve moves the groups
+  together.
 
 ## Parameters: leaves to groups to one buffer each
 
@@ -119,8 +121,8 @@ lambda(e, Val(g))               # decoupled decay toward decay_anchor(e, Val(g))
 no_decay(e, keypath, x)         # per leaf: excluded from decay; the default excludes 1-D leaves
 ```
 
-The optimizer program applies each chain once per group, not once per array, which is what keeps
-its compile small. `gradient_clip_norm(e)` is a global norm over the whole accumulated gradient,
+The optimizer program applies each chain once per group, not once per array, which keeps its
+compile small. `gradient_clip_norm(e)` is a global norm over the whole accumulated gradient,
 applied before any group, and is not per group or schedulable.
 
 ## Run keywords: keyword to accessor to field
@@ -132,9 +134,9 @@ e.max_epochs                # else a field of the same name, when the struct dec
 1                           # else the framework's value
 ```
 
-Thirteen keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`, `schedules`,
-`gradient_clip_norm`, `check_divergence`, `autolog_schedules`, `log_every_n_steps`, `logger`, `checkpointer`, `early_stop`. `schedules` is the one whose accessor
-reads no field. Four keywords name a fact about this construction and have no accessor: `data`,
+Thirteen keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`,
+`schedules`, `gradient_clip_norm`, `check_divergence`, `autolog_schedules`, `log_every_n_steps`,
+`logger`, `checkpointer`, `early_stop`. `schedules` is the one whose accessor reads no field. Four keywords name a fact about this construction and have no accessor: `data`,
 `weights`, `resume`, `run_ref`. `w0`, `restore_optimizer` and `restore_best` are more of that
 kind, and `checkpoint` is the deprecated spelling of `weights = path`.
 
@@ -163,7 +165,7 @@ says otherwise.
 
 | you change | what compiles again |
 | --- | --- |
-| a `Device` field, a `Host` field, `seed`, `run_dir`, `max_epochs`, `check_divergence`, a schedule | nothing |
+| a `Device` field, a `Host` field, `seed`, `run_dir`, `max_epochs`, `check_divergence`, `autolog_schedules`, `log_every_n_steps`, a schedule | nothing |
 | a `GraphConst` field | every program that reads it |
 | `accum` | the gradient program |
 | `gradient_clip_norm` | the optimizer program |
@@ -177,7 +179,8 @@ module-level cache recompiles only what moved. `ReactantNitro.cache_stats()` is 
 ## Where to read what bound
 
 `show(nitro)` prints the handle and, under it, the bindings: each split with its batch count and
-prefetch path, the clip threshold and every schedule key with its source, and one row per parameter
-group with rate, ratio, anchor, decay and rule. The same text goes to the logger at setup as
+prefetch path, the clip threshold and every schedule key with its source, one row per parameter
+group with rate, ratio, anchor, decay and rule, and for a Level 2 optimizer, the rule field each
+scheduled value landed in. The same text goes to the logger at setup as
 `binding_report`, so the run's record carries it. After training, [`history`](@ref)`(nitro)` is the
 run as a table.

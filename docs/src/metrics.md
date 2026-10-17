@@ -1,8 +1,8 @@
 # Metrics: the denominator is yours
 
-A metric is `value => mode`. The mode says how the framework combines the value across the batches
-of a split, and the framework never supplies a sample count of its own, because there is no single
-right one.
+A metric returned by [`metrics`](@ref) is `value => mode`. The mode says how the framework
+combines the value across the batches of a split. For a mean, the mode is the count to divide by,
+and you supply it: the framework has no single right count (samples, pixels, tokens, weights).
 
 | Mode | Across batches | [`finalize_metrics`](@ref) receives |
 | --- | --- | --- |
@@ -27,12 +27,13 @@ end
     computed where it is written, so `count(y) => :sum` holds a number. A ternary binds looser than
     `=>`, so wrap it: `(isempty(y) ? 0 : n) => :sum`.
 
-A count is any real number, so a weighted mean is `sum(w .* err) => sum(w)`. Any mode other than
-those in the table is refused on the first batch.
+A count is any real number, so a weighted mean is `sum(w .* err) => sum(w)`. Any other mode is
+refused on the first batch that returns it.
 
 Metrics never see padding. The framework pads a short final batch, runs the compiled program,
-slices the outputs back, and only then calls you. With no `metrics` method at all the framework
-substitutes `val_loss`, so a bare experiment still validates.
+slices the outputs back, and only then calls you. With no `metrics` method the framework reports
+`val_loss = loss(e, outputs; ...) => 1`, the mean of the per-batch losses, so a bare experiment
+still validates.
 
 ## Groups
 
@@ -98,10 +99,11 @@ function ReactantNitro.finalize_metrics(::Classifier, acc, split)
 end
 ```
 
-The ranks are `[5, 1, 3, 2, 4]`, the positives hold 5, 2, and 4, so `auroc = (11 - 6) / 6 = 0.833`:
-the positive scores higher in 5 of the 6 positive and negative pairs. Only what `finalize_metrics`
-returns, `(; accuracy = 0.6, worst = 0.7, auroc = 0.833)`, reaches the run history, the logger, and
-checkpoint selection, so `TopKCheckpointer(metric = :auroc, mode = :max)` works.
+The ranks are `[5, 1, 3, 2, 4]` and the positives hold 5, 2, and 4, so
+`auroc = (11 - 6) / 6 = 0.833`: the positive scores higher in 5 of the 6 positive-negative pairs.
+Only what `finalize_metrics` returns, `(; accuracy = 0.6, worst = 0.7, auroc = 0.833)`, reaches the
+run history, the logger, and checkpoint selection, so `TopKCheckpointer(metric = :auroc, mode = :max)`
+works.
 
 `n_pos` is here to show a mixed group; `count(label)` in `finalize_metrics` gives the same number.
 
@@ -119,7 +121,7 @@ checkpoint selection, so `TopKCheckpointer(metric = :auroc, mode = :max)` works.
 - **`:concat` is an input to `finalize_metrics` only.** Reduce it there. A `:concat` array returned
   unreduced is refused, because it would be stored in the run history every epoch, logged, and
   written into every checkpoint. Per-sample outputs for analysis come from [`predict`](@ref).
-- **Types are yours.** Each value accumulates in the type the hook returns. Return `Float64` where
+- **Values keep their type.** Each value accumulates in the type the hook returns. Return `Float64` where
   precision matters, such as sums of squares.
 
 `:concat` holds the split's per-sample values in host memory for one evaluation pass. The other
@@ -127,8 +129,7 @@ modes hold one value per key.
 
 ## Host or device
 
-Where a metric runs is a per-hook choice that trades compile cost, expressiveness, and transfer
-cost against each other:
+[`metrics_residency`](@ref)`(e, hook)` sets where each hook runs, `:device` or `:host`:
 
 | | `:device` (traced) | `:host` (ordinary Julia) |
 | --- | --- | --- |
@@ -136,11 +137,10 @@ cost against each other:
 | Expressiveness | must be expressible as a traced program | anything Julia can do: matching, connected components, sorting with tie-breaking, any library |
 | Editing the hook | edits the program, so it recompiles | part of no program, so it recompiles nothing |
 
-The defaults follow the cadence. `train_metrics` runs once per micro-batch, so it is traced by
-default; transferring a full output batch that often would cost far more than the few scalars it
-produces. `metrics` runs once per eval batch, once per epoch, after a training epoch of thousands
-of steps, so the same transfer is noise, and host residency lets evaluation code use anything Julia
-can do.
+The defaults follow how often each hook runs. `train_metrics` runs once per micro-batch, so it is
+traced by default: transferring a full output batch that often costs far more than the few scalars
+it produces. `metrics` runs once per eval batch, once per epoch, so the same transfer is small
+against an epoch of training, and host residency lets evaluation code use any Julia code.
 
 ```julia
 # The defaults, written out. You would not normally write this line.
@@ -151,16 +151,19 @@ ReactantNitro.metrics_residency(::MyExp, hook) =
 ReactantNitro.metrics_residency(::MyExp, ::Symbol) = :device
 ```
 
-Both hooks accept both values. The only difference for the hook author is what `outputs` is: device
-arrays under `:device`, host arrays under `:host`. Keyword routing, the modes, and the no-padding
-guarantee are the same either way. The cost to weigh is compilation: editing a traced
-`train_metrics` repays the gradient compile, while a host metric can be added mid-session without
-one.
+Both hooks accept both values. For the hook author, the only difference is what `outputs` holds:
+device arrays under `:device`, host arrays under `:host`. Keyword routing, the modes, and the
+no-padding guarantee are the same either way. A traced `train_metrics` is part of the gradient
+program, so editing it recompiles that program; a host metric can be edited without a recompile.
+
+[`train_metrics`](@ref) returns a `NamedTuple` of plain scalars, with no modes: nothing is
+accumulated. It runs on every micro-batch, also under `log_every_n_steps`, but only the values of
+a logged step's last micro-batch are written to the train line.
 
 ## A worked pair
 
-Validation metrics for the `MnistMLP` from the quick start, in host mode, the default for
-`metrics`: ordinary Julia on transferred arrays, once per eval batch. `validate(nitro)` reports
+Validation metrics for the `MnistMLP` from the [Tutorial](tutorial.md), in host mode, the default
+for `metrics`: ordinary Julia on transferred arrays, once per eval batch. `validate(nitro)` reports
 these every epoch, and `evaluate(nitro; split = :test)` runs the same hooks on the test split.
 
 ```julia
@@ -188,14 +191,14 @@ already divided and `:sum` keys as raw totals, so `acc.confusion` is the whole s
 `macro_recall` is computed once at the end rather than averaged per batch. Neither hook is traced,
 so editing either recompiles nothing.
 
-The general rule for `finalize_metrics`: reduce host-side for anything that is not a mean of
-per-batch values. Averaging per-batch recalls instead of computing recall from the split's
-confusion matrix gives a different, wrong number that still looks plausible.
+Compute anything that is not a mean of per-batch values in `finalize_metrics`. Averaging
+per-batch recalls instead of computing recall from the split's confusion matrix gives a different
+and wrong number.
 
 ## R², exact from sums
 
-R² looks like it needs the split's mean target before the residuals can be compared to it. It does
-not, because the total sum of squares expands into sums:
+R² needs the split's mean target, which no single batch knows. The total sum of squares expands
+into sums, so `:sum` is enough:
 
 ```math
 SS_\text{tot} = \sum (y - \bar y)^2 = \sum y^2 - \frac{(\sum y)^2}{n}
@@ -215,14 +218,14 @@ end
 ```
 
 This is the split's R², not a mean of per-batch values. `syy - sy^2 / n` loses precision when the
-target mean is large relative to its spread, which is what the `Float64` and the shift are for. Any
-fixed shift leaves the variance unchanged; the training target mean is a good choice.
+target mean is large relative to its spread; the `Float64` and the shift reduce that. Any fixed
+shift leaves the variance unchanged; the training target mean is a good choice.
 
 ## AUROC, binned
 
-The [traced example](@ref "One split, traced end to end") computes AUROC exactly from `:concat`. When the
-split is large, a histogram of scores per class is a `:sum` value, so memory stays fixed and the
-result is exact up to the bin width:
+The [traced example](@ref "One split, traced end to end") computes AUROC exactly from `:concat`,
+which holds every score in host memory. For a large split, a histogram of scores per class is a
+`:sum` value of fixed size, and the result is accurate to the bin width:
 
 ```julia
 function ReactantNitro.metrics(::MyClassifier, logit; label)
@@ -253,7 +256,8 @@ approximation: AUROC, average precision, Spearman correlation, medians, and quan
 ## Older spellings
 
 `(value, mode)` is the older spelling of `value => mode`, and `nothing` the older spelling of
-`:sum`, so `(cm, nothing)` and `cm => :sum` mean the same. Both still work at the top of a key.
+`:sum`, so `(cm, nothing)` and `cm => :sum` mean the same. The tuple form is accepted only at the
+top of a key; `nothing` is accepted wherever a mode is.
 
 ## See also
 

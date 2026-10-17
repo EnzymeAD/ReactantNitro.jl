@@ -5,35 +5,50 @@ The logging contract is ten verbs on your own type:
 `log_metrics!`, `log_params!`, `log_tags!`, `log_other!`, `log_confusion!`, `finish!`, `run_id`,
 `run_url`, `logger_state`, `reattach!`
 
-It is **duck-typed**: no supertype, no registration, and `nothing` is the public "no logging" value
-with a no-op method for every verb. A missing method is a `MethodError` rather than a silent no-op,
-because optional-no-op contracts make wrappers quietly lossy; a backend opts into silence per verb.
+It is **duck-typed**: no supertype and no registration. `nothing` is the "no logging" value and has
+a no-op method for every verb. A verb your type does not define raises a `MethodError` (except
+`logger_state`, which defaults to `nothing`), so a wrapper cannot drop data unnoticed; a backend that wants a verb to do nothing defines it as a no-op.
 
-The step counter lives in the driver, not the logger, which is what makes the contract stateless.
-Train metrics carry `step`, validation metrics carry `epoch` plus the current step so the two
-overlay, and a third context, `"data"`, carries the host data path's per-epoch `data_wait_frac`.
+The driver owns the step counter and passes `step` and `epoch` to every `log_metrics!` call, so a
+logger needs no step counter of its own. Each call names one of three contexts:
 
-A fast run writes a train line every optimizer step, which can overwhelm a hosted backend.
-[`log_every_n_steps`](@ref) (default `1`) writes it on every `n`th step only, schedule values
-included; validation and the per-epoch lines are unaffected.
+- `"train"`: one line per logged optimizer step, carrying `loss`, the [`train_metrics`](@ref)
+  values, and the schedule values. With `accum > 1` these are the values of the step's last
+  micro-batch.
+- `"validate"`: one line per validation pass, carrying the validation metrics at the current step
+  and epoch, so it overlays the train curve.
+- `"data"`: one line per epoch, carrying the host data path's `data_wait_frac`.
+
+Every varying scalar schedule is logged on the train line with no code from you: a `Device` field as
+`schedule/<field>`, an optimizer rule value as `schedule/<group>/<field>`, after the per-group
+scaling (see [Schedules](schedules.md)). Constant schedules are left out, since the binding report
+records them. In manual mode each optimizer schedule key is logged as given, its path joined by
+`/`. Pass `autolog_schedules = false` (see [`autolog_schedules`](@ref)) to turn this off.
+
+[`log_every_n_steps`](@ref) (default `1`) writes the train line only on steps that are a multiple
+of `n`, so a fast run does not flood a hosted backend. It thins the writing only: the loss is still
+read back and `train_metrics` still runs every micro-batch, and the validate and data lines are
+unaffected.
+
+Before the logger is called, the framework drops every non-finite value from the train and validate
+lines, and every schedule value that is not a `Real`. Other non-`Real` metric values reach the
+backend as they are.
 
 ## Three ways to get a backend
 
-None of them blocks on another:
-
 1. **Your own logger** defines the verbs in your own code, with no extension and no supertype.
 2. **A common public logger** gets an extension here, with the logger as a weak dependency.
-3. **A backend's own package** may equally define them itself, taking ReactantNitro as a weak
+3. **A backend's own package** can define them itself, taking ReactantNitro as a weak
    dependency so that nobody installing it pays for Reactant and Enzyme.
 
-None of these is type piracy. If both sides ship glue for the same backend, the methods have
-identical signatures and the last one loaded wins silently, so the convention is that a backend's
-own implementation is authoritative and the extension here is retired once one exists.
+None of these is type piracy. If both an extension here and the backend's own package define the
+verbs, the signatures are identical and whichever loads last wins. The backend's own implementation
+is authoritative, and the extension here is retired once one exists.
 
 ## The shipped default
 
 A run that names no logger gets `JSONLogger`, which writes JSON Lines to `metrics.jsonl` in the
-run's directory. That file is the first place to look for a run's numbers.
+run's directory.
 
 ```json
 {"type":"params","seed":42,"max_epochs":40,"width":128}
@@ -44,18 +59,20 @@ run's directory. That file is the first place to look for a run's numbers.
 {"type":"finish","status":"completed"}
 ```
 
-Every line carries a `type` discriminator so the file is self-describing and filterable, and every
-write flushes, so a crash loses at most the line being written. The handle opens in append mode, so
-a resumed run extends the same file rather than truncating it. That is also why `logger_state`
-returns `nothing` for it: a file logger has nothing to reattach, and a backend that defines neither
-`logger_state` nor `reattach!` keeps working.
+Every line carries a `type` field to filter on, and every write flushes, so a crash loses at most
+the line being written. The file opens in append mode, so a resumed run extends it. For the same
+reason `logger_state` returns `nothing`: there is nothing to reattach (see
+[Resumption state](#Resumption-state)).
 
-`logger = nothing` is the documented opt-out, as a `Nitro` keyword or as a `logger = nothing` field.
+To turn logging off, pass `logger = nothing` as a `Nitro` keyword or declare a `logger` field with
+default `nothing`.
 
 ## Supplying a logger
 
-`logger(e)` is called **exactly once**, at the end of setup, which is what makes it safe for the
-accessor to have a side effect: opening a file here, or registering a run with a hosted tracker.
+`logger(e)` is called once per `Nitro`, at the start of construction, before `build_data` and the
+first compile, and not at all when the `logger` keyword is given. A side effect in the accessor,
+such as opening a file or registering a run with a hosted tracker, therefore happens once per run.
+A field default runs when the experiment is constructed instead.
 
 ```julia
 # a field on the experiment
@@ -85,24 +102,24 @@ ReactantNitro.logger(::MnistMLP) = TBLogger("tb/mnist_v1", tb_append)
 tensorboard --logdir tb
 ```
 
-Metrics become scalar summaries tagged by context, `train/loss`, `validate/val_loss`, `data/…`,
-with `step` as the x axis in every context and the epoch alongside as `<context>/epoch`.
+Each metric becomes a scalar summary tagged `<context>/<name>`, such as `train/loss`,
+`train/schedule/backbone/eta` or `validate/val_loss`, with `step` as the x axis in every context and
+the epoch logged as `<context>/epoch`. A metric value that is not a `Real` is an error naming the
+key; write it through `backend` instead (see [below](#Past-the-ten-verbs)).
 
-**The driver's step is the only one in the file.** Nothing goes through the stdlib `AbstractLogger`
-path, so `TBLogger`'s own global counter never moves and cannot disagree with the step recorded in
-the checkpoint. If you also use the logger for ordinary `@info` under `with_logger`, that traffic
-still increments it, which is fine and does not interfere.
+Every scalar is written at the driver's step. Nothing goes through the stdlib `AbstractLogger`
+path, so `TBLogger`'s own step counter does not move and cannot disagree with the step in the
+checkpoint. Ordinary `@info` under `with_logger` still increments it, which does not affect the
+scalars.
 
-**Parameters are written twice, deliberately.** They land immediately as a text summary, so a crash
-during the first compile still leaves them in the file, and again through `write_hparams!` at
-`finish!`, which is the first moment the metric tags the HParams comparison table needs actually
-exist.
+Parameters are written twice: as a text summary immediately, so a crash during the first compile
+still leaves them in the file, and through `write_hparams!` at `finish!`, because the HParams table
+also needs the metric tags, which exist only after metrics have been logged.
 
-**Pass `tb_append`.** `TBLogger(dir)` defaults to `tb_increment`, which silently writes to `dir_1`
-when `dir` already exists, and on a resume it always exists. `logger_state` stores the directory
-and `reattach!` refuses a resume that would write somewhere else, naming `tb_append` as the fix, so
-the mistake is an error rather than a run whose curves are split across two entries in TensorBoard's
-run list.
+**Pass `tb_append`.** `TBLogger(dir)` defaults to `tb_increment`, which writes to `dir_1` when `dir`
+already exists, and on a resume it always exists. `logger_state` stores the directory, and
+`reattach!` refuses a resume into a different one and names `tb_append` as the fix, instead of
+splitting the run's curves across two TensorBoard runs.
 
 ### Runs, and comparing experiments
 
@@ -119,27 +136,26 @@ interleave the curves.
 
 ### Past the ten verbs
 
-`backend(lgr)` returns the `TBLogger` itself, so everything TensorBoardLogger can do stays
-callable. A phase monitor is the natural place, since `info.logger` hands you the run's logger:
+`backend(lgr)` returns the `TBLogger` itself, so every TensorBoardLogger function stays callable.
+A phase monitor can reach it through `info.logger`, the run's logger:
 
 ```julia
 register_phase_monitor!(n) do phase, step, epoch, info
-    phase isa EvalStepping && return                # fires on entry and on exit
+    haskey(info, :metrics) || return                # only the transition out of EvalStepping
     lg = ReactantNitro.backend(info.logger)
     lg isa TBLogger || return
     TensorBoardLogger.log_histogram(lg, "weights/dense1", vec(Array(n.ps.layer_1.weight)); step)
 end
 ```
 
-That is also where `log_confusion!` belongs. **The framework never calls it**, because only the
-experiment knows both that a matrix exists and what its class labels mean: accumulate it in
-`metrics` with `:sum`, stash it from `finalize_metrics`, and emit it on the transition
-out of `EvalStepping`, which is exactly when a fresh one exists.
+The same monitor is where `log_confusion!` belongs. **The framework never calls it**, because only
+the experiment knows that a matrix exists and what its class labels mean. Accumulate the matrix in
+`metrics` with `:sum`, stash it from `finalize_metrics`, and emit it on the transition out of
+`EvalStepping`, when a new one has just been computed.
 
-One caveat if you read event files back from Julia rather than from TensorBoard:
-`TensorBoardLogger.map_summaries` raises a `FieldError` on any text summary, because its
-deserializer reaches for a field its generated protobuf type does not have. That is a reader bug
-and not a writer bug, so TensorBoard itself reads these files without complaint.
+If you read event files back from Julia, `TensorBoardLogger.map_summaries` raises a `FieldError` on
+any text summary, because its deserializer reads a field its generated protobuf type does not have.
+The bug is in the reader; TensorBoard reads the files correctly.
 
 ## Resumption state
 
@@ -148,9 +164,10 @@ a hosted experiment key, a run id plus project and entity, a tracking URI, a dir
 return plain serializable data, never the live backend object, because the checkpoint record goes
 through JLD2 and outlives the process.
 
-The pair is self-describing. If `logger_state` returns anything but `nothing`, `reattach!` is
-**required** and a missing method is the usual `MethodError`. Resuming into a different logger type
-is refused by name, since the record stores the logger's type alongside its state.
+`logger_state` defaults to `nothing`, which stores nothing and attempts no reattachment, so a
+backend that defines neither verb keeps working. If `logger_state` returns anything else,
+`reattach!` is **required**, and a missing method is a `MethodError`. The record stores the
+logger's type with its state, and a resume into a different logger type is refused with both names.
 
 `run_id`, `run_url` and `logger_info` are informational, for humans and for tools.
 `logger_info(nitro)` is what the Kaimon `nitro_logger` tool renders; see [Kaimon](kaimon.md).

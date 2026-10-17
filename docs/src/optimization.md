@@ -8,48 +8,47 @@ learning-rate curve is on the [Schedules](schedules.md) page.
 
 Declare nothing and setup resolves a complete optimizer: [`optimizer`](@ref) is `RAdam` at `1f-3`
 over one parameter group, [`lambda`](@ref) is zero so there is no [`Decay`](@ref) in the chain,
-[`gradient_clip_norm`](@ref) is zero so clipping is off, and no schedule is configured. Every
-accessor below changes one part of that picture.
+[`gradient_clip_norm`](@ref) is zero so clipping is off, and no schedule is configured. Each
+accessor below changes one of these.
 
 Gradient accumulation changes none of it: `accum` folds N micro-batches into one optimizer step,
 and the optimizer runs once per accumulated gradient, so every accessor here means the same thing
-whether `accum` is 1 or 16. Its only other appearance is in the schedule horizon
+whether `accum` is 1 or 16. The only other place `accum` appears is the schedule horizon
 ([Schedules](schedules.md)).
 
 `RAdam` is the default rather than `Adam` because it rectifies the adaptive variance term over the
-first steps instead of leaving you to hand-tune a warmup. `Adam` is one line away at Level 1. The
-price is a hard floor of `Optimisers` 0.4.8, the first release whose Reactant extension can trace
-`RAdam`.
+first steps, so you need not tune a warmup by hand. `Adam` is one line away at Level 1. The cost is
+a minimum of `Optimisers` 0.4.8, the first release whose Reactant extension can trace `RAdam`.
 
-## Rules are Optimisers.jl rules, and that is structural
+## Rules are Optimisers.jl rules
 
-The framework builds `Optimisers.Leaf` objects, calls `Optimisers.apply!`, and checks membership of
-an allowlist of rules verified to trace: `Descent`, `Momentum`, `Nesterov`, `Adam`, `AdamW`,
+The framework builds `Optimisers.Leaf` objects, calls `Optimisers.apply!`, and checks each rule
+against an allowlist of rules verified to trace: `Descent`, `Momentum`, `Nesterov`, `Adam`, `AdamW`,
 `RAdam`, `WeightDecay`, `ClipGrad`, `ClipNorm`, [`Decay`](@ref), and `OptimiserChain`s of them. A
 rule outside the allowlist is refused at setup, with an error naming the admitted set, rather than
-discovered inside a trace. The criterion is mechanical: the rule has to trace with device-resident
-state, be a type fixed point across a step, and hold no host `Number` in its state. Two exclusions
-are deliberate rather than untested: `AccumGrad` traces and is numerically wrong under tracing,
-and layer-adaptive rules such as LARS and LAMB would compute one trust ratio per
+failing inside a trace. `ClipNorm` is admitted only with `throw = false`. A rule is admitted once it
+traces with device-resident state, keeps its type across a step, and matches the untraced
+`Optimisers` result. Two rules are excluded on purpose: `AccumGrad` traces but is numerically wrong
+under tracing, and layer-adaptive rules such as LARS and LAMB would compute one trust ratio per
 parameter group rather than per layer.
 
-A custom rule is possible if it satisfies the same three properties.
+The allowlist has no extension hook: admitting a new rule that meets these criteria is a change to
+the package source.
 
 ## Three levels of optimizer
 
-The [`optimizer`](@ref) hook has three levels, each a smaller or larger share of the construction:
+The [`optimizer`](@ref) hook has three levels, each handing more of the construction to you:
 
 ```julia
-# Level 0: declare nothing. The defaults are the whole configuration: RAdam at 1f-3 over one
-# parameter group, per-group hyperparameters from `learning_rate` and `lambda`.
+# Level 0: declare nothing. RAdam at 1f-3 over one parameter group, per-group hyperparameters
+# from `learning_rate` and `lambda`.
 
-# Level 1: return a rule TYPE and the framework constructs it, splatting the resolved
-# hyperparameters in by field name. Momentum and Adam are each one line away; RAdam is shown
-# because it is the default and the recommended rule.
+# Level 1: return a rule TYPE and the framework constructs it, filling its fields from `hp` by
+# name. Shown here per group; `optimizer(::MyExp) = Optimisers.Adam` sets every group.
 ReactantNitro.optimizer(::MyExp, ::Val{:backbone}) = Optimisers.RAdam
 
-# Level 2: supply the whole chain. `hp` is this group's already resolved, already
-# device-converted hyperparameters; it is called at setup and every optimizer step.
+# Level 2: supply the whole chain. `hp` is this group's resolved, device-converted
+# hyperparameters; the method is called at setup and again every optimizer step.
 function ReactantNitro.optimizer(::MyExp, group::Symbol, hp)
     Optimisers.OptimiserChain(
         Optimisers.ClipNorm(1.0f0, 2.0f0, false),
@@ -58,28 +57,33 @@ function ReactantNitro.optimizer(::MyExp, group::Symbol, hp)
 end
 ```
 
-At Level 1 the framework composes the [`Decay`](@ref) tail itself, so the per-group accessors, the
-`w0` anchor, and the no-decay mask all keep working unchanged. **Level 1 rejects any rule declaring
-a `lambda` field, which is `AdamW` today**: that rule plus the framework's own decay tail would
-decay twice, silently, at whatever the two coefficients sum to.
+Both levels receive the same `hp`, a `NamedTuple` with keys `eta` (this group's effective learning
+rate), `lambda` (already multiplied by that `eta`, or `nothing` when it is zero and not scheduled),
+`anchor` (a flat device array or `nothing`), `no_decay_mask`, and one key per scheduled rule field,
+present from the first call. A field is schedulable unless [`nonschedulable`](@ref) lists it.
 
-At Level 2 the framework supplies `hp`, a `NamedTuple` with keys `eta` (this group's effective
-learning rate), `lambda` (already multiplied by that `eta`, or `nothing` when it is zero and not
-scheduled), `anchor` (a flat device array or `nothing`), `no_decay_mask`, and one key per scheduled
-rule field, present from the first call, where schedulable means every field
-[`nonschedulable`](@ref) does not list. The framework checks that the returned chain is on the
-allowlist and that `Decay` is last. Two rules may share a field name: one `hp.eta` reaches whichever
+At Level 1 the framework calls `R()` and replaces each field that `hp` has a key for, so fields
+`hp` does not carry keep the rule's constructor defaults. It then appends the
+[`Decay`](@ref)`(hp.lambda, hp.anchor, hp.no_decay_mask)` tail when `hp.lambda` is not `nothing`,
+so the per-group accessors, the `w0` anchor, and the no-decay mask all work unchanged. **Level 1
+rejects any rule declaring a `lambda` field**, which among the admitted rules is `AdamW` and
+`WeightDecay`: that rule plus the framework's decay tail would decay twice, at whatever the two
+coefficients sum to.
+
+At Level 2 the framework adds nothing to your chain, including no `Decay` tail: to decay, end the
+chain with `Decay(hp.lambda, hp.anchor, hp.no_decay_mask)`. It checks that the returned chain is on
+the allowlist and that `Decay` is last. Two rules may share a field name: `hp.eta` reaches whichever
 rules the factory passes it to, and nothing else.
 
-Level 2 places the values, so the framework checks the placement too, once at setup and on the
-host: it calls the factory with two values of each varying field and records which rule fields
+Because Level 2 places the values itself, setup checks the placement once, on the host: for each
+scheduled field it calls the factory with two different values and records which rule fields
 change. A scheduled field that changes nothing is a setup error, and the binding report shows where
-each one landed. A value computed from `hp`, such as `2 * hp.eta`, is a host number, which would
-bake into the optimizer program at its first value; the recorded fields are moved to the device
-each step, so a computed value follows its schedule too.
+each one landed. A value computed from `hp`, such as `2 * hp.eta`, is a host number, which would be
+baked into the optimizer program at its first value; the framework moves each recorded field to
+the device every step, so a computed value follows its schedule too.
 
-There is no path that accepts a fully constructed chain with baked hyperparameter values, because
-rules carry tracked device scalars rebuilt every step.
+No level accepts a fully constructed chain with fixed values, because rules carry device scalars
+that are rebuilt every step.
 
 ## Parameter groups
 
@@ -94,12 +98,15 @@ rate, its decay coefficient, its decay anchor, and its rule chain.
 # η_g(t) = eta_sched(t) * (learning_rate(e, Val(g)) / learning_rate(e))
 ```
 
-so a schedule on `eta` moves every group together and the ratio holds at every step. Per-group
-curves are a separate key shape: a path-bound `opt.<group>.eta` binds one group's chain only, with
-the same ratio applied ([Schedules](schedules.md)).
-`learning_rate(e) == 0` is therefore a setup error rather than "everything trains at zero": it
-makes every group's ratio undefined, which is also why the default is `1f-3` rather than `0`. To
-train one group only, zero that group's own rate.
+where `eta_sched(t)` is the `eta` schedule's value, or `learning_rate(e)` when `eta` is not
+scheduled. A schedule on `eta` therefore moves every group together and the ratio holds at every
+step; with no schedule, each group trains at its own `learning_rate(e, Val(g))`. A path-bound
+`opt.<group>.eta` gives one group its own curve, with the same ratio applied
+([Schedules](schedules.md)).
+
+`learning_rate(e) == 0` is a setup error, because it makes every group's ratio undefined; this is
+also why the default is `1f-3` rather than `0`. To freeze one group, set that group's own rate to
+zero.
 
 The classic fine-tuning setup is two groups, a pretrained backbone at a tenth of the head:
 
@@ -127,20 +134,18 @@ consumer of `ps` already wants a tree.
 
 **Compile size.** A tree-level `Optimisers.update` emits the rule's operations once per parameter
 array. A model with several hundred arrays therefore produces an optimizer program with several
-hundred copies of them, and XLA compiles all of it. Flattening collapses that to `G`, which for most
+hundred copies of them, and XLA compiles all of it. Flattening reduces that to `G`, which for most
 models is one or two.
 
 **`apply!` is array-level.** `Optimisers.apply!` works on an array, not a tree, so a flat group
-buffer hands it exactly what it wants and skips the tree walk. Per-group calls also solve the
-scalar-`eta` limitation that a single whole-model buffer would run into, since each group carries
-its own hyperparameters.
+buffer is what it expects and no tree walk is needed. Because each group is a separate call, each
+can carry its own scalar hyperparameters, which one whole-model buffer could not.
 
 ### What it costs, and what it does not
 
-`flatten` is a **concatenate**, so it is a real copy of the parameter set rather than a fold into a
-consumer. It is not a runtime permuted gather: the permutation is one row per leaf, not one entry
-per element, so the operand order is known at trace time and grouping by leaf costs nothing beyond
-the copy. That is also why it emits no control flow.
+`flatten` is a **concatenate**, so it is a real copy of the parameter set. It is not a runtime
+gather: the permutation has one row per leaf, not one entry per element, so the operand order is
+known at trace time and grouping costs nothing beyond the copy and emits no control flow.
 
 `unflatten` is a **reshape over a contiguous slice**, per leaf. Under trace both the slice and the
 reshape fold into the consuming operation, so the reconstruction is free.
@@ -148,39 +153,45 @@ reshape fold into the consuming operation, so the reconstruction is free.
 ### The layout is stable, and the checkpoint depends on it
 
 The layout is a stable sort of the tree's traversal-order leaves by group index: `:default` is group
-one, the rest follow first-appearance order, and within a group leaves keep traversal order. That
-determinism is what lets a checkpoint store the permutation and a resume verify the restored tree
-against it, so a model whose structure changed is refused rather than silently reloaded into the
-wrong slots. The layout is built unconditionally, including for an evaluation handle, because it is
-host-side bookkeeping rather than device memory.
+one, the rest follow first-appearance order, and within a group leaves keep traversal order. Because
+the layout is deterministic, a checkpoint stores the permutation and a resume verifies the restored
+tree against it, so a model whose structure changed is refused rather than loaded into the wrong
+slots. The layout is built for every handle, including an evaluation handle, because it is
+host-side bookkeeping and costs no device memory.
 
 ## Decay, and what it decays toward
 
 [`Decay`](@ref) is one rule that differs only in the anchor:
 
 ```julia
-Decay(lambda)                        # anchor :zero, every parameter
-Decay(lambda, anchor)                # anchor :zero, :w0, or an array
+Decay(lambda)                        # toward zero, every parameter
+Decay(lambda, anchor)                # anchor: `nothing` (toward zero) or an array
 Decay(lambda, anchor, no_decay_mask)
 ```
 
-An anchor of `nothing` is decay toward zero, ordinary weight decay. An anchor of `:w0` is decay
-toward the parameters exactly as `build_model` returned them, before any training step or restore,
-which the literature calls L2-SP (Li, Grandvalet, and Davoine, ICML 2018, arXiv:1802.01483). An
-explicit array decays toward that target, which is the extension point: initialize from A while
-anchoring to B.
+An anchor of `nothing` is decay toward zero, ordinary weight decay. An array anchor decays toward
+that target. The framework fills the anchor from each group's [`decay_anchor`](@ref)`(e, Val(group))`,
+which defaults to `:zero` (anchor `nothing`). `:w0` decays toward the parameters exactly as
+`build_model` returned them, before any training step or restore, which the literature calls L2-SP
+(Li, Grandvalet, and Davoine, ICML 2018, arXiv:1802.01483). Returning an explicit array, aligned
+with that group's flat buffer, lets you initialize from A while anchoring to B.
 
-The anchor is per group, via [`decay_anchor`](@ref)`(e, Val(group))`, defaulting to `:zero`. The
-intended fine-tuning setup is `:w0` on the pretrained backbone and `:zero` on the fresh head, and
-one `opt.lambda` schedule drives both, because both are the same regularization-strength knob.
+The usual fine-tuning setup is `:w0` on the pretrained backbone and `:zero` on the fresh head, with
+one `opt.lambda` schedule driving both, since both are the same regularization strength.
 
-Decay is decoupled, AdamW-style: it goes after the base rule in the chain, scaled by the learning
-rate, so `lambda` arrives pre-multiplied by the group's effective rate and an LR schedule modulates
-regularization strength. `Decay` anywhere but last in a chain is an error checked at setup. The
-anchor is an explicit field, never captured at optimizer init, which is what keeps resume correct:
-an init-captured anchor would grab the restored weights instead. Anchoring anywhere but `:zero`
-puts a per-group `anchor_checksum` in the checkpoint record, and resume verifies it and refuses on
-mismatch.
+Decay is decoupled, AdamW-style: it goes after the base rule in the chain, and the coefficient is
+scaled by the group's effective learning rate,
+
+```julia
+# λ_g(t) = η_g(t) * lambda_sched(t)      # `opt.lambda` scheduled
+# λ_g(t) = η_g(t) * lambda(e, Val(g))    # otherwise
+```
+
+so an `eta` schedule also modulates regularization strength. `Decay` anywhere but last in a chain is
+a setup error. The anchor is an explicit field, never captured at optimizer init, which keeps resume
+correct: an anchor captured at init would take the restored weights instead. Anchoring anywhere but
+`:zero` puts a per-group `anchor_checksum` in the checkpoint record, and resume verifies it and
+refuses on mismatch.
 
 ## Per-leaf exclusion: `no_decay`
 
@@ -194,43 +205,40 @@ ReactantNitro.no_decay(::MyExp, ks, x) = default_no_decay(ks, x) || (:fc in ks)
 
 # REPLACE form: excludes ONLY the head. Every bias and every norm affine is now decayed,
 # which is almost certainly not what the framework you are porting from did.
-ReactantNitro.no_decay(::MyExp, ks, x) = (:fc in ks) && (:weights in ks)
+ReactantNitro.no_decay(::MyExp, ks, x) = (:fc in ks) && (:weight in ks)
 ```
 
-The REPLACE form is the single most common way to get a port's numerics wrong: most frameworks OR
-their own bias and norm exclusion in, so the ADD form is the faithful port and the REPLACE form a
-silent change to what gets regularized.
+Most frameworks exclude biases and norm affines from decay, so when porting, the ADD form keeps the
+original behavior and the REPLACE form changes what gets regularized without any error.
 
-Exclusion dominates the anchor for free: an excluded leaf gets a mask of 0, and `Decay` computes
+Exclusion overrides the anchor: an excluded leaf gets a mask of 0, and `Decay` computes
 `no_decay_mask * lambda * (x - anchor)`, so the term vanishes under either anchor. Exclusion is per
-leaf while the coefficient and the anchor are per group, and that split is deliberate: biases and
-norm affines occur inside every group, and expressing their exclusion through
-[`param_group`](@ref) would force a group split that also silently splits the learning-rate ratio,
-which is a different knob. The hook is resolved host-side, once, at setup; it never enters a trace,
-and it is not in the compile cache key.
+leaf while the coefficient and the anchor are per group, because biases and norm affines occur
+inside every group; expressing their exclusion through [`param_group`](@ref) would force a group
+split that also splits the learning-rate ratio. The hook runs on the host, once, at setup; it never
+enters a trace and is not in the compile cache key.
 
 ## Gradient clipping: `gradient_clip_norm`
 
-[`gradient_clip_norm`](@ref)`(e)` is the global-norm clip threshold, default `0f0`, meaning off. It
-is a global norm over the fully accumulated gradient, applied at the top of the optimizer program,
-never a chain member: a chain member would clip per group, which is a different algorithm producing
-different updates. It is not per group and it is not schedulable. It is also a
-[`Nitro`](@ref) keyword defaulting to this accessor, so `train!(e; gradient_clip_norm = 1f0)`
-overrides it for one run:
+[`gradient_clip_norm`](@ref)`(e)` is the global-norm clip threshold, default `0f0`, meaning off. The
+norm is taken over the fully accumulated gradient of all groups, at the top of the optimizer
+program, never as a chain member: a chain member would clip per group, which produces different
+updates. It is not per group and not schedulable. It is also a [`Nitro`](@ref) keyword defaulting
+to this accessor, so `train!(e; gradient_clip_norm = 1f0)` overrides it for one run:
 
 ```julia
 # 0 means off, and is the default.
 ReactantNitro.gradient_clip_norm(::MyExp) = 1f0
 ```
 
-The threshold is a trace-time host constant, so a disabled clip emits no ops at all. The price is
-that changing it recompiles the optimizer program, and only that one, so a clip sweep re-pays the
-cheap compile rather than the expensive one. A device-resident threshold could not keep "off": `0`
-would scale the gradient to zero norm, and on an all-zero gradient `0/0` yields `NaN` silently.
+The threshold is a trace-time host constant, so a disabled clip emits no ops at all. The cost is
+that changing it recompiles the optimizer program, and only that one, so a clip sweep repeats only
+the cheap compile. A device-resident threshold could not mean "off" at `0`: it would scale the
+gradient to zero norm, and on an all-zero gradient `0/0` yields `NaN`.
 
 ## A complete recipe
 
-Putting the per-group pieces together, from the README's MNIST experiment:
+The per-group pieces together, for an MNIST MLP:
 
 ```julia
 # Two groups: `layer_1` is the encoder, everything else is the head. Per-group rates are

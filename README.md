@@ -26,15 +26,16 @@ the framework supplies the compiled programs, the device transfers, the optimize
 checkpointing, and the run's lifecycle. Training and serving both stay in Julia, from the first
 `train!` to the exported [bundle](https://enzymead.github.io/ReactantNitro.jl/dev/export/).
 
-The design follows PyTorch Lightning, pointed at Reactant. Lux has a training loop; a Reactant-first
-stack also needs precision over when XLA compiles, control over what the tracer walks, device memory
-freed per batch rather than at the host GC's convenience, and binding by name between loaders, hooks,
-schedules and optimizer rules. On top of those it supplies what Lightning does: gradient
-accumulation, phases, schedules, checkpoint and resume, logging, and export.
+The design follows PyTorch Lightning, adapted to Reactant. Beyond a training loop, a Reactant-first
+stack needs control over when XLA compiles and what the tracer walks, device memory freed after each
+batch instead of when the host GC runs, and binding by name between loaders, hooks, schedules and
+optimizer rules. On top of those it supplies what Lightning does: gradient accumulation, phases,
+schedules, checkpoint and resume, logging, and export.
 
 A Reactant-first stack has [pitfalls](https://enzymead.github.io/ReactantNitro.jl/dev/pitfalls/) that are easy to
-hit and hard to diagnose: a compile that balloons for no visible reason, an edit that reuses a stale program,
-a run that goes OoM hours in. None of them raise, and the framework handles each one.
+hit and hard to diagnose: a compile that takes far longer than it should, an edit that reuses a stale
+program, a run that runs out of device memory hours in. None of them raises an error on its own; the
+framework guards against each one.
 
 ## The three field markers
 
@@ -47,7 +48,7 @@ program sees and whether changing the value recompiles:
 | `Device{T}` | a device-resident traced input | no, by construction | never recompiles: sweep it, schedule it, rewrite it live |
 | unmarked, i.e. `Host{T}` | not at all | no | never recompiles: driver-only, invisible to the tracer |
 
-Unmarked means `Host` because that is the common case. In the first model ported to the framework,
+Unmarked means `Host` because it is the common case: in the first model ported to the framework,
 83% of the fields were `Host`.
 
 ```julia
@@ -65,8 +66,8 @@ end
 
 Programs are keyed and stored once per process, not once per `Nitro`.
 
-[Recompilation](https://enzymead.github.io/ReactantNitro.jl/dev/recompilation/) documents how invalidation works as well 
-as any current limitations.
+[Recompilation](https://enzymead.github.io/ReactantNitro.jl/dev/recompilation/) explains when a
+program is reused and what the compile key cannot see.
 
 ## Quick start
 
@@ -80,15 +81,16 @@ Pkg.add("ReactantNitro")
 ### MNIST
 
 Four hooks are required. Everything else has a default: the optimizer (RAdam at 1e-3), one
-parameter group, no decay, no schedule, prefetching, validation, checkpointing, and a `.jsonl` logger.
+parameter group, no decay, no schedule, prefetching, validation, checkpointing, and a JSON Lines
+logger that writes the loss, metrics and schedule values to `metrics.jsonl` in the run directory.
 
 ```julia
 using ReactantNitro, Lux, Random
 using MLDatasets: MNIST
 using MLUtils: DataLoader
 
-# Explicit CPU, so the quick start runs anywhere. It has to come BEFORE the first `Nitro`: that
-# is where the XLA client initializes, and the backend is fixed for the process from then on.
+# Explicit CPU, so the quick start runs anywhere. It must come before the first `Nitro`, where the
+# XLA client initializes; the backend is fixed for the process from then on.
 setup_devices!(backend = "cpu")
 
 @experiment struct MnistMLP
@@ -131,5 +133,5 @@ n = Nitro(MnistMLP(); checkpointer = TopKCheckpointer(; metric = :acc, mode = :m
 train!(n)
 ```
 
-See the [tutorial](https://enzymead.github.io/ReactantNitro.jl/dev/tutorial/) for a more indepth walkthrough covering
-a wider range of framework features and explaining how they actually work.
+See the [tutorial](https://enzymead.github.io/ReactantNitro.jl/dev/tutorial/) for a longer walkthrough that
+covers more of the framework and how it works.

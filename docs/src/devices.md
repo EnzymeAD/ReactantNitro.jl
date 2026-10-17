@@ -23,8 +23,8 @@ setup_devices!()                              # report what is in effect, change
 
 `backend` is a Reactant backend name: `"cpu"`, `"gpu"` (CUDA or ROCm, whichever is present),
 `"cuda"`, `"rocm"`, `"tpu"`. The call returns `(; backend, visible, n_devs, pinned)`. An unknown
-backend, or more devices than are visible, is an error rather than a fallback. The Kaimon tool
-`nitro_setup` is a wrapper over the same function; see [Kaimon](kaimon.md).
+backend, or more devices than are visible, is an error. The Kaimon tool `nitro_setup` calls the
+same function; see [Kaimon](kaimon.md).
 
 The call is optional. Without it a run uses Reactant's default backend and every visible device.
 
@@ -34,21 +34,27 @@ The call is optional. Without it a run uses Reactant's default backend and every
 axis. `1` skips the mesh.
 
 - **The batch size is global.** `batch_size = 32` on four devices puts 8 samples on each, and the
-  numerics are those of a 32-sample batch. More devices buy throughput, not a larger batch.
-- **The default is every visible device**, so a host with four GPUs trains data-parallel without
-  being asked. Pin a count, or narrow `CUDA_VISIBLE_DEVICES`, if that is not what you want.
-- **A batch that does not divide evenly across the mesh** is a setup error naming both numbers.
+  numerics are those of a 32-sample batch. Adding devices raises throughput and leaves the batch
+  unchanged.
+- **The default is every visible device**, so a host with four GPUs trains data-parallel on all
+  four. Pin a count, or narrow `CUDA_VISIBLE_DEVICES`, to use fewer.
+- **A batch size that does not divide evenly across the mesh** is a setup error naming both
+  numbers.
 
 The count resolves in this order, highest first:
 
 1. an `n_devs` keyword on `Nitro` or `train!`, for one run
-2. the session pin from `setup_devices!(n_devs = k)`
-3. the experiment's [`n_devs`](@ref), which reads an `n_devs` field by default
-4. `length(Reactant.devices())`
+2. an [`n_devs`](@ref) method you define for the experiment
+3. the session pin from `setup_devices!(n_devs = k)`
+4. an `n_devs` field on the experiment
+5. `length(Reactant.devices())`
+
+Steps 3 to 5 are the default `n_devs` method, so a method you define replaces them, the pin
+included.
 
 ## What the mesh computes
 
-The mesh runs one global program, so a layer sees the whole batch, not one device's share:
+The mesh runs one global program, so a layer sees the whole batch, as on one device:
 
 - **BatchNorm statistics** are over the global batch.
 - **A `Dropout` mask** is one global mask, split across the devices. Every `ReactantRNG` is placed
@@ -62,8 +68,8 @@ axis.
 
 ## Restricting GPUs
 
-Set `CUDA_VISIBLE_DEVICES` in the shell or job script before Julia starts. `n_devs` can then only
-select within what is visible, and asking for more raises:
+Set `CUDA_VISIBLE_DEVICES` in the shell or job script before Julia starts. `n_devs` then selects
+from the visible devices, and asking for more raises:
 
 ```
 ReactantNitro: `n_devs = 4` but Reactant sees 2 device(s).

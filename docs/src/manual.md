@@ -5,40 +5,36 @@ framework sequences the forwards, the backwards, the optimizer steps, and the me
 mode** you define `train_step` and own the whole optimizer step, in whatever order your algorithm
 demands; the framework keeps everything outside it.
 
-Reach for it when the automatic loop cannot express your algorithm. The canonical case is a GAN:
+Use it when the automatic loop cannot express your algorithm. The typical case is a GAN:
 one generator and one discriminator in a single parameter tree, each with its own optimizer, two
 losses computed against the same batch, and a generator gradient that must flow through the
 discriminator's forward as a function of the fake data, never into the discriminator's parameters.
 
 ## The shape of the contract
 
-Three things select and describe a manual experiment:
+Three methods select and describe a manual experiment:
 
 ```julia
-# 1. Defining `train_step` is what selects manual mode. The automatic loop has no `train_step`;
-#    its step is framework-owned. `manual_training(e) = false` declines manual mode while keeping
-#    the method in source.
+# 1. Defining `train_step` selects manual mode.
 ReactantNitro.train_step(e::MyGAN, model, ps, opt_state, st; x, z) -> (; loss, ps, st, opt_state, stats)
 
 # 2. `setup_optimizers` supplies the optimizer states, one per network or group. The framework
-#    normalizes the result to device residency and asserts the no-host-Number property.
+#    moves the result to the device and asserts that no host `Number` remains in it.
 ReactantNitro.setup_optimizers(e::MyGAN, model, ps, st, mesh) -> opt_state
 
-# 3. `manual_training(e) -> Bool` is the mode flag. The default checks whether `train_step` has a
-#    method for this experiment type; override it to keep the method while using the automatic
-#    loop.
+# 3. `manual_training(e) -> Bool` is the mode flag. The default is whether `train_step` has a
+#    method for this experiment type; return `false` to keep the method but use the automatic loop.
 ReactantNitro.manual_training(::MyGAN) = false
 ```
 
-The closure is called **once per optimizer step**, in train mode (the framework owns the
-`Lux.trainmode` switch), on one transferred **device** batch whose fields are routed from the
-keywords the method declares, exactly like `forward`. The method is traced and compiled into one
-XLA program per run; nothing recompiles after step 1.
+`train_step` (the closure, below) is called **once per optimizer step**, in train mode (the
+framework owns the `Lux.trainmode` switch), on one **device** batch whose fields are routed from the
+keywords the method declares, as for `forward`. It is traced and compiled into one XLA program per
+run; nothing recompiles after step 1.
 
-## The very simple GAN
+## A minimal GAN
 
-A complete, minimal least-squares GAN, the worked example the [`train_step`](@ref) docstring
-points at:
+A complete least-squares GAN, the worked example the [`train_step`](@ref) docstring refers to:
 
 ```julia
 using Statistics: mean   # or `using Statistics` at the top of the file
@@ -90,32 +86,31 @@ end
 train!(Nitro(ToyGAN()))
 ```
 
-Four things in the example are the contract:
+Four parts of the example are the contract:
 
-- **Noise rides in the batch.** `z` is a batch field like any other, routed from the keyword the
-  closure declares, so it is transferred per step. Draw it fresh per batch: a GAN's generator must
-  learn the mapping from noise to data, and a fixed noise sequence lets it memorize the draw. The
-  loader's own iteration (reshuffling or regenerating) is where fresh draws happen, exactly as for
-  any other data source.
+- **Noise comes in the batch.** `z` is a batch field like any other, routed from the keyword the
+  closure declares and transferred each step. Draw it fresh per batch: with a fixed noise sequence
+  the generator can memorize the draw instead of learning the mapping from noise to data. Fresh
+  draws happen in the loader's own iteration (reshuffling or regenerating), as for any other data
+  source.
 - **Each sub-network applies with its own state subtree.** `st.gen` and `st.disc` are separate, and
   `st` stays the whole tree for the backwards and the return. The returned state is assembled as
   `(; gen = st_gen, disc = st.disc)`.
 - **The backwards take everything as arguments.** `backward`'s objective reads the model (a plain
   struct, safe to capture) and takes every *traced* value it needs as an explicit argument. A
-  closure capture of a traced value is silently treated as a constant, which zeroes the gradient
-  without any error. The all-arguments form is what makes the non-saturating generator gradient
-  work: `ps.disc` as a `Const` argument means the generator's loss flows through the
-  discriminator's forward as a function of the fake data and never into the discriminator's
-  parameters. No explicit stop-gradient op is needed.
+  traced value captured by the closure is treated as a constant, which zeroes its gradient without
+  any error. Passing `ps.disc` as an argument to the generator's `backward`, where it is a `Const`,
+  makes the generator's loss flow through the discriminator's forward as a function of the fake
+  data and never into the discriminator's parameters. No explicit stop-gradient op is needed.
 - **The optimizer steps return states, not leaves.** `step_optimizer` returns the new optimizer
-  *states*; the driver re-attaches the rules it handed in. The asymmetry is forced: a rule's device
-  scalars cannot leave a compiled program as an output on a multi-device mesh, though arrays can
-  (the same rule that makes the automatic `opt_program` return states).
+  *states*; the driver re-attaches the rules it handed in. This is required because a rule's device
+  scalars cannot leave a compiled program as an output on a multi-device mesh, though arrays can;
+  the automatic loop's optimizer program returns states for the same reason.
 
 ## The return contract
 
-The driver checks the closure's return every step and validates `loss` against the framework's
-fail-fast rule, then logs `(; loss, stats...)`:
+The driver checks the closure's return every step, validates `loss`, and logs `(; loss, stats...)`
+on the train line, together with any schedule values:
 
 | Key | Meaning |
 | --- | --- |
@@ -123,43 +118,42 @@ fail-fast rule, then logs `(; loss, stats...)`:
 | `ps` | The updated parameter tree |
 | `st` | The updated layer state |
 | `opt_state` | The new optimizer **states only**; the driver re-attaches the rules |
-| `stats` | Device scalars logged once per step, `(;)` allowed |
+| `stats` | Device scalars logged on each train line (every [`log_every_n_steps`](@ref) steps), `(;)` allowed |
 
 ## Learning rate schedules
 
-`opt`-keyed schedules work in manual mode, with a **path-bound** binding. The automatic loop
-binds `opt.eta` to every parameter group's chain, ratio-scaled through the `learning_rate`
-accessors; manual mode has no groups, so the keys name the rules themselves. A bare key is a rule
-field name and binds **every** rule in `opt_state` with that field, at the absolute value; a
-nested key is a **path into the `opt_state` tree**:
+`opt`-keyed schedules work in manual mode. Manual mode has no parameter groups and no
+`learning_rate` ratios, so every value is **absolute** and the keys address the rules in
+`opt_state` directly. A bare key is a rule field name and sets that field on **every** rule in
+`opt_state` that has it; a nested key is a **path into the `opt_state` tree** and sets the field on
+the rules under that path only:
 
 ```julia
 ReactantNitro.schedules(e::ToyGAN) = (;
     opt = (;
-        eta  = total -> t -> 1.0f-3 * (1 - t / total),  # every rule's eta, absolute
-        gen  = (; eta = total -> t -> 1.0f-4 * ...),     # opt_state.gen's rules' eta
-        disc = (; eta = _ -> _ -> 2.0f-3),               # opt_state.disc's rules' eta
+        eta  = total -> t -> 2.0f-4 * (1 - t / total),  # every rule's eta
+        disc = (; eta = _ -> _ -> 1.0f-4),              # then opt_state.disc's rules' eta
     ))
 ```
 
-The structure IS the binding: with two optimizers, `opt.gen.eta` says which one, and the two can
-carry different curves. The driver rebuilds the named rules between closure calls, host-side and
-type-preserving (fresh scalar values, same rule types), so the same compiled program serves every
-step, exactly like the automatic loop's `rebuild_rules`. A path that does not exist in `opt_state`
-and a field that `nonschedulable` excludes are setup errors naming the offender; the binding
-report shows each key and the path it binds.
+Here the generator follows the linear decay and the discriminator stays at `1f-4`. Keys apply in
+the order written, each overwriting what an earlier key set, so write the bare key first and the
+path keys after it.
 
-The automatic loop's `opt` keys name **parameter groups** instead of `opt_state` paths, and its
-path values are ratio-scaled through the `learning_rate` accessors rather than absolute. The two
-modes share the dotted-key syntax and differ in value semantics by design
-([Schedules](schedules.md)).
+The driver rebuilds the named rules on the host before each call, with new scalar values and the
+same rule types, so one compiled program serves every step. A path that does not exist in
+`opt_state`, a field no rule under the path has, a non-scalar field, and a field that
+`nonschedulable` excludes are setup errors naming the offender. The binding report shows each key
+and the path it binds.
 
-`device`-keyed schedules work exactly as in the automatic loop: the driver rewrites the scheduled
+The automatic loop uses the same syntax with different values: its paths name parameter groups,
+and its values are scaled by each group's `learning_rate` ratio ([Schedules](schedules.md)).
+
+`device`-keyed schedules work as in the automatic loop: the driver rewrites the scheduled
 `Device` fields before each call, and the closure reads them as traced inputs.
 
-For a per-step value the framework does not schedule, the closure can read a `device`-scheduled
-field or a batch field and rebuild its own rules with the traced value; that route is exact and
-recompiles nothing.
+For a per-step value an `opt` key cannot reach, the closure can read a `device`-scheduled field or
+a batch field and rebuild its own rules with the traced value; this recompiles nothing.
 
 ## What manual mode does not give you in v1
 
@@ -169,8 +163,8 @@ recompiles nothing.
 
 ## Everything else is unchanged
 
-Validation, checkpointing, early stopping, `request_stop!`, phases, `data_wait_frac`, and the
-prefetch pipeline work as in the automatic loop. The eval side (`validate`,
+Validation, checkpointing, early stopping, `request_stop!`, phases, `data_wait_frac`, schedule
+logging, and the prefetch pipeline work as in the automatic loop. The eval side (`validate`,
 `evaluate`, `predict`) never consults the mode: it uses `forward` and `metrics`, so a manual
 experiment defines those for its eval surface, and `loss` is only needed if you want the framework
 to substitute `val_loss` when `metrics` is absent.
@@ -183,16 +177,14 @@ Out of v1:
   handing the closure a tuple of micro-batches.
 - **Host-resident metrics from the closure**: `stats` are in-graph scalars in v1; a host branch
   would transfer the closure's outputs per step.
-- **Multi-device mesh verification**: CPU tests cannot see a mesh, and the rules-in/states-out
-  contract is exactly the kind of thing that wants a real-device run.
+- **Multi-device mesh verification**: CPU tests cannot see a mesh, and the rules-in, states-out
+  contract needs a real multi-device run to verify.
 - **A `Nitro(..., manual = ...)` keyword** as sugar over the `manual_training` accessor.
-
-`opt`-keyed schedules were on this list; they are built (path-bound keys, above).
 
 ## Toggling the mode
 
 Defining `train_step` selects manual mode; `manual_training(e) = false` declines it while keeping
-the method in source, which is the Revise-friendly toggle: redefining the accessor is an ordinary
-method edit, and the next `Nitro` you build picks up the new driver. The mode is frozen at
+the method in source. This works with Revise: redefining the accessor is an ordinary method edit,
+and the next `Nitro` you build picks up the new driver. The mode is frozen at
 construction, so an existing handle keeps its driver and `fixed_config_report`
 names the redefinition.

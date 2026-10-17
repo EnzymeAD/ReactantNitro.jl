@@ -202,7 +202,7 @@ constant and yields a zero gradient with no error.
 
 A complete minimal GAN, generator and discriminator with their own optimizers and the
 non-saturating formulation falling out of the activities, is worked through in the manual-mode page
-(see [The very simple GAN](@ref "The very simple GAN")).
+(see [A minimal GAN](@ref "A minimal GAN")).
 
 The return is a checked `NamedTuple`: `loss` (required; validated and logged), `ps`, `st`,
 `opt_state` (the new optimizer STATES only, since a rule's replicated device scalars cannot leave a

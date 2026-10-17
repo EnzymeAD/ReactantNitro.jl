@@ -2,10 +2,9 @@
 
 ## The cost
 
-Compiles are the dominant cost on this stack: a real gradient program has been measured at
-495.6 seconds, and its optimizer program at 63.1. An unintended recompile presents as slow training,
-not as an error: nothing raises, the graphs are identical, and the only symptom is time. The
-acceptance check below is the first thing to run on a new experiment.
+Compiling is the largest fixed cost on this stack: one measured gradient program took 496 s to
+compile, and its optimizer program 63 s. An unintended recompile raises no error and produces the
+same graph; the only symptom is lost time. Run the acceptance check below on every new experiment.
 
 ## The compile cache is module-level
 
@@ -16,7 +15,7 @@ program is first called with; there is no declaration of batch shapes anywhere.
 
 ## The acceptance check
 
-"It trains" is not the criterion. "No recompile after step 1" is.
+The criterion is no recompile after the first step.
 
 ```julia
 ReactantNitro.cache_reset!()
@@ -25,12 +24,11 @@ train!(n)
 ReactantNitro.cache_stats()      # (; hits, misses, entries)
 ```
 
-Both functions are unexported and documented on the [API](api.md) page. The criterion is
-`misses == entries` and `misses` not growing with steps. Both counters are cumulative, so a miss
-that is not also a new entry is a program compiled twice.
+Both functions are unexported and documented on the [API](api.md) page. Check that
+`misses == entries` and that `misses` does not grow with the number of steps. Both counters are
+cumulative, so a miss that is not also a new entry is a program compiled twice.
 
-The absolute number depends on what you ran, so assert the shape of the answer, not a literal. A
-train-only run compiles 2: the gradient program and the optimizer program, with deliberately no
+The expected count depends on what you ran. A train-only run compiles 2: the gradient program and the optimizer program, with deliberately no
 fused program even at `accum = 1`. Validation adds 1 for the evaluation `forward`, so a run that
 trains and validates reports 3. Add one more per `:device`-residency metric hook; a host metric
 adds nothing, because it is part of no program at all; and a split whose length is not a
@@ -41,13 +39,14 @@ schedule returning a type the field does not hold, or a batch whose shapes vary.
 
 ## What is in the key
 
-Every program's key is a tuple, and each component earns its place:
+Every program's key is a tuple of:
 
 | In the key | Why |
 | --- | --- |
-| the function, its argument types, and their shapes | shape is a runtime field, so Reactant's own guard covers types but not shapes |
+| the function, its argument types, and their shapes | Reactant's own guard covers types but not shapes |
 | a hash of the `GraphConst` fields only | they bake into the graph as trace-time constants |
-| the resolved method world of every user hook and every rule's `apply!` | so a redefinition is not silently ignored |
+| the resolved method world of every user hook and every rule's `apply!` | a redefined hook keeps its function identity |
+| `accum`, and `gradient_clip_norm` through an argument type | both reach the trace as constants |
 | the handle's `compile_options`, when set | the same trace compiles to a different executable; see [Compile options](compile_options.md) |
 
 Shape is a runtime field, so a ragged batch passes Reactant's generated type guard and fails
@@ -61,15 +60,16 @@ implies the other: [`compile_view`](@ref) strips `Host` and leaves `Device` in p
 the view itself would hash device scalars that change every step.
 
 The practical rule: changing a [`GraphConst`](@ref) field misses, changing a `Device` field hits,
-and changing a `Host` field hits.
+and changing a `Host` field hits. Changing `accum` misses the gradient program, and changing
+`gradient_clip_norm` misses the optimizer program only.
 
 ## The second guard: the dependency closure
 
 The key covers the hooks. It does not cover what the hooks *call*, and a redefined helper two
 levels below [`forward`](@ref) leaves every hook's world age untouched, so on the key alone it
-would hit the cache and silently run the old program.
+would hit the cache and run the old program.
 
-The entry points close that. Each cached program also records the transitive closure of the
+The entry points cover that. Each cached program also records the transitive closure of the
 methods it was compiled against, and [`train!`](@ref), [`validate`](@ref), [`evaluate`](@ref) and
 [`predict`](@ref) re-resolve that closure against live dispatch on entry, **poisoning** any entry
 whose methods moved. A redefinition anywhere below the hooks therefore misses for a new
@@ -82,12 +82,11 @@ An existing handle is a fixed point and keeps the programs it was built with, no
 entry-point report says so. There are two messages:
 
 - **The cache-level line** names how many entries were poisoned and which methods drifted. It is
-  informational and fires once per redefinition, whichever handle happens to run next. Seeing it
-  while running a freshly built handle is the *good* case: the poisoning is what makes that handle
-  recompile against your edit.
+  informational and fires once per redefinition, whichever handle runs next. On a freshly built
+  handle it is expected: the poisoning is what makes that handle recompile against your edit.
 - **The per-handle line**, `! this handle's compiled programs had dependency methods redefined`,
-  fires only when the handle actually running holds one of the poisoned programs. That is the one
-  that means "rebuild the `Nitro`".
+  fires only when the running handle holds one of the poisoned programs. When you see it, rebuild
+  the `Nitro`.
 
 What neither guard can see is values rather than methods: a `const` redefined, a global, or a
 literal edited in place. Those are the first of [the two holes](#Two-holes-in-the-key)
@@ -103,35 +102,32 @@ whenever one is converted to device residency, which happens at setup and again 
 step, and seeding with `hash(T)` would make every step miss and recompile.
 
 `ReactantNitro.assert_graphconst_hashable` refuses at setup a `GraphConst` value that does not
-hash and compare by content. The check is one line of semantics: a value and its `deepcopy` must hash equal and be
-`isequal`, and the two agree exactly when the answer comes from contents. What fails is a struct
+hash and compare by content: a value and its `deepcopy` must hash equal and be `isequal`. What fails is a struct
 containing a mutable field, because `Base.hash` has no method for that struct and falls through to
 `hash(objectid(x), h)`, and `objectid` reaches the mutable field by identity rather than descending
 into it; the field's own content-based hash is never called. A bare `GraphConst` `Vector` field is
 fine, because arrays hash by content.
 
-Three symptoms follow if one gets through, and the third is why this is an error rather than a
-warning: a full recompile per `Nitro` handle, a spurious resume refusal whose diff prints
-identically on both sides, and silent reuse of the wrong program when the value is mutated in place.
+Such a value would cause a full recompile per `Nitro` handle, a resume refusal whose diff prints
+identically on both sides, and reuse of the old program after the value is mutated in place. The
+last is why this is an error and not a warning.
 
 ## Two holes in the key
 
-Two things the key cannot see, both of which present as an edit that "did nothing".
+The key cannot see two things. Both show up as an edit that has no effect.
 
 **Constants reached from a method body are not in the key.** A `const` in your module, a global, an
 edited literal: the key covers the method's identity and world age, not what its body closed over.
 `ReactantNitro.cache_reset!()` is the escape hatch.
 
-**A value your model closed over is not in the key either, and this one is the common case.** A
-model written as a `@compact` block over a config object emits the same type whatever the object
-holds, so two experiments differing only in a captured value produce the same type, the same
-argument shapes, and the same key, and the second silently reuses the first's program. Nothing
-raises, and the run looks fine.
+**A value your model closed over is not in the key either**, and this is the more common case. A
+model written as a `@compact` block over a config object has the same type whatever the object
+holds, so two experiments that differ only in a captured value produce the same key, and the second
+reuses the first's program without any error.
 
-The rule that closes it is broader than "the traced code reads it from `e`": if a value determines
-the emitted graph, it must be reachable from `e` as a [`GraphConst`](@ref), whether or not the
-traced code reads it from there. A config object is a legal `GraphConst`, and marking it is what
-puts its contents in the key.
+The rule: a value that determines the emitted graph must be reachable from `e` as a
+[`GraphConst`](@ref), even if the traced code reads it from somewhere else. A config object is a
+legal `GraphConst`, and marking it puts its contents in the key.
 
 ## Nitro is a fixed point
 
@@ -143,12 +139,12 @@ workflow; the shape of it:
 ```julia
 n = Nitro(e)
 train!(n)          # ... edit `loss` in your editor ...
-train!(n)          # still the OLD program, deliberately
+train!(n)          # still the old program
 n2 = Nitro(e)      # this one sees the edit
 train!(n2)
 ```
 
-## When a compile is genuinely slow
+## When a compile is slow
 
 When the cache is healthy and a compile is still slow, the cost is what the tracer walks and how
 many operations the emitted graph contains. The usual cause is dataset-sized state reachable from
