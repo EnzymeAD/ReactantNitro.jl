@@ -469,6 +469,7 @@ function _build_nitro(
     # Hoisted so the freeze below can see it. `()` for a no-train `Nitro` and for manual mode,
     # whose rules enter the compile key through `worlds_manual` instead.
     chains = ()
+    bindings = (; fields = (), slots = (), level2 = ())
     # Resolved once, here: `no_decay` is a user hook, and recomputing it at `train!` would let a
     # revision take effect on a frozen handle. Training-only and skipped in manual mode.
     masks = training && !manual ? map(m -> place_replicated(m, mesh), no_decay_masks(e, ps, layout)) : nothing
@@ -484,7 +485,9 @@ function _build_nitro(
                 opt_state, accessor = ReactantNitro.schedules(e)
             )
         else
-            opt_state = build_opt_state(e, flat, layout; anchors, masks, mesh)
+            # `hp` carries every scheduled rule field from the first factory call.
+            svs = ntuple(gi -> setup_schedule_values(e, schedules, layout.groups[gi]), n_groups(layout))
+            opt_state = build_opt_state(e, flat, layout; svs, anchors, masks, mesh)
             # Re-normalize a RESTORED `opt_state`. Step 9's normalization applies to state the
             # framework constructed; a restore constructs nothing, and without this RAdam's `t`
             # stays host, never advances under trace, and the run silently trains at the wrong
@@ -502,7 +505,7 @@ function _build_nitro(
                 end
             end
             chains = map(
-                gi -> build_chain(e, layout.groups[gi], resolve_hp(e, layout, gi)),
+                gi -> build_chain(e, layout.groups[gi], setup_hp(e, layout, gi, svs[gi])),
                 ntuple(identity, n_groups(layout))
             )
             # `rebuild_rules` moves only the VALUES each step; the rule types, and so the `apply!`
@@ -512,6 +515,7 @@ function _build_nitro(
                 chains, accessor = ReactantNitro.schedules(e),
                 groups = layout.groups
             )
+            bindings = schedule_bindings(e, layout, resolved, chains; anchors, masks)
         end
     end
 
@@ -560,7 +564,7 @@ function _build_nitro(
         # The compile options ride with the dispatch freeze: both are compile-cache key components
         # fixed at construction (Cache.jl `compile_cached`).
         merge(frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state), (; compile_options)),
-        (; masks, anchors),
+        (; masks, anchors), bindings,
         map(zero, flat), RegisteredMonitor[], Int(step0), Int(epoch0), Starting(),
         false, nothing,
         # No metrics and no elapsed time yet, even for a restored handle.

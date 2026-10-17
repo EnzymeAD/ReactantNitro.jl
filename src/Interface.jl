@@ -312,21 +312,23 @@ optimizer(::MyExp) = Optimisers.Momentum
 optimizer(::MyExp, ::Val{:backbone}) = Optimisers.Momentum
 ```
 
-Level 2: supply the chain, receiving the group and its resolved, device-converted `hp`:
+Level 2: supply the chain, receiving the group and its resolved, device-converted `hp`. It is
+called at setup and again every optimizer step:
 
 ```julia
 optimizer(::MyExp, group::Symbol, hp) = Optimisers.OptimiserChain(
-    Optimisers.RAdam(; eta = hp.eta, beta = hp.beta),
-    Decay(hp.lambda, hp.anchor, hp.no_decay_mask),
+    Optimisers.ClipNorm(1.0f0, 2.0f0, false),
+    Optimisers.Momentum(hp.eta, get(hp, :rho, 0.9f0)),
 )
 ```
 
-`hp` carries `eta` (the group's effective learning rate), `lambda` (already multiplied by it),
-`anchor`, `no_decay_mask`, and one key per scheduled rule field. Level 2 owns hyperparameter
-application: a factory that ignores a scheduled `epsilon` passes the name check and the schedule
-does nothing, which the binding report shows per group rather than the framework erroring on. No
-path accepts a fully constructed chain with baked values, since rules carry device scalars rebuilt
-every step.
+`hp` carries `eta` (the group's effective learning rate), `lambda` (already multiplied by it, and
+`nothing` when it is zero and not scheduled), `anchor`, `no_decay_mask`, and one key per scheduled
+rule field, present from the first call. Level 2 places the values, so a scheduled field reaches
+the rule only if the factory reads it from `hp`. Setup checks this on the host: a scheduled field
+whose value does not change the returned chain is a setup error, and the binding report shows where
+each scheduled field landed. No path accepts a fully constructed chain with baked values, since
+rules carry device scalars rebuilt every step.
 """
 function optimizer end
 

@@ -49,11 +49,11 @@ The [`optimizer`](@ref) hook has three levels, each a smaller or larger share of
 ReactantNitro.optimizer(::MyExp, ::Val{:backbone}) = Optimisers.RAdam
 
 # Level 2: supply the whole chain. `hp` is this group's already resolved, already
-# device-converted hyperparameters.
+# device-converted hyperparameters; it is called at setup and every optimizer step.
 function ReactantNitro.optimizer(::MyExp, group::Symbol, hp)
     Optimisers.OptimiserChain(
-        Optimisers.RAdam(; eta = hp.eta, beta = hp.beta),
-        Decay(hp.lambda, hp.anchor, hp.no_decay_mask),
+        Optimisers.ClipNorm(1.0f0, 2.0f0, false),
+        Optimisers.Momentum(hp.eta, get(hp, :rho, 0.9f0)),
     )
 end
 ```
@@ -64,12 +64,19 @@ a `lambda` field, which is `AdamW` today**: that rule plus the framework's own d
 decay twice, silently, at whatever the two coefficients sum to.
 
 At Level 2 the framework supplies `hp`, a `NamedTuple` with keys `eta` (this group's effective
-learning rate), `lambda` (already multiplied by that `eta`), `anchor` (a flat device array or
-`nothing`), `no_decay_mask`, and one key per scheduled rule field, where schedulable means every
-field [`nonschedulable`](@ref) does not list. The framework checks that the returned chain is on
-the allowlist, that `Decay` is last, and that no two rules in the chain declare the same schedulable
-field. It deliberately does not check that the factory read what it was given: a Level 2 factory
-that ignores a scheduled key produces a silent no-op, confined to a level you opted into.
+learning rate), `lambda` (already multiplied by that `eta`, or `nothing` when it is zero and not
+scheduled), `anchor` (a flat device array or `nothing`), `no_decay_mask`, and one key per scheduled
+rule field, present from the first call, where schedulable means every field
+[`nonschedulable`](@ref) does not list. The framework checks that the returned chain is on the
+allowlist and that `Decay` is last. Two rules may share a field name: one `hp.eta` reaches whichever
+rules the factory passes it to, and nothing else.
+
+Level 2 places the values, so the framework checks the placement too, once at setup and on the
+host: it calls the factory with two values of each varying field and records which rule fields
+change. A scheduled field that changes nothing is a setup error, and the binding report shows where
+each one landed. A value computed from `hp`, such as `2 * hp.eta`, is a host number, which would
+bake into the optimizer program at its first value; the recorded fields are moved to the device
+each step, so a computed value follows its schedule too.
 
 There is no path that accepts a fully constructed chain with baked hyperparameter values, because
 rules carry tracked device scalars rebuilt every step.

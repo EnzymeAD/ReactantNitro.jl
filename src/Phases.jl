@@ -175,6 +175,8 @@ mutable struct Nitro
     # `(; masks, anchors)`, resolved at construction so a revised `no_decay` cannot change an
     # existing handle's numerics.
     decay::Any
+    # `(; fields, slots, level2)` from `schedule_bindings`, resolved once at construction.
+    bindings::Any
 
     # Mutated as it runs.
     g_accum::Any              # NTuple{G}, first written by the gradient program

@@ -429,6 +429,12 @@ function hp_host(e, group::Symbol, sv::NamedTuple = (;); elt::Type = Float32)
     return (; eta, lambda = lam, rest...)
 end
 
+# The `hp` setup builds a group's chain from: `sv` is the group's [`setup_schedule_values`](@ref).
+setup_hp(e, layout, gi, sv::NamedTuple; kwargs...) = resolve_hp(
+    e, layout, gi; host = hp_host(e, layout.groups[gi], sv), keep_decay = haskey(sv, :lambda),
+    kwargs...
+)
+
 """
     ReactantNitro.resolve_hp(e, layout, gi; eta_t = nothing, host = nothing, keep_decay = false,
                              anchors = nothing, masks = nothing)
@@ -452,17 +458,17 @@ percent of training wall time; take it for being exact rather than fast.
 """
 function resolve_hp(
         e, layout::FlatLayout, gi::Int; eta_t = nothing, host = nothing, keep_decay = false,
-        anchors = nothing, masks = nothing, elt::Type = Float32, mesh = nothing, memo = nothing
+        anchors = nothing, masks = nothing, elt::Type = Float32, mesh = nothing, memo = nothing,
+        device::Bool = true
     )
     g = layout.groups[gi]
     h = host === nothing ? hp_host(e, g, eta_t === nothing ? (;) : (; eta = eta_t); elt) : host
     rest = Base.structdiff(h, NamedTuple{(:eta, :lambda)})
-    eta = memo_to_device(memo, (gi, :eta), h.eta; mesh)
-    lambda = iszero(h.lambda) && !keep_decay ? nothing :
-        memo_to_device(memo, (gi, :lambda), h.lambda; mesh)
-    scheduled = NamedTuple{keys(rest)}(
-        map(k -> memo_to_device(memo, (gi, k), getproperty(rest, k); mesh), keys(rest))
-    )
+    # `device = false` keeps host values, for the setup-time binding probe.
+    place(k, x) = device ? memo_to_device(memo, (gi, k), x; mesh) : x
+    eta = place(:eta, h.eta)
+    lambda = iszero(h.lambda) && !keep_decay ? nothing : place(:lambda, h.lambda)
+    scheduled = NamedTuple{keys(rest)}(map(k -> place(k, getproperty(rest, k)), keys(rest)))
     return (;
         eta, lambda, scheduled...,
         anchor = anchors === nothing ? nothing : anchors[gi],
@@ -515,16 +521,15 @@ reuse_refused(x) = !hasfield(typeof(x), :donated) || getfield(x, :donated)
     ReactantNitro.build_chain(e, group::Symbol, hp) -> Optimisers.AbstractRule
 
 The three configuration levels resolved into one chain per group. At Levels 0 and 1 the framework
-constructs the rule from its type by field name; at Level 2 the user's factory constructs and the
-framework checks names only. Three setup errors: a base rule declaring its own `lambda` at Level 1
-(it would decay twice), two rules in one chain declaring the same schedulable field (one key would
-write both), and `Decay` anywhere but last (anything after it would produce coupled L2).
+constructs the rule from its type by field name; at Level 2 the user's factory constructs it, and
+setup records where each `hp` value lands ([`schedule_bindings`](@ref)), so two rules may share a
+field name. Two setup errors: a base rule declaring its own `lambda` at Level 1 (it would decay
+twice), and `Decay` anywhere but last (anything after it would produce coupled L2).
 """
 function build_chain(e, group::Symbol, hp)
     chain = optimizer(e, group, hp)
     check_allowlist(chain)
     check_decay_last(chain)
-    check_no_duplicate_fields(chain)
     return chain
 end
 
@@ -602,34 +607,6 @@ function check_decay_last(chain)
     return nothing
 end
 
-"""
-    ReactantNitro.check_no_duplicate_fields(chain) -> nothing
-
-Two rules in one chain declaring the same schedulable field name is a setup error naming
-both. Without it a single schedule key would silently write two rules. Only **schedulable** fields
-collide, since a non-schedulable field is never written by a key.
-"""
-function check_no_duplicate_fields(chain)
-    seen = Dict{Symbol, Symbol}()
-    for r in _rules_of(chain)
-        T = typeof(r)
-        for f in fieldnames(T)
-            f in nonschedulable(T) && continue
-            if haskey(seen, f)
-                error(
-                    """
-                    ReactantNitro: rules `$(seen[f])` and `$(nameof(T))` in the same chain both
-                    declare a schedulable field `$f`, so a single `opt.$f` schedule key would
-                    silently write both. Split them into different parameter
-                    groups, or drop one of the two rules."""
-                )
-            end
-            seen[f] = nameof(T)
-        end
-    end
-    return nothing
-end
-
 # ── Building the optimizer state ────────────────────────────────────────────────────
 
 """
@@ -641,9 +618,11 @@ against the group's flat buffer, normalize through [`to_device_leaf`](@ref), and
 collection is an `NTuple{G}`, never a `Vector`, which would infer abstractly and fail the thunk
 guard. Bias correction lives in the state, so resume restores it with the state.
 """
-function build_opt_state(e, flat::NTuple{G, Any}, layout::FlatLayout{G}; kwargs...) where {G}
+function build_opt_state(
+        e, flat::NTuple{G, Any}, layout::FlatLayout{G}; svs = ntuple(_ -> (;), Val(G)), kwargs...
+    ) where {G}
     state = ntuple(Val(G)) do gi
-        hp = resolve_hp(e, layout, gi; kwargs...)
+        hp = setup_hp(e, layout, gi, svs[gi]; kwargs...)
         chain = build_chain(e, layout.groups[gi], hp)
         to_device_leaf(Optimisers.setup(chain, flat[gi]); mesh = get(kwargs, :mesh, nothing))
     end

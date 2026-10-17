@@ -9,7 +9,7 @@
     using ReactantNitro
     using ReactantNitro: FlatLayout, ScalarMemo, apply_group, assert_device_state, build_layout,
         build_opt_state, cache_reset!, cache_stats, check_allowlist, check_decay_last,
-        check_no_duplicate_fields, clip_by_global_norm, construct_rule, effective_lr, flatten,
+        clip_by_global_norm, construct_rule, effective_lr, flatten,
         global_grad_norm, host_numbers, level1_chain, memo_to_device, no_decay_masks, resolve_hp,
         reuse_refused, to_device, to_device_leaf, to_device_rule, unflatten
     using Functors, JLD2, Lux, Optimisers, Random, Reactant, Statistics
@@ -780,6 +780,79 @@
         @test log_every_n_steps(MomGroups()) == 1
     end
 
+    # ── Level 2 chains and schedules ─────────────────────────────────────────────────────
+
+    @experiment struct L2Exp
+        unused::Int = 0
+        max_epochs::Host{Int} = 1
+    end
+    const L2_MODE = Ref(:direct)
+    function ReactantNitro.optimizer(::L2Exp, group::Symbol, hp)
+        m = L2_MODE[]
+        m === :direct && return Optimisers.Momentum(hp.eta, get(hp, :rho, 0.9f0))
+        m === :ignore && return Optimisers.Momentum(hp.eta, 0.9f0)
+        m === :shared && return Optimisers.OptimiserChain(
+            Optimisers.Adam(hp.eta), Optimisers.Descent(0.1f0 * hp.eta)
+        )
+        # `:computed`: values derived from `hp` on the host.
+        return Optimisers.Momentum(1.0f0 * hp.eta, 1.0f0 - get(hp, :rho, 0.1f0))
+    end
+    ReactantNitro.build_model(e::L2Exp, rng) =
+        Lux.setup(rng, mlp()) |> ((ps, st),) -> (mlp(), ps, st)
+    ReactantNitro.build_data(::L2Exp, dist) = (; train = two_group_data())
+    ReactantNitro.forward(::L2Exp, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    ReactantNitro.loss(::L2Exp, ŷ; y) = mean(abs2, ŷ .- y)
+    function l2_run(mode, sched; logger = nothing)
+        L2_MODE[] = mode
+        cache_reset!()
+        n = Nitro(L2Exp(); seed = 3, schedules = sched, logger, checkpointer = nothing, run_dir = mktempdir())
+        train!(n)
+        return n
+    end
+
+    @testset "Level 2: a scheduled field is in `hp` from the first call and reaches the rule" begin
+        # `hp.rho` used to be missing at setup, so this factory failed before training.
+        n = l2_run(:direct, (; opt = (; rho = _ -> t -> 0.5f0)))
+        @test Float32(n.opt_state[1].rule.rho) == 0.5f0
+        @test occursin("rho: Momentum.rho", sprint(show, MIME"text/plain"(), n))
+    end
+
+    @testset "Level 2: a factory that ignores a scheduled field is a setup error" begin
+        err = try
+            l2_run(:ignore, (; opt = (; rho = _ -> t -> 0.5f0)))
+            nothing
+        catch ex
+            ex
+        end
+        @test err isa ErrorException
+        @test occursin("schedules rho", err.msg) && occursin(":default", err.msg)
+    end
+
+    @testset "Level 2: two rules may share a field name" begin
+        # One `hp.eta` reaches the rules the factory passes it to; setup records both slots.
+        n = l2_run(:shared, (; opt = (; eta = _ -> t -> 1.0f-3 * t)))
+        @test phase(n) isa Done
+        @test occursin("eta: Adam.eta, Descent.eta", sprint(show, MIME"text/plain"(), n))
+        rules = n.opt_state[1].rule.opts
+        @test Float32(rules[2].eta) ≈ 0.1f0 * Float32(rules[1].eta)
+        @test cache_stats().misses == 2
+    end
+
+    @testset "Level 2: a value computed from `hp` follows its schedule" begin
+        # The regression: `1.0f0 * hp.eta` is a host number, which baked into the optimizer program
+        # at its step-1 value with no recompile, so the run trained at a frozen rate.
+        # rho = 0.5 makes `1 - hp.rho` exact, so the two runs must match bitwise.
+        sched = (; opt = (; eta = _ -> t -> 0.05f0 * t, rho = _ -> t -> 0.5f0))
+        a = l2_run(:direct, sched)
+        lg = SchedLog([])
+        b = l2_run(:computed, sched; logger = lg)
+        @test cache_stats().misses == 2
+        @test b.opt_state[1].rule.eta isa Reactant.RNumber
+        @test b.opt_state[1].rule.rho isa Reactant.RNumber
+        @test all(map((x, y) -> Array(x) == Array(y), flatten(parameters(a), a.layout), flatten(parameters(b), b.layout)))
+        @test haskey(lines(lg, "train")[end].m, Symbol("schedule/default/eta"))
+    end
+
     # ── the composition checks ───────────────────────────────────────────────────────────
 
     @testset "a base rule declaring `lambda` is rejected at Level 1, naming the fix" begin
@@ -813,20 +886,6 @@
         end
         @test err isa ErrorException
         @test occursin("LAST", err.msg) && occursin("coupled L2", err.msg)
-    end
-
-    @testset "two rules in one chain declaring the same schedulable field" begin
-        @test check_no_duplicate_fields(
-            Optimisers.OptimiserChain(Optimisers.RAdam(), Decay(1.0f-4))
-        ) === nothing
-        err = try
-            check_no_duplicate_fields(Optimisers.OptimiserChain(Optimisers.Adam(), Optimisers.Descent()))
-        catch ex
-            ex
-        end
-        @test err isa ErrorException
-        @test occursin("eta", err.msg)                   # both declare `eta`
-        @test occursin("Adam", err.msg) && occursin("Descent", err.msg)
     end
 
     @testset "the framework constructs Level 0 and 1 rules by field name" begin

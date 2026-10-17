@@ -453,7 +453,7 @@ function _train!(nitro::Nitro)
                                 rec, (;
                                     sched = schedule_log(
                                         nitro.schedules, device_raw; groups = layout.groups,
-                                        applied, chains = map(leaf -> leaf.rule, state)
+                                        applied, fields = nitro.bindings.fields
                                     ),
                                 )
                             )
@@ -920,7 +920,10 @@ function rebuild_rules(
             nitro.e, layout, gi; host = applied[gi], keep_decay, anchors, masks,
             mesh = nitro.mesh, memo
         )
-        Optimisers.Leaf(build_chain(nitro.e, g, hp), nitro.opt_state[gi].state, nitro.opt_state[gi].frozen)
+        chain = place_slots(
+            build_chain(nitro.e, g, hp), nitro.bindings.slots[gi], gi; memo, mesh = nitro.mesh
+        )
+        Optimisers.Leaf(chain, nitro.opt_state[gi].state, nitro.opt_state[gi].frozen)
     end
 end
 
