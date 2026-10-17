@@ -73,6 +73,15 @@
     ReactantNitro.reattach!(l::RecLogger, s) = (push!(l.calls, :reattach => s); nothing)
 
     kinds(l::RecLogger) = first.(l.calls)
+
+    # Only the data verbs the driver calls; no `run_id`, `run_url` or `logger_state`.
+    struct MinimalLog
+        calls::Vector{Pair{Symbol, Any}}
+    end
+    ReactantNitro.log_metrics!(l::MinimalLog, m; kwargs...) = nothing
+    ReactantNitro.log_params!(l::MinimalLog, p) = nothing
+    ReactantNitro.log_other!(l::MinimalLog, k, v) = nothing
+    ReactantNitro.finish!(l::MinimalLog, status) = (push!(l.calls, :finish => status); nothing)
     of(l::RecLogger, k::Symbol) = [v for (kk, v) in l.calls if kk === k]
 
     @testset "a ten-verb logger drives a run" begin
@@ -474,8 +483,18 @@
         @test phase(n) isa Done
         @test current_epoch(n) == 1                                 # stopped at the first check
         @test n.stop_reason === :requested                          # and says WHY, distinctly
-        @test of(lg, :finish) == [:early_stop]
+        @test of(lg, :finish) == [:requested]                       # the logger hears the same
         @test length([v for v in of(lg, :metrics) if v.context == "validate"]) == 1
+    end
+
+    @testset "a logger without `run_id` or `run_url` can checkpoint" begin
+        # Both are informational and default to `nothing`; this used to be a `MethodError` at the
+        # first checkpoint record.
+        lg = MinimalLog(Pair{Symbol, Any}[])
+        n = train!(Nitro(LifeMLP(); logger = lg, max_epochs = 1, run_dir = mktempdir()))
+        @test phase(n) isa Done
+        @test ReactantNitro.run_id(lg) === nothing && ReactantNitro.run_url(lg) === nothing
+        @test last(lg.calls) == (:finish => :completed)
     end
 
     @testset "`request_stop!` MID-EPOCH under a horizon-dependent schedule exits through `Done`" begin

@@ -589,7 +589,7 @@ function _train!(nitro::Nitro)
     # Before `Done`, so a Terminal monitor (an export, say) sees the weights the handle will hold.
     restore_best!(nitro)
     set_phase!(nitro, Done())
-    finish!(nitro.logger, nitro.stop_reason === :completed ? :completed : :early_stop)
+    finish!(nitro.logger, nitro.stop_reason)
     return nitro
 end
 
@@ -847,7 +847,7 @@ function _train_manual!(nitro::Nitro)
     # Before `Done`, so a Terminal monitor (an export, say) sees the weights the handle will hold.
     restore_best!(nitro)
     set_phase!(nitro, Done())
-    finish!(nitro.logger, nitro.stop_reason === :completed ? :completed : :early_stop)
+    finish!(nitro.logger, nitro.stop_reason)
     return nitro
 end
 

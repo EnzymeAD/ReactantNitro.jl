@@ -85,8 +85,8 @@ log_confusion!(::Nothing, matrix, labels; kwargs...) = nothing
 """
     finish!(lgr, status) -> nothing
 
-Close the run on the backend. `status` is `:completed`, `:early_stop`, or `:error`, matching the
-`stop_reason` recorded in the checkpoint.
+Close the run on the backend. `status` is `:completed`, `:early_stop`, `:requested` (a
+[`request_stop!`](@ref)), or `:error`, matching the `stop_reason` recorded in the checkpoint.
 
 **Do not map `Base.close` to `finish!(:completed)`**: in a `finally` it runs after the driver's
 `finish!(:error)` and would mark every failed run completed.
@@ -97,21 +97,21 @@ finish!(::Nothing, status) = nothing
 """
     run_id(lgr) -> Any
 
-The backend's run identifier, for people and reports, or `nothing` if it has none. Stored in the
-checkpoint record so a checkpoint traces back to its logged run. Unrelated to
+The backend's run identifier, for people and reports, or `nothing` if it has none (the default).
+Stored in the checkpoint record so a checkpoint traces back to its logged run. Unrelated to
 [`checkpoint_run`](@ref).
 """
 function run_id end
-run_id(::Nothing) = nothing
+run_id(lgr) = nothing
 
 """
     run_url(lgr) -> Any
 
-The backend's URL for the run, or `nothing` if it has none. Informational like
+The backend's URL for the run, or `nothing` if it has none (the default). Informational like
 [`run_id`](@ref), and stored in the checkpoint record with it.
 """
 function run_url end
-run_url(::Nothing) = nothing
+run_url(lgr) = nothing
 
 """
     logger_state(lgr) -> Any

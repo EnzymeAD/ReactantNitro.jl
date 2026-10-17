@@ -28,7 +28,7 @@ Everything a checkpoint holds: the `snapshot` passed to [`save_checkpoint!`](@re
 | `logger_state` | optional | Opaque, backend-specific resumption state |
 | `logger_type` | optional | So resuming into a different backend refuses |
 | `anchor_checksum` | optional | Per anchored group; the arrays themselves are not stored |
-| `stop_reason` | optional | `:completed`, `:early_stop`, or `:error` |
+| `stop_reason` | optional | `:completed`, `:early_stop`, `:requested`, or `:error` |
 | `preset` | optional | The preset the run was built from, `nothing` if none |
 | `derived` | optional | The keys `derive` returned, so a weights-only load restores them |
 

@@ -6,8 +6,10 @@ The logging contract is ten verbs on your own type:
 `run_url`, `logger_state`, `reattach!`
 
 It is **duck-typed**: no supertype and no registration. `nothing` is the "no logging" value and has
-a no-op method for every verb. A verb your type does not define raises a `MethodError` (except
-`logger_state`, which defaults to `nothing`), so a wrapper cannot drop data unnoticed; a backend that wants a verb to do nothing defines it as a no-op.
+a no-op method for every verb. A verb your type does not define raises a `MethodError`, so a
+wrapper cannot drop data unnoticed; a backend that wants a verb to do nothing defines it as a no-op.
+The exceptions are `logger_state`, `run_id` and `run_url`, which carry no data and default to
+`nothing`.
 
 The driver owns the step counter and passes `step` and `epoch` to every `log_metrics!` call, so a
 logger needs no step counter of its own. Each call names one of three contexts:

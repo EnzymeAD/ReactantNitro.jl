@@ -316,10 +316,6 @@ end
 ReactantNitro.log_other!(lg::TSVLog, key, value) = println(lg.io, join(("other", key, value), '\t'))
 ReactantNitro.finish!(lg::TSVLog, status) = (println(lg.io, "finish\t$status"); close(lg.io))
 
-# Read into every checkpoint record, so a run that checkpoints needs them.
-ReactantNitro.run_id(::TSVLog) = nothing
-ReactantNitro.run_url(::TSVLog) = nothing
-
 # The logger is a run accessor like any other. The framework calls it exactly ONCE, at setup, so an
 # accessor may have a side effect: opening a file, or registering a run with a hosted tracker.
 function ReactantNitro.logger(e::MnistMLP)
