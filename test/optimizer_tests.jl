@@ -662,6 +662,10 @@
             MomGroups(); schedules = (; opt = (; rho = _ -> t -> 0.5f0, lambda = _ -> t -> 2.0f0)),
             checkpointer = nothing, logger = nothing, run_dir = mktempdir()
         )
+        txt = sprint(show, MIME"text/plain"(), n)
+        # A scheduled lambda is reported as such, not as the accessor's value.
+        @test occursin("lambda scheduled", txt)
+        @test occursin("Momentum + Decay", txt)
         train!(n)
         rule(gi) = n.opt_state[gi].rule.opts
         @test Float32(rule(1)[1].rho) == 0.5f0
@@ -698,6 +702,8 @@
         @test isempty(filter(x -> x.context != "train" && x.context != "data", lg.lines))
         tl = lines(lg, "train")
         @test [x.step for x in tl] == [1, 2]
+        # `backbone` has a path key for eta, so the bare key reaches only `default`.
+        @test occursin("groups :default", sprint(show, MIME"text/plain"(), n))
         sk(name) = Symbol("schedule/", name)
         last_m = tl[end].m
         @test haskey(last_m, :loss)
@@ -814,7 +820,10 @@
         # `hp.rho` used to be missing at setup, so this factory failed before training.
         n = l2_run(:direct, (; opt = (; rho = _ -> t -> 0.5f0)))
         @test Float32(n.opt_state[1].rule.rho) == 0.5f0
-        @test occursin("rho: Momentum.rho", sprint(show, MIME"text/plain"(), n))
+        txt = sprint(show, MIME"text/plain"(), n)
+        @test occursin("rho: Momentum.rho", txt)
+        # The group row names the factory's chain, not the Level 1 rule.
+        @test occursin(", Momentum", txt) && !occursin("RAdam", txt)
     end
 
     @testset "Level 2: a factory that ignores a scheduled field is a setup error" begin

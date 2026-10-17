@@ -305,6 +305,20 @@
     ReactantNitro.run_id(::ManualLog) = nothing
     ReactantNitro.run_url(::ManualLog) = nothing
 
+    @testset "a path key overrides a bare key whatever the order they are written in" begin
+        # The path key comes first here; applied in written order, the bare key overwrote it.
+        n = Nitro(
+            ToyGAN(); checkpointer = nothing, run_dir = mktempdir(),
+            schedules = (; opt = (; gen = (; eta = _ -> _ -> 1.0f-5), eta = _ -> _ -> 2.0f-3))
+        )
+        train!(n)
+        @test Float32(n.opt_state.gen.layer_1.weight.rule.opt.eta) == 1.0f-5
+        @test Float32(n.opt_state.disc.layer_1.weight.rule.opt.eta) == 2.0f-3
+        @test occursin(
+            "every rule outside a path key for it", sprint(show, MIME"text/plain"(), n)
+        )
+    end
+
     @testset "manual mode logs each varying schedule as given" begin
         lg = ManualLog([])
         n = Nitro(

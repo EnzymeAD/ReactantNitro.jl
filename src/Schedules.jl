@@ -606,9 +606,11 @@ function rebuild_scheduled_rules(
     )
     isempty(raw) && return nitro.opt_state
     opt_state = nitro.opt_state
-    for (k, v) in pairs(raw)
+    # Shallower keys first, so a path key overrides a bare key for its subtree whatever the order
+    # they were written in, as in the automatic loop.
+    for k in sort(collect(keys(raw)); by = k -> count('.', string(k)))
         path, field = _schedule_target(k)
-        opt_state = apply_schedule(opt_state, path, field, v)
+        opt_state = apply_schedule(opt_state, path, field, raw[k])
     end
     return opt_state
 end
@@ -965,7 +967,14 @@ function binding_report_pieces(nitro)
                 anchor = decay_anchor(nitro.e, Val(g)) === :zero ? :zero :
                     decay_anchor(nitro.e, Val(g)) === :w0 ? :w0 : :array,
                 lambda = lambda(nitro.e, Val(g)),
-                rule = nameof(optimizer(nitro.e, Val(g))),
+                # Scheduled, so the accessor value above is not what the run uses.
+                lambda_scheduled = nitro.schedules !== nothing && any(
+                    k -> _binds(nitro.schedules, k, g) && last(_schedule_target(k)) === :lambda,
+                    keys(nitro.schedules.opt)
+                ),
+                # The chain the run steps with, which at Level 2 is the factory's.
+                rule = nitro.opt_state === nothing ? string(nameof(optimizer(nitro.e, Val(g)))) :
+                    _chain_label(nitro.opt_state[gi].rule),
                 params = lay.lengths[gi],
             )
                 for (gi, g) in enumerate(lay.groups)
@@ -1011,6 +1020,9 @@ clip_source(e, resolved) =
 
 _commas(n::Integer) = replace(string(n), r"(?<=[0-9])(?=(?:[0-9]{3})+$)" => ",")
 _g(x) = string(round(Float64(x); sigdigits = 3))
+
+# `Adam + Decay` for a chain, `Adam` for a single rule.
+_chain_label(r) = join((string(nameof(typeof(x))) for x in _rules_of(r)), " + ")
 
 """
     ReactantNitro.prefetch_report_entry(name, split) -> (; device_batches, host_batches, workers, ordered, path)
@@ -1118,7 +1130,10 @@ function binding_report_sections(;
             for k in keys(tbl)
                 disp = haskey(schedules.source, k) ? k : Symbol(ns, ".", k)
                 what = ns === :opt ?
-                    (manual ? _manual_opt_desc(k) : _auto_opt_desc(k)) :
+                    (
+                        manual ? _manual_opt_desc(k, keys(tbl)) :
+                        _auto_opt_desc(k, keys(tbl), Tuple(g.name for g in groups))
+                    ) :
                     "Device field   e.$k"
                 note = disp in schedules.constant ? "  (constant)" : ""
                 # The source keeps its brackets; `[train! keyword]` is the token used everywhere.
@@ -1143,7 +1158,8 @@ function binding_report_sections(;
                     string(
                         "eta ", _g(g.base_eta), " (x",
                         string(round(Float64(g.ratio); digits = 2)), "), lambda ",
-                        _g(g.lambda), " toward ", g.anchor, ", ", g.rule
+                        get(g, :lambda_scheduled, false) ? "scheduled" : _g(g.lambda),
+                        " toward ", g.anchor, ", ", g.rule
                     ),
                     _commas(g.params),
                 ] for g in groups
@@ -1212,12 +1228,19 @@ _source_label(s::Symbol) = s === :keyword ? "train! keyword" :
     s === :field ? "field on e" :
     s === :default ? "framework default" : string(s)
 
-# Automatic-loop opt keys: a bare key binds every group's chain, a dotted `group.field` key binds
-# that group's only, with the per-group ratio still applied.
-function _auto_opt_desc(k::Symbol)
+# Automatic-loop opt keys: a dotted `group.field` key binds that group's chain, and a bare key every
+# group without one, with the per-group ratio still applied.
+function _auto_opt_desc(k::Symbol, opt_keys = (), groups = ())
     parts = split(string(k), '.')
     field = Symbol(last(parts))
-    scope = length(parts) == 1 ? "all groups" : "group :$(first(parts))"
+    scope = if length(parts) > 1
+        "group :$(first(parts))"
+    else
+        rest = Tuple(g for g in groups if Symbol(g, ".", field) ∉ opt_keys)
+        isempty(groups) || length(rest) == length(groups) ? "all groups" :
+            isempty(rest) ? "no group, every group has a path key" :
+            "groups " * join(repr.(rest), ", ")
+    end
     return field === :eta ? "optimizer field, $scope, per-group ratio applied" :
         field === :lambda ? "optimizer field, $scope, times eta per group" :
         "optimizer field, $scope, absolute"
@@ -1225,8 +1248,10 @@ end
 
 # Manual mode: the opt schedule keys are binding descriptors (a bare field name, or a dotted
 # path into the user's opt_state). The report says what the key binds to.
-function _manual_opt_desc(k::Symbol)
+function _manual_opt_desc(k::Symbol, opt_keys = ())
     parts = split(string(k), '.')
-    length(parts) == 1 && return "optimizer field, every rule, absolute"
+    length(parts) == 1 && return any(o -> endswith(string(o), "." * string(k)), opt_keys) ?
+        "optimizer field, every rule outside a path key for it, absolute" :
+        "optimizer field, every rule, absolute"
     return "optimizer field at opt_state path $(join(parts[1:(end - 1)], "."))"
 end
