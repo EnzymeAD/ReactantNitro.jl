@@ -1381,6 +1381,66 @@
         end
     end
 
+    # ── Loading by selector, and `Average` ────────────────────────────────────────────
+
+    @testset "loading: selector sugar, `Average`, `among`, and the refusals" begin
+        dir = mktempdir()
+        script!([5.0, 1.0, 4.0, 3.0, 2.0])
+        n = train!(
+            Nitro(
+                ScriptedCkpt(; max_epochs = 5); run_dir = dir,
+                checkpointer = Checkpointer(; keep = (Best(1), Last(3)))
+            )
+        )
+        @test epochs_of(dir, run_of(n)) == Set([2, 3, 4, 5])
+        host_ps(path) = load_checkpoint(n.checkpointer, path).ps
+        flat(t) = reduce(vcat, vec.(Array.(Functors.fleaves(t))))
+        eval_nitro(w; kw...) = Nitro(ScriptedCkpt(); run_dir = dir, data = (;), weights = w, kw...)
+
+        @testset "`Best(1)` and `Last(1)` are `:best` and `:latest`" begin
+            @test flat(parameters(eval_nitro(:latest => Best(1)))) ==
+                flat(parameters(eval_nitro(:latest => :best)))
+            @test flat(parameters(eval_nitro(:latest => Last(1)))) ==
+                flat(parameters(eval_nitro(:latest => :latest)))
+        end
+
+        @testset "`Average(Last(3))` is the mean of the latest 3, state from the latest" begin
+            m = eval_nitro(:latest => Average(Last(3)))
+            want = sum(flat(host_ps(run_file(dir, run_of(n), ep))) for ep in 3:5) ./ 3
+            @test flat(parameters(m)) ≈ want rtol = 1.0e-6
+            @test occursin("epochs 3, 4, 5", m.checkpoint_source)
+        end
+
+        @testset "`Best(2; among = Last(3))` is the best 2 of the latest 3" begin
+            # Latest 3 are epochs 3, 4, 5 scoring 4, 3, 2: the best two are 4 and 5.
+            m = eval_nitro(:latest => Average(Best(2; among = Last(3))))
+            @test occursin("epochs 4, 5", m.checkpoint_source)
+            want = sum(flat(host_ps(run_file(dir, run_of(n), ep))) for ep in 4:5) ./ 2
+            @test flat(parameters(m)) ≈ want rtol = 1.0e-6
+        end
+
+        @testset "refusals" begin
+            @test_throws "holds 4 that" eval_nitro(:latest => Average(Last(5)))   # epoch 2 is kept as the best
+            @test_throws "Average them" eval_nitro(:latest => Last(3))
+            @test_throws "across runs" eval_nitro(:all => Average(Last(3)))
+            @test_throws "a resume continues one record" Nitro(
+                ScriptedCkpt(); run_dir = dir, resume = :latest => Average(Last(3))
+            )
+            @test_throws "carry no optimizer state" Nitro(
+                ScriptedCkpt(); run_dir = mktempdir(), weights = :latest => Average(Last(3)),
+                restore_optimizer = true
+            )
+            @test_throws "is for loading" Checkpointer(; keep = Best(2; among = Last(3)))
+            @test_throws "not supported yet" Average(Last(3); weight = :ema)
+        end
+
+        @testset "another handle's `keep` is checked before its manifest is read" begin
+            @test_throws "cannot hold everything" eval_nitro(n => Average(Last(5)))
+            m = eval_nitro(n => Average(Last(3)))
+            @test occursin("epochs 3, 4, 5", m.checkpoint_source)
+        end
+    end
+
     @testset "the default still keeps the newest, whatever it scored, in a real run" begin
         dir = mktempdir()
         script!([3.0, 1.0, 2.0, 4.0])

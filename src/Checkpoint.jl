@@ -117,15 +117,23 @@ optionally, [`admits`](@ref).
 abstract type Selector end
 
 """
-    Best(k = 1)
+    Best(k = 1; among = nothing)
 
 The `k` best entries by the checkpointer's `metric` and `mode`. Only entries scored under that pair
-are ranked; under `scope = :dir`, every run's entries compete.
+are ranked; under `scope = :dir`, every run's entries compete. `among`, a selector, ranks only what
+it picks: `Best(5; among = Last(20))` is the best 5 of the latest 20. `among` is for loading, as in
+[`Average`](@ref); `keep` refuses it.
 """
-struct Best <: Selector
+struct Best{A} <: Selector
     k::Int
+    among::A
 end
-Best() = Best(1)
+Best(k::Integer = 1; among = nothing) = Best(Int(k), check_among(among))
+
+check_among(a) = a === nothing || a isa Selector ? a : error(
+        "ReactantNitro: `Best(k; among)` takes a selector for `among`, such as `Last(20)`; got a \
+     `$(typeof(a))`."
+    )
 
 """
     Last(n = 1)
@@ -155,7 +163,9 @@ struct Every <: Selector
     n::Int
 end
 
-Base.show(io::IO, s::Best) = print(io, "Best(", s.k, ")")
+Base.show(io::IO, s::Best) =
+    s.among === nothing ? print(io, "Best(", s.k, ")") :
+    print(io, "Best(", s.k, "; among = ", s.among, ")")
 Base.show(io::IO, s::Last) = print(io, "Last(", s.n, ")")
 Base.show(io::IO, s::Epochs) = print(io, "Epochs(", s.epochs, ")")
 Base.show(io::IO, s::Every) = print(io, "Every(", s.n, ")")
@@ -172,7 +182,8 @@ _own(entries, ckpt) = [e for e in entries if isequal(e.run, ckpt.run)]
 _latest_order(ckpt) = ckpt.scope === :dir ? (e -> e.written) : (e -> e.epoch)
 
 function select(sel::Best, entries, ckpt)
-    scored = [e for e in entries if e.score !== nothing && same_selection(e, ckpt)]
+    pool = sel.among === nothing ? entries : select(sel.among, entries, ckpt)
+    scored = [e for e in pool if e.score !== nothing && same_selection(e, ckpt)]
     return first(sort(scored; by = e -> e.score, rev = ckpt.mode === :max), max(sel.k, 0))
 end
 select(sel::Last, entries, ckpt) =
@@ -287,6 +298,10 @@ function check_keep(keep::Tuple)
         sel isa Selector || error(
             "ReactantNitro: the checkpointer's `keep` holds a `$(typeof(sel))`; every entry must \
              be a selector such as `Best(3)` or `Last(10)`."
+        )
+        sel isa Best && sel.among !== nothing && error(
+            "ReactantNitro: `$(sel)` in the checkpointer's `keep`: `among` is for loading, as in \
+             `Average`. Keep the selector it narrows (`$(sel.among)`) instead."
         )
         n = sel isa Best ? sel.k : sel isa Union{Last, Every} ? sel.n : 1
         n >= 1 || error("ReactantNitro: `$(sel)` in the checkpointer's `keep` must count at least 1.")
@@ -508,7 +523,7 @@ end
 
 # Whether an entry's score was produced by this checkpointer's selection. An entry with no recorded
 # metric was written before the manifest carried one and is taken to match.
-same_selection(e, ckpt::Checkpointer) =
+same_selection(e, ckpt) =
     e.metric === nothing || (e.metric === ckpt.metric && e.mode === ckpt.mode)
 
 """
@@ -1408,6 +1423,192 @@ function holds_text(dir, entries)
     return body * "; `runs(\"$(dir)\")` lists them"
 end
 
+# ── Averaging checkpoints ───────────────────────────────────────────────────────────
+
+"""
+    Average(sel::Selector; weight = :uniform, state = nothing)
+
+The parameters of the checkpoints `sel` picks from one run, averaged, as a `weights` source:
+
+```julia
+Nitro(e; weights = :latest => Average(Last(10)))
+Nitro(e; weights = "a1b2c3" => Average(Best(5; among = Last(20))))
+```
+
+`weight` is `:uniform`, the only weighting so far. Lux state is not averaged: it comes from one
+picked checkpoint, the best when `sel` ranks (a [`Best`](@ref)) and the latest otherwise, or as
+`state = :best | :latest` says. That is exact for a model without running statistics and an
+approximation for one with them, such as BatchNorm. The optimizer starts fresh, so
+`restore_optimizer = true` and `resume` refuse an `Average`. Averaging across runs (`:all`) is
+refused for now. The run must still hold every checkpoint `sel` names; keep them while training
+with [`Checkpointer`](@ref)`(; keep)`, for example `keep = (Best(3), Last(10))`.
+"""
+struct Average{S <: Selector}
+    sel::S
+    weight::Symbol
+    state::Union{Nothing, Symbol}
+end
+
+function Average(sel::Selector; weight::Symbol = :uniform, state = nothing)
+    weight === :uniform || error(
+        "ReactantNitro: `Average(...; weight = $(repr(weight)))` is not supported yet; `:uniform` \
+         is the only weighting."
+    )
+    state in (nothing, :latest, :best) || error(
+        "ReactantNitro: `Average(...; state = $(repr(state)))`: `state` is `:latest`, `:best`, or \
+         left out to follow the selection."
+    )
+    return Average(sel, weight, state)
+end
+
+Base.show(io::IO, a::Average) = print(
+    io, "Average(", a.sel, a.state === nothing ? "" : "; state = " * repr(a.state), ")"
+)
+
+# How many entries `sel` names when the run holds them all; `nothing` when it is open-ended.
+expected_count(sel::Best) = sel.k
+expected_count(sel::Last) = sel.n
+expected_count(sel::Epochs) = length(sel.epochs)
+expected_count(::Selector) = nothing
+
+# Whether `sel` ranks by score, which decides where an `Average` takes its Lux state from.
+ranks(::Best) = true
+ranks(::Selector) = false
+
+"""
+    ReactantNitro.covers(keep, sel) -> Bool or nothing
+
+Whether a checkpointer retaining `keep` is sure to hold everything `sel` picks: `true`, `false`,
+or `nothing` when that cannot be decided without the manifest. `Last(n)` is covered by a
+`Last(m)` with `m >= n`; `Best(k)` by a `Best(j)` with `j >= k`; `Best(k; among)` by whatever
+covers `among`.
+"""
+function covers(keep, sel::Last)
+    return any(s -> s isa Last && s.n >= sel.n, keep)
+end
+function covers(keep, sel::Best)
+    sel.among === nothing || return covers(keep, sel.among)
+    return any(s -> s isa Best && s.among === nothing && s.k >= sel.k, keep)
+end
+covers(keep, sel::Selector) = any(==(sel), keep) ? true : nothing
+
+# The entries a lookup decides over: one run's (`:latest`, a run id) or the directory's (`:all`),
+# with a label for messages, the directory, and the run id (`nothing` for `:all`).
+function run_pool(ckpt, run_dir, run; what)
+    dir = lookup_dir(ckpt, run_dir)
+    entries = isdir(dir) ? read_manifest(dir) : ManifestEntry[]
+    pool, label, r = if run === :all
+        entries, "every run in `$(dir)`", nothing
+    elseif run === :latest
+        isempty(entries) && error("ReactantNitro: $(what) found no checkpoint: $(holds_text(dir, entries)).")
+        r = announce_recent_run(ckpt, dir, what)
+        ManifestEntry[e for e in entries if isequal(e.run, r)], run_label(r), r
+    else
+        r = run_from_key(run)
+        mine = ManifestEntry[e for e in entries if isequal(e.run, r)]
+        isempty(mine) && error(
+            "ReactantNitro: $(what) names run `$(run)`, which has no checkpoints here: \
+             $(holds_text(dir, entries))."
+        )
+        mine, run_label(r), r
+    end
+    isempty(pool) && error("ReactantNitro: $(what) found no checkpoint: $(holds_text(dir, entries)).")
+    return pool, label, dir, r
+end
+
+"""
+    ReactantNitro.AverageSource
+
+An [`Average`](@ref) resolved against a run's manifest: the files to average, in epoch order, the
+file the Lux state and metadata come from, and a description for messages and provenance.
+"""
+struct AverageSource
+    spec::Average
+    dir::String
+    run::Union{String, Nothing}
+    files::Vector{String}
+    epochs::Vector{Int}
+    state_file::String
+end
+
+describe(a::AverageSource) = string(
+    a.spec, " of ", run_label(a.run), " in `", a.dir, "`, epochs ", join(a.epochs, ", ")
+)
+
+"""
+    ReactantNitro.resolve_average(ckpt, run_dir, run, avg; what) -> AverageSource
+
+Pick `avg`'s checkpoints from one run's manifest. Refuses when the run no longer holds all of them,
+naming the `keep` that would have.
+"""
+function resolve_average(ckpt, run_dir, run, avg::Average; what)
+    run === :all && error(
+        "ReactantNitro: $(what) averages across every run in the directory. Averaging across runs \
+         (model soups) is planned and not supported yet: it needs a shared initialization and a \
+         layout check across runs. Name one run: `:latest => $(avg)` or `\"<run id>\" => $(avg)`."
+    )
+    pool, label, dir, r = run_pool(ckpt, run_dir, run; what)
+    view = (; run = r, metric = ckpt.metric, mode = ckpt.mode, scope = :run)
+    ranks(avg.sel) && warn_mixed_metrics(pool, ckpt, what)
+    picked = sort(select(avg.sel, pool, view); by = e -> e.epoch)
+    n = expected_count(avg.sel)
+    held = join(sort([e.epoch for e in pool]), ", ")
+    want = n === nothing ? "at least one checkpoint" : "$(n) checkpoints"
+    suggest = avg.sel isa Last ? avg.sel : Last(something(n, 10))
+    (isempty(picked) || (n !== nothing && length(picked) < n)) && error(
+        """
+        ReactantNitro: $(what) needs $(want)
+        and $(label) holds $(length(picked)) that `$(avg.sel)` picks. Its retained epochs are
+        $(isempty(held) ? "(none)" : held). Keep them while training, for example
+        `Checkpointer(; keep = (Best(3), $(suggest)))`."""
+    )
+    state = something(avg.state, ranks(avg.sel) ? :best : :latest)
+    src = if state === :latest
+        picked[argmax([e.epoch for e in picked])]
+    else
+        scored = [e for e in picked if e.score !== nothing && same_selection(e, view)]
+        isempty(scored) && error(
+            "ReactantNitro: $(what) takes its Lux state from the best picked checkpoint, and none \
+             is scored under $(_metric_label(ckpt.metric, ckpt.mode)). Pass `state = :latest`."
+        )
+        scored[(ckpt.mode === :max ? argmax : argmin)([e.score for e in scored])]
+    end
+    return AverageSource(avg, dir, r, [e.file for e in picked], [e.epoch for e in picked], src.file)
+end
+
+"""
+    ReactantNitro.average_records(ckpt, src::AverageSource) -> CheckpointRecord
+
+The averaged record: `src.state_file`'s record with `ps` replaced by the uniform mean of every
+picked record's `ps`. Records are read one at a time into a `Float64` accumulator, so memory holds
+one record and the sum, not all of them. Refuses records whose parameter layouts differ.
+"""
+function average_records(ckpt, src::AverageSource)
+    # Any `Checkpointer` reads the framework's format; this handle's may be `nothing`.
+    ckpt isa Checkpointer || (ckpt = Checkpointer())
+    base = load_checkpoint(ckpt, joinpath(src.dir, src.state_file))
+    zero64(x) = x isa AbstractArray{<:AbstractFloat} ? zeros(Float64, size(x)) : x
+    acc = Functors.fmap(zero64, base.ps)
+    for f in src.files
+        rec = load_checkpoint(ckpt, joinpath(src.dir, f))
+        rec.flat_permutation == base.flat_permutation || error(
+            "ReactantNitro: `$(f)` and `$(src.state_file)` have different parameter layouts, so \
+             they cannot be averaged leaf for leaf. Average checkpoints of one architecture."
+        )
+        Functors.fmap(acc, rec.ps) do a, x
+            a isa AbstractArray{Float64} && (a .+= x)
+            return a
+        end
+    end
+    n = length(src.files)
+    ps = Functors.fmap(acc, base.ps) do a, x
+        a isa AbstractArray{Float64} ? convert(typeof(x), a ./ n) : x
+    end
+    return CheckpointRecord(
+        map(f -> f === :ps ? ps : getfield(base, f), fieldnames(CheckpointRecord))...
+    )
+end
+
 """
     ReactantNitro.resolve_checkpoint(ckpt, run_dir, run, which; what) -> (; path, epoch, run)
 
@@ -1447,24 +1648,8 @@ function resolve_checkpoint(ckpt, run_dir, run, which::Symbol; what)
         path = which === :best ? found.path : found
         return (; path, epoch = nothing, run = nothing)
     end
-    dir = lookup_dir(ckpt, run_dir)
-    entries = isdir(dir) ? read_manifest(dir) : ManifestEntry[]
-    pool, label = if run === :all
-        entries, "every run in `$(dir)`"
-    elseif run === :latest
-        isempty(entries) && error("ReactantNitro: $(what) found no checkpoint: $(holds_text(dir, entries)).")
-        r = announce_recent_run(ckpt, dir, what)
-        ManifestEntry[e for e in entries if isequal(e.run, r)], run_label(r)
-    else
-        r = run_from_key(run)
-        mine = ManifestEntry[e for e in entries if isequal(e.run, r)]
-        isempty(mine) && error(
-            "ReactantNitro: $(what) names run `$(run)`, which has no checkpoints here: \
-             $(holds_text(dir, entries))."
-        )
-        mine, run_label(r)
-    end
-    isempty(pool) && error("ReactantNitro: $(what) found no checkpoint: $(holds_text(dir, entries)).")
+    pool, label, dir, _ = run_pool(ckpt, run_dir, run; what)
+    entries = read_manifest(dir)
     pick = if which === :latest
         pool[argmax([e.epoch for e in pool])]
     else

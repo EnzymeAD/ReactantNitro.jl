@@ -236,12 +236,15 @@ function _build_nitro(
     # the actual file. `other => :current` is the bare `other`, a `Nitro` source that stays in
     # `weights` and is transferred after step 7.
     weights = resolve_source(checkpointer, run_dir, weights, :weights)
-    weights_file = nothing
+    weights_file = averaged = nothing
     if weights isa AbstractString
         weights_file, weights = String(weights), nothing
+    elseif weights isa AverageSource
+        averaged, weights = weights, nothing
     end
     resume_file = resume_path(resume, checkpointer, run_dir)
-    (weights_file !== nothing || resume_file !== nothing) && progress_phase!("loading checkpoint")
+    (weights_file !== nothing || resume_file !== nothing || averaged !== nothing) &&
+        progress_phase!("loading checkpoint")
     record, source = nothing, nothing
     if weights_file !== nothing
         # `load_checkpoint` dispatches on the checkpointer, so `checkpointer = nothing` has no
@@ -257,12 +260,14 @@ function _build_nitro(
             is about WRITING; nothing is written by a `Nitro` that is never trained."""
         )
         record, source = load_checkpoint(checkpointer, weights_file), weights_file
+    elseif averaged !== nothing
+        record, source = average_records(checkpointer, averaged), describe(averaged)
     elseif resume_file !== nothing
         record, source = load_checkpoint(checkpointer, resume_file), resume_file
     end
     # Two restores, one compatibility check: `weights = path` takes the derived values from the
     # record (an evaluation process may lack the training data), `resume` recomputes them.
-    weights_only = record !== nothing && weights_file !== nothing
+    weights_only = record !== nothing && (weights_file !== nothing || averaged !== nothing)
 
     # This run's identity in the manifest, assigned every time, even to a checkpointer object the
     # caller reuses: retention, top-K and the handle's own selection are all per run. A resume
@@ -641,8 +646,12 @@ function check_weights_kwargs(weights, w0; resume, restore_optimizer::Bool = fal
              Drop `restore_optimizer`, or use `weights = <source>, restore_optimizer = true` for a \
              record's parameters and optimizer state under a fresh schedule."
         )
+        weights isa Pair && last(weights) isa Average && error(
+            "ReactantNitro: `restore_optimizer = true` with `weights = $(source_repr(weights))`: \
+             averaged parameters carry no optimizer state. Drop `restore_optimizer`."
+        )
         record = weights isa AbstractString ||
-            (weights isa Pair && last(weights) in (:best, :latest))
+            (weights isa Pair && source_sugar(last(weights)) in (:best, :latest))
         record || error(
             "ReactantNitro: `restore_optimizer = true` restores the optimizer state of a checkpoint \
              RECORD, so it needs `weights` to name one: a path, or `run => :best | :latest` \
@@ -673,9 +682,14 @@ _source_side(x) = repr(x)
 # The grammar, once, for the messages that teach it.
 const SOURCE_FORMS = "a checkpoint path, or `run => checkpoint`: the run is `:latest` (the most \
     recent run in `run_dir`), a run id string (`runs(run_dir)` lists them), `:all` (every run, \
-    with `:best`) or another `Nitro` (its own run), and the checkpoint is `:best` (the best by the \
-    checkpointer's current metric), `:latest` (the run's newest record) or, for a `Nitro`, \
-    `:current` (its parameters now, in memory)"
+    with `:best`) or another `Nitro` (its own run), and the checkpoint is `:best` or `Best(1)` (the \
+    best by the checkpointer's current metric), `:latest` or `Last(1)` (the run's latest record), \
+    for `weights` an `Average` of several (`Average(Last(10))`) or, for a `Nitro`, `:current` (its \
+    parameters now, in memory)"
+
+# `Best(1)` and `Last(1)` name the same record as `:best` and `:latest`.
+source_sugar(w) = w isa Best && w.k == 1 && w.among === nothing ? :best :
+    w isa Last && w.n == 1 ? :latest : w
 
 """
     ReactantNitro.check_source(src, kw) -> nothing
@@ -717,6 +731,25 @@ function check_source(src, kw::Symbol)
     (run isa Union{Nitro, AbstractString} || run === :latest || run === :all) || error(
         "ReactantNitro: `$(kw) = $(source_repr(src))` names no run: $(repr(run)) is not `:latest`, \
          `:all`, a run id string or a `Nitro`. $(takes)."
+    )
+    which = source_sugar(which)
+    if which isa Average
+        kw === :resume && error(
+            "ReactantNitro: `resume = $(source_repr(src))`: a resume continues one record, optimizer \
+             and step included, and an average has neither. Use `weights = $(source_repr(src))` for \
+             the averaged parameters with a fresh optimizer."
+        )
+        run === :all && error(
+            "ReactantNitro: `$(kw) = $(source_repr(src))` averages across every run in the \
+             directory. Averaging across runs (model soups) is planned and not supported yet: it \
+             needs a shared initialization and a layout check across runs. Name one run."
+        )
+        return nothing
+    end
+    which isa Selector && error(
+        "ReactantNitro: `$(kw) = $(source_repr(src))`: `$(which)` may pick several checkpoints, \
+         and a source names one record. Average them, `$(kw) = $(repr(run)) => \
+         Average($(which))`, or pick one with `Best(1)` or `Last(1)`."
     )
     which in (:best, :latest, :current) || error(
         "ReactantNitro: `$(kw) = $(source_repr(src))` names no checkpoint of the run: \
@@ -760,8 +793,10 @@ function resolve_source(ckpt, run_dir, src, kw::Symbol)
     src isa AbstractString && return String(src)
     src isa Nitro && return src
     run, which = src
+    which = source_sugar(which)
     which === :current && return run
     what = "`$(kw) = $(source_repr(src))`"
+    which isa Average && return resolve_average_source(ckpt, run_dir, run, which; what)
     run isa Nitro || return resolve_checkpoint(ckpt, run_dir, run, which; what).path
     ck = run.checkpointer
     has = ck === nothing ? "`checkpointer = nothing`" : "a `$(typeof(ck))`"
@@ -771,6 +806,32 @@ function resolve_source(ckpt, run_dir, src, kw::Symbol)
          `weights = other` takes its parameters from memory."
     )
     return resolve_checkpoint(ck, run.run_dir, run_key(ck.run), which; what).path
+end
+
+# An `Average` source: the run's own checkpointer for another handle, which also lets setup check
+# its `keep` can supply the selection before reading the manifest.
+function resolve_average_source(ckpt, run_dir, run, avg; what)
+    if run isa Nitro
+        ck = run.checkpointer
+        ck isa Checkpointer || error(
+            "ReactantNitro: $(what) averages `other`'s checkpoint records, and `other` has no \
+             `Checkpointer` whose manifest can be read."
+        )
+        need = avg.sel isa Best && avg.sel.among !== nothing ? avg.sel.among : avg.sel
+        covers(ck.keep, avg.sel) === false && error(
+            "ReactantNitro: $(what): `other`'s checkpointer keeps \
+             $(join(map(repr, ck.keep), ", ")), which cannot hold everything `$(avg.sel)` \
+             picks. Keep it while training, for example \
+             `Checkpointer(; keep = (Best(3), $(need)))`."
+        )
+        return resolve_average(ck, run.run_dir, run_key(ck.run), avg; what)
+    end
+    has = ckpt === nothing ? "`checkpointer = nothing` has none" : "a `$(typeof(ckpt))` records none"
+    ckpt isa Checkpointer || error(
+        "ReactantNitro: $(what) is looked up through the checkpointer's manifest, and $(has). \
+         Leave `checkpointer` at its default to read the run directory the framework writes."
+    )
+    return resolve_average(ckpt, run_dir, run, avg; what)
 end
 
 """
