@@ -133,8 +133,8 @@ end
 
 Require `size(leaf)[end] == batch_size` for every routed field of a training batch, the
 per-batch half of the accumulation contract. The training loader must drop its partial final batch.
-Samples a loader drops never reach this check (3001 samples at batch size 64 drop 57 per epoch);
-the binding report shows them when the source supports `MLUtils.numobs`.
+Samples a loader drops never reach this check (3001 samples at batch size 64 drop 57 per epoch),
+and nothing reports them.
 """
 function check_train_batch_shape(
         batch::NamedTuple, batch_size::Integer, split::Symbol,

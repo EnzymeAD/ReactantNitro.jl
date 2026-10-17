@@ -487,9 +487,9 @@ a field of their own name; `schedules` is the exception. The keyword wins for on
 with `schedules` for the same quantity.
 
 `show(nitro)` prints the handle's state, seed, accumulation, horizon, batch size and preset, and
-then the report's bands. The data band has one row per split: batch count, sample count, samples
-dropped by drop-last, whether the final batch is padded, and the prefetch path that bound, with its
-worker count, batches staged on device and on host, and a warning if delivery is unordered. The
+then the report's bands. The data band has one row per split: batch count and the prefetch path
+that bound, with its worker count, batches staged on device and on host, and a warning if delivery
+is unordered. The
 bindings band lists the clip threshold and every schedule key with its source, keyword or
 accessor. The parameter groups band has one row per group: rate, ratio, anchor, decay, rule, and
 parameter count. The prefetch settings are also logged as params, because the worker count follows
