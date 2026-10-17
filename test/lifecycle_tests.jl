@@ -455,6 +455,21 @@
         @test occursin("accuracy", err2.msg) && occursin("val_loss", err2.msg)
     end
 
+    @testset "early-stopping counters belong to the handle and survive a resume" begin
+        # `min_delta` larger than any change, so only epoch 1 counts as an improvement.
+        es = EarlyStopping(; patience = 3, min_delta = 100.0)
+        dir = mktempdir()
+        n = train!(Nitro(LifeMLP(); run_dir = dir, max_epochs = 2, early_stop = es))
+        # The handle trained a copy; the caller's instance is untouched.
+        @test n.early_stop !== es && es.best === nothing && es.wait == 0
+        @test n.early_stop.wait == 1
+        # The resume continues the count: wait 2 at epoch 3, and 3 = patience at epoch 4. With
+        # fresh counters epoch 3 would be a new best and the run would reach epoch 5.
+        r = train!(Nitro(LifeMLP(); run_dir = dir, max_epochs = 5, resume = :auto, early_stop = es))
+        @test r.stop_reason === :early_stop
+        @test current_epoch(r) == 4
+    end
+
     @testset "a run that stops on patience exits through `Done`, gracefully" begin
         lg = RecLogger()
         # `min_delta` larger than any change the loss can make, so no epoch ever counts as an

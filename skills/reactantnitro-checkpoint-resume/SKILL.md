@@ -245,7 +245,8 @@ normalize on the way in.**
 ## What resume restores, and what it does not
 
 Restored: parameters, layer state, optimizer state including its moments, the step and epoch counters,
-the seed, and derived-value bookkeeping. The logger reattaches so a resumed run extends one history
+the seed, derived-value bookkeeping, and the `EarlyStopping` counters when the resumed policy watches
+the same metric and mode. The logger reattaches so a resumed run extends one history
 rather than opening a second.
 
 **Recomputed, not restored:** derived values. `derive` runs again, so resuming against changed data

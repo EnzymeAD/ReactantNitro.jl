@@ -23,8 +23,10 @@ train!(e; early_stop = EarlyStopping(; metric = :val_loss, mode = :min,
 
 The stopping epoch still validates and checkpoints, then `train!` returns through `Done` with
 `stop_reason = :early_stop`, which the final checkpoint record stores. [`request_stop!`](@ref)
-stops at the same point on demand, with `stop_reason = :requested`. The `best` and `wait` counters
-live in the instance and are not checkpointed, so a resume does not restore them.
+stops at the same point on demand, with `stop_reason = :requested`. Setup copies the instance with
+fresh `best` and `wait` counters, so two handles never share them and the instance you passed is
+not mutated; the handle's copy is `nitro.early_stop`. The counters are stored in each checkpoint,
+and a resume that watches the same metric and mode continues from them.
 """
 mutable struct EarlyStopping
     metric::Symbol
@@ -71,6 +73,21 @@ function should_stop(es::EarlyStopping, epoch, metrics)
 end
 
 should_stop(::Nothing, epoch, metrics) = false
+
+# The resumable counters the checkpoint record stores; `nothing` for a policy without any.
+early_stop_state(es) = nothing
+early_stop_state(es::EarlyStopping) = (; es.metric, es.mode, es.best, es.wait)
+
+# The handle's own copy, with fresh counters, or a resumed record's counters when it watched the
+# same metric and mode. A policy of another type is used as given.
+setup_early_stop(es, state) = es
+function setup_early_stop(es::EarlyStopping, state)
+    own = EarlyStopping(es.metric, es.mode, es.patience, es.min_delta, nothing, 0)
+    if state !== nothing && state.metric === es.metric && state.mode === es.mode
+        own.best, own.wait = state.best, state.wait
+    end
+    return own
+end
 
 """
     ReactantNitro.check_early_stop(es, collection, routing) -> nothing

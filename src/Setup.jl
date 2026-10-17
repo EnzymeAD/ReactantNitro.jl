@@ -463,6 +463,9 @@ function _build_nitro(
     # Here because both need the split collection and the resolved routing: a policy with no `val`
     # split, or naming a metric the experiment cannot emit, is a configuration error.
     check_early_stop(early_stop, collection, routing)
+    early_stop = setup_early_stop(
+        early_stop, record !== nothing && !weights_only ? record.early_stop : nothing
+    )
     check_checkpointer(checkpointer, collection, routing)
     training && warn_keep_latest(checkpointer, resume)
     training && warn_retention_scope(checkpointer)

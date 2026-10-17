@@ -1105,6 +1105,7 @@ function snapshot(nitro::Nitro)
         stop_reason = nitro.stop_reason,
         preset = nitro.preset,                  # the named configuration, if any
         derived = nitro.derived,
+        early_stop = early_stop_state(nitro.early_stop),
     )
     # A structural walk over leaves, not elements: about a hundred checks per epoch.
     assert_host_record(snap)

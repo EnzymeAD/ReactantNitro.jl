@@ -31,6 +31,7 @@ Everything a checkpoint holds: the `snapshot` passed to [`save_checkpoint!`](@re
 | `stop_reason` | optional | `:completed`, `:early_stop`, `:requested`, or `:error` |
 | `preset` | optional | The preset the run was built from, `nothing` if none |
 | `derived` | optional | The keys `derive` returned, so a weights-only load restores them |
+| `early_stop` | optional | The early-stopping counters, so a resume continues its patience |
 
 Every value is a host value; setup moves them to the device when it loads a record.
 """
@@ -56,6 +57,8 @@ struct CheckpointRecord
     preset::Any
     # The keys `derive` returned, so a weights-only load restores them; `nothing` in older records.
     derived::Any
+    # `EarlyStopping`'s counters, so a resume continues its patience; `nothing` in older records.
+    early_stop::Any
 end
 
 # ── Showing a record never shows the weights ─────────────────────────────────────────
@@ -252,7 +255,8 @@ function save_checkpoint!(ckpt::TopKCheckpointer, epoch, metrics, snapshot)
         snapshot.anchor_checksum, snapshot.stop_reason,
         # `nothing` for a run that named no preset, which is most of them.
         hasproperty(snapshot, :preset) ? snapshot.preset : nothing,
-        hasproperty(snapshot, :derived) ? snapshot.derived : nothing
+        hasproperty(snapshot, :derived) ? snapshot.derived : nothing,
+        hasproperty(snapshot, :early_stop) ? snapshot.early_stop : nothing
     )
 
     name = owned_name(
@@ -645,14 +649,15 @@ _load_record_quietly(path) = Base.CoreLogging.with_logger(
     () -> JLD2.load(path, "record"), _QuietReconstruct(Base.CoreLogging.current_logger())
 )
 
-# Field-shape migrations: the `tunables` to `devices` rename, and the additions of `preset` and
-# `derived`.
+# Field-shape migrations: the `tunables` to `devices` rename, and the additions of `preset`,
+# `derived` and `early_stop`.
 # JLD2 reconstructs an old record as a ReconstructedMutable with the on-disk field names, and the
 # rename is done here. A function because `checkpoint_info` reads the same records. FORMAT_VERSION
 # stays 1, since the semantics did not change.
 function _migrate_record(raw, path = "<record>")
     raw isa CheckpointRecord && return raw
-    if hasproperty(raw, :tunables) || !hasproperty(raw, :preset) || !hasproperty(raw, :derived)
+    if hasproperty(raw, :tunables) || !hasproperty(raw, :preset) || !hasproperty(raw, :derived) ||
+            !hasproperty(raw, :early_stop)
         return CheckpointRecord(
             raw.format_version, raw.framework_version,
             raw.ps, raw.st, raw.opt_state, raw.flat_permutation,
@@ -661,7 +666,8 @@ function _migrate_record(raw, path = "<record>")
             raw.metrics, raw.run_id, raw.run_url, raw.logger_state,
             raw.logger_type, raw.anchor_checksum, raw.stop_reason,
             hasproperty(raw, :preset) ? raw.preset : nothing,
-            hasproperty(raw, :derived) ? raw.derived : nothing
+            hasproperty(raw, :derived) ? raw.derived : nothing,
+            hasproperty(raw, :early_stop) ? raw.early_stop : nothing
         )
     end
     return error("ReactantNitro: `$path` does not hold a `CheckpointRecord`; it holds a \
