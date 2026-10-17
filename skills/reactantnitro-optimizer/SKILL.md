@@ -138,6 +138,11 @@ A bare `Number` is accepted and means constant. That is what makes constants fre
 `Number` and a schedule is a callable, so the per-step transfer count equals the number of quantities
 actually varying.
 
+**Varying scalar schedules are logged for you**, on the train line under `schedule/`: `Device`
+fields as `schedule/<field>`, rule values as `schedule/<group>/<field>` after the per-group
+scaling, so `schedule/backbone/eta` is the rate the backbone actually trained at. Do not log a schedule yourself from
+`train_metrics` or a monitor. `autolog_schedules = false` turns it off.
+
 ### Use the ecosystem's schedules, not your own
 
 **The framework takes no dependency on any schedule library, and that is so you can use whichever

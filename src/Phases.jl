@@ -161,6 +161,8 @@ mutable struct Nitro
     max_epochs::Int
     gradient_clip_norm::Any
     check_divergence::Bool
+    autolog_schedules::Bool
+    log_every_n_steps::Int
     checkpointer::Any
     early_stop::Any
     # What the pure scalar run accessors returned at construction, for `fixed_config_report`. The
@@ -173,6 +175,8 @@ mutable struct Nitro
     # `(; masks, anchors)`, resolved at construction so a revised `no_decay` cannot change an
     # existing handle's numerics.
     decay::Any
+    # `(; fields, slots, level2)` from `schedule_bindings`, resolved once at construction.
+    bindings::Any
 
     # Mutated as it runs.
     g_accum::Any              # NTuple{G}, first written by the gradient program

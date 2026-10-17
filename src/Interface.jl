@@ -312,21 +312,23 @@ optimizer(::MyExp) = Optimisers.Momentum
 optimizer(::MyExp, ::Val{:backbone}) = Optimisers.Momentum
 ```
 
-Level 2: supply the chain, receiving the group and its resolved, device-converted `hp`:
+Level 2: supply the chain, receiving the group and its resolved, device-converted `hp`. It is
+called at setup and again every optimizer step:
 
 ```julia
 optimizer(::MyExp, group::Symbol, hp) = Optimisers.OptimiserChain(
-    Optimisers.RAdam(; eta = hp.eta, beta = hp.beta),
-    Decay(hp.lambda, hp.anchor, hp.no_decay_mask),
+    Optimisers.ClipNorm(1.0f0, 2.0f0, false),
+    Optimisers.Momentum(hp.eta, get(hp, :rho, 0.9f0)),
 )
 ```
 
-`hp` carries `eta` (the group's effective learning rate), `lambda` (already multiplied by it),
-`anchor`, `no_decay_mask`, and one key per scheduled rule field. Level 2 owns hyperparameter
-application: a factory that ignores a scheduled `epsilon` passes the name check and the schedule
-does nothing, which the binding report shows per group rather than the framework erroring on. No
-path accepts a fully constructed chain with baked values, since rules carry device scalars rebuilt
-every step.
+`hp` carries `eta` (the group's effective learning rate), `lambda` (already multiplied by it, and
+`nothing` when it is zero and not scheduled), `anchor`, `no_decay_mask`, and one key per scheduled
+rule field, present from the first call. Level 2 places the values, so a scheduled field reaches
+the rule only if the factory reads it from `hp`. Setup checks this on the host: a scheduled field
+whose value does not change the returned chain is a setup error, and the binding report shows where
+each scheduled field landed. No path accepts a fully constructed chain with baked values, since
+rules carry device scalars rebuilt every step.
 """
 function optimizer end
 
@@ -612,3 +614,26 @@ training continues from whatever state the divergence left. Host-side only: it c
 """
 function check_divergence end
 check_divergence(e) = _field(e, :check_divergence, true)
+
+"""
+    autolog_schedules(e) -> Bool
+
+Whether the framework logs every varying scalar schedule itself, with no code from you, on each
+train line (see [`log_every_n_steps`](@ref)). Default `_field(e, :autolog_schedules, true)`; also a
+`Nitro` keyword. Logged as `schedule/<field>` for a `Device` field and `schedule/<group>/<field>`
+for a rule value, after the per-group scaling (see [Schedules](schedules.md)). Host-side only: the values are the ones the step already computed.
+"""
+function autolog_schedules end
+autolog_schedules(e) = _field(e, :autolog_schedules, true)
+
+"""
+    log_every_n_steps(e) -> Int
+
+The train line, which carries the loss, [`train_metrics`](@ref) and the schedule values, is written
+on every `n`th optimizer step only, to keep a fast run from flooding its logger. Default `_field(e, :log_every_n_steps, 1)`; also a `Nitro`
+keyword. Only the writing is thinned: validation and the per-epoch lines are unaffected, the loss
+is still read back every micro-batch for the divergence check and `history`, and
+[`train_metrics`](@ref) still runs every micro-batch.
+"""
+function log_every_n_steps end
+log_every_n_steps(e) = _field(e, :log_every_n_steps, 1)

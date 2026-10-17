@@ -396,9 +396,11 @@ set with `CUDA_VISIBLE_DEVICES` before starting the process.
 [`train!`](@ref)`(e; ...)` is sugar for [`train!`](@ref)`(Nitro(e; ...))`. Every keyword belongs to
 the constructor and [`train!`](@ref)`(nitro)` takes none, so there is one keyword surface.
 
-**Eleven of the keywords default to an accessor of the same name**: [`seed`](@ref),
+**Thirteen of the keywords default to an accessor of the same name**: [`seed`](@ref),
 [`run_dir`](@ref), [`n_devs`](@ref), [`accum`](@ref), [`max_epochs`](@ref), [`schedules`](@ref),
-[`gradient_clip_norm`](@ref), [`check_divergence`](@ref), [`logger`](@ref), [`checkpointer`](@ref),
+[`gradient_clip_norm`](@ref), [`check_divergence`](@ref), [`autolog_schedules`](@ref),
+[`log_every_n_steps`](@ref), [`logger`](@ref),
+[`checkpointer`](@ref),
 and [`early_stop`](@ref).
 Passing the keyword replaces the accessor for that run, without editing the struct or redefining a
 method:

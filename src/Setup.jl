@@ -6,12 +6,12 @@
 
 """
     Nitro(e; seed, resume, run_dir, data, n_devs, weights, accum, max_epochs, schedules,
-             gradient_clip_norm, check_divergence, logger, checkpointer, early_stop, run_ref,
-             w0, restore_optimizer, restore_best) -> Nitro
+             gradient_clip_norm, check_divergence, autolog_schedules, log_every_n_steps, logger,
+             checkpointer, early_stop, run_ref, w0, restore_optimizer, restore_best) -> Nitro
 
 Run the setup sequence and return the handle. No training.
 
-Eleven keywords default to an accessor of the same name (the signature of `_build_nitro` is the
+Thirteen keywords default to an accessor of the same name (the signature of `_build_nitro` is the
 authority for the defaults), so the keyword replaces the accessor's value for one run and omitting
 it falls through to the experiment's own. `data`, `weights`, `resume` and `run_ref` are
 keyword-only, each naming a fact about this invocation. `early_stop` defaults to `nothing` and
@@ -158,7 +158,7 @@ end
 # heartbeat. The keyword defaults live here, on the function that reads `e`.
 function _build_nitro(
         e;
-        # Eleven keywords default to an accessor of the same name, so an experiment
+        # Thirteen keywords default to an accessor of the same name, so an experiment
         # declares what it IS and a caller passes only what this run changes.
         seed::Integer = ReactantNitro.seed(e),
         run_dir::AbstractString = ReactantNitro.run_dir(e),
@@ -168,6 +168,8 @@ function _build_nitro(
         schedules = ReactantNitro.schedules(e),
         gradient_clip_norm = ReactantNitro.gradient_clip_norm(e),
         check_divergence::Bool = ReactantNitro.check_divergence(e),
+        autolog_schedules::Bool = ReactantNitro.autolog_schedules(e),
+        log_every_n_steps::Integer = ReactantNitro.log_every_n_steps(e),
         logger = ReactantNitro.logger(e),
         checkpointer = ReactantNitro.checkpointer(e),
         early_stop = ReactantNitro.early_stop(e),
@@ -278,7 +280,7 @@ function _build_nitro(
     end
 
     # ── 1. validate config, cheapest failures first ────────────────────────────────
-    validate_config(e; accum, gradient_clip_norm)
+    validate_config(e; accum, gradient_clip_norm, log_every_n_steps)
 
     # Manual mode is selected by a `train_step` method and frozen into the handle; flipping it on
     # an existing handle is reported by `fixed_config_report` rather than applied.
@@ -467,6 +469,7 @@ function _build_nitro(
     # Hoisted so the freeze below can see it. `()` for a no-train `Nitro` and for manual mode,
     # whose rules enter the compile key through `worlds_manual` instead.
     chains = ()
+    bindings = (; fields = (), slots = (), level2 = ())
     # Resolved once, here: `no_decay` is a user hook, and recomputing it at `train!` would let a
     # revision take effect on a frozen handle. Training-only and skipped in manual mode.
     masks = training && !manual ? map(m -> place_replicated(m, mesh), no_decay_masks(e, ps, layout)) : nothing
@@ -482,7 +485,9 @@ function _build_nitro(
                 opt_state, accessor = ReactantNitro.schedules(e)
             )
         else
-            opt_state = build_opt_state(e, flat, layout; anchors, masks, mesh)
+            # `hp` carries every scheduled rule field from the first factory call.
+            svs = ntuple(gi -> setup_schedule_values(e, schedules, layout.groups[gi]), n_groups(layout))
+            opt_state = build_opt_state(e, flat, layout; svs, anchors, masks, mesh)
             # Re-normalize a RESTORED `opt_state`. Step 9's normalization applies to state the
             # framework constructed; a restore constructs nothing, and without this RAdam's `t`
             # stays host, never advances under trace, and the run silently trains at the wrong
@@ -500,7 +505,7 @@ function _build_nitro(
                 end
             end
             chains = map(
-                gi -> build_chain(e, layout.groups[gi], resolve_hp(e, layout, gi)),
+                gi -> build_chain(e, layout.groups[gi], setup_hp(e, layout, gi, svs[gi])),
                 ntuple(identity, n_groups(layout))
             )
             # `rebuild_rules` moves only the VALUES each step; the rule types, and so the `apply!`
@@ -510,6 +515,7 @@ function _build_nitro(
                 chains, accessor = ReactantNitro.schedules(e),
                 groups = layout.groups
             )
+            bindings = schedule_bindings(e, layout, resolved, chains; anchors, masks)
         end
     end
 
@@ -553,11 +559,12 @@ function _build_nitro(
         record === nothing ? nothing : record.run_id,
         record === nothing ? nothing : record.run_url,
         String(run_dir), Int(seed), Int(accum), Int(max_epochs), gradient_clip_norm,
-        check_divergence, checkpointer, early_stop, probe_accessors(e),
+        check_divergence, autolog_schedules, Int(log_every_n_steps), checkpointer, early_stop,
+        probe_accessors(e),
         # The compile options ride with the dispatch freeze: both are compile-cache key components
         # fixed at construction (Cache.jl `compile_cached`).
         merge(frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state), (; compile_options)),
-        (; masks, anchors),
+        (; masks, anchors), bindings,
         map(zero, flat), RegisteredMonitor[], Int(step0), Int(epoch0), Starting(),
         false, nothing,
         # No metrics and no elapsed time yet, even for a restored handle.
@@ -900,7 +907,7 @@ are not checked.
 """
 const DRIVER_ONLY_FIELDS = (
     :seed, :max_epochs, :run_dir, :n_devs, :logger, :checkpointer,
-    :early_stop, :check_divergence,
+    :early_stop, :check_divergence, :autolog_schedules, :log_every_n_steps,
 )
 
 function check_driver_fields(e)
@@ -1078,8 +1085,10 @@ Setup step 1, cheapest failures first, before any allocation: marker legality, o
 membership, mutually exclusive decay settings, `learning_rate(e) != 0`, and the parameter-group name
 checks.
 """
-function validate_config(e; accum = 1, gradient_clip_norm = 0.0f0)
+function validate_config(e; accum = 1, gradient_clip_norm = 0.0f0, log_every_n_steps = 1)
     accum >= 1 || error("ReactantNitro: `accum` must be at least 1, and is $accum.")
+    log_every_n_steps >= 1 ||
+        error("ReactantNitro: `log_every_n_steps` must be at least 1, and is $log_every_n_steps.")
     check_driver_fields(e)
     lr = learning_rate(e)
     iszero(lr) && error(
@@ -1109,8 +1118,8 @@ n = Nitro(MyExp, :baseline; max_epochs = 40, aug_rotate_deg = 9.0)
 
 Keywords are split by one rule: a `Nitro` keyword goes to `Nitro`; anything else must be a field
 of `E` and goes to the recipe; a name that is both (`max_epochs`, `seed`, `run_dir`, `accum`,
-`n_devs`, `gradient_clip_norm`, `check_divergence`) is the run keyword. Anything in neither set is an error naming
-both. The keyword set is derived from the constructor's declaration, so it cannot go stale.
+`n_devs`, `gradient_clip_norm`, `check_divergence`, `autolog_schedules`, `log_every_n_steps`) is
+the run keyword. Anything in neither set is an error naming both. The keyword set is derived from the constructor's declaration, so it cannot go stale.
 
 The longer spelling, `Nitro(from_preset(MyExp, :baseline; ...); preset = :baseline)`, still works
 and is what this is shorthand for, but it names the preset twice and nothing checks the two agree.
@@ -1499,7 +1508,10 @@ end
 # The run knobs whose accessors are pure and safe to re-probe. `logger`, `checkpointer`,
 # `early_stop` and `schedules` are constructors called exactly once at setup, so probing them would
 # fire their side effects and compare by identity anyway; a revised one is not detected here.
-const _PROBED = (:seed, :accum, :max_epochs, :gradient_clip_norm, :check_divergence, :run_dir)
+const _PROBED = (
+    :seed, :accum, :max_epochs, :gradient_clip_norm, :check_divergence, :autolog_schedules,
+    :log_every_n_steps, :run_dir,
+)
 
 """
     ReactantNitro.frozen_dispatch(ev, model, ps, st, routing, chains) -> NamedTuple

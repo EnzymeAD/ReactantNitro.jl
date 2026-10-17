@@ -18,7 +18,8 @@
 """
     log_metrics!(lgr, metrics; step, epoch, context, kwargs...) -> nothing
 
-The metric channel. `context` is `"train"` (one line per optimizer step), `"validate"` (one per
+The metric channel. `context` is `"train"` (one line per optimizer step, or per
+[`log_every_n_steps`](@ref), with the schedule values under `schedule/`), `"validate"` (one per
 epoch of metrics), or `"data"` (the per-epoch `data_wait_frac`, a third context so it dilutes
 neither count). The framework drops non-finite values before calling.
 """

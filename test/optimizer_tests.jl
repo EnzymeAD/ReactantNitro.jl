@@ -9,7 +9,7 @@
     using ReactantNitro
     using ReactantNitro: FlatLayout, ScalarMemo, apply_group, assert_device_state, build_layout,
         build_opt_state, cache_reset!, cache_stats, check_allowlist, check_decay_last,
-        check_no_duplicate_fields, clip_by_global_norm, construct_rule, effective_lr, flatten,
+        clip_by_global_norm, construct_rule, effective_lr, flatten,
         global_grad_norm, host_numbers, level1_chain, memo_to_device, no_decay_masks, resolve_hp,
         reuse_refused, to_device, to_device_leaf, to_device_rule, unflatten
     using Functors, JLD2, Lux, Optimisers, Random, Reactant, Statistics
@@ -624,6 +624,235 @@
         @test err2 isa ErrorException && occursin("epsilon", err2.msg)
     end
 
+    # ── every scheduled rule field, and the schedule log ────────────────────────────────
+
+    struct SchedLog
+        lines::Vector{Any}
+    end
+    ReactantNitro.log_metrics!(l::SchedLog, m; step, epoch, context, kwargs...) =
+        push!(l.lines, (; context, step, m))
+    ReactantNitro.log_params!(::SchedLog, p) = nothing
+    ReactantNitro.log_other!(::SchedLog, k, v) = nothing
+    ReactantNitro.finish!(::SchedLog, s) = nothing
+    ReactantNitro.run_id(::SchedLog) = nothing
+    ReactantNitro.run_url(::SchedLog) = nothing
+    lines(l, ctx) = [x for x in l.lines if x.context == ctx]
+
+    @experiment struct MomGroups
+        unused::Int = 0
+        max_epochs::Host{Int} = 1
+        aux::Device{Float32} = 1.0f0
+    end
+    ReactantNitro.param_group(::MomGroups, ks) = ks[1] === :backbone ? :backbone : :default
+    ReactantNitro.learning_rate(::MomGroups) = 1.0f-3
+    ReactantNitro.learning_rate(::MomGroups, ::Val{:backbone}) = 1.0f-4
+    ReactantNitro.optimizer(::MomGroups) = Optimisers.Momentum
+    ReactantNitro.lambda(::MomGroups) = 1.0f-2
+    ReactantNitro.build_model(e::MomGroups, rng) =
+        Lux.setup(rng, mlp()) |> ((ps, st),) -> (mlp(), ps, st)
+    ReactantNitro.build_data(::MomGroups, dist) = (; train = two_group_data())
+    ReactantNitro.forward(::MomGroups, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    ReactantNitro.loss(e::MomGroups, ŷ; y) = e.aux * mean(abs2, ŷ .- y)
+
+    @testset "every scheduled rule field reaches the rule in the automatic loop" begin
+        # The regression: only `eta` was looked up per step, so `rho` and `lambda` schedules were
+        # accepted, reported as bound, and never applied.
+        cache_reset!()
+        n = Nitro(
+            MomGroups(); schedules = (; opt = (; rho = _ -> t -> 0.5f0, lambda = _ -> t -> 2.0f0)),
+            checkpointer = nothing, logger = nothing, run_dir = mktempdir()
+        )
+        train!(n)
+        rule(gi) = n.opt_state[gi].rule.opts
+        @test Float32(rule(1)[1].rho) == 0.5f0
+        @test Float32(rule(2)[1].rho) == 0.5f0
+        # lambda_g = eta_g * lambda(t): 1e-3 * 2 and 1e-4 * 2.
+        @test Float32(rule(1)[2].lambda) ≈ 2.0f-3 rtol = 1.0e-5
+        @test Float32(rule(2)[2].lambda) ≈ 2.0f-4 rtol = 1.0e-5
+        @test cache_stats().misses == 2
+
+        # A scheduled lambda that reaches zero keeps its `Decay` tail, so the chain does not change.
+        nz = Nitro(
+            MomGroups(); schedules = (; opt = (; lambda = _ -> t -> 0.0f0)),
+            checkpointer = nothing, logger = nothing, run_dir = mktempdir()
+        )
+        train!(nz)
+        @test phase(nz) isa Done
+        @test Float32(nz.opt_state[1].rule.opts[2].lambda) == 0.0f0
+    end
+
+    @testset "the schedule log reports the applied values, once per optimizer step" begin
+        lg = SchedLog([])
+        n = Nitro(
+            MomGroups(); accum = 2, logger = lg, checkpointer = nothing, run_dir = mktempdir(),
+            schedules = (;
+                device = (; aux = _ -> t -> 1.0 + t),
+                opt = (;
+                    rho = _ -> t -> 0.5f0 + 0.1f0 * t, eta = _ -> t -> 1.0f-2 * t,
+                    backbone = (; eta = 1.0f-1),
+                ),
+            )
+        )
+        train!(n)
+        # One call per optimizer step: the schedule values ride on the train line.
+        @test isempty(filter(x -> x.context != "train" && x.context != "data", lg.lines))
+        tl = lines(lg, "train")
+        @test [x.step for x in tl] == [1, 2]
+        sk(name) = Symbol("schedule/", name)
+        last_m = tl[end].m
+        @test haskey(last_m, :loss)
+        @test last_m[sk("aux")] == 3.0
+        @test last_m[sk("default/eta")] ≈ 2.0f-2
+        # A varying eta moves the decay too.
+        @test last_m[sk("default/lambda")] ≈ 2.0f-2 * 1.0f-2
+        @test last_m[sk("backbone/rho")] ≈ 0.7f0
+        # The backbone's eta is a constant, so it is left out.
+        @test !haskey(last_m, sk("backbone/eta"))
+        # What was logged is what the rule holds after the last step.
+        @test Float32(n.opt_state[1].rule.opts[1].eta) == last_m[sk("default/eta")]
+        @test Float32(n.opt_state[2].rule.opts[1].rho) == last_m[sk("backbone/rho")]
+
+        # Off by keyword: no schedule keys, the train lines unchanged.
+        lg2 = SchedLog([])
+        n2 = Nitro(
+            MomGroups(); logger = lg2, autolog_schedules = false, checkpointer = nothing,
+            run_dir = mktempdir(), schedules = (; opt = (; eta = _ -> t -> 1.0f-3))
+        )
+        train!(n2)
+        @test !isempty(lines(lg2, "train"))
+        @test all(x -> keys(x.m) == (:loss,), lines(lg2, "train"))
+        @test autolog_schedules(MomGroups()) === true
+
+        # Only finite `Real` values reach a logger: backends reject a `Complex` or a device scalar.
+        s = (; device = (; a = t -> 1.0, c = t -> 1.0 + 2im), opt = (;))
+        @test keys(ReactantNitro.schedule_log(s, (; a = 1.0, c = 1.0 + 2im))) == (Symbol("schedule/a"),)
+        @test ReactantNitro.finite_only((; a = NaN, b = 1.0f0)) == (; b = 1.0f0)
+    end
+
+    @experiment struct HostEvery
+        unused::Int = 0
+        max_epochs::Host{Int} = 1
+    end
+    const HOST_CALLS = Ref(0)
+    ReactantNitro.build_model(e::HostEvery, rng) =
+        Lux.setup(rng, mlp()) |> ((ps, st),) -> (mlp(), ps, st)
+    ReactantNitro.build_data(::HostEvery, dist) = (; train = two_group_data(; n_batches = 6))
+    ReactantNitro.forward(::HostEvery, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    ReactantNitro.loss(::HostEvery, ŷ; y) = mean(abs2, ŷ .- y)
+    ReactantNitro.metrics_residency(::HostEvery, ::Symbol) = :host
+    ReactantNitro.train_metrics(::HostEvery, out) = (HOST_CALLS[] += 1; (; m = 1.0))
+
+    @testset "`log_every_n_steps` thins the train line only" begin
+        lg = SchedLog([])
+        n = Nitro(
+            MomGroups(); logger = lg, log_every_n_steps = 2, checkpointer = nothing,
+            run_dir = mktempdir(), schedules = (; opt = (; eta = _ -> t -> 1.0f-3 * t))
+        )
+        @test n.log_every_n_steps == 2
+        train!(n)
+        @test [x.step for x in lines(lg, "train")] == [2, 4]
+        @test all(x -> haskey(x.m, Symbol("schedule/default/eta")), lines(lg, "train"))
+        # The per-epoch line is not thinned.
+        @test length(lines(lg, "data")) == 1
+        # Every step still trains: only the logging is thinned.
+        @test n.step == 4
+
+        # A `:host` train_metrics still runs every micro-batch; only its line is thinned.
+        HOST_CALLS[] = 0
+        lh = SchedLog([])
+        train!(
+            Nitro(
+                HostEvery(); logger = lh, log_every_n_steps = 3, checkpointer = nothing,
+                run_dir = mktempdir()
+            )
+        )
+        @test HOST_CALLS[] == 6
+        @test [x.step for x in lines(lh, "train")] == [3, 6]
+        @test all(x -> haskey(x.m, :m), lines(lh, "train"))
+
+        err = try
+            Nitro(MomGroups(); log_every_n_steps = 0, checkpointer = nothing, run_dir = mktempdir())
+            nothing
+        catch ex
+            ex
+        end
+        @test err isa ErrorException && occursin("log_every_n_steps", err.msg)
+        @test log_every_n_steps(MomGroups()) == 1
+    end
+
+    # ── Level 2 chains and schedules ─────────────────────────────────────────────────────
+
+    @experiment struct L2Exp
+        unused::Int = 0
+        max_epochs::Host{Int} = 1
+    end
+    const L2_MODE = Ref(:direct)
+    function ReactantNitro.optimizer(::L2Exp, group::Symbol, hp)
+        m = L2_MODE[]
+        m === :direct && return Optimisers.Momentum(hp.eta, get(hp, :rho, 0.9f0))
+        m === :ignore && return Optimisers.Momentum(hp.eta, 0.9f0)
+        m === :shared && return Optimisers.OptimiserChain(
+            Optimisers.Adam(hp.eta), Optimisers.Descent(0.1f0 * hp.eta)
+        )
+        # `:computed`: values derived from `hp` on the host.
+        return Optimisers.Momentum(1.0f0 * hp.eta, 1.0f0 - get(hp, :rho, 0.1f0))
+    end
+    ReactantNitro.build_model(e::L2Exp, rng) =
+        Lux.setup(rng, mlp()) |> ((ps, st),) -> (mlp(), ps, st)
+    ReactantNitro.build_data(::L2Exp, dist) = (; train = two_group_data())
+    ReactantNitro.forward(::L2Exp, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    ReactantNitro.loss(::L2Exp, ŷ; y) = mean(abs2, ŷ .- y)
+    function l2_run(mode, sched; logger = nothing)
+        L2_MODE[] = mode
+        cache_reset!()
+        n = Nitro(L2Exp(); seed = 3, schedules = sched, logger, checkpointer = nothing, run_dir = mktempdir())
+        train!(n)
+        return n
+    end
+
+    @testset "Level 2: a scheduled field is in `hp` from the first call and reaches the rule" begin
+        # `hp.rho` used to be missing at setup, so this factory failed before training.
+        n = l2_run(:direct, (; opt = (; rho = _ -> t -> 0.5f0)))
+        @test Float32(n.opt_state[1].rule.rho) == 0.5f0
+        @test occursin("rho: Momentum.rho", sprint(show, MIME"text/plain"(), n))
+    end
+
+    @testset "Level 2: a factory that ignores a scheduled field is a setup error" begin
+        err = try
+            l2_run(:ignore, (; opt = (; rho = _ -> t -> 0.5f0)))
+            nothing
+        catch ex
+            ex
+        end
+        @test err isa ErrorException
+        @test occursin("schedules rho", err.msg) && occursin(":default", err.msg)
+    end
+
+    @testset "Level 2: two rules may share a field name" begin
+        # One `hp.eta` reaches the rules the factory passes it to; setup records both slots.
+        n = l2_run(:shared, (; opt = (; eta = _ -> t -> 1.0f-3 * t)))
+        @test phase(n) isa Done
+        @test occursin("eta: Adam.eta, Descent.eta", sprint(show, MIME"text/plain"(), n))
+        rules = n.opt_state[1].rule.opts
+        @test Float32(rules[2].eta) ≈ 0.1f0 * Float32(rules[1].eta)
+        @test cache_stats().misses == 2
+    end
+
+    @testset "Level 2: a value computed from `hp` follows its schedule" begin
+        # The regression: `1.0f0 * hp.eta` is a host number, which baked into the optimizer program
+        # at its step-1 value with no recompile, so the run trained at a frozen rate.
+        # rho = 0.5 makes `1 - hp.rho` exact, so the two runs must match bitwise.
+        sched = (; opt = (; eta = _ -> t -> 0.05f0 * t, rho = _ -> t -> 0.5f0))
+        a = l2_run(:direct, sched)
+        lg = SchedLog([])
+        b = l2_run(:computed, sched; logger = lg)
+        @test cache_stats().misses == 2
+        @test b.opt_state[1].rule.eta isa Reactant.RNumber
+        @test b.opt_state[1].rule.rho isa Reactant.RNumber
+        @test all(map((x, y) -> Array(x) == Array(y), flatten(parameters(a), a.layout), flatten(parameters(b), b.layout)))
+        @test haskey(lines(lg, "train")[end].m, Symbol("schedule/default/eta"))
+    end
+
     # ── the composition checks ───────────────────────────────────────────────────────────
 
     @testset "a base rule declaring `lambda` is rejected at Level 1, naming the fix" begin
@@ -657,20 +886,6 @@
         end
         @test err isa ErrorException
         @test occursin("LAST", err.msg) && occursin("coupled L2", err.msg)
-    end
-
-    @testset "two rules in one chain declaring the same schedulable field" begin
-        @test check_no_duplicate_fields(
-            Optimisers.OptimiserChain(Optimisers.RAdam(), Decay(1.0f-4))
-        ) === nothing
-        err = try
-            check_no_duplicate_fields(Optimisers.OptimiserChain(Optimisers.Adam(), Optimisers.Descent()))
-        catch ex
-            ex
-        end
-        @test err isa ErrorException
-        @test occursin("eta", err.msg)                   # both declare `eta`
-        @test occursin("Adam", err.msg) && occursin("Descent", err.msg)
     end
 
     @testset "the framework constructs Level 0 and 1 rules by field name" begin
