@@ -273,14 +273,13 @@ the transfer is small next to the epoch, and evaluation code is often not tracea
 connected components, sorting with tie-breaking, any library that knows nothing about Reactant.
 
 ```julia
-# The defaults, written out. You would not normally write either line.
+# The defaults, written out. You would not normally write this.
 ReactantNitro.metrics_residency(::MnistMLP, hook) =
     hook === :train_metrics ? :device : :host
-
-# Trace the validation metric instead. Every value it computes must then be traceable, which the
-# loop in `confusion_matrix` is not.
-ReactantNitro.metrics_residency(::MnistMLP, ::Symbol) = :device
 ```
+
+A metric can run traced only if every value it computes is traceable; this page's `metrics` keeps
+the default `:host`, since the loop in `confusion_matrix` is not.
 
 The hook's code sees one difference: `outputs` are device arrays under `:device` and host arrays
 under `:host`. The other difference is whether editing the metric recompiles. A traced

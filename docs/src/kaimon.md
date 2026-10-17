@@ -21,8 +21,9 @@ registers them again; it also starts a gate if none is running.
 
 ## Why runs are background tasks
 
-Kaimon's agent-side tool calls carry a hard deadline, and its eval path fails after ten minutes
-without output, and a training run lasts hours. So **no tool call blocks until the work
+A Kaimon session tool call fails after five minutes of continuous silence and after one hour in
+any case (`KAIMON_SESSION_TOOL_TIMEOUT` and `KAIMON_SESSION_TOOL_MAX` change both), and its eval
+path has a ten-minute hard timeout. A training run lasts hours. So **no tool call blocks until the work
 finishes**. Every launching tool starts the work on a background task in the session and returns a
 run id immediately; the agent then polls `nitro_status` or `nitro_runs`, both fast calls, until the
 run completes. `nitro_runs()` lists every run the session knows about:
