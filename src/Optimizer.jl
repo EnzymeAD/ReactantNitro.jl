@@ -153,13 +153,16 @@ the stock host path bitwise (64-element buffer, every rule at the buffer's eleme
 | `ClipNorm(ω, p; throw = false)` | yes | yes | 0.0 |
 | `OptimiserChain(RAdam, WeightDecay)` | yes | yes | 0.0 |
 | `OptimiserChain(ClipNorm, Adam)` | yes | yes | 0.0 |
+| [`Decay`](@ref), plain and anchored | yes | yes | 0.0 |
+| `OptimiserChain(RAdam, Decay)` | yes | yes | 0.0 |
 
 `Descent`'s update `x - eta * g` is a multiply feeding a subtract, which XLA contracts into a fused
 multiply-add that rounds once; the compiled result equals host `fma.(-eta, g, x)` exactly, and the
-tests assert against that. Every other rule has a division or sqrt in between. The tuple also
-admits this package's [`Decay`](@ref). `AccumGrad` is absent because it traces and gives wrong
-results (Train.jl). Layer-adaptive rules (LARS, LAMB) are absent because they would compute one
-trust ratio per group rather than per layer.
+tests assert against that. Every other rule has a division or sqrt in between. The 0.0 entries
+were measured on x86-64; another target may contract a site differently, which the tests bound at a
+few ulps. `AccumGrad` is absent because it traces and gives wrong results (Train.jl). Layer-adaptive
+rules (LARS, LAMB) are absent because they would compute one trust ratio per group rather than per
+layer.
 """
 const ADMITTED_RULES = (
     Optimisers.Descent, Optimisers.Momentum, Optimisers.Nesterov,
