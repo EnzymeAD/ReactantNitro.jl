@@ -3,11 +3,13 @@
 # Retrying the one I/O path in the framework whose failure loses hours of compute.
 
 """
-    ReactantNitro.with_io_retry(f; attempts, backoff) -> f()
+    ReactantNitro.with_io_retry(f; attempts::Int = 5, backoff::Real = 0.5) -> f()
 
-Retry a filesystem operation that failed transiently. A checkpoint write is the one I/O path whose
-failure loses hours of compute; writes go through here to a temporary path renamed into place, and
-rotation deletes the displaced file only after the new one is durable.
+Call `f`, retrying up to `attempts` times in total when it throws a transient I/O error (see
+`is_transient_io`). The wait before retry `k` is `backoff * 2^(k - 1)` seconds, and each retry logs
+a warning. Any other error, and the error from the last attempt, is rethrown. Checkpoint reads,
+writes and rotation deletes go through it, since a failed checkpoint write can lose hours of
+training; a write goes to a temporary path that is then renamed into place.
 """
 function with_io_retry(f; attempts::Int = 5, backoff::Real = 0.5)
     attempts >= 1 || error("ReactantNitro: `with_io_retry` needs at least one attempt, and got \
@@ -30,7 +32,8 @@ end
 """
     ReactantNitro.is_transient_io(err) -> Bool
 
-Whether a retry can fix the exception: `SystemError`, `Base.IOError`, and `EOFError` (a truncated
-read of a file another process is still writing). Everything else is rethrown on the first attempt.
+Whether [`with_io_retry`](@ref) retries `err`: true for `SystemError`, `Base.IOError` and
+`EOFError` (a truncated read of a file another process is still writing). Any other error is
+rethrown on the first attempt.
 """
 is_transient_io(err) = err isa SystemError || err isa Base.IOError || err isa EOFError

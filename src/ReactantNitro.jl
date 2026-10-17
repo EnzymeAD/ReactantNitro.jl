@@ -1,12 +1,11 @@
 """
     ReactantNitro
 
-A general Julia training framework on Reactant.jl + Lux.jl.
+A training framework for Lux models compiled with Reactant.
 
-The central object is a [`Nitro`](@ref): `Nitro(e)` runs the setup sequence and nothing else, so
-`validate`, `evaluate`, and `predict` work with no training anywhere in the process. `train!` is a
-separate verb. A *run* is what happens when you `train!` a `Nitro`, which is why the `run_*`
-accessors keep that name while the object does not.
+The central object is a [`Nitro`](@ref). `Nitro(e)` runs setup only, so `validate`, `evaluate` and
+`predict` work without training; [`train!`](@ref) trains it. A *run* is one `train!` of a `Nitro`,
+which is what the `run_*` accessors are named for.
 """
 module ReactantNitro
 
@@ -40,9 +39,8 @@ import UUIDs
 """
     ReactantNitro._unimplemented(what, detail)
 
-Uniform body for a declared-but-unbuilt entry point. The message says the entry point is not built
-yet, so a `MethodError`-shaped hole and a not-yet-built one are distinguishable at a glance;
-`detail` is whatever identifies the missing piece to whoever is building it.
+The error body for an entry point that is declared but not built yet. The message says so, which
+tells it apart from a `MethodError`; `detail` names the missing piece.
 """
 @noinline _unimplemented(what, detail) = error(
     "ReactantNitro: `$what` is declared but not implemented yet (not yet built: $detail)."

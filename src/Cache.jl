@@ -19,21 +19,20 @@ const CACHE_LOCK = ReentrantLock()
     ReactantNitro.CACHE_CLOSURES
 
 The world-closure guard: each entry's dependency closure, captured at compile time under the same
-key as [`CACHE`](@ref). [`world_closure_staleness`](@ref) re-resolves it against live dispatch at
-the entry points and poisons any entry whose methods moved, so a redefinition below the hooks (a
-helper `forward` calls) becomes a miss for a new `Nitro`; an existing one keeps its programs and is
+key as [`CACHE`](@ref). [`world_closure_staleness`](@ref) re-resolves the closures against live
+dispatch at the entry points and poisons any entry whose methods moved, so a redefinition below the
+hooks (a helper `forward` calls) makes a new `Nitro` miss; an existing one keeps its programs and is
 told so. The gradient program stores [`objective_wrapper`](@ref)'s closure (`forward`, `loss` and a
-traced `train_metrics`): native inference of `grad_program` stops at `Enzyme.autodiff` and never
-reaches the objective. The backward pass itself has no Julia methods to guard: Reactant traces the
-forward pass once and Enzyme-JAX derives the gradient from that MLIR, so the forward methods are the
-whole dependency set of a gradient program. `LAST_WORLD_CHECKED` memoizes the scan on the world
-counter.
+traced `train_metrics`), because native inference of `grad_program` stops at `Enzyme.autodiff`. The
+backward pass has no Julia methods to guard: Enzyme-JAX derives it from the traced forward MLIR, so
+the forward methods are the whole dependency set. `LAST_WORLD_CHECKED` memoizes the scan on the
+world counter.
 
 With precise invalidation on (the default; the `precise_invalidation` preference turns it off), an
-entry stores a `TraceHook.TraceRecord` instead: every specialization the trace actually went
-through, which also covers methods that dispatch only on traced types, Reactant overlays, and
-callees behind runtime dispatch, none of which inference on the concrete arguments sees. The inference closure remains the fallback whenever recording is
-unavailable.
+entry stores a `TraceHook.TraceRecord` instead: every specialization the trace went through,
+including methods that dispatch only on traced types, Reactant overlays, and callees behind runtime
+dispatch, none of which inference on the concrete arguments sees. The inference closure is the
+fallback when recording is unavailable.
 """
 const CACHE_CLOSURES = Dict{Any, Any}()
 const LAST_WORLD_CHECKED = Ref{UInt}(0)
@@ -42,50 +41,6 @@ const LAST_WORLD_CHECKED = Ref{UInt}(0)
 # whether its OWN programs were among the poisoned. Set by `world_closure_staleness`.
 const LAST_WORLD_STALENESS = Ref((; poisoned = Any[], drifted = Symbol[]))
 
-"""
-    ReactantNitro.cache_key(f, ev, args, baked) -> key
-
-The compile cache key. The experiment-derived component is computed once per `Nitro`
-(`nitro.frozen.graphconst_hash`); the argument types and shapes are read on every call, because
-Reactant's `@generated` guard covers types but not shapes, which is why a ragged batch passes it and
-fails inside XLA.
-
-| Component | Why |
-| --- | --- |
-| Function identity | The obvious part |
-| Argument types | Includes `st`'s train/eval mode, so the two paths separate for free |
-| Argument shapes | Reactant's guard covers types but not shapes |
-| A hash of the `GraphConst` experiment fields | These bake as trace-time constants |
-| The `primary_world` of every resolved user hook | Method redefinition |
-| `baked` | `train!` keywords that reach a trace as constants (`accum`) |
-
-Method redefinition is in the key because function identity is stable across one: in a REPL with
-Revise, editing `forward` and calling `train!` again would otherwise run the old program.
-`primary_world` moves only when that method is redefined, where `Base.get_world_counter()` moves
-on any definition. Hooks covered: `forward`, `loss`, `metrics`, `train_metrics`,
-`finalize_metrics`, `param_group`, `optimizer`, plus every rule's `apply!` for the optimizer program
-only. All of it is resolved at construction into `nitro.frozen`, so only a new `Nitro` observes a
-redefinition (see [`frozen_dispatch`](@ref) and [`stale_hooks`](@ref)).
-
-`accum` and `gradient_clip_norm` have no world entry: both are resolved once into the handle and
-reach a trace through `baked` and through `Val`'s type parameter, so an accessor override cannot
-change a program without moving a component already present, and a world entry could only fire
-spuriously (it once re-bought a 500 s gradient compile for a byte-identical program). `accum`
-invalidates the gradient program and the clip the optimizer program, so a clip sweep re-pays the
-cheap compile only.
-
-`Device` fields are skipped (traced inputs) and `Host` fields are skipped (not in the traced view);
-the key hashes `compile_view(e)`'s `GraphConst` fields only, since hashing the view itself would
-include device scalars that change every step. Every included field must hash by content, which
-[`assert_graphconst_hashable`](@ref) enforces: identity hashing fails in both directions, a
-harmless miss on two identical configurations and a silent hit on a value mutated in place.
-
-Not covered: constants reached from method bodies, a `const` in the user's module, a global, a
-literal changed on edit. The closure guard catches a method redefinition below the hooks; values
-are the one thing that still requires a REPL restart. A custom ChainRules `rrule` is not a gap:
-Reactant differentiates at the MLIR level and never consults ChainRules, so no `rrule` is part of
-any program.
-"""
 const CACHE_HITS = Ref(0)
 const CACHE_MISSES = Ref(0)
 
@@ -126,10 +81,10 @@ Refuse at setup a `GraphConst` value that does not hash and compare by content, 
 cache and the resume check both rest on `hash` and `isequal` meaning "the same configuration". The
 check: a value and its `deepcopy` must hash equal and be `isequal`. A `GraphConst{Vector{Int}}`
 passes, since arrays hash by content; a struct containing a mutable field fails, since `Base.hash`
-falls through to `objectid` for it. Left through, that costs a full recompile per handle, a spurious
-resume refusal with an identical-looking diff, and, silently, reuse of a program compiled for a
-value since mutated in place. Refused rather than fixed by a structural hash, which would change
-every existing key and paper over a type whose author never decided what equality means.
+falls through to `objectid` for it. Such a value would cost a full recompile per handle and a
+spurious resume refusal with an identical-looking diff, and mutating it in place would reuse a
+program compiled for the old value. It is refused rather than given a structural hash, which would
+change every existing key and decide equality for a type whose author has not.
 """
 function assert_graphconst_hashable(e)
     for (f, x) in pairs(graphconst_fields(e))
@@ -206,9 +161,9 @@ end
 
 `which(f, argtypes).primary_world`, or `0` when the hook has no method. `primary_world` moves when
 that method is redefined and is stable otherwise, where the global world counter moves on any
-definition at the REPL. It is one of the load-bearing internals the Julia floor of 1.12 is pinned
-for; `Base.get_world_counter()` is the over-firing fallback if it goes away, and
-[`primary_world_available`](@ref) is the test that says so.
+definition at the REPL. It is one of the Julia internals behind the 1.12 minimum;
+`Base.get_world_counter()` is the fallback if it goes away, which over-fires, and
+[`primary_world_available`](@ref) reports which one is in use.
 """
 function method_world(f, argtypes)
     hasmethod(f, argtypes) || return UInt(0)
@@ -219,9 +174,8 @@ end
 """
     ReactantNitro.primary_world_available() -> Bool
 
-Whether `Method.primary_world` still exists. Each load-bearing internal needs a test asserting it
-still behaves as documented, and this is the one for the compile cache: a `false` here means the
-cache has silently degraded to the over-firing `get_world_counter` fallback.
+Whether `Method.primary_world` still exists. A test asserts it: `false` means the compile cache has
+fallen back to `get_world_counter`, which misses on every unrelated definition.
 """
 primary_world_available() = hasfield(Method, :primary_world)
 
@@ -232,9 +186,9 @@ The `primary_world` of every resolved user hook, so that editing `forward` in a 
 `train!` again does not run the old program. Its only caller is [`frozen_dispatch`](@ref), at
 construction: the chain set has to be resolved once, since `rebuild_rules` reconstructs chains
 every step while only their values move, and the rules' `apply!` worlds go into `worlds_opt` only,
-so a rule edit cannot re-buy the gradient compile. `accum` and `gradient_clip_norm` are absent by
-design (see [`cache_key`](@ref)). A `const` redefined without touching a method is the one thing
-that requires a REPL restart.
+so a rule edit cannot re-buy the gradient compile. `accum` and `gradient_clip_norm` are absent (see
+[`cache_key`](@ref)). A `const` redefined without touching a method needs `cache_reset!` or a REPL
+restart.
 """
 function hook_worlds(ev; model = Any, ps = Any, st = Any, chains = ())
     # An instance, not a type: `metrics_residency` has to be evaluated to know whether a metric
@@ -266,6 +220,50 @@ end
 # `gc_hash` is supplied by a caller that already has it and recomputed only when it does not.
 _gc_hash(ev, gc_hash) = gc_hash === nothing ? graphconst_field_hash(ev) : gc_hash
 
+"""
+    ReactantNitro.cache_key(f, ev, args, baked) -> key
+
+The compile cache key. The experiment-derived component is computed once per `Nitro`
+(`nitro.frozen.graphconst_hash`); the argument types and shapes are read on every call, because
+Reactant's `@generated` guard covers types but not shapes, which is why a ragged batch passes it and
+fails inside XLA.
+
+| Component | Why |
+| --- | --- |
+| Function identity | Which program |
+| Argument types | Includes `st`'s train/eval mode, so the two paths separate for free |
+| Argument shapes | Reactant's guard covers types but not shapes |
+| A hash of the `GraphConst` experiment fields | These bake as trace-time constants |
+| The `primary_world` of every resolved user hook | Method redefinition |
+| `baked` | `train!` keywords that reach a trace as constants (`accum`) |
+
+Method redefinition is in the key because function identity is stable across one: in a REPL with
+Revise, editing `forward` and calling `train!` again would otherwise run the old program.
+`primary_world` moves only when that method is redefined, where `Base.get_world_counter()` moves
+on any definition. Hooks covered: `forward`, `loss`, `finalize_metrics`, `param_group`,
+`optimizer`, `metrics` and `train_metrics` when their residency is `:device`, and every rule's
+`apply!` for the optimizer program only. All of it is resolved at construction into `nitro.frozen`, so only a new `Nitro` observes a
+redefinition (see [`frozen_dispatch`](@ref) and [`stale_hooks`](@ref)).
+
+`accum` and `gradient_clip_norm` have no world entry: both are resolved once into the handle and
+reach a trace through `baked` and through `Val`'s type parameter, so an accessor override cannot
+change a program without moving a component already present, and a world entry could only fire
+spuriously, re-paying the gradient compile, the most expensive one, for an identical program.
+`accum` invalidates the gradient program and the clip the optimizer program, so a clip sweep
+re-pays the cheap compile only.
+
+`Device` fields are skipped (traced inputs) and `Host` fields are skipped (not in the traced view);
+the key hashes `compile_view(e)`'s `GraphConst` fields only, since hashing the view itself would
+include device scalars that change every step. Every included field must hash by content, which
+[`assert_graphconst_hashable`](@ref) enforces: identity hashing fails in both directions, a
+harmless miss on two identical configurations and a silent hit on a value mutated in place.
+
+Not covered: constants reached from method bodies, a `const` in the user's module, a global, a
+literal changed on edit. The closure guard catches a method redefinition below the hooks; a changed
+value needs [`cache_reset!`](@ref) or a REPL restart. A custom ChainRules `rrule` is not a gap:
+Reactant differentiates at the MLIR level and never consults ChainRules, so no `rrule` is part of
+any program.
+"""
 function cache_key(f, ev, args, baked = (); gc_hash = nothing)
     return (f, map(typeof, args), map(_shape, args), _gc_hash(ev, gc_hash), baked)
 end
@@ -275,12 +273,13 @@ function cache_key(f, ev, args, baked, worlds; gc_hash = nothing)
 end
 
 """
-    ReactantNitro.compile_cached(f, ev, args...; phase, baked) -> thunk
+    ReactantNitro.compile_cached(f, ev, args...; phase, baked, worlds, nitro, ...) -> thunk
 
-Look the program up and compile on a miss; the cache is populated lazily from real batches, not
-declared shapes. When `nitro` is passed, the thunk is also memoized on the handle, so a handle that
-has compiled a program keeps its thunk even after the module entry is poisoned: an existing `Nitro`
-is a true fixed point and a stale program is served explicitly, with the report saying to rebuild.
+Look the program up and compile on a miss; the cache fills lazily from real batches, not declared
+shapes. When `nitro` is passed, its `compile_options` join the key and the thunk is also memoized on
+the handle, so the handle keeps its thunk even after the module entry is poisoned: an existing
+`Nitro` never recompiles behind the user's back, and the report tells it to rebuild when its
+program is stale.
 A miss publishes the `Compiling` phase before the blocking call and restores the previous phase
 after it; a hit publishes nothing. A compile that throws is wrapped by
 [`compile_with_context`](@ref) and leaves the phase where it is.
@@ -350,7 +349,7 @@ end
     ReactantNitro.compile_with_context(f, args; phase, compile_options = (;)) -> thunk
 
 An XLA compile failure surfaces as an enormous MLIR dump with no context, so every compile is
-wrapped in a handler that **names the phase, the function, and the argument shapes** before
+wrapped in a handler that names the phase, the function, and the argument shapes before
 rethrowing, and truncates the dump to a bounded prefix with a pointer to the full text on disk.
 `compile_options` is the handle's, as `ReactantNitro.check_compile_options` normalized it: Reactant's
 compile keywords as a `NamedTuple`.
@@ -390,8 +389,8 @@ const MAX_DUMP_CHARS = 2000
     ReactantNitro.world_closure_available() -> Bool
 
 Whether the internals the world-closure guard builds on (`Base.specialize_method`, `Base._which`,
-`Core.CodeInstance.edges`) still exist. `false` means the guard has silently degraded to no
-coverage, the one direction the cache invariant forbids.
+`Core.CodeInstance.edges`) still exist. `false` means the guard covers nothing, so a stale program
+can be served, which is the failure the cache invariant forbids.
 """
 world_closure_available() =
     isdefined(Base, :specialize_method) && isdefined(Base, :_which) &&
@@ -469,19 +468,14 @@ closure_drift(rec::TraceHook.TraceRecord) = TraceHook.trace_drift(rec)
     ReactantNitro._closure_target(f, args) -> (f, argtypes)
 
 Which function and argtypes an entry's closure is captured from. `grad_program` captures
-[`objective_wrapper`](@ref)'s instead of its own: native inference of `grad_program` stops at
-`Enzyme.autodiff`, so its own closure is glue with no `forward` or `loss` in it. The objective's
-closure is the complete set: the backward pass is derived from the traced forward by Enzyme-JAX at
-the MLIR level and has no Julia methods of its own.
-`objective_wrapper` is the plain-Julia function that `grad_program` differentiates, `forward` then
-`loss` then a traced `train_metrics`, each through `call_hook`, so inference reaches every user
-method the objective calls. Going through `call_hook` is also what gets past the kwcall shim a hook's
-keyword batch fields put in front of a direct capture.
-
-The stand-in used to be [`fwd_program`](@ref), which calls `forward` alone: a Revise edit to a
-helper that `loss` calls moved neither the closure nor the key (only the `loss` hook's own world is
-in the key), and the next `Nitro` in the process silently reused the gradient program compiled
-against the old helper.
+[`objective_wrapper`](@ref)'s, since native inference of `grad_program` stops at `Enzyme.autodiff`
+and its own closure contains no `forward` or `loss`. `objective_wrapper` is the plain-Julia
+objective `grad_program` differentiates: `forward`, then `loss`, then a traced `train_metrics`,
+each through `call_hook`, so inference reaches every user method the objective calls, past the
+kwcall shim that keyword batch fields put in front of a direct capture. The backward pass is
+derived from the traced forward by Enzyme-JAX and has no Julia methods of its own. Capturing
+[`fwd_program`](@ref), which calls `forward` alone, would miss an edit to a helper only `loss`
+calls.
 
 The argtypes are grad's own `(ev, model, ps, st, batch)`, its routers (`args[9]`, which also carry
 any hook supplied as a value), and its metrics-residency `Val` (`args[11]`, `Val(:device)` when a
@@ -538,8 +532,8 @@ end
 """
     ReactantNitro.cache_stats() -> (; hits, misses, entries)
 
-The counter behind the acceptance check that a fixed-LR loop trains a two-layer MLP for two epochs
-on CPU with **no recompile after step 1**.
+The compile cache counters. A test uses them to check that a fixed-LR loop trains a two-layer MLP
+for two epochs on CPU with no recompile after step 1.
 """
 cache_stats() = (; hits = CACHE_HITS[], misses = CACHE_MISSES[], entries = length(CACHE))
 

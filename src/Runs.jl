@@ -8,11 +8,12 @@
 """
     run_state(run_id) -> NamedTuple
 
-The current state of a run started through a `nitro_*` gate tool, as data: `id`, `kind`,
-`experiment`, `status` (`:running`, `:completed`, `:failed`), `phase`, `epoch`, `step`, `loss`,
-`val_metrics`, `run_dir`, `error`, `result`, and `elapsed_s`. Not exported; call it as
-`ReactantNitro.run_state`. Throws for an unknown id and when no KaimonGate extension is loaded.
-The intended use is a wait predicate: `run_state("7928bb0e").status !== :running`.
+The current state of a run started through a `nitro_*` gate tool, as a `NamedTuple` with `id`,
+`kind`, `experiment`, `status` (`:running`, `:completed` or `:failed`), `phase`, `epoch`, `step`,
+`loss`, `val_metrics`, `run_dir`, `error`, `result` and `elapsed_s` (seconds since the start, up
+to the finish once the run has ended). It holds the facts `nitro_status` prints, for code such as a
+wait predicate: `ReactantNitro.run_state("7928bb0e").status !== :running`. Not exported. Throws for
+an unknown id, and when the KaimonGate extension is not loaded.
 """
 function run_state(run_id)
     error(

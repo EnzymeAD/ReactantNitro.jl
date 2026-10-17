@@ -8,11 +8,11 @@
 """
     ReactantNitro.MetricHistory
 
-The per-epoch metric series a handle keeps. What [`history`](@ref)`(nitro)` returns: one row per
-validated epoch, `(; epoch, step, loss,
-metrics...)`, with `loss` the epoch's mean train loss and the rest that epoch's finalized
-validation metrics as host values. Indexing selects by epoch for rows and by name for columns;
-`epoch` and `step` always stay:
+The per-epoch metric series a handle keeps, as returned by [`history`](@ref). Each trained epoch
+adds one row, `(; epoch, step, loss, metrics...)`: `step` is the optimizer step the epoch ended
+on, `loss` the epoch's mean train loss (`NaN` if it ran no micro-batch), and the rest that epoch's
+finalized validation metrics as host values (none without a `val` split). Integers and ranges
+select epochs, symbols select metrics, and a selection always keeps `epoch` and `step`:
 
 ```julia
 h = history(nitro)
@@ -26,12 +26,12 @@ h.acc                        # the column as a Vector, for a plot or a threshold
 h.epoch, h.step, h.loss      # the axes and the train loss
 ```
 
-It is a Tables.jl table with column access, so `DataFrame(h)` and `CSV.write(path, h)` take it
-directly; with a Makie backend loaded, `plot(h)` draws it (see [`history_series`](@ref)). Columns
-are `epoch`, `step`, `loss`, the checkpointer's selection metric when the handle has one, then the
-remaining scalar metrics in first-appearance order; an epoch lacking a metric has `missing`. A
-non-scalar metric (a confusion matrix) is not a column of the table view, but `propertynames(h)`
-lists it and `h.confusion` returns it per epoch.
+It is a Tables.jl table with column access, so `DataFrame(h)` and `CSV.write(path, h)` accept it;
+with a Makie backend loaded, `plot(h)` draws it (see [`history_series`](@ref)). The columns are
+`epoch`, `step`, `loss`, the checkpointer's selection metric if it has one, then the other scalar
+metrics in order of first appearance; an epoch lacking a metric has `missing`. A non-scalar metric,
+such as a confusion matrix, is not a table column, but `propertynames(h)` lists it and
+`h.confusion` returns it per epoch.
 """
 struct MetricHistory
     experiment::Symbol
@@ -54,9 +54,10 @@ history_row(nitro, loss_sum, loss_n, metrics_out) = merge(
 """
     history(nitro) -> MetricHistory
 
-The per-epoch series this handle's `train!` calls produced, as a [`MetricHistory`](@ref). Fresh per
-handle: a resumed handle starts at the epoch it resumed from, and the table says so. Nothing is read
-from disk, so it works with any logger backend or none.
+The per-epoch series this handle's `train!` calls produced, as a [`MetricHistory`](@ref). Each
+handle keeps its own: a resumed handle's history begins at the first epoch it trained, and its
+table notes that earlier epochs ran in another process. Nothing is read from disk, so it works
+with any logger backend or none.
 """
 function history(nitro::Nitro)
     rows = nitro.history
@@ -279,8 +280,8 @@ end
 
 Everything a renderer needs to draw `h` in a `height` x `width` terminal: `title`, `labels`,
 `cells::Matrix{String}`, `alignment`, `best_row`, `gap_rows` and `note`. Rows are thinned with
-[`thin_rows`](@ref); columns past the fixed four are dropped from the right until the widths fit,
-and the note says what was left out and how to select it.
+[`thin_rows`](@ref). Columns after `epoch`, `step`, `loss` and the selection metric are dropped from
+the right until the table fits `width`, and `note` says what was left out and how to select it.
 """
 function history_table(h::MetricHistory, height::Integer, width::Integer)
     rows, cols = _rows(h), _columns(h)
@@ -375,10 +376,11 @@ end
 
 Everything a plot of `h` draws, computed without a plotting package: `title`, `xlabel`, and
 `panels`, one per curve, each `(; name, x, y, best, subtitle)`. `x` is `:epoch` or `:step`.
-`metrics` is `nothing` (the checkpointer's metric when the history has it, else every metric
-column, else `loss`), `:all`, one name, or a collection. `best` marks the checkpointer's chosen
-epoch on that metric's panel. A row lacking a metric is skipped; a non-finite value is kept, so the
-line breaks where the run did. The Makie extension turns this into `plot(h)`.
+`metrics` is `nothing` (the checkpointer's metric if the history has it, else every scalar metric
+but `loss`, else `loss`), `:all` (every scalar column including `loss`), one name, or a collection
+of names. `best` is the `(x, y)` point of the checkpointer's chosen epoch on that metric's panel,
+else `nothing`. A row lacking the metric is skipped; a non-finite value is kept, so the line breaks
+where the run did. The Makie extension turns this into `plot(h)`.
 """
 function history_series(h::MetricHistory; x::Symbol = :epoch, metrics = nothing)
     x in (:epoch, :step) || error("ReactantNitro: `x` must be `:epoch` or `:step`, got `$x`.")

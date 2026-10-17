@@ -223,7 +223,7 @@
         @test dat["required"] == false
         @test dat["is_kwarg"] == true
         @test dat["type_meta"]["kind"] == "string"
-        @test occursin("does not build the training data", xmeta["description"])
+        @test occursin("builds no data by default", xmeta["description"])
     end
 
     @testset "nitro_setup / setup_devices!" begin

@@ -7,22 +7,26 @@
 # pathless `JSONLogger()` and setup pins its path to the resolved `run_dir`.
 
 """
-    JSONLogger(path = nothing) -> JSONLogger
+    JSONLogger(path) -> JSONLogger
+    JSONLogger() -> JSONLogger
 
-The framework's default logger: JSON Lines to `path`, defaulting to the run's `metrics.jsonl`. It
-is what [`logger`](@ref)`(e)` returns when the experiment declares none, so a bare `Nitro(e)` writes
-`runs/<Exp>/metrics.jsonl` beside its checkpoints. Every line carries a `"type"` discriminator:
+The default logger: writes JSON Lines to `path`, or, when constructed without one, to
+`metrics.jsonl` in the run's `run_dir`. [`logger`](@ref)`(e)` returns a pathless one when the
+experiment declares no logger, so a plain `Nitro(e)` writes `runs/<Exp>/metrics.jsonl` beside its
+checkpoints. Each line is one object with a `"type"` key (`params`, `tags`, `metrics`, `other`,
+`confusion` or `finish`); metric lines also carry `context`, `epoch` and `step`:
 
 ```json
-{"type":"params","seed":42,"max_epochs":40,"width":128}
-{"type":"metrics","context":"train","epoch":1,"step":4,"loss":0.31}
-{"type":"metrics","context":"validate","epoch":1,"step":160,"val_loss":0.29}
-{"type":"metrics","context":"data","epoch":1,"step":160,"data_wait_frac":0.012}
+{"seed":42,"max_epochs":40,"width":128,"type":"params"}
+{"loss":0.31,"type":"metrics","context":"train","epoch":1,"step":4}
+{"val_loss":0.29,"type":"metrics","context":"validate","epoch":1,"step":160}
+{"data_wait_frac":0.012,"type":"metrics","context":"data","epoch":1,"step":160}
 {"type":"other","key":"binding_report","value":"..."}
 {"type":"finish","status":"completed"}
 ```
 
-Append mode, so a resumed run extends the same file. `logger = nothing` is the opt-out.
+The file is opened in append mode and flushed after every line, so a resumed run extends the same
+file. Pass `logger = nothing` to log nothing.
 """
 mutable struct JSONLogger
     path::Union{String, Nothing}
@@ -49,9 +53,9 @@ const METRICS_FILE = "metrics.jsonl"
 """
     ReactantNitro._jsonl_open(lgr::JSONLogger) -> IO
 
-Open (or return) the append handle, and error for a pathless logger that reaches a write without
-having been adopted by a `Nitro`, since silently dropping the line is the lossy no-op the contract
-forbids.
+Return the logger's append handle, opening it (and creating its directory) on first use. Errors
+for a logger that still has no path, one written to without going through a `Nitro`'s setup,
+rather than dropping the line.
 """
 function _jsonl_open(lgr::JSONLogger)
     lgr.path === nothing && error(
@@ -67,9 +71,11 @@ end
 """
     ReactantNitro._json_value(x) -> JSON-safe x
 
-Coerce a value to what JSON serializes: scalars pass through, arrays and tables are walked,
-anything else becomes its string. Non-finite floats become `null`; the framework already drops
-non-finite metrics, so this only sees them from a params table or a user's `log_other!`.
+Convert a value to one JSON can serialize. Strings, `Bool`s, integers and `nothing` pass through;
+symbols become strings; arrays, dicts and `NamedTuple`s are converted elementwise, a matrix as
+row-major nested arrays; anything else becomes its `string`. Non-finite floats become `null`;
+a metric line can still hold one inside an array or `NamedTuple`, since the framework drops only
+non-finite `Real` metrics.
 """
 _json_value(x::Union{AbstractString, Bool, Nothing, Integer}) = x
 _json_value(x::AbstractFloat) = isfinite(x) ? x : nothing
@@ -85,8 +91,7 @@ _json_value(x) = string(x)
 """
     ReactantNitro._jsonl_write(lgr::JSONLogger, obj) -> nothing
 
-Serialize `obj` as one JSON line and flush. `obj` is a `NamedTuple`; the `type` discriminator is
-the caller's responsibility so each verb names its own kind.
+Write `obj`, a `NamedTuple`, as one JSON line and flush. The caller adds the `type` key.
 """
 function _jsonl_write(lgr::JSONLogger, obj)
     io = _jsonl_open(lgr)
@@ -140,7 +145,7 @@ logger_state(lgr::JSONLogger) = nothing
 """
     logger_info(lgr::JSONLogger) -> NamedTuple
 
-The one identifying parameter of a file logger: where the lines land. `path` is the resolved
-`metrics.jsonl` path, or `nothing` for a pathless default that setup has not adopted yet.
+`(; path)`, the file the logger writes to, or `nothing` before setup has given a pathless logger
+its `run_dir`.
 """
 logger_info(lgr::JSONLogger) = (; path = lgr.path)
