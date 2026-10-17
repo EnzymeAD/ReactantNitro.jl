@@ -48,8 +48,7 @@ program sees and whether changing the value recompiles:
 | `Device{T}` | a device-resident traced input | no, by construction | never recompiles: sweep it, schedule it, rewrite it live |
 | unmarked, i.e. `Host{T}` | not at all | no | never recompiles: driver-only, invisible to the tracer |
 
-Unmarked means `Host` because it is the common case: in the first model ported to the framework,
-83% of the fields were `Host`.
+Unmarked means `Host` because most fields are.
 
 ```julia
 @experiment struct MyExp
@@ -113,8 +112,8 @@ function ReactantNitro.build_data(::MnistMLP, dist)
     end
     part(idx) = (; img = x[:, idx], label = y[:, idx])   # batch dimension LAST, always
     return (;
-        train = DataLoader(part(1:55_000); batchsize = 32, shuffle = true, partial = false),
-        val = DataLoader(part(55_001:60_000); batchsize = 32),
+        train = DataLoader(part(1:55_000); batchsize = 100, shuffle = true, partial = false),
+        val = DataLoader(part(55_001:60_000); batchsize = 100),
     )
 end
 

@@ -1,8 +1,8 @@
 # Tutorial: MNIST end to end
 
 MNIST, from configuration through training to prediction on new data. The model is an encoder and
-a linear head over ten classes, with the README quick start's network, split, learning rate and
-epoch budget. It differs in batch size (100 rather than 32) and in the features this page adds.
+a linear head over ten classes, with the README quick start's network, split, batch size, learning
+rate and epoch budget, plus the features this page adds.
 
 !!! tip "The whole thing, runnable"
     `examples/mnist/mnist_tutorial.jl` is this page's experiment as one file with its own

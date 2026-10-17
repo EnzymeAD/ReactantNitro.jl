@@ -286,9 +286,11 @@ restores the derived values from the checkpoint instead, so an evaluation proces
 data:
 
 ```julia
+# `data` is what `build_data` returned; here each training batch has integer class labels in `label`.
 function ReactantNitro.derive(e::MyExp, data)
-    counts = [count(==(c), labels) for c in 0:9]         # from the training split
-    (; class_weights = Float32.(sum(counts) ./ (10 .* counts)))
+    labels = reduce(vcat, (vec(b.label) for b in data.train))
+    counts = [count(==(c), labels) for c in 0:9]
+    return (; class_weights = Float32.(sum(counts) ./ (10 .* counts)))
 end
 ```
 

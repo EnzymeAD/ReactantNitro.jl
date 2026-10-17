@@ -57,6 +57,3 @@ buffers to the finalizer can run out of device memory while host memory use stay
 frees each batch's buffers as soon as the loss readback confirms the step has finished, and the
 prefetch pipeline frees what it staged when a phase ends. Freeing nulls the buffer pointer, so a
 use-after-free raises on readback instead of returning stale memory.
-
-The host/device boundary, and what a model author may do at it, is covered by the
-`reactantnitro-device-boundary` skill in the repository's `skills/` directory.

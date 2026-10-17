@@ -132,13 +132,12 @@ the rules under that path only:
 ReactantNitro.schedules(e::ToyGAN) = (;
     opt = (;
         eta  = total -> t -> 2.0f-4 * (1 - t / total),  # every rule's eta
-        disc = (; eta = _ -> _ -> 1.0f-4),              # then opt_state.disc's rules' eta
+        disc = (; eta = _ -> _ -> 1.0f-4),              # opt_state.disc's rules' eta
     ))
 ```
 
-Here the generator follows the linear decay and the discriminator stays at `1f-4`. Keys apply in
-the order written, each overwriting what an earlier key set, so write the bare key first and the
-path keys after it.
+Here the generator follows the linear decay and the discriminator stays at `1f-4`. A path key
+overrides the bare key for the rules under its path, whatever order the two are written in.
 
 The driver rebuilds the named rules on the host before each call, with new scalar values and the
 same rule types, so one compiled program serves every step. A path that does not exist in
