@@ -694,35 +694,38 @@
             )
         )
         train!(n)
-        sl, tl = lines(lg, "schedule"), lines(lg, "train")
-        # One line per optimizer step, at the train line's step: 4 batches / accum 2.
-        @test [x.step for x in sl] == [x.step for x in tl] == [1, 2]
-        last_m = sl[end].m
-        @test last_m.aux == 3.0
-        @test last_m[Symbol("default/eta")] ≈ 2.0f-2
+        # One call per optimizer step: the schedule values ride on the train line.
+        @test isempty(filter(x -> x.context != "train" && x.context != "data", lg.lines))
+        tl = lines(lg, "train")
+        @test [x.step for x in tl] == [1, 2]
+        sk(name) = Symbol("schedule/", name)
+        last_m = tl[end].m
+        @test haskey(last_m, :loss)
+        @test last_m[sk("aux")] == 3.0
+        @test last_m[sk("default/eta")] ≈ 2.0f-2
         # A varying eta moves the decay too.
-        @test last_m[Symbol("default/lambda")] ≈ 2.0f-2 * 1.0f-2
-        @test last_m[Symbol("backbone/rho")] ≈ 0.7f0
+        @test last_m[sk("default/lambda")] ≈ 2.0f-2 * 1.0f-2
+        @test last_m[sk("backbone/rho")] ≈ 0.7f0
         # The backbone's eta is a constant, so it is left out.
-        @test !haskey(last_m, Symbol("backbone/eta"))
+        @test !haskey(last_m, sk("backbone/eta"))
         # What was logged is what the rule holds after the last step.
-        @test Float32(n.opt_state[1].rule.opts[1].eta) == last_m[Symbol("default/eta")]
-        @test Float32(n.opt_state[2].rule.opts[1].rho) == last_m[Symbol("backbone/rho")]
+        @test Float32(n.opt_state[1].rule.opts[1].eta) == last_m[sk("default/eta")]
+        @test Float32(n.opt_state[2].rule.opts[1].rho) == last_m[sk("backbone/rho")]
 
-        # Off by keyword: no schedule lines, the train lines unchanged.
+        # Off by keyword: no schedule keys, the train lines unchanged.
         lg2 = SchedLog([])
         n2 = Nitro(
             MomGroups(); logger = lg2, autolog_schedules = false, checkpointer = nothing,
             run_dir = mktempdir(), schedules = (; opt = (; eta = _ -> t -> 1.0f-3))
         )
         train!(n2)
-        @test isempty(lines(lg2, "schedule"))
         @test !isempty(lines(lg2, "train"))
+        @test all(x -> keys(x.m) == (:loss,), lines(lg2, "train"))
         @test autolog_schedules(MomGroups()) === true
 
         # Only finite `Real` values reach a logger: backends reject a `Complex` or a device scalar.
         s = (; device = (; a = t -> 1.0, c = t -> 1.0 + 2im), opt = (;))
-        @test keys(ReactantNitro.schedule_log(s, (; a = 1.0, c = 1.0 + 2im))) == (:a,)
+        @test keys(ReactantNitro.schedule_log(s, (; a = 1.0, c = 1.0 + 2im))) == (Symbol("schedule/a"),)
         @test ReactantNitro.finite_only((; a = NaN, b = 1.0f0)) == (; b = 1.0f0)
     end
 
@@ -739,7 +742,7 @@
     ReactantNitro.metrics_residency(::HostEvery, ::Symbol) = :host
     ReactantNitro.train_metrics(::HostEvery, out) = (HOST_CALLS[] += 1; (; m = 1.0))
 
-    @testset "`log_every_n_steps` thins the per-step lines only" begin
+    @testset "`log_every_n_steps` thins the train line only" begin
         lg = SchedLog([])
         n = Nitro(
             MomGroups(); logger = lg, log_every_n_steps = 2, checkpointer = nothing,
@@ -748,7 +751,7 @@
         @test n.log_every_n_steps == 2
         train!(n)
         @test [x.step for x in lines(lg, "train")] == [2, 4]
-        @test [x.step for x in lines(lg, "schedule")] == [2, 4]
+        @test all(x -> haskey(x.m, Symbol("schedule/default/eta")), lines(lg, "train"))
         # The per-epoch line is not thinned.
         @test length(lines(lg, "data")) == 1
         # Every step still trains: only the logging is thinned.

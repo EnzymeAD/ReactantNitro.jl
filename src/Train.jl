@@ -436,9 +436,11 @@ function _train!(nitro::Nitro)
                     # belongs to (before the increment below, which is what the divergence error
                     # names) and the `e` its host metrics see (the next step's `step_experiment`
                     # may replace it before the record is completed).
+                    # `sched` is the step's schedule values, set below on a logged closing
+                    # micro-batch and written with its train line.
                     rec = (;
                         l, b, batch, aux, e = nitro.e, step = nitro.step, epoch = nitro.epoch,
-                        closes = micro == nitro.accum - 1,
+                        closes = micro == nitro.accum - 1, sched = (;),
                     )
 
                     if rec.closes
@@ -446,12 +448,16 @@ function _train!(nitro::Nitro)
                         # select, Adam's moments would decay once per micro-batch.
                         applied = applied_hp(nitro, layout)
                         state = rebuild_rules(nitro, layout, masks, anchors, scalar_memo; applied)
-                        schedule_line_due(nitro, nitro.step + 1) && write_schedule_line!(
-                            nitro, nitro.step + 1, schedule_log(
-                                nitro.schedules, device_raw; groups = layout.groups, applied,
-                                chains = map(leaf -> leaf.rule, state)
+                        if logs_schedules(nitro) && step_line_due(nitro, nitro.step + 1)
+                            rec = merge(
+                                rec, (;
+                                    sched = schedule_log(
+                                        nitro.schedules, device_raw; groups = layout.groups,
+                                        applied, chains = map(leaf -> leaf.rule, state)
+                                    ),
+                                )
                             )
-                        )
+                        end
                         othunk = compile_cached(
                             opt_program, ev, ev, nitro.g_accum, nitro.ps, state,
                             lref, clipv; phase = OptCompiling(),
@@ -614,7 +620,7 @@ function complete_micro_batch!(nitro::Nitro, rec, tmv)
     # Once per logged optimizer step, the cadence the metrics contract names. The stats are the
     # closing micro-batch's, unreduced. `finite_only` drops a non-finite loss when the check is off.
     rec.closes && step_line_due(nitro, rec.step + 1) && log_metrics!(
-        nitro.logger, finite_only((; loss = lh, stats...));
+        nitro.logger, finite_only((; loss = lh, stats..., rec.sched...));
         step = rec.step + 1, epoch = rec.epoch, context = "train"
     )
     # Freed here, not when the compiled call returns: XLA is asynchronous and the executable holds
@@ -730,9 +736,8 @@ function _train_manual!(nitro::Nitro)
                     # serves every step.
                     opt_raw = opt_schedule_values(nitro.schedules, nitro.step + 1)
                     opt_state = rebuild_scheduled_rules(nitro, nitro.step + 1; raw = opt_raw)
-                    schedule_line_due(nitro, nitro.step) && write_schedule_line!(
-                        nitro, nitro.step, schedule_log(nitro.schedules, device_raw, opt_raw)
-                    )
+                    sched_line = logs_schedules(nitro) && step_line_due(nitro, nitro.step) ?
+                        schedule_log(nitro.schedules, device_raw, opt_raw) : (;)
                     thunk = compile_cached(
                         manual_program, ev, ev, nitro.model, nitro.ps, opt_state, st,
                         bf, router; phase = GradCompiling(), worlds, nitro
@@ -756,7 +761,7 @@ function _train_manual!(nitro::Nitro)
                     # batch (accum is fixed at 1 by construction).
                     step_line_due(nitro, nitro.step) && log_metrics!(
                         nitro.logger,
-                        finite_only((; loss = lh, get(out, :stats, (;))...));
+                        finite_only((; loss = lh, get(out, :stats, (;))..., sched_line...));
                         step = nitro.step, epoch = nitro.epoch, context = "train"
                     )
                     # Safe to free: the loss readback awaited the step.
@@ -933,14 +938,8 @@ end
 # Whether the per-step lines are written at the logged step `step`; see `log_every_n_steps`.
 step_line_due(nitro::Nitro, step::Integer) = step % nitro.log_every_n_steps == 0
 
-# One `"schedule"` line per logged optimizer step, at the step the train line carries.
-schedule_line_due(nitro::Nitro, step::Integer) =
-    nitro.autolog_schedules && nitro.schedules !== nothing && step_line_due(nitro, step)
-function write_schedule_line!(nitro::Nitro, step, lg)
-    lg = finite_only(lg)
-    isempty(lg) && return nothing
-    return log_metrics!(nitro.logger, lg; step, epoch = nitro.epoch, context = "schedule")
-end
+# Whether the train line carries the schedule values; see `autolog_schedules`.
+logs_schedules(nitro::Nitro) = nitro.autolog_schedules && nitro.schedules !== nothing
 
 """
     ReactantNitro.to_device_batch(batch, routing) -> NamedTuple

@@ -642,11 +642,12 @@ end
 """
     ReactantNitro.schedule_log(sched, device_raw, opt_raw; groups, applied, chains) -> NamedTuple
 
-What the `"schedule"` context logs at one optimizer step. Constants and values that are not `Real`
-are left out; the binding report already records the constants.
+The schedule values the train line carries at one optimizer step, every key prefixed `schedule/`.
+Constants and values that are not `Real` are left out; the binding report already records the
+constants.
 
-- A `device` schedule logs under its field name.
-- In the automatic loop, each group logs `<group>/<field>` for every rule field a varying schedule
+- A `device` schedule logs as `schedule/<field>`.
+- In the automatic loop, each group logs `schedule/<group>/<field>` for every rule field a varying schedule
   sets in its chain, as `applied` holds it: `eta` and `lambda` after the per-group scaling of
   [`effective_lr`](@ref). `lambda` is also logged when only `eta` varies, since decoupled decay
   scales with it.
@@ -660,11 +661,12 @@ function schedule_log(
     out = Pair{Symbol, Any}[]
     # `Real`, not `Number`: a device scalar or a `Complex` is a `Number` that backends reject.
     logged(tbl, k, v) = !(tbl[k] isa Constant) && v isa Real
+    key(name) = Symbol("schedule/", name)
     for (k, v) in pairs(device_raw)
-        logged(sched.device, k, v) && push!(out, k => v)
+        logged(sched.device, k, v) && push!(out, key(k) => v)
     end
     for (k, v) in pairs(opt_raw)
-        logged(sched.opt, k, v) && push!(out, Symbol(replace(string(k), "." => "/")) => v)
+        logged(sched.opt, k, v) && push!(out, key(replace(string(k), "." => "/")) => v)
     end
     groups === nothing && return (; out...)
     for (gi, g) in enumerate(groups)
@@ -675,7 +677,7 @@ function schedule_log(
         :eta in fs && !(:lambda in fs) && !iszero(applied[gi].lambda) && push!(fs, :lambda)
         present = schedulable_fields((chains[gi],))
         for f in fs
-            f in present && push!(out, Symbol(g, "/", f) => applied[gi][f])
+            f in present && push!(out, key(string(g, "/", f)) => applied[gi][f])
         end
     end
     return (; out...)

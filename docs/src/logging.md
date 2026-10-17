@@ -14,8 +14,8 @@ Train metrics carry `step`, validation metrics carry `epoch` plus the current st
 overlay, and a third context, `"data"`, carries the host data path's per-epoch `data_wait_frac`.
 
 A fast run writes a train line every optimizer step, which can overwhelm a hosted backend.
-[`log_every_n_steps`](@ref) (default `1`) writes the `"train"` and `"schedule"` lines on every
-`n`th step only; validation and the per-epoch lines are unaffected.
+[`log_every_n_steps`](@ref) (default `1`) writes it on every `n`th step only, schedule values
+included; validation and the per-epoch lines are unaffected.
 
 ## Three ways to get a backend
 

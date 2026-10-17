@@ -315,12 +315,13 @@
             )
         )
         train!(n)
-        sl = [x for x in lg.lines if x.context == "schedule"]
         tl = [x for x in lg.lines if x.context == "train"]
-        @test [x.step for x in sl] == [x.step for x in tl]
-        @test sl[end].m.scale ≈ 1.0f0
-        @test sl[end].m[Symbol("gen/eta")] ≈ 6.0f-4
-        @test !haskey(sl[end].m, Symbol("disc/eta"))
+        @test length(tl) == 6
+        m = tl[end].m
+        @test haskey(m, :loss) && haskey(m, :l_d)
+        @test m[Symbol("schedule/scale")] ≈ 1.0f0
+        @test m[Symbol("schedule/gen/eta")] ≈ 6.0f-4
+        @test !haskey(m, Symbol("schedule/disc/eta"))
     end
 
     @testset "path-bound `opt` schedules: the key says what eta binds to" begin
