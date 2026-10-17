@@ -301,6 +301,15 @@ function check_trainable_after_restore(nitro::Nitro)
     head = nitro.preset === nothing ? "$(T)()" : "$(T), :$(nitro.preset)"
     id = run_key(rb.run)
     dir = repr(nitro.run_dir)
+    haskey(rb, :average) && return error(
+        """
+        ReactantNitro: this handle's weights were replaced at the end of `train!` by
+        `restore_best = $(rb.average)`: epochs $(join(rb.epochs, ", ")) of run `$(id)`, averaged.
+        It cannot train again: averaged weights beside the optimizer state, step and schedule
+        position training ended in are not a training state any run was ever in.
+        For the averaged weights with a fresh optimizer (a new run):
+            Nitro($(head); run_dir = $(dir), weights = "$(id)" => $(rb.average))"""
+    )
     return error(
         """
         ReactantNitro: this handle's weights were replaced at the end of `train!` by its best
@@ -329,6 +338,7 @@ checkpointer's current metric. `checkpoint_source` becomes that file, so export 
 no scored checkpoint warns and keeps its final weights.
 """
 function restore_best!(nitro::Nitro)
+    nitro.restore_best isa Average && return restore_average!(nitro, nitro.restore_best)
     nitro.restore_best || return nothing
     bc = nitro.best_checkpoint
     if bc === nothing
@@ -348,6 +358,31 @@ function restore_best!(nitro::Nitro)
     @info "ReactantNitro: `restore_best = true`: the handle now holds the weights of its best \
            checkpoint, epoch $(bc.epoch) ($(bc.metric) $(_shown(bc.score))), `$(bc.path)`; step and \
            epoch stay at $(nitro.step) and $(nitro.epoch)."
+    return nothing
+end
+
+# `restore_best = Average(sel)`: the run's own checkpoints, averaged as `weights` would load them.
+function restore_average!(nitro::Nitro, avg)
+    ck = nitro.checkpointer
+    what = "`restore_best = $(avg)`"
+    src = try
+        resolve_average(ck, nitro.run_dir, run_key(ck.run), avg; what)
+    catch err
+        @warn "ReactantNitro: $(what), and this run cannot supply it, so the handle keeps the \
+               weights training ended with. $(first(split(sprint(showerror, err), '\n')))"
+        return nothing
+    end
+    record = average_records(ck, src)
+    nitro.ps = place_replicated(from_host(to_host(record.ps)), nitro.mesh)
+    nitro.st = place_replicated(from_host(to_host(record.st)), nitro.mesh)
+    nitro.checkpoint_source = describe(src)
+    nitro.averaged_from = record.averaged_from
+    nitro.restored_best = (;
+        path = describe(src), epoch = maximum(src.epochs), average = avg, epochs = src.epochs,
+        run = ck.run,
+    )
+    @info "ReactantNitro: $(what): the handle now holds $(describe(src)); step and epoch stay at \
+           $(nitro.step) and $(nitro.epoch)."
     return nothing
 end
 

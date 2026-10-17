@@ -1459,6 +1459,36 @@
             @test !haskey(export_provenance(eval_nitro(:latest => :latest)), "averaged_from")
         end
 
+        @testset "`restore_best = Average(...)` ends `train!` holding the average" begin
+            d = mktempdir()
+            script!([5.0, 1.0, 4.0, 3.0, 2.0])
+            r = train!(
+                Nitro(
+                    ScriptedCkpt(; max_epochs = 5); run_dir = d, restore_best = Average(Last(3)),
+                    checkpointer = Checkpointer(; keep = (Best(1), Last(3)))
+                )
+            )
+            want = sum(flat(host_ps(run_file(d, run_of(r), ep))) for ep in 3:5) ./ 3
+            @test flat(parameters(r)) ≈ want rtol = 1.0e-6
+            @test r.averaged_from.epochs == [3, 4, 5]
+            @test_throws "weights = \"$(ReactantNitro.run_key(run_of(r)))\" => Average(Last(3))" train!(r)
+
+            @test_throws "cannot hold everything" Nitro(
+                ScriptedCkpt(); run_dir = mktempdir(), restore_best = Average(Last(5)),
+                checkpointer = Checkpointer(; keep = (Best(1), Last(3)))
+            )
+            @test_throws "or an `Average`" Nitro(ScriptedCkpt(); run_dir = mktempdir(), restore_best = :yes)
+
+            # A run that stops before it has enough keeps its final weights, and says so.
+            script!([3.0, 2.0])
+            short = Nitro(
+                ScriptedCkpt(; max_epochs = 2); run_dir = mktempdir(),
+                restore_best = Average(Last(5)), checkpointer = Checkpointer(; keep = Last(5))
+            )
+            @test_logs (:warn, r"cannot supply it") match_mode = :any train!(short)
+            @test short.restored_best === nothing && short.averaged_from === nothing
+        end
+
         @testset "another handle's `keep` is checked before its manifest is read" begin
             @test_throws "cannot hold everything" eval_nitro(n => Average(Last(5)))
             m = eval_nitro(n => Average(Last(3)))

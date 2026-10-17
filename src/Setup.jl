@@ -74,6 +74,10 @@ optimizer's bias correction with no error. `step` and `epoch` come from the reco
 | `:best` | the run's best record by the current checkpointer's `metric` and `mode` (for `other`, its checkpointer's) |
 | `:latest` | the run's newest retained record |
 | `:current` | a live handle's in-memory state; only as `weights = other => :current` |
+| `Average(sel)` | the run's checkpoints [`Average`](@ref) picks, averaged; only for `weights` |
+
+`Best(1)` and `Last(1)` are the same as `:best` and `:latest`; any other [`Selector`](@ref) may pick
+several checkpoints, so a source takes it only inside `Average`.
 
 Bare `:best` and `:latest` are refused, naming the pair to use (`weights = :latest => :best`), as
 is `:all => :latest`, which is `:latest => :latest`. A source that cannot be found raises, naming
@@ -90,9 +94,9 @@ several runs, each with its own id in the manifest; see [`Checkpointer`](@ref). 
 run's newest record continues that run: its id is adopted and later checkpoints join it. Resuming
 anything else (an earlier record such as `:best`, `:all => :best`, or a file this directory's
 manifest does not list) branches into a new run, so the original run's later epochs are never
-overwritten, and logs that it does. Under a checkpointer with `keep_latest = false` a run's newest
-record is its most recent top-K epoch rather than where it stopped, and the epochs after it are
-trained again.
+overwritten, and logs that it does. Under a checkpointer with no [`Last`](@ref) in `keep` (what
+`keep_latest = false` builds) a run's latest record is its most recent kept epoch rather than
+where it stopped, and the epochs after it are trained again.
 `resume = other` and `other => :current`, a continuation from the handle's in-memory state, are
 not supported yet; `weights = other` takes the parameters.
 
@@ -110,6 +114,10 @@ checkpoints keeps them (under the default retention `scope = :run`).
   ```julia
   n = Nitro(MyExp, :baseline; run_dir = "runs/my_run", weights = :latest => :best, logger = nothing)
   ```
+
+- `weights = run => Average(sel)` restores the average of the run's checkpoints `sel` picks, with
+  `st` and the derived values from one of them (see [`Average`](@ref)), and records what it
+  averaged in `averaged_from`. [`average_checkpoints`](@ref) writes the same record to a file.
 
 - `weights = other::Nitro`, or `other => :current`, is a warm start from a handle in this process:
   `ps` and `st` are taken after step 7, through host memory, and otherwise the fresh sequence runs.
@@ -129,6 +137,11 @@ requested stop) by loading this run's own best checkpoint, under the current met
 becomes that file, so export provenance names it, and `show` says the handle holds it. With no
 scored checkpoint it warns and keeps the final weights. A handle restored this way refuses a later
 `train!`, and the error shows the three constructions that continue from the best checkpoint.
+
+**`restore_best = Average(sel)`** ends `train!` holding the average of the run's own checkpoints
+that `sel` picks instead, exactly as `weights = run => Average(sel)` would load them. Setup refuses
+a checkpointer whose `keep` cannot hold that selection; a run that ends before it has enough
+(an early stop, say) warns and keeps its final weights.
 
 `w0` says what `decay_anchor = :w0` anchors to: `:build_model` (the default), `:weights` (the
 transferred parameters, for L2-SP fine-tuning), or a parameter tree.
@@ -194,7 +207,7 @@ function _build_nitro(
         # Whether a `weights` record's optimizer state comes with its parameters.
         restore_optimizer::Bool = false,
         # Whether `train!` ends by loading this run's best checkpoint into the handle.
-        restore_best::Bool = false,
+        restore_best = false,
         # DEPRECATED spelling of `weights = path`; removed in 0.2.0.
         checkpoint = nothing,
         # PROTOTYPE: hooks supplied as values shadow the method of the same name (Hooks.jl).
@@ -215,6 +228,7 @@ function _build_nitro(
         weights, checkpoint = checkpoint, nothing
     end
     check_weights_kwargs(weights, w0; resume, restore_optimizer)
+    check_restore_average(restore_best, checkpointer)
 
     # ── before step 2: locate a checkpoint (the resume path) ───────────────────────
     # `run_dir` is the one path concept in the framework, so a checkpointer constructed without an
@@ -670,6 +684,26 @@ function check_weights_kwargs(weights, w0; resume, restore_optimizer::Bool = fal
     w0 === :weights && weights === nothing && error(
         "ReactantNitro: `w0 = :weights` anchors to the parameters taken through `weights = `, and no \
          `weights = ` was given."
+    )
+    return nothing
+end
+
+# `restore_best = Average(sel)` reads the run's own manifest, so the checkpointer must keep `sel`.
+function check_restore_average(rb, ckpt)
+    rb isa Bool && return nothing
+    rb isa Average || error(
+        "ReactantNitro: `restore_best` is `true`, `false`, or an `Average` of the run's own \
+         checkpoints (`restore_best = Average(Last(10))`); got a `$(typeof(rb))`."
+    )
+    ckpt isa Checkpointer || error(
+        "ReactantNitro: `restore_best = $(rb)` averages this run's checkpoints, and \
+         $(ckpt === nothing ? "`checkpointer = nothing` writes none" : "a `$(typeof(ckpt))` records no manifest")."
+    )
+    need = rb.sel isa Best && rb.sel.among !== nothing ? rb.sel.among : rb.sel
+    covers(ckpt.keep, rb.sel) === false && error(
+        "ReactantNitro: `restore_best = $(rb)`, and the checkpointer keeps \
+         $(join(map(repr, ckpt.keep), ", ")), which cannot hold everything `$(rb.sel)` picks. \
+         Keep it: `Checkpointer(; keep = (Best(3), $(need)))`."
     )
     return nothing
 end

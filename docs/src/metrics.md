@@ -102,7 +102,7 @@ end
 The ranks are `[5, 1, 3, 2, 4]` and the positives hold 5, 2, and 4, so
 `auroc = (11 - 6) / 6 = 0.833`: the positive scores higher in 5 of the 6 positive-negative pairs.
 Only what `finalize_metrics` returns, `(; accuracy = 0.6, worst = 0.7, auroc = 0.833)`, reaches the
-run history, the logger, and checkpoint selection, so `TopKCheckpointer(metric = :auroc, mode = :max)`
+run history, the logger, and checkpoint selection, so `Checkpointer(metric = :auroc, mode = :max)`
 works.
 
 `n_pos` is here to show a mixed group; `count(label)` in `finalize_metrics` gives the same number.

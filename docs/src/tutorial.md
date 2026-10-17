@@ -368,7 +368,7 @@ ReactantNitro.gradient_clip_norm(::MnistMLP) = 1f0
 ReactantNitro.accum(::MnistMLP)        = 2        # 550 batches per epoch, so 275 optimizer steps
 ReactantNitro.run_dir(::MnistMLP)      = "runs/mnist"
 ReactantNitro.checkpointer(::MnistMLP) =
-    TopKCheckpointer(; k = 3, metric = :macro_recall, mode = :max)
+    Checkpointer(; keep = (Best(3), Last(1)), metric = :macro_recall, mode = :max)
 ReactantNitro.early_stop(::MnistMLP)   =
     EarlyStopping(; metric = :macro_recall, mode = :max, patience = 5)
 
@@ -444,8 +444,8 @@ train!(e; accum = 4)                  # new gradient program, the costly one
 
 The other keywords have no accessor, because each describes this call rather than the experiment.
 `data` substitutes for [`build_data`](@ref). `weights` and `resume` name where this call's
-parameters come from: a file, a `run => checkpoint` pair such as `:latest => :best`, or another
-handle. `run_ref` is a `Ref` that setup fills with the new handle before training starts. `w0`,
+parameters come from: a file, a `run => checkpoint` pair such as `:latest => :best`, an average
+of several such as `:latest => Average(Last(10))`, or another handle. `run_ref` is a `Ref` that setup fills with the new handle before training starts. `w0`,
 `restore_optimizer` and `restore_best` refine `weights` and `resume`; the [API](api.md) has them
 all.
 

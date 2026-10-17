@@ -128,7 +128,7 @@ function ReactantNitro.metrics(::MnistMLP, logits; label)
     return (; acc = sum(argmax(logits; dims = 1) .== argmax(label; dims = 1)) => size(label, 2))
 end
 
-n = Nitro(MnistMLP(); checkpointer = TopKCheckpointer(; metric = :acc, mode = :max))
+n = Nitro(MnistMLP(); checkpointer = Checkpointer(; metric = :acc, mode = :max))
 train!(n)
 ```
 

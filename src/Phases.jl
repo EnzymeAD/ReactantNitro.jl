@@ -214,7 +214,8 @@ mutable struct Nitro
     # `restore_best = true`: `train!` ends by loading this run's selected checkpoint into `ps` and
     # `st`. `restored_best` is that checkpoint, `(; path, epoch, metric, score, run)`, once it has,
     # and a handle holding it refuses a further `train!`.
-    restore_best::Bool
+    # `false`, `true` (the best checkpoint) or an `Average` of the run's own checkpoints.
+    restore_best::Any
     restored_best::Any
     # What the weights average, from an averaged record (`averaged_from`), else `nothing`.
     averaged_from::Any
@@ -454,8 +455,13 @@ end
 # wordings share a shape: an origin, and `trained here` in front of it when this handle trained.
 function _nitro_weights(nitro::Nitro)
     rb = nitro.restored_best
-    rb === nothing || return "trained here, then restored to the best checkpoint, epoch " *
-        string(rb.epoch) * " (`restore_best`)"
+    rb === nothing || return (
+        haskey(rb, :average) ?
+            "trained here, then restored to " * string(rb.average) * ", epochs " *
+            join(rb.epochs, ", ") * " (`restore_best`)" :
+            "trained here, then restored to the best checkpoint, epoch " * string(rb.epoch) *
+            " (`restore_best`)"
+    )
     src = nitro.checkpoint_source
     ws = nitro.weights_source
     origin = ws !== nothing ?
@@ -556,7 +562,8 @@ function _show_nitro(io::IO, mime::MIME, nitro::Nitro)
                         string(
                             "epoch ", bc.epoch, ", ", bc.metric, " ", _shown(bc.score),
                             hasproperty(bc, :run) ? ", run " * run_key(bc.run) : "",
-                            nitro.restored_best === nothing ? "" : "  (the handle holds these weights)",
+                            nitro.restored_best === nothing || haskey(nitro.restored_best, :average) ? "" :
+                                "  (the handle holds these weights)",
                         ),
                     ],
                     ["path", _nitro_relpath(bc.path)],

@@ -144,7 +144,8 @@ kind, and `checkpoint` is the deprecated spelling of `weights = path`.
 
 `weights` and `resume` name a record the same way: a path, or `run => checkpoint` with the run
 `:latest`, a run id, `:all` or another `Nitro`, and the checkpoint `:best` or `:latest`
-(`weights = :latest => :best`). See the `Nitro` docstring for the whole grammar.
+(`weights = :latest => :best`, or `Best(1)` and `Last(1)`). `weights` also takes an average of
+several, `run => Average(Last(10))`. See the `Nitro` docstring for the whole grammar.
 
 | construction | weights | optimizer | epoch | `derive` |
 | --- | --- | --- | --- | --- |
@@ -153,10 +154,12 @@ kind, and `checkpoint` is the deprecated spelling of `weights = path`.
 | `Nitro(e; weights = run => :best, restore_optimizer = true)` | the record's | the record's | 0 | skipped, values restored |
 | `Nitro(e; resume = :auto)` (`:latest => :latest`) | the latest record's | restored | restored | runs |
 | `Nitro(e; resume = run => :best)` | the record's | restored | restored (a branch) | runs |
+| `Nitro(e; weights = run => Average(Last(10)))` | the average of the run's latest 10 | fresh | 0 | skipped, values restored |
 | `Nitro(e; weights = other)` | `other`'s `ps` and `st` | fresh | 0 | runs |
 
 `restore_best = true` changes where a handle ends rather than where it starts: `train!` finishes by
-loading the run's own best checkpoint into `ps` and `st`.
+loading the run's own best checkpoint into `ps` and `st`. `restore_best = Average(Last(10))` ends it
+holding the average of the run's own latest 10 instead.
 
 `w0`, the anchor for `decay_anchor = :w0`, is `build_model`'s init unless `w0 = :weights` or a tree
 says otherwise.
