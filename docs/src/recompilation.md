@@ -28,8 +28,8 @@ Both functions are unexported and documented on the [API](api.md) page. Check th
 `misses == entries` and that `misses` does not grow with the number of steps. Both counters are
 cumulative, so a miss that is not also a new entry is a program compiled twice.
 
-The expected count depends on what you ran. A train-only run compiles 2: the gradient program and the optimizer program, with deliberately no
-fused program even at `accum = 1`. Validation adds 1 for the evaluation `forward`, so a run that
+The expected count depends on what you ran. A train-only run compiles 2: the gradient program and
+the optimizer program, which stay separate even at `accum = 1`. Validation adds 1 for the evaluation `forward`, so a run that
 trains and validates reports 3. Add one more per `:device`-residency metric hook; a host metric
 adds nothing, because it is part of no program at all; and a split whose length is not a
 multiple of the batch size builds the `:device` metric program twice, once at the padded width

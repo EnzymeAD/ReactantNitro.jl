@@ -649,29 +649,33 @@ h.macro_recall             # the column, as a Vector
 ```
 
 ```text
-history of MnistMLP  (runs/mnist, 13 of 40 epochs)
+history of MnistMLP  (runs/mnist, 14 of 25 epochs)
 ┌──────────────────────────────────────────────┐
-│ epoch   step     loss  macro_recall     acc  │
+│ epoch  step    loss  macro_recall     acc    │
 ├──────────────────────────────────────────────┤
-│     1    275  0.70000        0.9158  0.9124  │
-│     2    550  0.37512        0.9194  0.9162  │
-│     3    825  0.26043        0.9230  0.9200  │
-│     4   1100  0.20102        0.9265  0.9237  │
+│     1   275  2.2659        0.3614  0.3682    │
+│     2   550  1.7067        0.8100  0.8138    │
+│     3   825  0.9654        0.9026  0.9036    │
+│     4  1100  0.6851        0.9278  0.9284    │
+│     5  1375  0.5988        0.9412  0.9420    │
 │     ⋮                                        │
-│    21   5775  0.04520        0.9749  0.9749  │
-│    22   6050  0.04334        0.9765  0.9766  │
-│    23   6325  0.04164        0.9776  0.9778 *│
-│    24   6600  0.04008        0.9765  0.9766  │
-│    25   6875  0.03863        0.9749  0.9749  │
-│    26   7150  0.03729        0.9730  0.9729  │
-│     ⋮                                        │
-│    38  10450  0.02650        0.9400  0.9380  │
-│    39  10725  0.02589        0.9368  0.9346  │
-│    40  11000  0.02531        0.9334  0.9310  │
+│    17  4675  0.3625        0.9805  0.9808    │
+│    18  4950  0.3582        0.9801  0.9804    │
+│    19  5225  0.3546        0.9807  0.9810    │
+│    20  5500  0.3513        0.9824  0.9826  * │
+│    21  5775  0.3483        0.9814  0.9816    │
+│    22  6050  0.3456        0.9817  0.9820    │
+│    23  6325  0.3434        0.9816  0.9820    │
+│    24  6600  0.3412        0.9795  0.9798    │
+│    25  6875  0.3394        0.9807  0.9810    │
 └──────────────────────────────────────────────┘
   * best macro_recall (max), the checkpointer's metric
-  27 of 40 epochs thinned to fit; select fewer, `h[16:30]` say, for every row
+  11 of 25 epochs thinned to fit; select fewer, `h[11:25]` say, for every row
 ```
+
+This is a real CPU run of `examples/mnist/mnist_tutorial.jl` with `NITRO_EXAMPLE_EPOCHS=40`: the
+best `macro_recall` was at epoch 20, and early stopping ended the run at epoch 25, five epochs
+without improvement later.
 
 The columns are fixed: epoch, step, the train loss, the checkpointer's metric, then the rest. A
 metric that is not a scalar, such as a confusion matrix returned from `finalize_metrics`, is named
