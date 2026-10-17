@@ -184,7 +184,8 @@ that produced it. A group's `lambda` is logged whenever its `eta` varies, since 
 scales with it. Manual mode logs each `opt` key's value as given, with the path joined by `/`
 (`gen/eta`).
 
-Constants are left out; the binding report records them. To turn it off, pass
+Constants, non-finite values and values that are not `Real` (an array, a device scalar) are left
+out; the binding report records the constants. To turn it off, pass
 `Nitro(e; autolog_schedules = false)` or define [`autolog_schedules`](@ref)`(e) = false`.
 
 ## Use the ecosystem

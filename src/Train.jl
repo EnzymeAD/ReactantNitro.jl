@@ -936,8 +936,11 @@ step_line_due(nitro::Nitro, step::Integer) = step % nitro.log_every_n_steps == 0
 # One `"schedule"` line per logged optimizer step, at the step the train line carries.
 schedule_line_due(nitro::Nitro, step::Integer) =
     nitro.autolog_schedules && nitro.schedules !== nothing && step_line_due(nitro, step)
-write_schedule_line!(nitro::Nitro, step, lg) = isempty(lg) ? nothing :
-    log_metrics!(nitro.logger, lg; step, epoch = nitro.epoch, context = "schedule")
+function write_schedule_line!(nitro::Nitro, step, lg)
+    lg = finite_only(lg)
+    isempty(lg) && return nothing
+    return log_metrics!(nitro.logger, lg; step, epoch = nitro.epoch, context = "schedule")
+end
 
 """
     ReactantNitro.to_device_batch(batch, routing) -> NamedTuple

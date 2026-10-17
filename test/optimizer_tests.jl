@@ -719,6 +719,11 @@
         @test isempty(lines(lg2, "schedule"))
         @test !isempty(lines(lg2, "train"))
         @test autolog_schedules(MomGroups()) === true
+
+        # Only finite `Real` values reach a logger: backends reject a `Complex` or a device scalar.
+        s = (; device = (; a = t -> 1.0, c = t -> 1.0 + 2im), opt = (;))
+        @test keys(ReactantNitro.schedule_log(s, (; a = 1.0, c = 1.0 + 2im))) == (:a,)
+        @test ReactantNitro.finite_only((; a = NaN, b = 1.0f0)) == (; b = 1.0f0)
     end
 
     @experiment struct HostEvery

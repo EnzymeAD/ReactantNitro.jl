@@ -642,8 +642,8 @@ end
 """
     ReactantNitro.schedule_log(sched, device_raw, opt_raw; groups, applied, chains) -> NamedTuple
 
-What the `"schedule"` context logs at one optimizer step. Constants and non-scalar values are left
-out, since the binding report already records the constants.
+What the `"schedule"` context logs at one optimizer step. Constants and values that are not `Real`
+are left out; the binding report already records the constants.
 
 - A `device` schedule logs under its field name.
 - In the automatic loop, each group logs `<group>/<field>` for every rule field a varying schedule
@@ -658,7 +658,8 @@ function schedule_log(
         groups = nothing, applied = (), chains = ()
     )
     out = Pair{Symbol, Any}[]
-    logged(tbl, k, v) = !(tbl[k] isa Constant) && v isa Number
+    # `Real`, not `Number`: a device scalar or a `Complex` is a `Number` that backends reject.
+    logged(tbl, k, v) = !(tbl[k] isa Constant) && v isa Real
     for (k, v) in pairs(device_raw)
         logged(sched.device, k, v) && push!(out, k => v)
     end
