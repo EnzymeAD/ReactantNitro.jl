@@ -145,7 +145,8 @@ kind, and `checkpoint` is the deprecated spelling of `weights = path`.
 `weights` and `resume` name a record the same way: a path, or `run => checkpoint` with the run
 `:latest`, a run id, `:all` or another `Nitro`, and the checkpoint `:best` or `:latest`
 (`weights = :latest => :best`, or `Best(1)` and `Last(1)`). `weights` also takes an average of
-several, `run => Average(Last(10))`. See the `Nitro` docstring for the whole grammar.
+several, `run => Average(Last(10))`. [Checkpoints](checkpoints.md) covers the grammar, retention
+and averaging.
 
 | construction | weights | optimizer | epoch | `derive` |
 | --- | --- | --- | --- | --- |
