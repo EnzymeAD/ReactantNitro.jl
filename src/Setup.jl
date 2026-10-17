@@ -292,6 +292,11 @@ function _build_nitro(
     # Manual mode is selected by a `train_step` method and frozen into the handle; flipping it on
     # an existing handle is reported by `fixed_config_report` rather than applied.
     manual = manual_training(e)
+    manual && (grad_level2(e) || !(grad_rule(e) isa SingleGrad)) && error(
+        "ReactantNitro: manual mode (`train_step` defined) supports `grad_rule(e) = SingleGrad()` \
+         only, and this experiment defines another gradient rule. The closure owns its own \
+         backward passes and can run them at perturbed parameters itself."
+    )
     if manual && accum > 1
         error(
             """
@@ -480,6 +485,8 @@ function _build_nitro(
     # whose rules enter the compile key through `worlds_manual` instead.
     chains = ()
     bindings = (; fields = (), slots = (), level2 = ())
+    # The automatic loop's rule type, checked again at every step; `nothing` without training.
+    grad_rule_type = nothing
     # Resolved once, here: `no_decay` is a user hook, and recomputing it at `train!` would let a
     # revision take effect on a frozen handle. Training-only and skipped in manual mode.
     masks = training && !manual ? map(m -> place_replicated(m, mesh), no_decay_masks(e, ps, layout)) : nothing
@@ -520,12 +527,16 @@ function _build_nitro(
             )
             # `rebuild_rules` moves only the VALUES each step; the rule types, and so the `apply!`
             # methods, are these, so resolving the rule worlds here covers the whole run.
+            rule0 = build_grad_rule(e, grad_setup_hp(schedules))
+            grad_rule_type = typeof(rule0)
             resolved = resolve_schedules(
                 e, schedules, total;
                 chains, accessor = ReactantNitro.schedules(e),
-                groups = layout.groups
+                groups = layout.groups, grad_fields = schedulable_grad_fields(rule0)
             )
             bindings = schedule_bindings(e, layout, resolved, chains; anchors, masks)
+            landed = check_grad_bindings(e, resolved, bindings.landed)
+            bindings = merge(bindings, (; landed))
         end
     end
 
@@ -573,7 +584,10 @@ function _build_nitro(
         probe_accessors(e),
         # The compile options ride with the dispatch freeze: both are compile-cache key components
         # fixed at construction (Cache.jl `compile_cached`).
-        merge(frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state), (; compile_options)),
+        merge(
+            frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state),
+            (; compile_options, grad_rule_type)
+        ),
         (; masks, anchors), bindings,
         map(zero, flat), RegisteredMonitor[], Int(step0), Int(epoch0), Starting(),
         false, nothing,

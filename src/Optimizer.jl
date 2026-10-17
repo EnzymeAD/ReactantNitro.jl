@@ -431,12 +431,13 @@ The host values one group's rule is built from at one step, before device conver
 group's scheduled rule fields at this step ([`group_schedule_values`](@ref)); `eta` and `lambda`
 fall back to the group's accessors when `sv` lacks them. `eta` is the group's effective rate and
 `lambda` is multiplied by it ([`effective_lr`](@ref)); every other field in `sv` is passed through
-as is. All are converted to `elt`.
+as is, `bind` as a NamedTuple. All are converted to `elt`.
 """
 function hp_host(e, group::Symbol, sv::NamedTuple = (;); elt::Type = Float32)
     eta = elt(effective_lr(e, group, get(sv, :eta, nothing)))
     lam = elt(eta * (haskey(sv, :lambda) ? sv.lambda : lambda(e, Val(group))))
-    rest = map(elt, Base.structdiff(sv, NamedTuple{(:eta, :lambda)}))
+    conv(x) = x isa NamedTuple ? map(elt, x) : elt(x)
+    rest = map(conv, Base.structdiff(sv, NamedTuple{(:eta, :lambda)}))
     return (; eta, lambda = lam, rest...)
 end
 
@@ -480,7 +481,13 @@ function resolve_hp(
     place(k, x) = device ? memo_to_device(memo, (gi, k), x; mesh) : x
     eta = place(:eta, h.eta)
     lambda = iszero(h.lambda) && !keep_decay ? nothing : place(:lambda, h.lambda)
-    scheduled = NamedTuple{keys(rest)}(map(k -> place(k, getproperty(rest, k)), keys(rest)))
+    function place_any(k, x)
+        x isa NamedTuple || return place(k, x)
+        return NamedTuple{keys(x)}(
+            map(k2 -> place(Symbol(k, ".", k2), getproperty(x, k2)), keys(x))
+        )
+    end
+    scheduled = NamedTuple{keys(rest)}(map(k -> place_any(k, getproperty(rest, k)), keys(rest)))
     return (;
         eta, lambda, scheduled...,
         anchor = anchors === nothing ? nothing : anchors[gi],

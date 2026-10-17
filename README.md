@@ -30,7 +30,7 @@ The design follows PyTorch Lightning, adapted to Reactant. Beyond a training loo
 stack needs control over when XLA compiles and what the tracer walks, device memory freed after each
 batch instead of when the host GC runs, and binding by name between loaders, hooks, schedules and
 optimizer rules. On top of those it supplies what Lightning does: gradient accumulation, phases,
-schedules, checkpoint and resume, logging, and export.
+schedules, checkpoint and resume, logging, and export, plus sharpness-aware minimization (SAM).
 
 A Reactant-first stack has [pitfalls](https://enzymead.github.io/ReactantNitro.jl/dev/pitfalls/) that are easy to
 hit and hard to diagnose: a compile that takes far longer than it should, an edit that reuses a stale

@@ -1,7 +1,8 @@
 # Schedules: what varies with the step
 
 A schedule varies one quantity per optimizer step: the learning rate, a decay coefficient, another
-rule field, or a `Device` field read inside a traced hook. Everything else is fixed at setup.
+rule field, a `Device` field read inside a traced hook, or a gradient rule field such as SAM's
+`rho`. Everything else is fixed at setup.
 
 ## The contract
 
@@ -42,8 +43,8 @@ experiment and reaches traced code as `e.field`.
 
 `device` and `opt` are reserved at the top level and name the two namespaces; every other top-level
 key is unqualified and must resolve to exactly one of them. A key matching neither is an error
-naming the fix. A key matching both is an ambiguity error that shows the qualified form, so you
-never have to rename the field. Collisions are common: `lambda` is a natural name for a decay
+naming the fix. A key matching more than one is refused, and the error shows the qualified forms
+and the `bind` form, so you never have to rename the field. Collisions are common: `lambda` is a natural name for a decay
 coefficient and for a loss weight, and `eta`, `rho`, and `epsilon` are plausible model
 hyperparameters.
 
@@ -54,6 +55,38 @@ schedules = (; eta = total -> OneCycle(total, 1f-3),
 ```
 
 Rule field names are the rule's actual field names, so the learning-rate key is `eta`, not `lr`.
+
+A third reserved namespace, `grad`, holds the fields of the [`grad_rule`](@ref), such as
+[`SAM`](@ref)'s `rho`. An unqualified `rho` resolves to it when nothing else has that name; with
+`Optimisers.Momentum`, whose field is also `rho`, it is refused and you qualify it. The value
+logs as `schedule/grad/rho`.
+
+```julia
+schedules = (; grad = (; rho = total -> t -> 0.05f0 * min(1, t / 500)))
+```
+
+## Binding by hand: `bind`
+
+Every namespace above binds by name, which is where collisions come from. `bind` holds names of
+your choosing that resolve against nothing; you place the values yourself, in a Level 2
+`optimizer(e, group, hp)` and in `grad_rule(e, hp)`, where they arrive as `hp.bind.<name>`:
+
+```julia
+schedules(::MyExp) = (;
+    eta  = total -> OneCycle(total, 1f-3),
+    bind = (; mom_ramp = _ -> t -> min(1f0, t / 1000), sam_warm = _ -> t -> min(1f0, t / 500)),
+)
+ReactantNitro.optimizer(::MyExp, group::Symbol, hp) =
+    Optimisers.Momentum(hp.eta, 0.85f0 + 0.1f0 * hp.bind.mom_ramp)
+ReactantNitro.grad_rule(::MyExp, hp) = SAM(0.05f0 * hp.bind.sam_warm)
+```
+
+A value computed from `hp`, as here, follows its schedule and never recompiles: setup probes each
+hook with two values of each `bind` key, records which rule fields change, and the framework moves
+those fields to the device every step. A `bind` key that changes nothing is a setup error. The
+binding report lists where each key landed, and the train line logs `schedule/bind/<name>`.
+`bind` covers the optimizer and the gradient rule; a `Device` field is the experiment's own named
+slot and needs no binding.
 
 Scheduling [`lambda`](@ref) has one extra rule: `opt.lambda` together with per-group `lambda`
 accessors is a setup error naming both, because the schedule supplies the decay coefficient for

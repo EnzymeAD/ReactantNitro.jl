@@ -16,8 +16,12 @@ report.
 Keys resolve against two namespaces, `Device` field names and the rule field names of `chains`,
 reserved at the top level as `device` and `opt`. A scheduled rule field reaches the per-group `hp`;
 a scheduled `Device` field is written into the experiment each step and traced code reads it as
-`e.<field>`. A key matching neither is an error naming the fix. A key matching both is an ambiguity
-error showing the qualified form; `lambda`, `eta` and `epsilon` collide often.
+`e.<field>`. A third, `grad`, holds the [`grad_rule`](@ref)'s fields (`grad_fields`). An
+unqualified key resolves to the one namespace it matches. A key matching none is an error naming the
+fix; a key matching several is refused, and the error shows the qualified forms and `bind`.
+
+`bind` holds free names that resolve against nothing: their values reach `hp.bind` in a Level 2
+`optimizer(e, group, hp)` and in `grad_rule(e, hp)`, and the user places them.
 
 `step` is the optimizer step, and `total = max_epochs * div(steps_per_epoch, accum)` is exact. A
 nested `opt` key is a one-level parameter-group path: `opt = (; backbone = (; eta = ...))` binds
@@ -26,15 +30,18 @@ For each group a path key overrides the bare key, which overrides the accessor. 
 same per-group scaling as bare ones (see [`effective_lr`](@ref)). Manual mode's path values are
 absolute ([`resolve_manual_schedules`](@ref)).
 """
-struct ResolvedSchedules{T <: NamedTuple, O <: NamedTuple}
+struct ResolvedSchedules{T <: NamedTuple, O <: NamedTuple, R <: NamedTuple, B <: NamedTuple}
     device::T                       # Device field name -> callable(step)
     opt::O                          # rule field name    -> callable(step)
+    grad::R                         # grad_rule field    -> callable(step)
+    bind::B                         # free name          -> callable(step)
     source::Dict{Symbol, Symbol}     # display key        -> :keyword | :accessor
     constant::Vector{Symbol}        # display keys that were bare Numbers
     horizon_dependent::Bool
 end
 
-Base.isempty(r::ResolvedSchedules) = isempty(r.device) && isempty(r.opt)
+Base.isempty(r::ResolvedSchedules) =
+    isempty(r.device) && isempty(r.opt) && isempty(r.grad) && isempty(r.bind)
 
 # A constant is a `Number` and a schedule is a `Callable`, so the per-step transfer count equals the
 # number of quantities actually being varied.
@@ -83,13 +90,13 @@ function (g::HorizonGuard)(step)
     end
 end
 
-# `device` and `opt` are reserved at the top level; every other key is unqualified and must resolve
-# to exactly one namespace. A NamedTuple value under `opt` is a parameter-group path, flattened to a
-# dotted display key (`Symbol("backbone.eta")`).
+# `device`, `opt`, `grad` and `bind` are reserved at the top level; every other key is unqualified
+# and must resolve to exactly one of `device`, `opt` and `grad`. A NamedTuple value under `opt` is a
+# parameter-group path, flattened to a dotted display key (`Symbol("backbone.eta")`).
 function _flatten_schedules(nt::NamedTuple, what::AbstractString)
     out = Tuple{Symbol, Symbol, Any}[]
     for (k, v) in pairs(nt)
-        if k === :device || k === :opt
+        if k === :device || k === :opt || k === :grad || k === :bind
             v isa NamedTuple || error(
                 """
                 ReactantNitro: `$k` is reserved at the top level of $what and names a namespace, so
@@ -98,6 +105,14 @@ function _flatten_schedules(nt::NamedTuple, what::AbstractString)
             )
             if k === :opt
                 _flatten_opt!(out, v)
+            elseif k === :bind
+                for (k2, v2) in pairs(v)
+                    v2 isa NamedTuple && error(
+                        "ReactantNitro: `bind.$k2` is a NamedTuple. `bind` names are flat: each \
+                         is a schedule, read as `hp.bind.$k2`."
+                    )
+                    push!(out, (k, k2, v2))
+                end
             else
                 for (k2, v2) in pairs(v)
                     push!(out, (k, k2, v2))
@@ -147,14 +162,14 @@ end
 
 function resolve_schedules(
         e, given::NamedTuple, total::Integer;
-        chains = (), accessor = nothing, groups = (:default,)
+        chains = (), accessor = nothing, groups = (:default,), grad_fields = ()
     )
     df = device_fields(typeof(e))
     of = schedulable_fields(chains)
     acc = accessor === nothing ? given : accessor
     from_accessor = Set(_display_key(ns, k) for (ns, k, _) in _flatten_schedules(acc, "`schedules(e)`"))
 
-    tun, opt = Pair{Symbol, Any}[], Pair{Symbol, Any}[]
+    tun, opt, grad, bind = ntuple(_ -> Pair{Symbol, Any}[], 4)
     source, constant = Dict{Symbol, Symbol}(), Symbol[]
     varying = false
 
@@ -162,39 +177,49 @@ function resolve_schedules(
         display = _display_key(ns, k)
         target = ns
         if ns === :auto
-            in_t, in_o = k in df, k in of
-            if in_t && in_o
+            spaces = ((:device, df), (:opt, of), (:grad, grad_fields))
+            hits = Symbol[ns2 for (ns2, fs) in spaces if k in fs]
+            if length(hits) > 1
+                where = Dict(
+                    :device => "a `Device` field on $(nameof(typeof(e))), read as `e.$k`",
+                    :opt => "a schedulable field of the optimizer chain",
+                    :grad => "a field of the gradient rule",
+                )
                 error(
                     """
-                    ReactantNitro: schedule key `$k` is ambiguous. It matches a `Device` field on
-                    $(nameof(typeof(e))) AND a schedulable field of the optimizer chain, and the
-                    two route to different places: an `opt` key is applied to the optimizer, a
-                    `device` key is written into the experiment and reaches traced code as
-                    `e.$k`.
-                    Qualify it. To schedule the experiment's field:
-                        schedules = (; device = (; $k = <factory>))
-                    To schedule the optimizer's:
-                        schedules = (; opt = (; $k = <factory>))
+                    ReactantNitro: schedule key `$k` is ambiguous, so it is refused rather than
+                    guessed. It names:
+                    $(join(("  - " * where[h] for h in hits), "\n"))
+                    Qualify it:
+                    $(join(("    schedules = (; $h = (; $k = <factory>))" for h in hits), "\n"))
+                    or bind it yourself under a name of your choosing:
+                        schedules = (; bind = (; my_$k = <factory>))
+                    and read `hp.bind.my_$k` in `optimizer(e, group, hp)` or `grad_rule(e, hp)`.
                     Renaming the field is never required; collisions on `lambda`, `eta`, `rho`, and
                     `epsilon` are expected rather than exotic."""
                 )
-            elseif in_t
-                target = :device
-            elseif in_o
-                target = :opt
+            elseif length(hits) == 1
+                target = only(hits)
             else
                 error(
                     """
-                    ReactantNitro: schedule key `$k` matches nothing. A schedule key is either a
-                    `Device` field name or a rule field name, resolved against the union of the
-                    two.
+                    ReactantNitro: schedule key `$k` matches nothing. An unqualified key is a
+                    `Device` field name, a rule field name, or a gradient rule field name.
                     `Device` fields on $(nameof(typeof(e))): $(isempty(df) ? "(none)" : df)
                     Schedulable optimizer fields: $(isempty(of) ? "(none; no chain was supplied)" : of)
+                    Gradient rule fields: $(isempty(grad_fields) ? "(none)" : grad_fields)
                     Anything you want to vary inside `loss`, `forward`, or `metrics` must be a
                     `Device` field; anything on the optimizer must be a rule field. Note the
-                    learning-rate key is `eta`, not `lr`."""
+                    learning-rate key is `eta`, not `lr`. A free name goes under `bind`."""
                 )
             end
+        elseif ns === :bind
+            # Free names: the probe at setup checks that something reads each one.
+        elseif ns === :grad
+            k in grad_fields || error(
+                "ReactantNitro: `grad.$k` names no schedulable field of the gradient rule. \
+                 Its schedulable fields are $(isempty(grad_fields) ? "(none)" : grad_fields)."
+            )
         elseif ns === :device
             k in df || error("ReactantNitro: `device.$k` names no `Device` field on \
                               $(nameof(typeof(e))). Its `Device` fields are \
@@ -248,7 +273,8 @@ function resolve_schedules(
         # past the horizon it holds rather than throws (HorizonGuard).
         sched = _as_factory(spec)(total)
         spec isa Number || (sched = guard_horizon(sched, total, display))
-        push!(target === :device ? tun : opt, k => sched)
+        dest = target === :device ? tun : target === :grad ? grad : target === :bind ? bind : opt
+        push!(dest, k => sched)
         source[display] = display in from_accessor ? :accessor : :keyword
     end
 
@@ -261,7 +287,9 @@ function resolve_schedules(
         (field === :lambda && !isempty(path)) || continue
         check_lambda_conflict(e, (only(path),), k)
     end
-    return ResolvedSchedules(NamedTuple(tun), opt_nt, source, constant, varying)
+    return ResolvedSchedules(
+        NamedTuple(tun), opt_nt, NamedTuple(grad), NamedTuple(bind), source, constant, varying
+    )
 end
 
 """
@@ -454,7 +482,7 @@ function resolve_manual_schedules(e, given::NamedTuple, total::Integer; opt_stat
     rest = (; (k => v for (k, v) in pairs(given) if k !== :opt)...)
     r = resolve_schedules(e, rest, total; chains = (), accessor = acc)
     return ResolvedSchedules(
-        r.device, flat, merge(r.source, source), vcat(r.constant, constant),
+        r.device, flat, r.grad, r.bind, merge(r.source, source), vcat(r.constant, constant),
         r.horizon_dependent || varying
     )
 end
@@ -635,8 +663,13 @@ function group_schedule_values(sched, group::Symbol, step::Integer)
     for (k, f) in pairs(sched.opt)
         _binds(sched, k, group) && push!(vals, last(_schedule_target(k)) => f(step))
     end
+    isempty(sched.bind) || push!(vals, :bind => bind_schedule_values(sched, step))
     return (; vals...)
 end
+
+# The `bind` schedules evaluated at `step`; `(;)` when none are configured.
+bind_schedule_values(sched, step::Integer) =
+    sched === nothing ? (;) : map(f -> f(step), sched.bind)
 
 # Whether `opt` key `k` sets its field for `group`: a path key binds its group, and a bare key every
 # group without a path key for the same field.
@@ -657,15 +690,18 @@ than one level are skipped.
 """
 function setup_schedule_values(e, given::NamedTuple, group::Symbol; elt::Type = Float32)
     df = device_fields(typeof(e))
-    fs = Symbol[]
+    fs, bs = Symbol[], Symbol[]
     for (ns, k, _) in _flatten_schedules(given, "`schedules`")
-        ns === :device && continue
+        ns === :bind && (push!(bs, k); continue)
+        (ns === :device || ns === :grad) && continue
         ns === :auto && (k in df || occursin('.', string(k))) && continue
         path, field = _schedule_target(k)
         length(path) <= 1 && (isempty(path) || only(path) === group) || continue
         field === :eta || field in fs || push!(fs, field)
     end
-    return NamedTuple{Tuple(fs)}(ntuple(_ -> zero(elt), length(fs)))
+    sv = NamedTuple{Tuple(fs)}(ntuple(_ -> zero(elt), length(fs)))
+    isempty(bs) && return sv
+    return merge(sv, (; bind = NamedTuple{Tuple(bs)}(ntuple(_ -> zero(elt), length(bs)))))
 end
 
 # The rule fields one group's train line logs: each varying schedule binding the group, plus
@@ -699,8 +735,11 @@ constant or varying, that lands in no slot is a setup error.
 """
 function schedule_bindings(e, layout, sched, chains; anchors = nothing, masks = nothing)
     G = length(layout.groups)
-    none = (; fields = ntuple(_ -> (), G), slots = ntuple(_ -> (), G), level2 = ())
+    none = (; fields = ntuple(_ -> (), G), slots = ntuple(_ -> (), G), level2 = (), landed = Dict())
     sched === nothing && return none
+    bkeys = Tuple(keys(sched.bind))
+    # Where each `bind` key landed, across groups; the grad rule's landings are added at setup.
+    landed_all = Dict{Symbol, Vector{String}}(Symbol("bind.", k) => String[] for k in bkeys)
     level2 = !is_framework_default(optimizer, Tuple{typeof(e), Symbol, Any})
     fields, slots = Vector{Tuple}(undef, G), Vector{Tuple}(undef, G)
     report = []
@@ -718,9 +757,18 @@ function schedule_bindings(e, layout, sched, chains; anchors = nothing, masks = 
         end
         scheduled = Symbol[last(_schedule_target(k)) for k in keys(sched.opt) if _binds(sched, k, g)]
         landed = Dict(
-            f => _probe_field(e, layout, gi, scheduled, f; anchors, masks)
+            f => _probe_field(e, layout, gi, scheduled, f; anchors, masks, bind_keys = bkeys)
                 for f in unique(vcat(scheduled, fs))
         )
+        blanded = Dict(
+            k => _probe_field(
+                e, layout, gi, scheduled, k; anchors, masks, bind_keys = bkeys, bind = true
+            )
+                for k in bkeys
+        )
+        for k in bkeys, sl in blanded[k]
+            push!(landed_all[Symbol("bind.", k)], "$(repr(g)) $(sl.rule).$(sl.field)")
+        end
         absent = [f for f in scheduled if isempty(landed[f])]
         isempty(absent) || error(
             """
@@ -733,35 +781,49 @@ function schedule_bindings(e, layout, sched, chains; anchors = nothing, masks = 
         )
         fields[gi] = Tuple(f for f in fs if !isempty(landed[f]))
         # Only the varying fields' slots: a slot fed by a constant is correct as a baked constant.
-        slots[gi] = Tuple(unique((s.pos, s.field) for f in fs for s in landed[f]))
+        varying_bind = [k for k in bkeys if !(sched.bind[k] isa Constant)]
+        slots[gi] = Tuple(
+            unique(
+                vcat(
+                    [(s.pos, s.field) for f in fs for s in landed[f]],
+                    [(s.pos, s.field) for k in varying_bind for s in blanded[k]],
+                )
+            )
+        )
         present = Tuple(
             "$f: " * join(("$(s.rule).$(s.field)" for s in landed[f]), ", ")
                 for f in unique(vcat(scheduled, fs)) if !isempty(landed[f])
         )
         push!(report, (; group = g, present, absent = ()))
     end
-    return (; fields = Tuple(fields), slots = Tuple(slots), level2 = report)
+    return (; fields = Tuple(fields), slots = Tuple(slots), level2 = report, landed = landed_all)
 end
 
 # The rule slots `hp.<field>` reaches in group `gi`'s chain, as `(; pos, rule, field)`: the factory
 # called on two host `hp`s that differ only in `field`. Every scheduled field is present, as at setup.
-function _probe_field(e, layout, gi, scheduled, field; anchors, masks, elt::Type = Float32)
+function _probe_field(
+        e, layout, gi, scheduled, field; anchors, masks, elt::Type = Float32, bind_keys = (),
+        bind::Bool = false
+    )
     g = layout.groups[gi]
     names = Tuple(f for f in scheduled if f !== :eta)
-    base = hp_host(e, g, NamedTuple{names}(ntuple(_ -> elt(0.5), length(names))); elt)
+    sv = NamedTuple{names}(ntuple(_ -> elt(0.5), length(names)))
+    isempty(bind_keys) ||
+        (sv = merge(sv, (; bind = NamedTuple{bind_keys}(ntuple(_ -> elt(0.5), length(bind_keys))))))
+    base = hp_host(e, g, sv; elt)
+    one_key = NamedTuple{(field,)}
+    with(v) = bind ? merge(base, (; bind = merge(base.bind, one_key((elt(v),))))) :
+        merge(base, one_key((elt(v),)))
     keep_decay = :lambda in scheduled
     chain(v) = optimizer(
-        e, g, resolve_hp(
-            e, layout, gi; host = merge(base, NamedTuple{(field,)}((elt(v),))), keep_decay,
-            anchors, masks, device = false
-        )
+        e, g, resolve_hp(e, layout, gi; host = with(v), keep_decay, anchors, masks, device = false)
     )
     ra, rb = _rules_of(chain(0.25)), _rules_of(chain(0.75))
     length(ra) == length(rb) || error(
         """
         ReactantNitro: `optimizer(e, $(repr(g)), hp)` returns a chain of $(length(ra)) rules for
-        one value of `hp.$field` and $(length(rb)) for another. The chain's structure is fixed at
-        setup, since the optimizer state is built from it; vary values only."""
+        one value of `hp.$(bind ? "bind." : "")$field` and $(length(rb)) for another. The chain's
+        structure is fixed at setup, since the optimizer state is built from it; vary values only."""
     )
     at = NamedTuple{(:pos, :rule, :field), Tuple{Int, Symbol, Symbol}}[]
     for (i, (x, y)) in enumerate(zip(ra, rb)), f in fieldnames(typeof(x))
@@ -799,13 +861,16 @@ _with_field(r, f::Symbol, v) = Base.typename(typeof(r)).wrapper(
 )
 
 """
-    ReactantNitro.schedule_log(sched, device_raw, opt_raw; groups, applied, fields) -> NamedTuple
+    ReactantNitro.schedule_log(
+        sched, device_raw, opt_raw; groups, applied, fields, grad_raw, bind_raw
+    ) -> NamedTuple
 
 The schedule values the train line carries at one optimizer step, every key prefixed `schedule/`.
 Constants and raw values that are not `Real` are left out; the binding report records the
 constants.
 
-- A `device` schedule logs as `schedule/<field>`
+- A `device` schedule logs as `schedule/<field>`, a `grad` one as `schedule/grad/<field>`, and a
+  `bind` one as `schedule/bind/<name>`
 - In the automatic loop, each group logs `schedule/<group>/<field>` for each of its
   [`schedule_bindings`](@ref) `fields`, as `applied` holds it: `eta` and `lambda` after the
   per-group scaling of [`effective_lr`](@ref)
@@ -814,7 +879,7 @@ constants.
 """
 function schedule_log(
         sched, device_raw::NamedTuple, opt_raw::NamedTuple = (;);
-        groups = nothing, applied = (), fields = ()
+        groups = nothing, applied = (), fields = (), grad_raw = (;), bind_raw = (;)
     )
     out = Pair{Symbol, Any}[]
     # `Real`, not `Number`: a device scalar or a `Complex` is a `Number` that backends reject.
@@ -822,6 +887,12 @@ function schedule_log(
     key(name) = Symbol("schedule/", name)
     for (k, v) in pairs(device_raw)
         logged(sched.device, k, v) && push!(out, key(k) => v)
+    end
+    for (k, v) in pairs(grad_raw)
+        logged(sched.grad, k, v) && push!(out, key(string("grad/", k)) => v)
+    end
+    for (k, v) in pairs(bind_raw)
+        logged(sched.bind, k, v) && push!(out, key(string("bind/", k)) => v)
     end
     for (k, v) in pairs(opt_raw)
         logged(sched.opt, k, v) && push!(out, key(replace(string(k), "." => "/")) => v)
@@ -992,6 +1063,7 @@ function binding_report_pieces(nitro)
         schedules = nitro.schedules, groups,
         manual = get(nitro.frozen, :manual, false),
         level2 = nitro.bindings.level2,
+        landed = get(nitro.bindings, :landed, Dict()),
     )
 end
 
@@ -1086,7 +1158,7 @@ size and preset belong to the `state` band, so no fact is printed twice.
 function binding_report_sections(;
         name = "", splits = (), clip = 0,
         clip_source::Symbol = :default, schedules = nothing, groups = (),
-        level2 = (), manual = false
+        level2 = (), manual = false, landed = Dict()
     )
     sections = TableSection[]
 
@@ -1134,7 +1206,11 @@ function binding_report_sections(;
     )
 
     if schedules !== nothing && !isempty(schedules)
-        for (ns, tbl) in ((:opt, schedules.opt), (:device, schedules.device))
+        tables = (
+            (:opt, schedules.opt), (:device, schedules.device), (:grad, schedules.grad),
+            (:bind, schedules.bind),
+        )
+        for (ns, tbl) in tables
             for k in keys(tbl)
                 disp = haskey(schedules.source, k) ? k : Symbol(ns, ".", k)
                 what = ns === :opt ?
@@ -1142,6 +1218,8 @@ function binding_report_sections(;
                         manual ? _manual_opt_desc(k, keys(tbl)) :
                         _auto_opt_desc(k, keys(tbl), Tuple(g.name for g in groups))
                     ) :
+                    ns === :grad ? "gradient rule field, the ε program only" :
+                    ns === :bind ? "bound by hand: " * join(get(landed, disp, String[]), ", ") :
                     "Device field   e.$k"
                 note = disp in schedules.constant ? "  (constant)" : ""
                 # The source keeps its brackets; `[train! keyword]` is the token used everywhere.

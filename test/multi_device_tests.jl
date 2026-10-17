@@ -326,3 +326,47 @@ end
     @test get(got, "out_xr_shape", "") == "true"
     @test get(got, "out_buf_agree", "") == "true"
 end
+
+# SAM on the mesh: `ps_adv` must come out of the ε program with the types of `ps`, or pass 2 misses
+# the cached gradient program; and the device count stays throughput only.
+@testitem "multi_device sam" setup = [MultiDevice] timeout = 1200 begin
+    using Test
+
+    ok, got = run_on_two_devices(
+        raw"""
+        using Optimisers
+        using ReactantNitro: CACHE, grad_program
+        @experiment struct SamExp
+            max_epochs::Int = 2
+        end
+        ReactantNitro.build_model(::SamExp, rng) = (
+            m = Chain(Dense(4 => 16, tanh), Dropout(0.5f0), Dense(16 => 2));
+            (m, Lux.setup(rng, m)...)
+        )
+        ReactantNitro.forward(::SamExp, model, ps, st; x) = Lux.apply(model, x, ps, st)
+        ReactantNitro.loss(::SamExp, ŷ; y) = mean(abs2, ŷ .- y)
+        ReactantNitro.optimizer(::SamExp) = Optimisers.RAdam
+        ReactantNitro.grad_rule(::SamExp) = SAM(0.05f0)
+
+        run!(; n_devs) = train!(Nitro(SamExp(); run_dir = mktempdir(), n_devs, accum = 2, seed = 5,
+            checkpointer = nothing, data = (; train = vectors(4; seed = 3)),
+            schedules = (; grad = (; rho = _ -> t -> 0.02f0 * t))))
+
+        try
+            s1 = run!(; n_devs = 1)
+            ReactantNitro.cache_reset!()
+            s2 = run!(; n_devs = 2)
+            record("sam_grad_programs", count(k -> k[1] === grad_program, keys(CACHE)))
+            record("sam_maxdiff", maxdiff(flat(parameters(s1)), flat(parameters(s2))))
+            record("sam", "ok")
+        catch err
+            record("sam", firstline(err))
+        end
+        """
+    )
+    num(k) = parse(Float64, get(got, k, "NaN"))
+    @test ok
+    @test get(got, "sam", "<missing>") == "ok"
+    @test get(got, "sam_grad_programs", "") == "1"
+    @test num("sam_maxdiff") < 1.0e-5
+end

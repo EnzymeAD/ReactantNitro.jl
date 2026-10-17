@@ -37,6 +37,7 @@
         # alongside the hook so a user can extend the built-ins rather than replace them.
         :no_decay, :default_no_decay,
         :gradient_clip_norm, :schedules, :nonschedulable, :dispatch_variant,
+        :grad_rule, :GradRule, :SingleGrad, :PerturbRule, :SAM, :perturbation,
         :max_epochs,
         # Manual training mode. Defining `train_step` for an experiment type is what selects
         # manual mode; `manual_training(e) = false` declines it while keeping the method;

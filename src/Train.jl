@@ -69,6 +69,57 @@ function grad_program(
     return l, g_accum, program_out(st_new), program_out(aux)
 end
 
+# ── Gradient rules in the driver ───────────────────────────────────────────────────
+
+"""
+    ReactantNitro.micro_grad!(rule, nitro, gctx, ev, st, b, flag) -> (l, st_out, aux, extra)
+
+One micro-batch's gradient into `nitro.g_accum` under `rule`. `extra` is what the deferred half
+needs beyond the loss: empty for [`SingleGrad`](@ref), `(; l2, ps_adv)` for a
+[`PerturbRule`](@ref).
+"""
+function micro_grad!(::SingleGrad, nitro, gctx, ev, st, b, flag)
+    l, nitro.g_accum, st_out, aux = grad_call(nitro, gctx, ev, nitro.ps, st, b, nitro.g_accum, flag)
+    return l, st_out, aux, (;)
+end
+
+function micro_grad!(rule::PerturbRule, nitro, gctx, ev, st, b, flag)
+    # Pass 1 overwrites the scratch; its loss, state and outputs are the micro-batch's.
+    l, gctx.scratch[], st_out, aux =
+        grad_call(nitro, gctx, ev, nitro.ps, st, b, gctx.scratch[], gctx.is_first)
+    ps_adv = compile_cached(
+        eps_program, ev, rule, nitro.ps, gctx.scratch[], gctx.masks, gctx.lref;
+        phase = GradCompiling(), nitro,
+        worlds = (method_world(perturbation, Tuple{typeof(rule), Any, Any, Any}),)
+    )(rule, nitro.ps, gctx.scratch[], gctx.masks, gctx.lref)
+    # The same input `st`: the gradient program does not donate it, and reusing it gives pass 2
+    # the same RNG key, so dropout draws the same masks.
+    l2, nitro.g_accum, _, _ = grad_call(nitro, gctx, ev, ps_adv, st, b, nitro.g_accum, flag)
+    return l, st_out, aux, (; l2, ps_adv)
+end
+
+function grad_call(nitro, gctx, ev, ps, st, b, acc, flag)
+    thunk = compile_cached(
+        grad_program, ev, ev, nitro.model, ps, st, b, acc, gctx.is_first, gctx.inv_n,
+        nitro.routing, gctx.lref, gctx.tmv; phase = GradCompiling(), worlds = gctx.worlds, nitro,
+        baked = (; accum = nitro.accum)
+    )
+    return thunk(
+        ev, nitro.model, ps, st, b, acc, flag, gctx.inv_n, nitro.routing, gctx.lref, gctx.tmv
+    )
+end
+
+# This step's rule on the device, refused if its type moved since construction.
+function step_grad_rule(nitro, grad_raw, bind_raw, memo)
+    r = build_grad_rule(nitro.e, grad_hp(grad_raw, bind_raw))
+    typeof(r) == nitro.frozen.grad_rule_type || error(
+        "ReactantNitro: `grad_rule` now returns a `$(typeof(r))`, but this handle was built \
+         with a `$(nitro.frozen.grad_rule_type)`. The rule's type is fixed: vary its values only, \
+         or construct a new `Nitro` to change the rule."
+    )
+    return place_grad_rule(r, memo; mesh = nitro.mesh)
+end
+
 """
     ReactantNitro.opt_program(ev, g_accum::NTuple{G}, ps, opt_state::NTuple{G}, lref, ::Val{CLIP})
         -> (ps, states::NTuple{G})
@@ -357,6 +408,14 @@ function _train!(nitro::Nitro)
     # An experiment with no `train_metrics` stays on the `:device` program whatever the residency
     # says; there is nothing to move to the host.
     tmv = Val(nitro.frozen.tm_residency)
+    rule = step_grad_rule(
+        nitro, grad_schedule_values(nitro.schedules, nitro.step + 1),
+        bind_schedule_values(nitro.schedules, nitro.step + 1), scalar_memo
+    )
+    gctx = (;
+        is_first, inv_n, lref, tmv, worlds, masks,
+        scratch = Ref{Any}(rule isa PerturbRule ? map(zero, nitro.g_accum) : nothing),
+    )
     # The per-run copy of the module-level registry, taken here rather than at construction, so
     # that a monitor registered between `Nitro(e)` and `train!` is in this run.
     adopt_monitors!(nitro)
@@ -402,7 +461,7 @@ function _train!(nitro::Nitro)
                 it = iterate(stream)
                 t_wait += time() - t0
                 # Set on a step's first micro-batch and logged on its closing one.
-                device_raw = (;)
+                device_raw = grad_raw = bind_raw = (;)
                 while it !== nothing
                     ((batch, b), st_stream) = it
                     t_body = time()
@@ -426,18 +485,12 @@ function _train!(nitro::Nitro)
                             nitro.e = e_next
                             ev = compile_view(e_next)
                         end
+                        grad_raw = grad_schedule_values(nitro.schedules, nitro.step + 1)
+                        bind_raw = bind_schedule_values(nitro.schedules, nitro.step + 1)
+                        rule = step_grad_rule(nitro, grad_raw, bind_raw, scalar_memo)
                     end
-                    gthunk = compile_cached(
-                        grad_program, ev, ev, nitro.model, nitro.ps, st, b,
-                        nitro.g_accum, is_first, inv_n, nitro.routing, lref,
-                        tmv; phase = GradCompiling(), worlds, nitro,
-                        baked = (; accum = nitro.accum)
-                    )
-                    l, nitro.g_accum, st_out, aux = gthunk(
-                        ev, nitro.model, nitro.ps, st, b,
-                        nitro.g_accum,
-                        micro == 0 ? is_first : is_next, inv_n,
-                        nitro.routing, lref, tmv
+                    l, st_out, aux, extra = micro_grad!(
+                        rule, nitro, gctx, ev, st, b, micro == 0 ? is_first : is_next
                     )
                     st, aux = program_in(st_out), program_in(aux)
                     # What this micro-batch's deferred half needs, captured now: the step it
@@ -448,7 +501,7 @@ function _train!(nitro::Nitro)
                     # micro-batch and written with its train line.
                     rec = (;
                         l, b, batch, aux, e = nitro.e, step = nitro.step, epoch = nitro.epoch,
-                        closes = micro == nitro.accum - 1, sched = (;),
+                        closes = micro == nitro.accum - 1, sched = (;), extra,
                     )
 
                     if rec.closes
@@ -461,7 +514,8 @@ function _train!(nitro::Nitro)
                                 rec, (;
                                     sched = schedule_log(
                                         nitro.schedules, device_raw; groups = layout.groups,
-                                        applied, fields = nitro.bindings.fields
+                                        applied, fields = nitro.bindings.fields, grad_raw,
+                                        bind_raw
                                     ),
                                 )
                             )
@@ -493,7 +547,7 @@ function _train!(nitro::Nitro)
                     end
                     pending = rec
                     # The step half ends after the readback, which is where the device is awaited;
-                    # timing `gthunk` alone would report a near-zero step. Lagged, it awaits the
+                    # timing the dispatch alone would report a near-zero step. Lagged, it awaits the
                     # previous micro-batch, so over an epoch it still sums the device time the host
                     # waited through. Micro-batch 1 is excluded from both halves because it
                     # carries the fan-out's spin-up.
@@ -603,10 +657,13 @@ loss back ([`check_finite`](@ref) under `check_divergence`, else [`read_loss`](@
 logged optimizer step (see [`log_every_n_steps`](@ref)), and free its batch. Returns the host
 loss, for the epoch mean.
 
-`rec` is `(; l, b, batch, aux, e, step, epoch, closes, sched)`, captured at dispatch. `step` is
-the counter before that micro-batch's optimizer step: the divergence error names it, and the train
-line is logged at `step + 1`, the step the micro-batch belonged to, whatever the counter reads by
-now. `sched` holds the step's `schedule/` values when the line is due, else `(;)`.
+`rec` is `(; l, b, batch, aux, e, step, epoch, closes, sched, extra)`, captured at dispatch.
+`step` is the counter before that micro-batch's optimizer step: the divergence error names it, and
+the train line is logged at `step + 1`, the step the micro-batch belonged to, whatever the counter
+reads by now. `sched` holds the step's `schedule/` values when the line is due, else `(;)`.
+`extra` is [`micro_grad!`](@ref)'s: under a [`PerturbRule`](@ref), reading pass 2's loss awaits
+pass 2 before `b` and `ps_adv` are freed, and `sam/gap`, pass 2's loss minus pass 1's, joins the
+train line.
 
 Freeing the batch last is safe: the loss readback awaited the record's program, and no later
 program reads its batch. Holding `aux` across the later dispatches is safe because no later program
@@ -618,6 +675,12 @@ input buffer itself.
 function complete_micro_batch!(nitro::Nitro, rec, tmv)
     # One D2H serves the divergence check, the epoch mean and the train line.
     lh = nitro.check_divergence ? check_finite(rec.l, rec.step, rec.epoch) : read_loss(rec.l)
+    # A perturbation rule's pass 2 also reads `b` and `ps_adv`; this readback awaits it.
+    gap = (;)
+    if haskey(rec.extra, :l2)
+        gap = NamedTuple{(Symbol("sam/gap"),)}((read_loss(rec.extra.l2) - lh,))
+        free_batch!(rec.extra.ps_adv)
+    end
     # The host path for `train_metrics`: `aux` is the primal, and the hook runs in ordinary Julia
     # on it. The transfer is the cost the user chose by asking. Every micro-batch, as the contract
     # says, though only a logged step's closing one is logged.
@@ -629,7 +692,7 @@ function complete_micro_batch!(nitro::Nitro, rec, tmv)
     # Once per logged optimizer step, the cadence the metrics contract names. The stats are the
     # closing micro-batch's, unreduced. `finite_only` drops a non-finite loss when the check is off.
     rec.closes && step_line_due(nitro, rec.step + 1) && log_metrics!(
-        nitro.logger, finite_only((; loss = lh, stats..., rec.sched...));
+        nitro.logger, finite_only((; loss = lh, gap..., stats..., rec.sched...));
         step = rec.step + 1, epoch = rec.epoch, context = "train"
     )
     # Freed here, not when the compiled call returns: XLA is asynchronous and the executable holds

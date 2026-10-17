@@ -433,6 +433,32 @@ function no_decay end
 no_decay(e, ks, x) = default_no_decay(ks, x)
 
 """
+    grad_rule(e) -> GradRule
+    grad_rule(e, hp) -> GradRule
+
+Which gradient each micro-batch contributes: [`SingleGrad`](@ref) by default, or a
+[`PerturbRule`](@ref) such as [`SAM`](@ref). Its fields are host numbers, never `Device` fields.
+
+The one-argument form returns the rule, and a scheduled field (`rho = ...` or
+`grad = (; rho = ...)`) is filled in by name. The two-argument form mirrors a Level 2
+[`optimizer`](@ref): `hp` holds this step's scheduled rule fields by name and `bind` values as
+`hp.bind.<name>`, all host numbers, and you place them:
+
+```julia
+ReactantNitro.grad_rule(::MyExp) = SAM(0.05f0)
+ReactantNitro.grad_rule(::MyExp, hp) = SAM(0.05f0 * hp.bind.sam_warm)
+```
+
+Called on the host once per optimizer step; the framework moves the rule's fields to the device, so
+a changing value never recompiles. The rule's type must not change. Manual mode supports
+`SingleGrad` only.
+"""
+function grad_rule end
+
+grad_rule(e) = SingleGrad()
+grad_rule(e, hp) = grad_rule(e)
+
+"""
     gradient_clip_norm(e) -> Real
 
 The global-norm gradient clip threshold. Default `_field(e, :gradient_clip_norm, 0f0)`, where `0`

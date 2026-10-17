@@ -1,7 +1,8 @@
-# Optimization: groups, decay, and clipping
+# Optimization: groups, decay, clipping, and SAM
 
 Rules are `Optimisers.jl` rules, and the framework owns everything around them: which rules may
-be traced, parameter groups, decay, per-leaf decay exclusion, and gradient clipping. The
+be traced, parameter groups, decay, per-leaf decay exclusion, gradient clipping, and the gradient
+rule (SAM). The
 learning-rate curve is on the [Schedules](schedules.md) page.
 
 ## The defaults get you a working run
@@ -59,8 +60,9 @@ end
 
 Both levels receive the same `hp`, a `NamedTuple` with keys `eta` (this group's effective learning
 rate), `lambda` (already multiplied by that `eta`, or `nothing` when it is zero and not scheduled),
-`anchor` (a flat device array or `nothing`), `no_decay_mask`, and one key per scheduled rule field,
-present from the first call. A field is schedulable unless [`nonschedulable`](@ref) lists it.
+`anchor` (a flat device array or `nothing`), `no_decay_mask`, one key per scheduled rule field,
+present from the first call, and `bind` when the schedules have a `bind` table (Level 2 reads it;
+[Schedules](schedules.md)). A field is schedulable unless [`nonschedulable`](@ref) lists it.
 
 At Level 1 the framework calls `R()` and replaces each field that `hp` has a key for, so fields
 `hp` does not carry keep the rule's constructor defaults. It then appends the
@@ -235,6 +237,44 @@ The threshold is a trace-time host constant, so a disabled clip emits no ops at 
 that changing it recompiles the optimizer program, and only that one, so a clip sweep repeats only
 the cheap compile. A device-resident threshold could not mean "off" at `0`: it would scale the
 gradient to zero norm, and on an all-zero gradient `0/0` yields `NaN`.
+
+## Sharpness-aware minimization: `grad_rule`
+
+[`grad_rule`](@ref)`(e)` decides which gradient each micro-batch adds to the accumulator. The
+default, [`SingleGrad`](@ref), is one forward and backward pass. [`SAM`](@ref) takes the gradient
+at `ps + rho * g / ‖g‖`, where `g` is the micro-batch's gradient at `ps`:
+
+```julia
+ReactantNitro.grad_rule(::MyExp) = SAM(0.05f0)
+ReactantNitro.optimizer(::MyExp) = Optimisers.RAdam
+# Optional: warm rho up over the first 500 steps.
+ReactantNitro.schedules(::MyExp) = (; rho = _ -> t -> 0.05f0 * min(1, t / 500))
+```
+
+Like the optimizer, the rule has a second form that places scheduled values itself,
+`grad_rule(e, hp)`, where `hp` holds the scheduled rule fields by name and `bind` values as
+`hp.bind.<name>` ([Schedules](schedules.md)).
+
+- **Cost.** Two forward and backward passes per micro-batch, plus a small program that builds the
+  perturbed parameters. The gradient program is the same compiled program for both passes, so SAM
+  adds no compile of it, and the optimizer program does not change.
+- **`rho`** is a host number the framework places on the device, so a different value never
+  recompiles. A schedule key `rho` binds to it when nothing else is named `rho`; otherwise qualify
+  it as `grad = (; rho = ...)` or bind it by hand. A `Device` field passed into the rule is refused.
+  Values around 0.01 to 0.1 are typical with Adam-family rules.
+- **Masking.** Leaves that [`no_decay`](@ref) excludes (biases and norm affines by default) are
+  not perturbed and do not count toward `‖g‖`.
+- **Per micro-batch.** `ε` comes from each accumulation micro-batch's own gradient, which is
+  m-sharpness with `m` equal to the micro-batch size. A smaller per-device `m` is reserved
+  (`SAM(rho; m)`) and refused for now.
+- **What is reported.** The loss, the layer state and the `train_metrics` outputs come from the
+  unperturbed pass, so curves compare directly with a run without SAM. Pass 2 reuses pass 1's
+  input state, so dropout draws the same masks in both. The train line adds `sam/gap`, pass 2's
+  loss minus pass 1's.
+
+Manual mode supports `SingleGrad` only; a `train_step` closure can call [`backward`](@ref) at
+perturbed parameters itself. A new [`PerturbRule`](@ref) defines [`perturbation`](@ref) and reuses
+the same driver path.
 
 ## A complete recipe
 
