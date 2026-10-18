@@ -68,6 +68,36 @@
     ReactantNitro.export_inputs(::GateMLP) = [ReactantNitro.ExportSpec("x", Float32, [3, 1])]
     ReactantNitro.export_outputs(::GateMLP) = [ReactantNitro.ExportSpec("y", Float32, [1, 1])]
 
+    # ── An experiment whose logger has resumable state ───────────────────────────────────
+    #
+    # GateMLP's model and data, with a logger whose `logger_state` is a key, as a hosted backend's
+    # is. `KEYED_REATTACHED` collects every key `reattach!` receives.
+    @experiment struct GateKeyed
+        width::GraphConst{Int} = 4
+        max_epochs::Int = 1
+    end
+    ReactantNitro.build_model(::GateKeyed, rng) = ReactantNitro.build_model(GateMLP(), rng)
+    ReactantNitro.forward(::GateKeyed, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    ReactantNitro.loss(::GateKeyed, y; yhat) = mean(abs2, y .- yhat)
+    ReactantNitro.build_data(::GateKeyed, dist) = ReactantNitro.build_data(GateMLP(), dist)
+    const KEYED_SPEC = string(nameof(@__MODULE__)) * ".GateKeyed"
+
+    mutable struct KeyedLog
+        key::String
+    end
+    const KEYED_COUNT = Ref(0)
+    const KEYED_REATTACHED = Any[]
+    ReactantNitro.logger(::GateKeyed) = KeyedLog("key-$(KEYED_COUNT[] += 1)")
+    ReactantNitro.log_metrics!(::KeyedLog, m; kwargs...) = nothing
+    ReactantNitro.log_params!(::KeyedLog, p) = nothing
+    ReactantNitro.log_tags!(::KeyedLog, t) = nothing
+    ReactantNitro.log_other!(::KeyedLog, k, v) = nothing
+    ReactantNitro.log_confusion!(::KeyedLog, m, labels; kwargs...) = nothing
+    ReactantNitro.finish!(::KeyedLog, s) = nothing
+    ReactantNitro.logger_info(l::KeyedLog) = (; key = l.key)
+    ReactantNitro.logger_state(l::KeyedLog) = l.key
+    ReactantNitro.reattach!(l::KeyedLog, s) = (push!(KEYED_REATTACHED, s); l.key = s; nothing)
+
     # ── An experiment whose exportable handle is a different build ───────────────────────
     #
     # A real model's shape in miniature, and the reason `nitro_export` grew a `data` keyword. A
@@ -515,6 +545,29 @@
         @test isfile(best.path)
     end
 
+    @testset "a resume through the tools continues the logged run" begin
+        dir = mktempdir()
+        a = wait_run(run_id(EXT.nitro_train(KEYED_SPEC, max_epochs = 1, run_dir = dir)))
+        @test a.status == :completed
+        key = ReactantNitro.logger_state(a.nitro.logger)
+        rec = ReactantNitro.load_checkpoint(
+            a.nitro.checkpointer, joinpath(dir, only(e.file for e in read_manifest(dir)))
+        )
+        @test rec.logger_state == key
+        @test rec.logger_type == "KeyedLog"
+
+        empty!(KEYED_REATTACHED)
+        r = wait_run(run_id(EXT.nitro_train(KEYED_SPEC, max_epochs = 2, run_dir = dir, resume = "latest => latest")))
+        @test r.status == :completed && r.epoch == 2
+        @test KEYED_REATTACHED == [key]
+        @test ReactantNitro.logger_state(r.nitro.logger) == key
+
+        # A record written through the tools resumes without them, into the same logged run.
+        empty!(KEYED_REATTACHED)
+        n = Nitro(GateKeyed(); run_dir = dir, max_epochs = 3, resume = :latest => :latest)
+        @test KEYED_REATTACHED == [key]
+    end
+
     @testset "nitro_logger reports the run's logger, live" begin
         dir = mktempdir()
         msg = EXT.nitro_train(GATE_SPEC, max_epochs = 1, run_dir = dir)
@@ -549,6 +602,16 @@
         @test ReactantNitro.logger_info(wrapped) == (; path = inner.path)
         bare = EXT.RecordingLogger(EXT.RunState("zz888888", :train, "x"), nothing)
         @test ReactantNitro.logger_info(bare) == (;)
+        # Resumable state forwards both ways, and the record names the inner logger.
+        keyed = EXT.RecordingLogger(EXT.RunState("zz777777", :train, "x"), KeyedLog("k1"))
+        @test ReactantNitro.logger_state(keyed) == "k1"
+        @test ReactantNitro.inner_logger(keyed) === keyed.inner
+        ReactantNitro.reattach!(keyed, "k0")
+        @test keyed.inner.key == "k0"
+        empty!(KEYED_REATTACHED)
+        @test ReactantNitro.logger_state(bare) === nothing
+        @test ReactantNitro.reattach!(bare, "k") === nothing
+        @test ReactantNitro.inner_logger(bare) === nothing
         @test ReactantNitro.run_id(bare) === nothing
         @test ReactantNitro.run_url(bare) === nothing
         # A train-context log advances the status step and epoch between phase transitions; a
