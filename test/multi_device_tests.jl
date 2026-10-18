@@ -370,3 +370,46 @@ end
     @test get(got, "sam_grad_programs", "") == "1"
     @test num("sam_maxdiff") < 1.0e-5
 end
+
+# The EMA on the mesh: its update program writes in place, so the shadow must keep the mesh types
+# step after step, and the device count must stay throughput only.
+@testitem "multi_device ema" setup = [MultiDevice] timeout = 1200 begin
+    using Test
+
+    ok, got = run_on_two_devices(
+        raw"""
+        using Optimisers
+        @experiment struct EmaExp
+            max_epochs::Int = 2
+        end
+        ReactantNitro.build_model(::EmaExp, rng) = (
+            m = Chain(Dense(4 => 16, tanh), Dropout(0.5f0), Dense(16 => 2));
+            (m, Lux.setup(rng, m)...)
+        )
+        ReactantNitro.forward(::EmaExp, model, ps, st; x) = Lux.apply(model, x, ps, st)
+        ReactantNitro.loss(::EmaExp, ŷ; y) = mean(abs2, ŷ .- y)
+        ReactantNitro.optimizer(::EmaExp) = Optimisers.RAdam
+        ReactantNitro.grad_rule(::EmaExp) = SAM(0.05f0)
+        ReactantNitro.ema(::EmaExp) = EMA(0.9)
+
+        run!(; n_devs) = train!(Nitro(EmaExp(); run_dir = mktempdir(), n_devs, accum = 2, seed = 5,
+            checkpointer = nothing, data = (; train = vectors(4; seed = 3), val = vectors(2; seed = 4))))
+
+        try
+            s1 = run!(; n_devs = 1)
+            s2 = run!(; n_devs = 2)
+            record("ema_maxdiff", maxdiff(flat(s1.ema_weights), flat(s2.ema_weights)))
+            record("ema_val_rdiff", abs(s1.last_metrics.val_loss - s2.last_metrics.val_loss) /
+                abs(s1.last_metrics.val_loss))
+            record("ema", "ok")
+        catch err
+            record("ema", firstline(err))
+        end
+        """
+    )
+    num(k) = parse(Float64, get(got, k, "NaN"))
+    @test ok
+    @test get(got, "ema", "<missing>") == "ok"
+    @test num("ema_maxdiff") < 1.0e-5
+    @test num("ema_val_rdiff") < 1.0e-5
+end

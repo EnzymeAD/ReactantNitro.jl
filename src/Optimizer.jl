@@ -406,10 +406,23 @@ per group (1 decayed, 0 excluded). It is per leaf because biases occur inside ev
 once at construction and stored on the [`Nitro`](@ref), so a redefined `no_decay` takes effect on
 the next handle.
 """
-function no_decay_masks(e, ps, layout::FlatLayout{G}; elt::Type = Float32) where {G}
+no_decay_masks(e, ps, layout::FlatLayout; elt::Type = Float32) =
+    leaf_masks((ks, x) -> !no_decay(e, ks, x), ps, layout; elt)
+
+"""
+    ReactantNitro.no_perturb_masks(e, ps, layout; elt = Float32) -> NTuple{G}
+
+[`no_perturb`](@ref) as flat 0/1 buffers (1 perturbed), built once at construction like
+[`no_decay_masks`](@ref).
+"""
+no_perturb_masks(e, ps, layout::FlatLayout; elt::Type = Float32) =
+    leaf_masks((ks, x) -> !no_perturb(e, ks, x), ps, layout; elt)
+
+# One 0/1 flat buffer per group, 1 where `keep(keypath, leaf)` holds.
+function leaf_masks(keep_leaf, ps, layout::FlatLayout{G}; elt::Type = Float32) where {G}
     keep = Dict{Tuple, Bool}()
     Functors.fmap_with_path(ps) do kp, x
-        x isa AbstractArray && (keep[Tuple(kp)] = !no_decay(e, Tuple(kp), x))
+        x isa AbstractArray && (keep[Tuple(kp)] = keep_leaf(Tuple(kp), x))
         return x
     end
     return ntuple(Val(G)) do gi

@@ -208,6 +208,12 @@ function _build_nitro(
         restore_optimizer::Bool = false,
         # Whether `train!` ends by loading this run's best checkpoint into the handle.
         restore_best = false,
+        # The weights' exponential moving average, and which weights evaluation reads (`:ema`
+        # when there is an average, else `:raw`).
+        ema = ReactantNitro.ema(e),
+        eval_weights = nothing,
+        # Whether a `weights` source's average is loaded in place of its weights.
+        load_ema::Bool = false,
         # DEPRECATED spelling of `weights = path`; removed in 0.2.0.
         checkpoint = nothing,
         # PROTOTYPE: hooks supplied as values shadow the method of the same name (Hooks.jl).
@@ -219,6 +225,7 @@ function _build_nitro(
     )
     check_hooks(hooks)
     compile_options = check_compile_options(compile_options)
+    eval_weights = check_ema(ema, eval_weights, load_ema, weights)
     if checkpoint !== nothing
         warn_checkpoint_keyword()
         weights === nothing || error(
@@ -274,8 +281,10 @@ function _build_nitro(
             is about WRITING; nothing is written by a `Nitro` that is never trained."""
         )
         record, source = load_checkpoint(checkpointer, weights_file), weights_file
+        load_ema && (record = ema_as_weights(record, source))
     elseif averaged !== nothing
-        record, source = average_records(checkpointer, averaged), describe(averaged)
+        record = average_records(checkpointer, averaged; field = load_ema ? :ema : :ps)
+        source = describe(averaged)
     elseif resume_file !== nothing
         record, source = load_checkpoint(checkpointer, resume_file), resume_file
     end
@@ -413,7 +422,10 @@ function _build_nitro(
     # layout: the transferred tree has to fit this model.
     if weights !== nothing
         check_weights_compatible(weights, build_layout(e, ps))
-        ps = place_replicated(from_host(to_host(weights.ps)), mesh)
+        load_ema && weights.ema_weights === nothing && error(
+            "ReactantNitro: `load_ema = true`, and the `Nitro` passed as `weights` keeps no EMA."
+        )
+        ps = place_replicated(from_host(to_host(load_ema ? weights.ema_weights : weights.ps)), mesh)
         st = place_replicated(from_host(to_host(weights.st)), mesh)
     end
     w0_tree = resolve_w0(w0, w0_tree, ps, e, mesh)
@@ -509,6 +521,19 @@ function _build_nitro(
     # Resolved once, here: `no_decay` is a user hook, and recomputing it at `train!` would let a
     # revision take effect on a frozen handle. Training-only and skipped in manual mode.
     masks = training && !manual ? map(m -> place_replicated(m, mesh), no_decay_masks(e, ps, layout)) : nothing
+    perturb = training && !manual ?
+        map(m -> place_replicated(m, mesh), no_perturb_masks(e, ps, layout)) : nothing
+    # The EMA starts from the weights training starts from; a resume continues the record's.
+    resumed = record !== nothing && !weights_only
+    ema_weights = if !training || ema === nothing
+        nothing
+    elseif resumed && record.ema !== nothing
+        place_replicated(from_host(to_host(record.ema)), mesh)
+    else
+        resumed && @info "ReactantNitro: the record being resumed keeps no EMA, so the average \
+                          starts again from its weights."
+        ema_copy(ps, mesh)
+    end
     if training
         n_batches = length(collection.train)
         check_train_divisibility(n_batches, accum)
@@ -607,7 +632,7 @@ function _build_nitro(
             frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state),
             (; compile_options, grad_rule_type)
         ),
-        (; masks, anchors), bindings,
+        (; masks, anchors, perturb), bindings,
         map(zero, flat), RegisteredMonitor[], Int(step0), Int(epoch0), Starting(),
         false, nothing,
         # No metrics and no elapsed time yet, even for a restored handle.
@@ -616,7 +641,8 @@ function _build_nitro(
         NamedTuple[],
         false,
         restore_best, nothing,
-        record !== nothing && weights_only ? record.averaged_from : nothing
+        record !== nothing && weights_only ? record.averaged_from : nothing,
+        ema, ema_weights, eval_weights
     )
     # Two builds from one set of pieces: the text goes to `log_other!` so the record says where
     # every value bound, and the sections are what `show(nitro)` appends to the handle's display.

@@ -350,6 +350,9 @@ function restore_best!(nitro::Nitro)
     record = load_checkpoint(nitro.checkpointer, bc.path)
     nitro.ps = place_replicated(from_host(to_host(record.ps)), nitro.mesh)
     nitro.st = place_replicated(from_host(to_host(record.st)), nitro.mesh)
+    # The EMA comes with it, so evaluation under `eval_weights = :ema` sees the best epoch's.
+    nitro.ema_weights === nothing || record.ema === nothing ||
+        (nitro.ema_weights = place_replicated(from_host(to_host(record.ema)), nitro.mesh))
     nitro.checkpoint_source = bc.path
     nitro.restored_best = (;
         path = bc.path, epoch = bc.epoch, metric = bc.metric, score = bc.score,
@@ -375,6 +378,16 @@ function restore_average!(nitro::Nitro, avg)
     record = average_records(ck, src)
     nitro.ps = place_replicated(from_host(to_host(record.ps)), nitro.mesh)
     nitro.st = place_replicated(from_host(to_host(record.st)), nitro.mesh)
+    if nitro.ema_weights !== nothing
+        try
+            averaged_ema = average_records(ck, src; field = :ema).ps
+            nitro.ema_weights = place_replicated(from_host(to_host(averaged_ema)), nitro.mesh)
+        catch err
+            @warn "ReactantNitro: $(what): the picked records do not all keep an EMA, so the \
+                   handle's EMA stays where training ended. \
+                   $(first(split(sprint(showerror, err), '\n')))"
+        end
+    end
     nitro.checkpoint_source = describe(src)
     nitro.averaged_from = record.averaged_from
     nitro.restored_best = (;
@@ -448,7 +461,7 @@ function _train!(nitro::Nitro)
         bind_schedule_values(nitro.schedules, nitro.step + 1), scalar_memo
     )
     gctx = (;
-        is_first, inv_n, lref, tmv, worlds, masks,
+        is_first, inv_n, lref, tmv, worlds, masks = nitro.decay.perturb,
         scratch = Ref{Any}(rule isa PerturbRule ? map(zero, nitro.g_accum) : nothing),
     )
     # The per-run copy of the module-level registry, taken here rather than at construction, so
@@ -536,7 +549,7 @@ function _train!(nitro::Nitro)
                     # micro-batch and written with its train line.
                     rec = (;
                         l, b, batch, aux, e = nitro.e, step = nitro.step, epoch = nitro.epoch,
-                        closes = micro == nitro.accum - 1, sched = (;), extra,
+                        closes = micro == nitro.accum - 1, sched = (;), extra, ema_log = (;),
                     )
 
                     if rec.closes
@@ -570,6 +583,9 @@ function _train!(nitro::Nitro)
                             (l, s) -> Optimisers.Leaf(l.rule, s, l.frozen), state, new_states
                         )
                         nitro.step += 1
+                        eb = ema_step!(nitro, nitro.step, scalar_memo)
+                        eb === nothing ||
+                            (rec = merge(rec, (; ema_log = NamedTuple{(Symbol("ema/beta"),)}((eb,)))))
                         # One completed unit of work, for a monitor measuring time since progress.
                         note_progress!()
                     end
@@ -727,7 +743,7 @@ function complete_micro_batch!(nitro::Nitro, rec, tmv)
     # Once per logged optimizer step, the cadence the metrics contract names. The stats are the
     # closing micro-batch's, unreduced. `finite_only` drops a non-finite loss when the check is off.
     rec.closes && step_line_due(nitro, rec.step + 1) && log_metrics!(
-        nitro.logger, finite_only((; loss = lh, gap..., stats..., rec.sched...));
+        nitro.logger, finite_only((; loss = lh, gap..., stats..., rec.sched..., rec.ema_log...));
         step = rec.step + 1, epoch = rec.epoch, context = "train"
     )
     # Freed here, not when the compiled call returns: XLA is asynchronous and the executable holds
@@ -797,6 +813,7 @@ function _train_manual!(nitro::Nitro)
     worlds = nitro.frozen.worlds_manual
     router = nitro.routing.train_step
     adopt_monitors!(nitro)
+    ema_memo = ScalarMemo()
     t_started = time()
     last_metrics = (;)
     wrote_epoch = false
@@ -863,6 +880,8 @@ function _train_manual!(nitro::Nitro)
                     loss_sum += Float64(lh)
                     loss_n += 1
                     nitro.ps = out.ps
+                    eb = ema_step!(nitro, nitro.step + 1, ema_memo)
+                    ema_line = eb === nothing ? (;) : NamedTuple{(Symbol("ema/beta"),)}((eb,))
                     st = program_in(out.st)
                     # Re-attach the rules the closure was handed to the states it returned. The
                     # rules are not donated, so reuse across steps is safe.
@@ -871,7 +890,7 @@ function _train_manual!(nitro::Nitro)
                     # batch (accum is fixed at 1 by construction).
                     step_line_due(nitro, nitro.step) && log_metrics!(
                         nitro.logger,
-                        finite_only((; loss = lh, get(out, :stats, (;))..., sched_line...));
+                        finite_only((; loss = lh, get(out, :stats, (;))..., sched_line..., ema_line...));
                         step = nitro.step, epoch = nitro.epoch, context = "train"
                     )
                     # Safe to free: the loss readback awaited the step.
@@ -1191,6 +1210,7 @@ function snapshot(nitro::Nitro)
     end
     snap = (;
         ps = to_host(nitro.ps), st = to_host(nitro.st),
+        ema = nitro.ema_weights === nothing ? nothing : to_host(nitro.ema_weights),
         opt_state = to_host(nitro.opt_state),
         flat_permutation = nitro.layout.permutation,
         step = nitro.step, epoch = nitro.epoch, seed = nitro.seed,
@@ -1606,14 +1626,14 @@ function eval_forward(nitro::Nitro, ev, st, b, fwd_router)
     # Frozen against an eval-mode `st`, which every caller passes. The handle-local memo means a
     # hit never reaches the phase machinery, so only the first compile publishes `EvalCompiling`.
     thunk = compile_cached(
-        fwd_program, ev, ev, nitro.model, nitro.ps, st, bf, fwd_router,
+        fwd_program, ev, ev, nitro.model, eval_ps(nitro), st, bf, fwd_router,
         hook_fn(hook_fns(nitro.routing), :forward, forward);
         phase = EvalCompiling(), worlds = nitro.frozen.worlds_eval,
         gc_hash = nitro.frozen.graphconst_hash, nitro
     )
     return program_in(
         thunk(
-            ev, nitro.model, nitro.ps, st, bf, fwd_router,
+            ev, nitro.model, eval_ps(nitro), st, bf, fwd_router,
             hook_fn(hook_fns(nitro.routing), :forward, forward)
         )
     )
@@ -2008,7 +2028,7 @@ Computed once per eval call, not per batch.
 """
 function protected_buffers(nitro::Nitro, st = nothing)
     out = Set{Ptr{Cvoid}}()
-    for tree in (nitro.ps, nitro.st, st, nitro.w0, nitro.opt_state, nitro.g_accum)
+    for tree in (nitro.ps, nitro.st, st, nitro.w0, nitro.opt_state, nitro.g_accum, nitro.ema_weights)
         tree === nothing && continue
         _each_concrete_leaf(tree) do x
             for buf in _device_buffers(x)
