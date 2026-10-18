@@ -1,9 +1,9 @@
-# Optimization: groups, decay, clipping, and SAM
+# Optimization: groups, decay, clipping, SAM, and EMA
 
 Rules are `Optimisers.jl` rules, and the framework owns everything around them: which rules may
-be traced, parameter groups, decay, per-leaf decay exclusion, gradient clipping, and the gradient
-rule (SAM). The
-learning-rate curve is on the [Schedules](schedules.md) page.
+be traced, parameter groups, decay, per-leaf decay exclusion, gradient clipping, the gradient
+rule (SAM and ASAM), and a moving average of the weights (EMA). The learning-rate curve is on the
+[Schedules](schedules.md) page.
 
 ## The defaults get you a working run
 
@@ -262,8 +262,9 @@ Like the optimizer, the rule has a second form that places scheduled values itse
   recompiles. A schedule key `rho` binds to it when nothing else is named `rho`; otherwise qualify
   it as `grad = (; rho = ...)` or bind it by hand. A `Device` field passed into the rule is refused.
   Values around 0.01 to 0.1 are typical with Adam-family rules.
-- **Masking.** Leaves that [`no_decay`](@ref) excludes (biases and norm affines by default) are
-  not perturbed and do not count toward `‖g‖`.
+- **Masking.** Every leaf is perturbed by default, as in Foret et al. Leaves that
+  [`no_perturb`](@ref) excludes are not perturbed and do not count toward `‖g‖`. It is independent
+  of [`no_decay`](@ref); to mirror decay exclusion, `no_perturb(e::MyExp, ks, x) = no_decay(e, ks, x)`.
 - **Per micro-batch.** `ε` comes from each accumulation micro-batch's own gradient, which is
   m-sharpness with `m` equal to the micro-batch size. A smaller per-device `m` is reserved
   (`SAM(rho; m)`) and refused for now.
@@ -275,6 +276,55 @@ Like the optimizer, the rule has a second form that places scheduled values itse
 Manual mode supports `SingleGrad` only; a `train_step` closure can call [`backward`](@ref) at
 perturbed parameters itself. A new [`PerturbRule`](@ref) defines [`perturbation`](@ref) and reuses
 the same driver path.
+
+### Adaptive SAM: `ASAM`
+
+[`ASAM`](@ref) (Kwon et al. 2021) scales the perturbation by each parameter's own size, so the
+sharpness it measures does not change when the weights are rescaled. With `T = |w| + eta`,
+
+```julia
+# ε = rho * T² g / ‖T g‖
+ReactantNitro.grad_rule(::MyExp) = ASAM(0.5f0)            # eta = 0.01f0 by default
+ReactantNitro.grad_rule(::MyExp) = ASAM(1f0; eta = 0.1f0)
+```
+
+- **`rho` is relative**, so typical values are about ten times SAM's: around 0.5 to 2 with SGD,
+  smaller with Adam-family rules. It schedules and logs exactly as SAM's does.
+- **`eta` is not schedulable.** It is structural, and keeping it off the schedule leaves an
+  unqualified `eta` key meaning the learning rate.
+- **Which leaves scale.** [`adaptive_perturb`](@ref) picks them. The default scales rank-2 and
+  higher leaves (weight matrices and kernels) and leaves biases, norm affines and scalars at
+  `T = 1`, as SAM treats every leaf. `no_perturb` still applies on top.
+
+```julia
+# Scale every leaf, biases included.
+ReactantNitro.adaptive_perturb(::MyExp, ks, x) = true
+```
+
+Everything else, cost, per-micro-batch `ε`, `sam/gap` and what is reported, is as for SAM.
+
+## Exponential moving average: `ema`
+
+[`ema`](@ref)`(e)` keeps a device copy of the weights averaged after every optimizer step,
+`θ_ema ← β θ_ema + (1 - β) θ`. Training never reads it.
+
+```julia
+ReactantNitro.ema(::MyExp) = EMA(0.999)
+n = Nitro(MyExp(); ema = EMA(0.9999; every = 4))   # or as a keyword
+```
+
+- **Warmup.** `warmup = true` (the default) uses `β = min(beta, (1 + t) / (10 + t))` at step `t`,
+  so the average is not held at the initial weights for `1 / (1 - beta)` steps. The train line logs
+  the `β` applied as `ema/beta`.
+- **`every = k`** updates on every `k`-th optimizer step only.
+- **What reads it.** Under `eval_weights = :ema`, the default with an EMA, validation, checkpoint
+  selection, `restore_best`, [`predict`](@ref) and export use the average. `eval_weights = :raw`
+  evaluates the raw weights instead. Training and [`parameters`](@ref) always use the raw weights.
+- **Cost.** One copy of the parameters on the device and a small elementwise program per update.
+  It works in the automatic loop and in manual mode.
+
+Checkpoints keep the average in the record's `ema` field, and a resume continues it. `load_ema =
+true` loads a source's average as the weights of a new handle; see [Checkpoints](checkpoints.md).
 
 ## A complete recipe
 

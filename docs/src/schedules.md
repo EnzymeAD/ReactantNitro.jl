@@ -57,7 +57,8 @@ schedules = (; eta = total -> OneCycle(total, 1f-3),
 Rule field names are the rule's actual field names, so the learning-rate key is `eta`, not `lr`.
 
 A third reserved namespace, `grad`, holds the fields of the [`grad_rule`](@ref), such as
-[`SAM`](@ref)'s `rho`. An unqualified `rho` resolves to it when nothing else has that name; with
+[`SAM`](@ref)'s and [`ASAM`](@ref)'s `rho` (ASAM's `eta` is not schedulable, so an unqualified
+`eta` stays the learning rate). An unqualified `rho` resolves to it when nothing else has that name; with
 `Optimisers.Momentum`, whose field is also `rho`, it is refused and you qualify it. The value
 logs as `schedule/grad/rho`.
 

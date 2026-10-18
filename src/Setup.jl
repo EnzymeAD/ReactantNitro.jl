@@ -11,16 +11,17 @@
 """
     Nitro(e; seed, resume, run_dir, data, n_devs, weights, accum, max_epochs, schedules,
              gradient_clip_norm, check_divergence, autolog_schedules, log_every_n_steps, logger,
-             checkpointer, early_stop, run_ref, w0, restore_optimizer, restore_best,
-             compile_options) -> Nitro
+             checkpointer, early_stop, ema, run_ref, w0, restore_optimizer, restore_best,
+             eval_weights, load_ema, compile_options) -> Nitro
 
 Build a handle for experiment `e` by running the setup sequence below. Nothing is trained or
 compiled.
 
-Thirteen keywords default to the accessor of the same name: [`seed`](@ref), [`run_dir`](@ref),
+Fourteen keywords default to the accessor of the same name: [`seed`](@ref), [`run_dir`](@ref),
 [`n_devs`](@ref), [`accum`](@ref), [`max_epochs`](@ref), [`schedules`](@ref),
 [`gradient_clip_norm`](@ref), [`check_divergence`](@ref), [`autolog_schedules`](@ref),
-[`log_every_n_steps`](@ref), [`logger`](@ref), [`checkpointer`](@ref) and [`early_stop`](@ref).
+[`log_every_n_steps`](@ref), [`logger`](@ref), [`checkpointer`](@ref), [`early_stop`](@ref) and
+[`ema`](@ref).
 Passing one replaces the accessor's value for this run; omitting it calls the accessor, before
 step 1. `data`, `weights`, `resume` and `run_ref` have no accessor, since each names a fact about
 this construction: `data` supplies the collection and skips `build_data`, and `run_ref`, a `Ref`,
@@ -143,6 +144,11 @@ that `sel` picks instead, exactly as `weights = run => Average(sel)` would load 
 a checkpointer whose `keep` cannot hold that selection; a run that ends before it has enough
 (an early stop, say) warns and keeps its final weights.
 
+**`eval_weights`** is `:ema` (the default with an [`EMA`](@ref)) or `:raw` (the default without
+one), and says which weights validation, checkpoint selection, `predict` and export read.
+**`load_ema = true`** loads the `weights` source's EMA in place of its weights: a record's, an
+average of records' (`run => Average(sel)`), or another handle's. A source without one is refused.
+
 `w0` says what `decay_anchor = :w0` anchors to: `:build_model` (the default), `:weights` (the
 transferred parameters, for L2-SP fine-tuning), or a parameter tree.
 
@@ -178,7 +184,7 @@ end
 # heartbeat. The keyword defaults live here, on the function that reads `e`.
 function _build_nitro(
         e;
-        # Thirteen keywords default to an accessor of the same name, so an experiment
+        # Fourteen keywords default to an accessor of the same name, so an experiment
         # declares what it IS and a caller passes only what this run changes.
         seed::Integer = ReactantNitro.seed(e),
         run_dir::AbstractString = ReactantNitro.run_dir(e),
@@ -193,6 +199,7 @@ function _build_nitro(
         logger = ReactantNitro.logger(e),
         checkpointer = ReactantNitro.checkpointer(e),
         early_stop = ReactantNitro.early_stop(e),
+        ema = ReactantNitro.ema(e),
         # A preset name is a fact about how this handle was built; `Nitro(E, :name)` sets it.
         preset::Union{Symbol, Nothing} = nothing,
         # Four stay keyword-only, because each names a fact about THIS INVOCATION rather than
@@ -208,9 +215,7 @@ function _build_nitro(
         restore_optimizer::Bool = false,
         # Whether `train!` ends by loading this run's best checkpoint into the handle.
         restore_best = false,
-        # The weights' exponential moving average, and which weights evaluation reads (`:ema`
-        # when there is an average, else `:raw`).
-        ema = ReactantNitro.ema(e),
+        # Which weights evaluation reads: `:ema` when there is an average, else `:raw`.
         eval_weights = nothing,
         # Whether a `weights` source's average is loaded in place of its weights.
         load_ema::Bool = false,

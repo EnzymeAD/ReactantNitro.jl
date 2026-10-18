@@ -36,7 +36,7 @@ Sharpness-aware minimization (Foret et al. 2021): the gradient taken at `ps + rh
 `rho` is a host number; the framework places it on the device, so changing it never recompiles.
 Schedule it as `rho = ...`, as `grad = (; rho = ...)` when another namespace has a `rho`, or by
 hand through `bind` and [`grad_rule`](@ref)`(e, hp)`. `ε` is computed per accumulation
-micro-batch and excludes the leaves [`no_decay`](@ref) excludes. The cost is two forward and
+micro-batch and excludes the leaves [`no_perturb`](@ref) excludes, none by default. The cost is two forward and
 backward passes per micro-batch. `m`, a per-chunk sample count for independent m-sharpness, is
 reserved and not supported yet.
 """
@@ -59,7 +59,7 @@ nonschedulable(::Type{<:SAM}) = (:m,)
     perturbation(rule::PerturbRule, g, p, mask) -> ε
 
 The parameter perturbation for one chunk. `g` (the unperturbed gradient), `p` (the parameters),
-`mask` (1 for a leaf that may be perturbed, 0 for one [`no_decay`](@ref) excludes) and `ε` are
+`mask` (1 for a leaf that may be perturbed, 0 for one [`no_perturb`](@ref) excludes) and `ε` are
 `NTuple{G}`s of flat per-group buffers. Norms must reduce over the parameter axes only, so a
 per-chunk variant can map the method over chunks unchanged. Traced.
 """
@@ -75,9 +75,10 @@ end
 """
     ASAM(rho; eta = 0.01f0, m = nothing)
 
-Adaptive SAM (Kwon et al. 2021): the gradient at `ps + ε` with `ε = rho * T² g / ‖T g‖` and
-`T = |w| + eta`, so each parameter is perturbed in proportion to its own size and the sharpness it
-measures is invariant to rescaling the weights. Leaves [`adaptive_perturb`](@ref) declines (by
+Adaptive SAM (Kwon et al. 2021), which perturbs each parameter in proportion to its own size.
+
+The gradient is taken at `ps + ε` with `ε = rho * T² g / ‖T g‖` and `T = |w| + eta`, so the
+sharpness it measures is invariant to rescaling the weights. Leaves [`adaptive_perturb`](@ref) declines (by
 default the rank-1 leaves: biases, norm affines, scalar parameters) get `T = 1`, as under
 [`SAM`](@ref). `rho` is relative, so typical values are about ten times SAM's, around 0.5 to 2
 with SGD and smaller with Adam-family rules. `eta` is not schedulable; `m` is reserved, as for

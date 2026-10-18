@@ -15,7 +15,8 @@ The driver owns the step counter and passes `step` and `epoch` to every `log_met
 logger needs no step counter of its own. Each call names one of three contexts:
 
 - `"train"`: one line per logged optimizer step, carrying `loss`, the [`train_metrics`](@ref)
-  values, and the schedule values. With `accum > 1` these are the values of the step's last
+  values, the schedule values, `sam/gap` under a [`PerturbRule`](@ref), and `ema/beta` with an
+  [`EMA`](@ref). With `accum > 1` these are the values of the step's last
   micro-batch.
 - `"validate"`: one line per validation pass, carrying the validation metrics at the current step
   and epoch, so it overlays the train curve.

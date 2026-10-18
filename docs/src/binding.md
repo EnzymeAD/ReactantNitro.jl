@@ -119,6 +119,8 @@ param_group(e, keypath)         # each leaf of `ps` to a group: :encoder, :defau
 learning_rate(e, Val(g))        # a RATIO against learning_rate(e); a schedule scales the base
 lambda(e, Val(g))               # decoupled decay toward decay_anchor(e, Val(g)): :zero, :w0, array
 no_decay(e, keypath, x)         # per leaf: excluded from decay; the default excludes 1-D leaves
+no_perturb(e, keypath, x)       # per leaf: excluded from SAM's perturbation; the default excludes none
+adaptive_perturb(e, keypath, x) # per leaf: ASAM scales by |w| + eta; the default scales rank 2 and up
 ```
 
 The optimizer program applies each chain once per group, not once per array, which keeps its
@@ -134,10 +136,10 @@ e.max_epochs                # else a field of the same name, when the struct dec
 1                           # else the framework's value
 ```
 
-Thirteen keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`,
+Fourteen keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`,
 `schedules`, `gradient_clip_norm`, `check_divergence`, `autolog_schedules`, `log_every_n_steps`,
-`logger`, `checkpointer`, `early_stop`. `schedules` is the one whose accessor reads no field. Four keywords name a fact about this construction and have no accessor: `data`,
-`weights`, `resume`, `run_ref`. `w0`, `restore_optimizer` and `restore_best` are more of that
+`logger`, `checkpointer`, `early_stop`, `ema`. `schedules` is the one whose accessor reads no field. Four keywords name a fact about this construction and have no accessor: `data`,
+`weights`, `resume`, `run_ref`. `w0`, `restore_optimizer`, `restore_best`, `eval_weights` and `load_ema` are more of that
 kind, and `checkpoint` is the deprecated spelling of `weights = path`.
 
 ## Weights: the ways in
@@ -157,6 +159,7 @@ and averaging.
 | `Nitro(e; resume = run => :best)` | the record's | restored | restored (a branch) | runs |
 | `Nitro(e; weights = run => Average(Last(10)))` | the average of the run's latest 10 | fresh | 0 | skipped, values restored |
 | `Nitro(e; weights = other)` | `other`'s `ps` and `st` | fresh | 0 | runs |
+| any `weights` above, with `load_ema = true` | the source's EMA | fresh | 0 | as above |
 
 `restore_best = true` changes where a handle ends rather than where it starts: `train!` finishes by
 loading the run's own best checkpoint into `ps` and `st`. `restore_best = Average(Last(10))` ends it

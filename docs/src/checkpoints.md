@@ -9,7 +9,8 @@ one, and how to average several. The docstrings of [`Checkpointer`](@ref), [`Ave
 
 **A checkpoint is full training state; weights are parameters alone.** Every checkpoint holds the
 parameters, layer state and optimizer state, plus the step, epoch, seed, config and validation
-metrics, so any of them can be resumed. Anything that produces parameters alone, for export or
+metrics, so any of them can be resumed. A run with an [`EMA`](@ref) also keeps the average in the
+record's `ema` field. Anything that produces parameters alone, for export or
 serving, is named for weights.
 
 A [`CheckpointRecord`](@ref) is a JLD2 file, and every value in it is a host value. A device array
@@ -127,6 +128,7 @@ never overwritten.
 | a record's parameters and optimizer state, fresh step and schedule | `weights = run => :best, restore_optimizer = true` |
 | a record's parameters, fresh optimizer | `weights = run => :best` |
 | another handle's parameters, in memory | `weights = other` |
+| a record's EMA as the parameters, fresh optimizer | `weights = run => :best, load_ema = true` |
 
 A resume restores the seed from the record, overriding a `seed` keyword with a warning, and
 recomputes derived values by running `derive` again. It refuses, with a diff, when:
@@ -141,7 +143,7 @@ A seed sweep that varies the seed and not `run_dir` resumes into itself under `r
 the directory too.
 
 **`restore_best = true`** ends `train!` holding the run's own best checkpoint rather than its final
-weights. Step, epoch and history stay as training ended, and the handle then refuses a further
+weights, and its EMA with them when the run keeps one. Step, epoch and history stay as training ended, and the handle then refuses a further
 `train!`, since those weights beside that optimizer state are not a state any run was in; the error
 shows the constructions that continue from the best checkpoint.
 
@@ -167,6 +169,9 @@ n = Nitro(MyExp(); run_dir = "runs/my_run",
   without running statistics and an approximation for one with them, such as BatchNorm.
 - **The run must still hold them.** When it does not, the error lists the epochs it kept and the
   `keep` that would have held them. `other => Average(...)` checks `other`'s `keep` first.
+- **EMA.** `load_ema = true` averages the picked records' EMAs instead, and refuses when one
+  keeps none. `restore_best = Average(...)` on a run with an EMA averages both, and warns and keeps
+  the final EMA when a picked record has none.
 - **Refused:** averaging across runs (`:all => Average(...)`, planned), `Average` in `resume`, and
   `restore_optimizer = true` with an average, which carries no optimizer state.
 

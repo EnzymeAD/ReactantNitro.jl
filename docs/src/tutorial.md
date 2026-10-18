@@ -410,10 +410,11 @@ set with `CUDA_VISIBLE_DEVICES` before starting the process.
 [`train!`](@ref)`(e; ...)` is sugar for [`train!`](@ref)`(Nitro(e; ...))`. Every keyword belongs to
 the constructor and [`train!`](@ref)`(nitro)` takes none, so there is one keyword surface.
 
-Thirteen of the keywords default to an accessor of the same name: [`seed`](@ref),
+Fourteen of the keywords default to an accessor of the same name: [`seed`](@ref),
 [`run_dir`](@ref), [`n_devs`](@ref), [`accum`](@ref), [`max_epochs`](@ref), [`schedules`](@ref),
 [`gradient_clip_norm`](@ref), [`check_divergence`](@ref), [`autolog_schedules`](@ref),
-[`log_every_n_steps`](@ref), [`logger`](@ref), [`checkpointer`](@ref), and [`early_stop`](@ref).
+[`log_every_n_steps`](@ref), [`logger`](@ref), [`checkpointer`](@ref), [`early_stop`](@ref), and
+[`ema`](@ref).
 Passing the keyword replaces the accessor for that run, without editing the struct or redefining a
 method:
 
@@ -479,7 +480,7 @@ overrides a bare `eta`, which still applies to every other group. [Schedules](sc
 rules.
 
 **Keyword to accessor to field.** `max_epochs` was never given a method: the accessor read the
-struct field. `run_dir` was given a method. Twelve of the thirteen run-knob accessors fall back to
+struct field. `run_dir` was given a method. Thirteen of the fourteen run-knob accessors fall back to
 a field of their own name; `schedules` is the exception. The keyword wins for one run either way.
 
 **Per-group values have no keyword.** [`learning_rate`](@ref)`(e, Val(g))` and
