@@ -866,7 +866,7 @@ function export_model(
 
         # Host arrays throughout. `host_rngs` after `host_tree`, which passes a `ReactantRNG`
         # through, and a device seed reaching a trace is lifted into an argument.
-        ps = host_rngs(host_tree(nitro.ps))
+        ps = host_rngs(host_tree(eval_ps(nitro)))
         st = host_rngs(host_tree(Lux.testmode(nitro.st)))   # the framework owns eval mode
 
         nb = Int(first(batch_sizes))

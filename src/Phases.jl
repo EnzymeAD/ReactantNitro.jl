@@ -219,6 +219,11 @@ mutable struct Nitro
     restored_best::Any
     # What the weights average, from an averaged record (`averaged_from`), else `nothing`.
     averaged_from::Any
+    # The `EMA` spec or `nothing`, its device shadow (training handles only), and which weights
+    # evaluation reads, `:ema` or `:raw`.
+    ema::Any
+    ema_weights::Any
+    eval_weights::Symbol
 end
 
 # ── The accessors, which are reads and which everything downstream is specified in terms of.

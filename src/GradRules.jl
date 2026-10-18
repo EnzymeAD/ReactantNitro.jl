@@ -36,7 +36,7 @@ Sharpness-aware minimization (Foret et al. 2021): the gradient taken at `ps + rh
 `rho` is a host number; the framework places it on the device, so changing it never recompiles.
 Schedule it as `rho = ...`, as `grad = (; rho = ...)` when another namespace has a `rho`, or by
 hand through `bind` and [`grad_rule`](@ref)`(e, hp)`. `ε` is computed per accumulation
-micro-batch and excludes the leaves [`no_decay`](@ref) excludes. The cost is two forward and
+micro-batch and excludes the leaves [`no_perturb`](@ref) excludes, none by default. The cost is two forward and
 backward passes per micro-batch. `m`, a per-chunk sample count for independent m-sharpness, is
 reserved and not supported yet.
 """
@@ -59,7 +59,7 @@ nonschedulable(::Type{<:SAM}) = (:m,)
     perturbation(rule::PerturbRule, g, p, mask) -> ε
 
 The parameter perturbation for one chunk. `g` (the unperturbed gradient), `p` (the parameters),
-`mask` (1 for a leaf that may be perturbed, 0 for one [`no_decay`](@ref) excludes) and `ε` are
+`mask` (1 for a leaf that may be perturbed, 0 for one [`no_perturb`](@ref) excludes) and `ε` are
 `NTuple{G}`s of flat per-group buffers. Norms must reduce over the parameter axes only, so a
 per-chunk variant can map the method over chunks unchanged. Traced.
 """
@@ -71,6 +71,54 @@ function perturbation(r::SAM, g, p, mask)
     s = r.rho / (global_grad_norm(gm) + eps(T))
     return map(x -> x .* s, gm)
 end
+
+"""
+    ASAM(rho; eta = 0.01f0, m = nothing)
+
+Adaptive SAM (Kwon et al. 2021), which perturbs each parameter in proportion to its own size.
+
+The gradient is taken at `ps + ε` with `ε = rho * T² g / ‖T g‖` and `T = |w| + eta`, so the
+sharpness it measures is invariant to rescaling the weights. Leaves [`adaptive_perturb`](@ref) declines (by
+default the rank-1 leaves: biases, norm affines, scalar parameters) get `T = 1`, as under
+[`SAM`](@ref). `rho` is relative, so typical values are about ten times SAM's, around 0.5 to 2
+with SGD and smaller with Adam-family rules. `eta` is not schedulable; `m` is reserved, as for
+`SAM`.
+"""
+struct ASAM{R, E, M} <: PerturbRule
+    rho::R
+    eta::E
+    m::M
+end
+
+function ASAM(rho; eta = 0.01f0, m = nothing)
+    m === nothing || error(
+        "ReactantNitro: `ASAM(rho; m = $m)`: per-chunk m-sharpness is not supported yet. Omit \
+         `m`; `ε` is then computed per accumulation micro-batch."
+    )
+    return ASAM(rho, eta, m)
+end
+
+# `eta` is structural, and an unqualified `eta` schedule key must keep meaning the learning rate.
+nonschedulable(::Type{<:ASAM}) = (:eta, :m)
+
+"""
+    perturbation(rule::ASAM, g, p, mask, adaptive) -> ε
+
+ASAM's perturbation. `adaptive` holds 1 where [`adaptive_perturb`](@ref) scales the leaf by
+`|w| + eta` and 0 where it is left unscaled.
+"""
+function perturbation(r::ASAM, g, p, mask, adaptive)
+    t = map((pi, ai) -> ai .* (abs.(pi) .+ r.eta) .+ (1 .- ai), p, adaptive)
+    tg = map((ti, gi, mi) -> ti .* (gi .* mi), t, g, mask)
+    T = eltype(first(tg))
+    s = r.rho / (global_grad_norm(tg) + eps(T))
+    return map((ti, x) -> ti .* x .* s, t, tg)
+end
+
+# The perturbation with what each rule reads: `adaptive` only for ASAM, so a `PerturbRule`
+# written against the four-argument `perturbation` keeps working.
+_perturbation(rule, g, p, mask, adaptive) = perturbation(rule, g, p, mask)
+_perturbation(rule::ASAM, g, p, mask, adaptive) = perturbation(rule, g, p, mask, adaptive)
 
 function check_grad_rule(r::GradRule)
     T = typeof(r)
@@ -201,13 +249,13 @@ function check_grad_bindings(e, resolved, landed)
 end
 
 """
-    ReactantNitro.eps_program(rule, ps, g, masks, lref) -> ps_adv
+    ReactantNitro.eps_program(rule, ps, g, masks, adaptive, lref) -> ps_adv
 
 `ps + ε` as a fresh tree; `ps` itself is not written, since pass 1's values must survive.
 """
-function eps_program(rule, ps, g, masks, lref)
+function eps_program(rule, ps, g, masks, adaptive, lref)
     layout = resolve_layout(lref)
-    ε = unflatten(perturbation(rule, g, flatten(ps, layout), masks), ps, layout)
+    ε = unflatten(_perturbation(rule, g, flatten(ps, layout), masks, adaptive), ps, layout)
     return Functors.fmap(ps, ε) do p, e
         p isa AbstractArray ? program_out(p .+ e) : p
     end

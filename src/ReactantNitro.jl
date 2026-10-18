@@ -58,6 +58,7 @@ include("Data.jl")        # the data contract and the dataloaders
 include("Decay.jl")       # weight decay
 include("Optimizer.jl")   # optimizer construction and parameter groups
 include("GradRules.jl")   # gradient rules: SAM and the default single gradient
+include("EMA.jl")         # the exponential moving average of the weights
 include("Schedules.jl")   # schedules
 include("TraceHook.jl")   # opt-in precise invalidation: records what each trace went through
 include("Cache.jl")       # the compiled-program cache
@@ -89,13 +90,17 @@ export build_data, build_model, forward, loss
 export metrics, train_metrics, finalize_metrics, metrics_residency, derive
 export param_group, optimizer, learning_rate, lambda, decay_anchor, gradient_clip_norm
 # Gradient rules: `grad_rule` picks one; `perturbation` is what a new `PerturbRule` defines.
-export grad_rule, GradRule, SingleGrad, PerturbRule, SAM, perturbation
+export grad_rule, GradRule, SingleGrad, PerturbRule, SAM, ASAM, perturbation, adaptive_perturb
 # Manual training mode: defining `train_step` selects it, `manual_training(e) = false` declines it,
 # `setup_optimizers` supplies the user-owned optimizer states, `backward` and `step_optimizer` are
 # the helpers the closure calls.
 export train_step, setup_optimizers, manual_training, backward, step_optimizer
 # Per-leaf decay exclusion; `default_no_decay` is exported so `no_decay` can extend it.
 export no_decay, default_no_decay
+# What a perturbation rule such as SAM leaves alone; independent of `no_decay`.
+export no_perturb
+# The exponential moving average of the weights.
+export EMA, ema
 export schedules, nonschedulable, dispatch_variant, max_epochs
 # The run accessors: each one's `Nitro` keyword defaults to the accessor call.
 export seed, accum, n_devs, checkpointer, early_stop, logger, check_divergence, autolog_schedules,

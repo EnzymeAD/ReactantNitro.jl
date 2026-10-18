@@ -433,6 +433,30 @@ function no_decay end
 no_decay(e, ks, x) = default_no_decay(ks, x)
 
 """
+    no_perturb(e, keypath::Tuple, param) -> Bool
+
+Whether a [`PerturbRule`](@ref) such as [`SAM`](@ref) leaves this parameter leaf unperturbed and out
+of `‖g‖`. Default `false`: every leaf is perturbed, as in Foret et al. Independent of
+[`no_decay`](@ref); to mirror it, `no_perturb(e::MyExp, ks, x) = no_decay(e, ks, x)`. Runs on the
+host once, at construction.
+"""
+function no_perturb end
+
+no_perturb(e, ks, x) = false
+
+"""
+    adaptive_perturb(e, keypath::Tuple, param) -> Bool
+
+Whether [`ASAM`](@ref) scales this leaf's perturbation by its own size, `|w| + eta`, rather than
+leaving it unscaled as [`SAM`](@ref) does. Default: rank-2 and higher leaves (weight matrices and
+kernels); biases, norm affines and 1-element scalar parameters are unscaled. Runs on the host once,
+at construction.
+"""
+function adaptive_perturb end
+
+adaptive_perturb(e, ks, x) = ndims(x) >= 2
+
+"""
     grad_rule(e) -> GradRule
     grad_rule(e, hp) -> GradRule
 
@@ -629,6 +653,15 @@ ReactantNitro.checkpointer(::MyExp) = Checkpointer(metric = :f1, mode = :max)
 """
 function checkpointer end
 checkpointer(e) = _field(e, :checkpointer, Checkpointer())
+
+"""
+    ema(e) -> EMA or nothing
+
+The run's exponential moving average of the weights. Default `_field(e, :ema, nothing)`, no EMA;
+also a `Nitro` keyword. See [`EMA`](@ref).
+"""
+function ema end
+ema(e) = _field(e, :ema, nothing)
 
 """
     early_stop(e)

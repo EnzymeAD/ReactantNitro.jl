@@ -11,16 +11,17 @@
 """
     Nitro(e; seed, resume, run_dir, data, n_devs, weights, accum, max_epochs, schedules,
              gradient_clip_norm, check_divergence, autolog_schedules, log_every_n_steps, logger,
-             checkpointer, early_stop, run_ref, w0, restore_optimizer, restore_best,
-             compile_options) -> Nitro
+             checkpointer, early_stop, ema, run_ref, w0, restore_optimizer, restore_best,
+             eval_weights, load_ema, compile_options) -> Nitro
 
 Build a handle for experiment `e` by running the setup sequence below. Nothing is trained or
 compiled.
 
-Thirteen keywords default to the accessor of the same name: [`seed`](@ref), [`run_dir`](@ref),
+Fourteen keywords default to the accessor of the same name: [`seed`](@ref), [`run_dir`](@ref),
 [`n_devs`](@ref), [`accum`](@ref), [`max_epochs`](@ref), [`schedules`](@ref),
 [`gradient_clip_norm`](@ref), [`check_divergence`](@ref), [`autolog_schedules`](@ref),
-[`log_every_n_steps`](@ref), [`logger`](@ref), [`checkpointer`](@ref) and [`early_stop`](@ref).
+[`log_every_n_steps`](@ref), [`logger`](@ref), [`checkpointer`](@ref), [`early_stop`](@ref) and
+[`ema`](@ref).
 Passing one replaces the accessor's value for this run; omitting it calls the accessor, before
 step 1. `data`, `weights`, `resume` and `run_ref` have no accessor, since each names a fact about
 this construction: `data` supplies the collection and skips `build_data`, and `run_ref`, a `Ref`,
@@ -143,6 +144,11 @@ that `sel` picks instead, exactly as `weights = run => Average(sel)` would load 
 a checkpointer whose `keep` cannot hold that selection; a run that ends before it has enough
 (an early stop, say) warns and keeps its final weights.
 
+**`eval_weights`** is `:ema` (the default with an [`EMA`](@ref)) or `:raw` (the default without
+one), and says which weights validation, checkpoint selection, `predict` and export read.
+**`load_ema = true`** loads the `weights` source's EMA in place of its weights: a record's, an
+average of records' (`run => Average(sel)`), or another handle's. A source without one is refused.
+
 `w0` says what `decay_anchor = :w0` anchors to: `:build_model` (the default), `:weights` (the
 transferred parameters, for L2-SP fine-tuning), or a parameter tree.
 
@@ -178,7 +184,7 @@ end
 # heartbeat. The keyword defaults live here, on the function that reads `e`.
 function _build_nitro(
         e;
-        # Thirteen keywords default to an accessor of the same name, so an experiment
+        # Fourteen keywords default to an accessor of the same name, so an experiment
         # declares what it IS and a caller passes only what this run changes.
         seed::Integer = ReactantNitro.seed(e),
         run_dir::AbstractString = ReactantNitro.run_dir(e),
@@ -193,6 +199,7 @@ function _build_nitro(
         logger = ReactantNitro.logger(e),
         checkpointer = ReactantNitro.checkpointer(e),
         early_stop = ReactantNitro.early_stop(e),
+        ema = ReactantNitro.ema(e),
         # A preset name is a fact about how this handle was built; `Nitro(E, :name)` sets it.
         preset::Union{Symbol, Nothing} = nothing,
         # Four stay keyword-only, because each names a fact about THIS INVOCATION rather than
@@ -208,6 +215,10 @@ function _build_nitro(
         restore_optimizer::Bool = false,
         # Whether `train!` ends by loading this run's best checkpoint into the handle.
         restore_best = false,
+        # Which weights evaluation reads: `:ema` when there is an average, else `:raw`.
+        eval_weights = nothing,
+        # Whether a `weights` source's average is loaded in place of its weights.
+        load_ema::Bool = false,
         # DEPRECATED spelling of `weights = path`; removed in 0.2.0.
         checkpoint = nothing,
         # PROTOTYPE: hooks supplied as values shadow the method of the same name (Hooks.jl).
@@ -219,6 +230,7 @@ function _build_nitro(
     )
     check_hooks(hooks)
     compile_options = check_compile_options(compile_options)
+    eval_weights = check_ema(ema, eval_weights, load_ema, weights)
     if checkpoint !== nothing
         warn_checkpoint_keyword()
         weights === nothing || error(
@@ -274,8 +286,10 @@ function _build_nitro(
             is about WRITING; nothing is written by a `Nitro` that is never trained."""
         )
         record, source = load_checkpoint(checkpointer, weights_file), weights_file
+        load_ema && (record = ema_as_weights(record, source))
     elseif averaged !== nothing
-        record, source = average_records(checkpointer, averaged), describe(averaged)
+        record = average_records(checkpointer, averaged; field = load_ema ? :ema : :ps)
+        source = describe(averaged)
     elseif resume_file !== nothing
         record, source = load_checkpoint(checkpointer, resume_file), resume_file
     end
@@ -413,7 +427,10 @@ function _build_nitro(
     # layout: the transferred tree has to fit this model.
     if weights !== nothing
         check_weights_compatible(weights, build_layout(e, ps))
-        ps = place_replicated(from_host(to_host(weights.ps)), mesh)
+        load_ema && weights.ema_weights === nothing && error(
+            "ReactantNitro: `load_ema = true`, and the `Nitro` passed as `weights` keeps no EMA."
+        )
+        ps = place_replicated(from_host(to_host(load_ema ? weights.ema_weights : weights.ps)), mesh)
         st = place_replicated(from_host(to_host(weights.st)), mesh)
     end
     w0_tree = resolve_w0(w0, w0_tree, ps, e, mesh)
@@ -509,6 +526,21 @@ function _build_nitro(
     # Resolved once, here: `no_decay` is a user hook, and recomputing it at `train!` would let a
     # revision take effect on a frozen handle. Training-only and skipped in manual mode.
     masks = training && !manual ? map(m -> place_replicated(m, mesh), no_decay_masks(e, ps, layout)) : nothing
+    perturb = training && !manual ?
+        map(m -> place_replicated(m, mesh), no_perturb_masks(e, ps, layout)) : nothing
+    # ASAM's per-leaf scaling, built below once the rule is known; `nothing` for any other rule.
+    adaptive = nothing
+    # The EMA starts from the weights training starts from; a resume continues the record's.
+    resumed = record !== nothing && !weights_only
+    ema_weights = if !training || ema === nothing
+        nothing
+    elseif resumed && record.ema !== nothing
+        place_replicated(from_host(to_host(record.ema)), mesh)
+    else
+        resumed && @info "ReactantNitro: the record being resumed keeps no EMA, so the average \
+                          starts again from its weights."
+        ema_copy(ps, mesh)
+    end
     if training
         n_batches = length(collection.train)
         check_train_divisibility(n_batches, accum)
@@ -547,6 +579,8 @@ function _build_nitro(
             # `rebuild_rules` moves only the VALUES each step; the rule types, and so the `apply!`
             # methods, are these, so resolving the rule worlds here covers the whole run.
             rule0 = build_grad_rule(e, grad_setup_hp(schedules))
+            rule0 isa ASAM &&
+                (adaptive = map(m -> place_replicated(m, mesh), adaptive_masks(e, ps, layout)))
             grad_rule_type = typeof(rule0)
             resolved = resolve_schedules(
                 e, schedules, total;
@@ -607,7 +641,7 @@ function _build_nitro(
             frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state),
             (; compile_options, grad_rule_type)
         ),
-        (; masks, anchors), bindings,
+        (; masks, anchors, perturb, adaptive), bindings,
         map(zero, flat), RegisteredMonitor[], Int(step0), Int(epoch0), Starting(),
         false, nothing,
         # No metrics and no elapsed time yet, even for a restored handle.
@@ -616,7 +650,8 @@ function _build_nitro(
         NamedTuple[],
         false,
         restore_best, nothing,
-        record !== nothing && weights_only ? record.averaged_from : nothing
+        record !== nothing && weights_only ? record.averaged_from : nothing,
+        ema, ema_weights, eval_weights
     )
     # Two builds from one set of pieces: the text goes to `log_other!` so the record says where
     # every value bound, and the sections are what `show(nitro)` appends to the handle's display.

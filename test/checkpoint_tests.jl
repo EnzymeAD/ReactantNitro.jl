@@ -491,7 +491,7 @@
             rec.opt_state, moved, rec.step, rec.epoch, rec.seed, rec.config,
             rec.devices, rec.metrics, rec.run_id, rec.run_url, rec.logger_state,
             rec.logger_type, rec.anchor_checksum, rec.stop_reason, rec.preset, rec.derived,
-            rec.early_stop, rec.averaged_from
+            rec.early_stop, rec.averaged_from, rec.ema
         )
         err = try
             check_permutation_compatible(bad, n.layout, "x")

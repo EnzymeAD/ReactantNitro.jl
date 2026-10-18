@@ -35,7 +35,7 @@
         :param_group, :optimizer, :learning_rate, :lambda, :decay_anchor,
         # The per-LEAF decay exclusion. `default_no_decay` is exported
         # alongside the hook so a user can extend the built-ins rather than replace them.
-        :no_decay, :default_no_decay,
+        :no_decay, :default_no_decay, :no_perturb, :EMA, :ema, :ASAM, :adaptive_perturb,
         :gradient_clip_norm, :schedules, :nonschedulable, :dispatch_variant,
         :grad_rule, :GradRule, :SingleGrad, :PerturbRule, :SAM, :perturbation,
         :max_epochs,

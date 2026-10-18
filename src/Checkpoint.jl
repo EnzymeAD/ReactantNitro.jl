@@ -33,6 +33,7 @@ Everything a checkpoint holds: the `snapshot` passed to [`save_checkpoint!`](@re
 | `derived` | optional | The keys `derive` returned, so a weights-only load restores them |
 | `early_stop` | optional | The early-stopping counters, so a resume continues its patience |
 | `averaged_from` | optional | For an averaged record, what it averages: the spec, run, directory, files, epochs, weights and the state's file |
+| `ema` | optional | The weights' exponential moving average ([`EMA`](@ref)), a tree like `ps`; `nothing` without one |
 
 Every value is a host value; setup moves them to the device when it loads a record.
 """
@@ -62,6 +63,8 @@ struct CheckpointRecord
     early_stop::Any
     # What an averaged record averages (`average_checkpoints`); `nothing` for a trained one.
     averaged_from::Any
+    # The weights' moving average, when the run kept one; `nothing` otherwise and in older records.
+    ema::Any
 end
 
 # ── Showing a record never shows the weights ─────────────────────────────────────────
@@ -423,7 +426,8 @@ function save_checkpoint!(ckpt::Checkpointer, epoch, metrics, snapshot)
         hasproperty(snapshot, :preset) ? snapshot.preset : nothing,
         hasproperty(snapshot, :derived) ? snapshot.derived : nothing,
         hasproperty(snapshot, :early_stop) ? snapshot.early_stop : nothing,
-        nothing
+        nothing,
+        hasproperty(snapshot, :ema) ? snapshot.ema : nothing
     )
 
     name = owned_name(
@@ -658,7 +662,7 @@ function checkpoint_info(path::AbstractString)
         epoch = r.epoch, step = r.step, seed = r.seed, preset = r.preset,
         run_id = r.run_id, run_url = r.run_url, logger_type = r.logger_type,
         stop_reason = r.stop_reason, anchor_checksum = r.anchor_checksum,
-        metrics = r.metrics, averaged_from = r.averaged_from,
+        metrics = r.metrics, averaged_from = r.averaged_from, has_ema = r.ema !== nothing,
     )
 end
 
@@ -806,14 +810,15 @@ _load_record_quietly(path) = Base.CoreLogging.with_logger(
 )
 
 # Field-shape migrations: the `tunables` to `devices` rename, and the additions of `preset`,
-# `derived`, `early_stop` and `averaged_from`.
+# `derived`, `early_stop`, `averaged_from` and `ema`.
 # JLD2 reconstructs an old record as a ReconstructedMutable with the on-disk field names, and the
 # rename is done here. A function because `checkpoint_info` reads the same records. FORMAT_VERSION
 # stays 1, since the semantics did not change.
 function _migrate_record(raw, path = "<record>")
     raw isa CheckpointRecord && return raw
     if hasproperty(raw, :tunables) || !hasproperty(raw, :preset) || !hasproperty(raw, :derived) ||
-            !hasproperty(raw, :early_stop) || !hasproperty(raw, :averaged_from)
+            !hasproperty(raw, :early_stop) || !hasproperty(raw, :averaged_from) ||
+            !hasproperty(raw, :ema)
         return CheckpointRecord(
             raw.format_version, raw.framework_version,
             raw.ps, raw.st, raw.opt_state, raw.flat_permutation,
@@ -824,7 +829,8 @@ function _migrate_record(raw, path = "<record>")
             hasproperty(raw, :preset) ? raw.preset : nothing,
             hasproperty(raw, :derived) ? raw.derived : nothing,
             hasproperty(raw, :early_stop) ? raw.early_stop : nothing,
-            hasproperty(raw, :averaged_from) ? raw.averaged_from : nothing
+            hasproperty(raw, :averaged_from) ? raw.averaged_from : nothing,
+            hasproperty(raw, :ema) ? raw.ema : nothing
         )
     end
     return error("ReactantNitro: `$path` does not hold a `CheckpointRecord`; it holds a \
@@ -1592,32 +1598,41 @@ The averaged record: `src.state_file`'s record with `ps` replaced by the uniform
 picked record's `ps`, and `averaged_from` saying what was averaged. Records are read one at a time into a `Float64` accumulator, so memory holds
 one record and the sum, not all of them. Refuses records whose parameter layouts differ.
 """
-function average_records(ckpt, src::AverageSource)
+function average_records(ckpt, src::AverageSource; field::Symbol = :ps)
     # Any `Checkpointer` reads the framework's format; this handle's may be `nothing`.
     ckpt isa Checkpointer || (ckpt = Checkpointer())
     base = load_checkpoint(ckpt, joinpath(src.dir, src.state_file))
     zero64(x) = x isa AbstractArray{<:AbstractFloat} ? zeros(Float64, size(x)) : x
-    acc = Functors.fmap(zero64, base.ps)
+    getfield(base, field) === nothing && error(
+        "ReactantNitro: averaging the records' `$(field)`, and `$(src.state_file)` keeps none (its \
+         run kept no EMA)."
+    )
+    acc = Functors.fmap(zero64, getfield(base, field))
     for f in src.files
         rec = load_checkpoint(ckpt, joinpath(src.dir, f))
+        getfield(rec, field) === nothing && error(
+            "ReactantNitro: averaging the records' `$(field)`, and `$(f)` keeps none."
+        )
         rec.flat_permutation == base.flat_permutation || error(
             "ReactantNitro: `$(f)` and `$(src.state_file)` have different parameter layouts, so \
              they cannot be averaged leaf for leaf. Average checkpoints of one architecture."
         )
-        Functors.fmap(acc, rec.ps) do a, x
+        Functors.fmap(acc, getfield(rec, field)) do a, x
             a isa AbstractArray{Float64} && (a .+= x)
             return a
         end
     end
     n = length(src.files)
-    ps = Functors.fmap(acc, base.ps) do a, x
+    ps = Functors.fmap(acc, getfield(base, field)) do a, x
         a isa AbstractArray{Float64} ? convert(typeof(x), a ./ n) : x
     end
     from = (;
         spec = string(src.spec), run = src.run, dir = src.dir, files = copy(src.files),
         epochs = copy(src.epochs), weights = fill(1 / n, n), state_file = src.state_file,
+        field,
     )
-    swap(f) = f === :ps ? ps : f === :averaged_from ? from : getfield(base, f)
+    # The average is the record's weights; its own EMA, if any, does not describe them.
+    swap(f) = f === :ps ? ps : f === :averaged_from ? from : f === :ema ? nothing : getfield(base, f)
     return CheckpointRecord(map(swap, fieldnames(CheckpointRecord))...)
 end
 

@@ -41,6 +41,18 @@
     ReactantNitro.learning_rate(::LinSam) = ETA
     ReactantNitro.grad_rule(e::LinSam) = SAM(e.rho)
 
+    # The same model, perturbing only what `no_decay` decays: the weight, not the bias.
+    @experiment struct LinSamMasked
+        max_epochs::Host{Int} = 1
+    end
+    ReactantNitro.build_model(::LinSamMasked, rng) = (m = Dense(4 => 3); (m, Lux.setup(rng, m)...))
+    ReactantNitro.forward(::LinSamMasked, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    ReactantNitro.loss(::LinSamMasked, ŷ; y) = mean(abs2, ŷ .- y)
+    ReactantNitro.optimizer(::LinSamMasked) = Optimisers.Descent
+    ReactantNitro.learning_rate(::LinSamMasked) = ETA
+    ReactantNitro.grad_rule(::LinSamMasked) = SAM(0.05f0)
+    ReactantNitro.no_perturb(::LinSamMasked, ks, x) = default_no_decay(ks, x)
+
     # ∂/∂(W, b) of mean(abs2, W x .+ b .- y).
     function lin_grad(W, b, x, y)
         r = W * x .+ b .- y
@@ -49,13 +61,15 @@
 
     # SAM by hand: ε on the weight only (`no_decay` masks the bias), the step on the mean of the
     # micro-batches' perturbed gradients.
-    function sam_reference(W, b, batches, rho, accum)
+    # `bias = false` leaves the bias unperturbed and out of the norm.
+    function sam_reference(W, b, batches, rho, accum; bias = true)
         for step in Iterators.partition(batches, accum)
             gW, gb = zero(W), zero(b)
             for (; x, y) in step
-                g1W, _ = lin_grad(W, b, x, y)
-                εW = rho .* g1W ./ sqrt(sum(abs2, g1W))
-                g2W, g2b = lin_grad(W .+ εW, b, x, y)
+                g1W, g1b = lin_grad(W, b, x, y)
+                nrm = sqrt(sum(abs2, g1W) + (bias ? sum(abs2, g1b) : 0.0))
+                εW, εb = rho .* g1W ./ nrm, bias ? rho .* g1b ./ nrm : zero(b)
+                g2W, g2b = lin_grad(W .+ εW, b .+ εb, x, y)
                 gW .+= g2W ./ accum
                 gb .+= g2b ./ accum
             end
@@ -82,6 +96,83 @@
             Wp, _ = sam_reference(W0, b0, batches, 0.0, accum)
             @test !isapprox(Array(p.weight), Wp; rtol = 1.0e-5)
         end
+    end
+
+    @testset "`no_perturb` excludes leaves; the default perturbs every one" begin
+        n = Nitro(LinSamMasked(); data = (; train = DATA), checkpointer = nothing, run_dir = mktempdir())
+        W0, b0 = Float64.(Array(parameters(n).weight)), Float64.(Array(parameters(n).bias))
+        batches = [(; x = Float64.(d.x), y = Float64.(d.y)) for d in DATA]
+        W, b = sam_reference(W0, b0, batches, 0.05, 1; bias = false)
+        train!(n)
+        @test Array(parameters(n).weight) ≈ W rtol = 1.0e-5
+        @test Array(parameters(n).bias) ≈ b rtol = 1.0e-5
+        # Not vacuous: perturbing the bias too gives another answer.
+        Wall, _ = sam_reference(W0, b0, batches, 0.05, 1; bias = true)
+        @test !isapprox(W, Wall; rtol = 1.0e-6)
+    end
+
+    # ── ASAM: the perturbation scaled by each weight's size ───────────────────────────
+
+    for (T, adaptive) in ((:LinAsam, true), (:LinAsamFlat, false))
+        @eval begin
+            @experiment struct $T
+                max_epochs::Host{Int} = 1
+            end
+            ReactantNitro.build_model(::$T, rng) = (m = Dense(4 => 3); (m, Lux.setup(rng, m)...))
+            ReactantNitro.forward(::$T, model, ps, st; x) = Lux.apply(model, x, ps, st)
+            ReactantNitro.loss(::$T, ŷ; y) = mean(abs2, ŷ .- y)
+            ReactantNitro.optimizer(::$T) = Optimisers.Descent
+            ReactantNitro.learning_rate(::$T) = ETA
+            ReactantNitro.grad_rule(::$T) = ASAM(0.5f0; eta = 0.01f0)
+        end
+        adaptive || @eval ReactantNitro.adaptive_perturb(::$T, ks, x) = false
+    end
+
+    # ASAM by hand, default `adaptive_perturb`: the rank-2 weight scaled by |W| + eta, the bias not.
+    function asam_reference(W, b, batches, rho, eta)
+        for (; x, y) in batches
+            gW, gb = lin_grad(W, b, x, y)
+            tW = abs.(W) .+ eta
+            tgW, tgb = tW .* gW, gb
+            nrm = sqrt(sum(abs2, tgW) + sum(abs2, tgb))
+            εW, εb = rho .* tW .* tgW ./ nrm, rho .* tgb ./ nrm
+            g2W, g2b = lin_grad(W .+ εW, b .+ εb, x, y)
+            W, b = W .- ETA .* g2W, b .- ETA .* g2b
+        end
+        return W, b
+    end
+
+    @testset "ASAM matches a hand-computed reference" begin
+        n = Nitro(LinAsam(); data = (; train = DATA), checkpointer = nothing, run_dir = mktempdir())
+        W0, b0 = Float64.(Array(parameters(n).weight)), Float64.(Array(parameters(n).bias))
+        batches = [(; x = Float64.(d.x), y = Float64.(d.y)) for d in DATA]
+        W, b = asam_reference(W0, b0, batches, 0.5, 0.01)
+        train!(n)
+        @test Array(parameters(n).weight) ≈ W rtol = 1.0e-5
+        @test Array(parameters(n).bias) ≈ b rtol = 1.0e-5
+        # Not vacuous: SAM at the same radius lands elsewhere.
+        Ws, _ = sam_reference(W0, b0, batches, 0.5, 1)
+        @test !isapprox(W, Ws; rtol = 1.0e-4)
+    end
+
+    @testset "ASAM with no adaptive leaf is SAM" begin
+        a = train!(Nitro(LinAsamFlat(); data = (; train = DATA), checkpointer = nothing, run_dir = mktempdir()))
+        n = Nitro(LinAsamFlat(); data = (; train = DATA), checkpointer = nothing, run_dir = mktempdir())
+        W0, b0 = Float64.(Array(parameters(n).weight)), Float64.(Array(parameters(n).bias))
+        batches = [(; x = Float64.(d.x), y = Float64.(d.y)) for d in DATA]
+        W, b = sam_reference(W0, b0, batches, 0.5, 1)
+        @test Array(parameters(a).weight) ≈ W rtol = 1.0e-5
+        @test Array(parameters(a).bias) ≈ b rtol = 1.0e-5
+    end
+
+    @testset "an unqualified `eta` schedule still means the learning rate under ASAM" begin
+        n = Nitro(
+            LinAsam(); data = (; train = DATA), checkpointer = nothing, run_dir = mktempdir(),
+            schedules = (; eta = 0.05f0, rho = _ -> t -> 0.5f0)
+        )
+        @test haskey(n.schedules.opt, :eta) && haskey(n.schedules.grad, :rho)
+        @test !haskey(n.schedules.grad, :eta)
+        @test_throws "not supported yet" ASAM(0.5f0; m = 4)
     end
 
     # ── Dropout, RAdam, accumulation: SAM(0) must be the default rule exactly ─────────
