@@ -1194,18 +1194,19 @@ rule for the whole record is write host, read host, normalize on the way in.
 function snapshot(nitro::Nitro)
     lgr = nitro.logger
     state = logger_state(lgr)
+    inner = inner_logger(lgr)
     # A non-`nothing` `logger_state` makes `reattach!` required; checked now rather than hours
     # later at the resume.
     if state !== nothing
-        check_logger_state_serializable(state, lgr)
-        applicable(reattach!, lgr, state) || error(
+        check_logger_state_serializable(state, inner)
+        applicable(reattach!, inner, state) || error(
             """
-            ReactantNitro: `logger_state` on this `$(nameof(typeof(lgr)))` returned
+            ReactantNitro: `logger_state` on this `$(nameof(typeof(inner)))` returned
             $(repr(state)), which makes `reattach!` REQUIRED.
             The pair is self-describing: `logger_state` defaults to `nothing`, meaning "I have no
             resumable state", and then nothing is stored and no reattachment is attempted. Returning
             anything else is a promise this logger cannot keep.
-            Define `ReactantNitro.reattach!(lgr::$(nameof(typeof(lgr))), state)`, or return
+            Define `ReactantNitro.reattach!(lgr::$(nameof(typeof(inner))), state)`, or return
             `nothing`."""
         )
     end
@@ -1219,7 +1220,7 @@ function snapshot(nitro::Nitro)
         run_id = run_id(lgr), run_url = run_url(lgr),
         # Both or neither: storing the type alone would be a refusal waiting to happen on resume.
         logger_state = state,
-        logger_type = state === nothing ? nothing : string(nameof(typeof(lgr))),
+        logger_type = state === nothing ? nothing : string(nameof(typeof(inner))),
         anchor_checksum = nitro.anchor_checksum,
         stop_reason = nitro.stop_reason,
         preset = nitro.preset,                  # the named configuration, if any

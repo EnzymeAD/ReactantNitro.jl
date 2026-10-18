@@ -146,7 +146,8 @@ on failure. Every launch kind drives the phase monitor: an export run reports
 `ExportCompiling` while the trace is in flight (the framework publishes it around the backend
 call), a predict run reports `EvalCompiling` when its `forward` has to compile, and a completed
 run's phase reads `Repl`. The loss and metrics come from a recording logger the tools install
-for each run, which forwards every call to the experiment's own logger. A run that names no logger
+for each run, which forwards every call to the experiment's own logger, resumption state
+included, so a resume with or without the tools continues the same logged run. A run that names no logger
 gets the JSON default, which writes `metrics.jsonl` into the run's directory. `nitro_status` also
 carries a one-line logger summary.
 

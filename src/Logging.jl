@@ -138,6 +138,10 @@ logger of a different type than the one that wrote the record is refused, naming
 function reattach! end
 reattach!(::Nothing, state) = nothing
 
+# The logger a wrapper delegates to. The record's `logger_type` names it, so a resume through a
+# wrapper and one without it agree on the backend.
+inner_logger(lgr) = lgr
+
 """
     backend(lgr) -> Any
 

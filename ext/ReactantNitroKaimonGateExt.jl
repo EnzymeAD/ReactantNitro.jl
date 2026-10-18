@@ -139,7 +139,11 @@ function ReactantNitro.finish!(lgr::RecordingLogger, reason)
     return nothing
 end
 
-ReactantNitro.logger_state(lgr::RecordingLogger) = nothing
+# Forwarded, so a run started through the tools resumes into the same logged run.
+ReactantNitro.logger_state(lgr::RecordingLogger) = ReactantNitro.logger_state(lgr.inner)
+ReactantNitro.reattach!(lgr::RecordingLogger, state) = ReactantNitro.reattach!(lgr.inner, state)
+ReactantNitro.inner_logger(lgr::RecordingLogger) =
+    lgr.inner === nothing ? nothing : ReactantNitro.inner_logger(lgr.inner)
 # Forwarded, so the checkpoint record and the status tools carry the real backend's ids.
 # `applicable` guards the two accessors with no generic default.
 ReactantNitro.run_id(lgr::RecordingLogger) =
@@ -150,7 +154,6 @@ ReactantNitro.run_url(lgr::RecordingLogger) =
     ReactantNitro.run_url(lgr.inner)
 ReactantNitro.logger_info(lgr::RecordingLogger) =
     lgr.inner === nothing ? (;) : ReactantNitro.logger_info(lgr.inner)
-ReactantNitro.reattach!(lgr::RecordingLogger, state) = nothing
 ReactantNitro.backend(lgr::RecordingLogger) = :recording
 # Setup's adoption step, forwarded, so a wrapped default `JSONLogger` still lands in the run dir.
 ReactantNitro._adopt_logger!(lgr::RecordingLogger, dir) =

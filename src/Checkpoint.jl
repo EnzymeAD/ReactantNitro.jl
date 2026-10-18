@@ -1075,6 +1075,7 @@ a logger can be evaluated or exported without one.
 """
 function check_logger_compatible(record, logger, path; weights_only::Bool = false)
     record.logger_state === nothing && return nothing
+    logger = inner_logger(logger)
     logger === nothing && !weights_only && error(
         """
         ReactantNitro: the checkpoint at `$path` carries resumption state for a
