@@ -418,6 +418,15 @@ no_decay_masks(e, ps, layout::FlatLayout; elt::Type = Float32) =
 no_perturb_masks(e, ps, layout::FlatLayout; elt::Type = Float32) =
     leaf_masks((ks, x) -> !no_perturb(e, ks, x), ps, layout; elt)
 
+"""
+    ReactantNitro.adaptive_masks(e, ps, layout; elt = Float32) -> NTuple{G}
+
+[`adaptive_perturb`](@ref) as flat 0/1 buffers (1 scaled by `|w| + eta`), built at construction
+for an [`ASAM`](@ref) run only.
+"""
+adaptive_masks(e, ps, layout::FlatLayout; elt::Type = Float32) =
+    leaf_masks((ks, x) -> adaptive_perturb(e, ks, x), ps, layout; elt)
+
 # One 0/1 flat buffer per group, 1 where `keep(keypath, leaf)` holds.
 function leaf_masks(keep_leaf, ps, layout::FlatLayout{G}; elt::Type = Float32) where {G}
     keep = Dict{Tuple, Bool}()

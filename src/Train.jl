@@ -88,10 +88,10 @@ function micro_grad!(rule::PerturbRule, nitro, gctx, ev, st, b, flag)
     l, gctx.scratch[], st_out, aux =
         grad_call(nitro, gctx, ev, nitro.ps, st, b, gctx.scratch[], gctx.is_first)
     ps_adv = compile_cached(
-        eps_program, ev, rule, nitro.ps, gctx.scratch[], gctx.masks, gctx.lref;
+        eps_program, ev, rule, nitro.ps, gctx.scratch[], gctx.masks, gctx.adaptive, gctx.lref;
         phase = GradCompiling(), nitro,
         worlds = (method_world(perturbation, Tuple{typeof(rule), Any, Any, Any}),)
-    )(rule, nitro.ps, gctx.scratch[], gctx.masks, gctx.lref)
+    )(rule, nitro.ps, gctx.scratch[], gctx.masks, gctx.adaptive, gctx.lref)
     # The same input `st`: the gradient program does not donate it, and reusing it gives pass 2
     # the same RNG key, so dropout draws the same masks.
     l2, nitro.g_accum, _, _ = grad_call(nitro, gctx, ev, ps_adv, st, b, nitro.g_accum, flag)
@@ -462,6 +462,7 @@ function _train!(nitro::Nitro)
     )
     gctx = (;
         is_first, inv_n, lref, tmv, worlds, masks = nitro.decay.perturb,
+        adaptive = nitro.decay.adaptive,
         scratch = Ref{Any}(rule isa PerturbRule ? map(zero, nitro.g_accum) : nothing),
     )
     # The per-run copy of the module-level registry, taken here rather than at construction, so

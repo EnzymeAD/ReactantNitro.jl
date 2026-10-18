@@ -413,3 +413,42 @@ end
     @test num("ema_maxdiff") < 1.0e-5
     @test num("ema_val_rdiff") < 1.0e-5
 end
+
+# ASAM on the mesh: its adaptive masks are replicated like SAM's, and the device count stays
+# throughput only.
+@testitem "multi_device asam" setup = [MultiDevice] timeout = 1200 begin
+    using Test
+
+    ok, got = run_on_two_devices(
+        raw"""
+        using Optimisers
+        @experiment struct AsamExp
+            max_epochs::Int = 2
+        end
+        ReactantNitro.build_model(::AsamExp, rng) = (
+            m = Chain(Dense(4 => 16, tanh), Dropout(0.5f0), Dense(16 => 2));
+            (m, Lux.setup(rng, m)...)
+        )
+        ReactantNitro.forward(::AsamExp, model, ps, st; x) = Lux.apply(model, x, ps, st)
+        ReactantNitro.loss(::AsamExp, ŷ; y) = mean(abs2, ŷ .- y)
+        ReactantNitro.optimizer(::AsamExp) = Optimisers.RAdam
+        ReactantNitro.grad_rule(::AsamExp) = ASAM(0.5f0)
+
+        run!(; n_devs) = train!(Nitro(AsamExp(); run_dir = mktempdir(), n_devs, accum = 2, seed = 5,
+            checkpointer = nothing, data = (; train = vectors(4; seed = 3))))
+
+        try
+            s1 = run!(; n_devs = 1)
+            s2 = run!(; n_devs = 2)
+            record("asam_maxdiff", maxdiff(flat(parameters(s1)), flat(parameters(s2))))
+            record("asam", "ok")
+        catch err
+            record("asam", firstline(err))
+        end
+        """
+    )
+    num(k) = parse(Float64, get(got, k, "NaN"))
+    @test ok
+    @test get(got, "asam", "<missing>") == "ok"
+    @test num("asam_maxdiff") < 1.0e-5
+end

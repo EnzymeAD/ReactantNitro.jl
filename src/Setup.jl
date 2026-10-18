@@ -523,6 +523,8 @@ function _build_nitro(
     masks = training && !manual ? map(m -> place_replicated(m, mesh), no_decay_masks(e, ps, layout)) : nothing
     perturb = training && !manual ?
         map(m -> place_replicated(m, mesh), no_perturb_masks(e, ps, layout)) : nothing
+    # ASAM's per-leaf scaling, built below once the rule is known; `nothing` for any other rule.
+    adaptive = nothing
     # The EMA starts from the weights training starts from; a resume continues the record's.
     resumed = record !== nothing && !weights_only
     ema_weights = if !training || ema === nothing
@@ -572,6 +574,8 @@ function _build_nitro(
             # `rebuild_rules` moves only the VALUES each step; the rule types, and so the `apply!`
             # methods, are these, so resolving the rule worlds here covers the whole run.
             rule0 = build_grad_rule(e, grad_setup_hp(schedules))
+            rule0 isa ASAM &&
+                (adaptive = map(m -> place_replicated(m, mesh), adaptive_masks(e, ps, layout)))
             grad_rule_type = typeof(rule0)
             resolved = resolve_schedules(
                 e, schedules, total;
@@ -632,7 +636,7 @@ function _build_nitro(
             frozen_dispatch(e, model, ps, st, routing, chains; manual, opt_state),
             (; compile_options, grad_rule_type)
         ),
-        (; masks, anchors, perturb), bindings,
+        (; masks, anchors, perturb, adaptive), bindings,
         map(zero, flat), RegisteredMonitor[], Int(step0), Int(epoch0), Starting(),
         false, nothing,
         # No metrics and no elapsed time yet, even for a restored handle.

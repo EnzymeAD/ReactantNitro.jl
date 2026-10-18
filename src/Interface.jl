@@ -445,6 +445,18 @@ function no_perturb end
 no_perturb(e, ks, x) = false
 
 """
+    adaptive_perturb(e, keypath::Tuple, param) -> Bool
+
+Whether [`ASAM`](@ref) scales this leaf's perturbation by its own size, `|w| + eta`, rather than
+leaving it unscaled as [`SAM`](@ref) does. Default: rank-2 and higher leaves (weight matrices and
+kernels); biases, norm affines and 1-element scalar parameters are unscaled. Runs on the host once,
+at construction.
+"""
+function adaptive_perturb end
+
+adaptive_perturb(e, ks, x) = ndims(x) >= 2
+
+"""
     grad_rule(e) -> GradRule
     grad_rule(e, hp) -> GradRule
 

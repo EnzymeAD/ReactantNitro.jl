@@ -90,7 +90,7 @@ export build_data, build_model, forward, loss
 export metrics, train_metrics, finalize_metrics, metrics_residency, derive
 export param_group, optimizer, learning_rate, lambda, decay_anchor, gradient_clip_norm
 # Gradient rules: `grad_rule` picks one; `perturbation` is what a new `PerturbRule` defines.
-export grad_rule, GradRule, SingleGrad, PerturbRule, SAM, perturbation
+export grad_rule, GradRule, SingleGrad, PerturbRule, SAM, ASAM, perturbation, adaptive_perturb
 # Manual training mode: defining `train_step` selects it, `manual_training(e) = false` declines it,
 # `setup_optimizers` supplies the user-owned optimizer states, `backward` and `step_optimizer` are
 # the helpers the closure calls.
