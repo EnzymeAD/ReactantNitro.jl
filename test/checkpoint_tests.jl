@@ -10,7 +10,7 @@
     using ReactantNitro: HostRNG, anchor_checksum, assert_host_record, check_permutation_compatible,
         device_paths, find_latest, from_host, graphconst_fields, is_transient_io,
         read_manifest, sanitize_metric_name, snapshot, to_host, with_io_retry
-    using Functors, JLD2, Lux, Optimisers, Random, Reactant, Statistics
+    using Functors, JLD2, Logging, Lux, Optimisers, Random, Reactant, Statistics
 
     const FC = Float32
 
@@ -194,12 +194,6 @@
 
         load(e = DerivedCode(); weights = path) =
             Nitro(e; weights, run_dir = mktempdir(), logger = nothing, data = (; val = CK_VAL))
-        refusal(f) = try
-            f()
-            nothing
-        catch ex
-            ex
-        end
 
         # Without calling `derive`: an evaluation process may not have what it reads.
         DERIVE_CALLS[] = 0
@@ -207,9 +201,8 @@
         m = load()
         @test m.e.code == "program-a" && DERIVE_CALLS[] == 0
         @test params_of(m) == params_of(n)
-        # A user-set `GraphConst` is still compared.
-        err = refusal(() -> load(DerivedCode(; tag = 2)))
-        @test err isa ErrorException && occursin("tag: 1 -> 2", err.msg)
+        # A user-set `GraphConst` is still compared, and a weights load warns rather than refuses.
+        @test_logs (:warn, r"tag: 1 -> 2") match_mode = :any load(DerivedCode(; tag = 2))
 
         @testset "a record saved without `derived` falls back to `derive`" begin
             # A NamedTuple goes through the same migration as JLD2's reconstruction of an old struct.
@@ -221,14 +214,14 @@
             DERIVE_CALLS[] = 0
             CODE_NOW[] = "program-a"
             @test load(; weights = old).e.code == "program-a" && DERIVE_CALLS[] == 1
-            # `derive` now builds a different program, which the check still refuses.
+            # `derive` now builds a different program, which the check still reports.
             CODE_NOW[] = "program-b"
-            err = refusal(() -> load(; weights = old))
-            @test err isa ErrorException && occursin("code: \"program-a\" -> \"program-b\"", err.msg)
+            @test_logs (:warn, r"code: \"program-a\" -> \"program-b\"") match_mode = :any load(;
+                weights = old
+            )
             # A long value is cut, so the rest of the message survives a size-limited console.
             CODE_NOW[] = repeat("x", 1000)
-            err = refusal(() -> load(; weights = old))
-            @test occursin("(1002 characters)", err.msg) && length(err.msg) < 1000
+            @test_logs (:warn, r"\(1002 characters\)") match_mode = :any load(; weights = old)
         end
     end
 
@@ -473,6 +466,65 @@
         ).epoch == 1
         # A `Host` field may change: raising `max_epochs` on resume is the normal case.
         @test Nitro(CkptMLP(); run_dir = dir, max_epochs = 9).max_epochs == 9   # raised: no warning
+    end
+
+    # A record written before a `GraphConst` field existed, as an older framework run leaves it.
+    function drop_config_field!(path, k)
+        rec = JLD2.load(path, "record")
+        cfg = Base.structdiff(rec.config, NamedTuple{(k,)})
+        vals = map(f -> f === :config ? cfg : getfield(rec, f), fieldnames(CheckpointRecord))
+        JLD2.jldsave(path; record = CheckpointRecord(vals...))
+        return path
+    end
+
+    @testset "a field the record predates is compatible at its default, on resume" begin
+        dir = mktempdir()
+        n = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 1))
+        drop_config_field!(find_latest(n.checkpointer, dir), :tag)
+
+        @test Nitro(CkptMLP(); run_dir = dir, resume = :auto).epoch == 1
+        err = try
+            Nitro(CkptMLP(; tag = 2); run_dir = dir, resume = :auto)
+            nothing
+        catch ex
+            ex
+        end
+        @test err isa ErrorException && occursin("tag: (absent in the checkpoint) -> 2", err.msg)
+    end
+
+    @testset "a weights load warns on a changed config and refuses a mismatched tree" begin
+        dir = mktempdir()
+        n = train!(
+            Nitro(
+                CkptMLP(); run_dir = dir, max_epochs = 3,
+                checkpointer = Checkpointer(; keep = Last(3))
+            )
+        )
+        path = find_latest(n.checkpointer, dir)
+        served = @test_logs (:warn, r"tag: 1 -> 2") match_mode = :any Nitro(
+            CkptMLP(; tag = 2); weights = path, data = (; test = CK_VAL), run_dir = mktempdir()
+        )
+        @test params_of(served) == params_of(n)
+        @test evaluate(served; split = :test).val_loss isa Real
+
+        err = try
+            Nitro(CkptMLP(; width = 8); weights = path, data = (;), run_dir = mktempdir())
+            nothing
+        catch ex
+            ex
+        end
+        @test err isa ErrorException && occursin("does not match the model", err.msg)
+        @test occursin("size (6, 4) in the checkpoint, (8, 4) now", err.msg)
+
+        @testset "averaging reads records written before a field was added" begin
+            for e in read_manifest(dir)
+                drop_config_field!(joinpath(dir, e.file), :tag)
+            end
+            m = @test_logs min_level = Logging.Warn Nitro(
+                CkptMLP(); run_dir = dir, data = (;), weights = :latest => Average(Last(2))
+            )
+            @test occursin("epochs 2, 3", m.checkpoint_source)
+        end
     end
 
     @testset "a changed permutation refuses, naming the leaf that moved" begin

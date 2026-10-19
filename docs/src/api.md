@@ -68,6 +68,7 @@ ReactantNitro.set_phase!
 ReactantNitro.graphconst_field_hash
 ReactantNitro.assert_graphconst_hashable
 ReactantNitro.check_config_compatible
+ReactantNitro.check_record_tree_compatible
 ReactantNitro._stripped_error
 ReactantNitro.check_control_readback
 ReactantNitro.with_io_retry

@@ -396,7 +396,7 @@ function _build_nitro(
 
     # Here rather than between steps 1 and 2 because the field set is not final until `derive`
     # has merged.
-    record === nothing || check_config_compatible(record, e, source)
+    record === nothing || check_config_compatible(record, e, source; weights_only)
 
     # ── 4.5 devices, before conversion places values on the mesh ───────────────────
     progress_phase!("setting up devices")
@@ -415,8 +415,9 @@ function _build_nitro(
     w0_tree = deepcopy(ps)            # step 7: before any restore or step
 
     # Step 6's rebuild happens before the restore, in spite of being thrown away, because the
-    # anchor checksum is verified against a fresh `w0`.
+    # anchor checksum is verified against a fresh `w0` and the record's tree against its layout.
     if record !== nothing
+        check_record_tree_compatible(record, build_layout(e, ps), source)
         # `from_host` first: a record may hold a surrogate (`HostRNG`) that `to_rarray` cannot
         # recognise.
         ps = place_replicated(from_host(to_host(record.ps)), mesh)

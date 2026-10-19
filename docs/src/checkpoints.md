@@ -133,11 +133,16 @@ never overwritten.
 A resume restores the seed from the record, overriding a `seed` keyword with a warning, and
 recomputes derived values by running `derive` again. It refuses, with a diff, when:
 
-1. the `GraphConst` config changed (`Host` fields may change, which is how `max_epochs` is raised)
+1. the `GraphConst` config changed (`Host` fields may change, which is how `max_epochs` is raised;
+   a field added since the record is compatible at its declared default)
 2. the flat parameter permutation moved, which would scramble the optimizer state against the
    parameters
 3. a `:w0` decay anchor does not match its recorded checksum
 4. the logger backend differs from the one whose state is in the record
+
+Every restore refuses a record whose parameter tree does not fit the model, naming the leaf and
+both sizes. A `weights` load only warns about a changed `GraphConst` config: it builds the program
+from the current experiment, so evaluating old weights under a different graph is allowed.
 
 A seed sweep that varies the seed and not `run_dir` resumes into itself under `resume = :auto`; vary
 the directory too.
