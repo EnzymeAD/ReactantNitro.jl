@@ -855,19 +855,26 @@ function load_checkpoint(ckpt::Checkpointer, path)
 end
 
 """
-    ReactantNitro.check_config_compatible(record, e, path) -> nothing
+    ReactantNitro.check_config_compatible(record, e, path; weights_only = false) -> nothing
 
-Refuse, with a diff, a record whose `GraphConst` fields differ from `e`'s. These are the fields the
-compile cache is keyed on, so a change means the run would train a different compiled program.
+Compare a record's `GraphConst` fields with `e`'s. These are the fields the compile cache is keyed
+on, so for a resume a change means the run would train a different compiled program, and it
+refuses with a diff. A weights-only load rebuilds the program from `e` and reuses the parameters
+alone, so it warns with the same diff; the parameter tree is checked separately.
+A field the record predates is compatible while it holds its declared default, which by convention
+reproduces the behaviour from before the field existed.
 `Device` fields are recorded separately in `devices`, and `Host` fields may change on resume.
 Runs after `derive` has merged, so a derived field is compared under the kind it was declared as.
 """
-function check_config_compatible(record, e, path)
+function check_config_compatible(record, e, path; weights_only::Bool = false)
     now = graphconst_fields(e)
     was = record.config
     was isa NamedTuple || error("ReactantNitro: the checkpoint at `$path` has no usable `config` \
         field; it holds a `$(typeof(was))`.")
-    added = setdiff(keys(now), keys(was))
+    added = [
+        k for k in setdiff(keys(now), keys(was))
+            if !isequal(getproperty(now, k), _declared_default(typeof(e), k))
+    ]
     removed = setdiff(keys(was), keys(now))
     changed = [
         k for k in intersect(keys(now), keys(was))
@@ -884,6 +891,14 @@ function check_config_compatible(record, e, path)
     for k in removed
         push!(diff, "  $k: $(_diff_repr(getproperty(was, k))) -> (absent now)")
     end
+    if weights_only
+        @warn """
+        ReactantNitro: the configuration differs from the one the weights at `$path` were trained
+        with:
+        $(join(diff, "\n"))
+        The program is built from the current experiment and only the parameters are loaded."""
+        return nothing
+    end
     error(
         """
         ReactantNitro: the configuration changed since the checkpoint at `$path`, so the run
@@ -893,7 +908,56 @@ function check_config_compatible(record, e, path)
         key, so continuing would silently train a different program than the one being resumed.
         `Device` fields are not compared, since they are traced inputs and cannot change the graph,
         and `Host` fields are not compared, since raising `max_epochs` on resume is the normal case.
+        A field added since the checkpoint is compatible at its declared default.
         Start a fresh run, or pass `resume = false` to train from scratch in this `run_dir`."""
+    )
+end
+
+# The declared default of field `k`, converted to the declared type as the constructor converts a
+# `GraphConst`; `NO_DEFAULT` when there is none or it cannot be evaluated outside the constructor.
+function _declared_default(::Type{E}, k::Symbol) where {E}
+    meta = try
+        config_metadata(E)
+    catch
+        return NO_DEFAULT
+    end
+    haskey(meta, k) || return NO_DEFAULT
+    m = getproperty(meta, k)
+    m.default === NO_DEFAULT && return NO_DEFAULT
+    return try
+        convert(m.type, m.default)
+    catch
+        m.default
+    end
+end
+
+"""
+    ReactantNitro.check_record_tree_compatible(record, layout::FlatLayout, path) -> nothing
+
+Refuse a record whose parameter tree does not fit the model this experiment builds, naming the
+first mismatching leaves by keypath with both sizes. `layout` is the fresh model's, built before
+the record's parameters replace it. Keyed by keypath, so a changed `param_group` is not a mismatch.
+"""
+function check_record_tree_compatible(record, layout::FlatLayout, path)
+    was = Dict(r.keypath => r.size for r in record.flat_permutation)
+    now = Dict(r.keypath => r.size for r in layout.permutation)
+    diff = String[]
+    for r in layout.permutation
+        haskey(was, r.keypath) || push!(diff, "  $(r.keypath): absent in the checkpoint, size $(r.size) now")
+        haskey(was, r.keypath) && was[r.keypath] != r.size &&
+            push!(diff, "  $(r.keypath): size $(was[r.keypath]) in the checkpoint, $(r.size) now")
+    end
+    for r in record.flat_permutation
+        haskey(now, r.keypath) || push!(diff, "  $(r.keypath): size $(r.size) in the checkpoint, absent now")
+    end
+    isempty(diff) && return nothing
+    length(diff) > 6 && (diff = push!(diff[1:6], "  ..."))
+    error(
+        """
+        ReactantNitro: the checkpoint at `$path` holds a parameter tree that does not match the model
+        this experiment builds:
+        $(join(diff, "\n"))
+        This usually means the architecture fields differ from the ones the checkpoint was trained with."""
     )
 end
 
