@@ -36,7 +36,7 @@
         # The per-LEAF decay exclusion. `default_no_decay` is exported
         # alongside the hook so a user can extend the built-ins rather than replace them.
         :no_decay, :default_no_decay, :no_perturb, :EMA, :ema, :ASAM, :adaptive_perturb,
-        :gradient_clip_norm, :schedules, :nonschedulable, :dispatch_variant,
+        :gradient_clip_norm, :schedules, :Plateau, :nonschedulable, :dispatch_variant,
         :grad_rule, :GradRule, :SingleGrad, :PerturbRule, :SAM, :perturbation,
         :max_epochs,
         # Manual training mode. Defining `train_step` for an experiment type is what selects
@@ -46,7 +46,7 @@
         :train_step, :setup_optimizers, :manual_training, :backward, :step_optimizer,
         # The run accessors: each one's `Nitro` keyword defaults to the accessor call, so an
         # experiment declares what it is and a caller passes only what this run changes.
-        :seed, :accum, :n_devs, :checkpointer, :early_stop, :logger, :check_divergence,
+        :seed, :accum, :n_devs, :checkpointer, :early_stop, :monitor, :eval_loss, :logger, :check_divergence,
         :autolog_schedules, :log_every_n_steps,
     ]
     const ENTRY_POINTS = [
@@ -264,8 +264,9 @@
         @test_throws ErrorException load_checkpoint(TopKCheckpointer(), "no-such-file.jld2")
         # The phase system built the policy; the `::Nothing` no-op was shipped with the export
         # skeleton and still holds.
-        @test should_stop(nothing, 1, (; val_loss = 1.0)) === false
-        @test should_stop(EarlyStopping(), 1, (; val_loss = 1.0)) === false
+        @test should_stop(nothing, 1, (; loss = 1.0)) === false
+        @test should_stop(EarlyStopping(; metric = :loss, mode = :min), 1, (; loss = 1.0)) ===
+            false
     end
 
     @testset "the shipped contract methods that are pure declaration" begin
@@ -296,15 +297,16 @@
         @test backend("an experiment handle") == "an experiment handle"
 
         # No early stopping is the default, with no branch in the driver.
-        @test should_stop(nothing, 1, (; val_loss = 1.0)) === false
+        @test should_stop(nothing, 1, (; loss = 1.0)) === false
         es = EarlyStopping()
-        @test es.metric === :val_loss && es.mode === :min && es.patience == 5
+        @test es.metric === nothing && es.mode === nothing && es.patience == 5   # follows `monitor`
 
         # `checkpointer = nothing` is the documented opt-out, with `::Nothing` no-op methods.
         @test save_checkpoint!(nothing, 1, (;), (;)) === nothing
         @test load_checkpoint(nothing, "anywhere") === nothing
         ck = TopKCheckpointer()
-        @test ck.k == 3 && ck.metric === :val_loss && ck.mode === :min
+        @test ck.k == 3 && ck.metric === nothing && ck.mode === nothing   # follows `monitor`
+        @test_throws "alone" TopKCheckpointer(; mode = :max)
     end
 
 end

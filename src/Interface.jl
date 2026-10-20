@@ -81,13 +81,21 @@ switches between train and eval mode and discards the eval-mode `st_new`.
 function forward end
 
 """
-    loss(e, outputs; <declared batch fields>) -> scalar
+    loss(e, outputs; <declared batch fields>) -> scalar or (scalar, terms::NamedTuple)
 
 Required. The scalar Enzyme differentiates, traced together with [`forward`](@ref). `outputs` is
 already the first element of `forward`'s return; do not unpack it again, since `first(outputs)` is
 the first element of the prediction array and the run would train on one sample without an error.
 When an experiment defines no [`metrics`](@ref), the default validation metric calls `loss` with
 the same declared batch fields.
+
+Returning `(l, terms)` also logs each term, a flat `NamedTuple` of scalars, as `loss/<term>`:
+on the train line from the gradient program itself, so nothing is recomputed, and wherever the
+validation loss is reported (see [`eval_loss`](@ref)). Only `l` is differentiated.
+
+```julia
+ReactantNitro.loss(e::MyExp, ŷ; y) = (ce = crossent(ŷ, y); kl = kldiv(ŷ); (ce + 0.1f0 * kl, (; ce, kl)))
+```
 """
 function loss end
 
@@ -119,7 +127,8 @@ must not be returned from `finalize_metrics` unreduced. The tuple `(value, mode)
 spelling of `value => mode` and still works at the top of a key.
 
 `metrics` never sees padding. When the experiment defines none, the framework reports
-`val_loss = loss(e, outputs; ...) => 1`, the mean over batches. `metrics` takes no split argument,
+`loss = loss(e, outputs; ...) => 1`, the mean over batches, on every split. Name metrics without a
+split (`acc`, not `val_acc`): the split is the context they are logged under. `metrics` takes no split argument,
 since that would compile one program per split; branch on the split in
 [`finalize_metrics`](@ref).
 """
@@ -221,7 +230,7 @@ logged on each train line, `(;)` allowed).
 absolute. A bare key (`opt.eta`) sets that field on every rule that has it; a nested key
 (`opt.gen.eta`) is a path into the tree. `accum > 1` is a setup error, and
 [`train_metrics`](@ref) is unused, since `stats` replaces it. The `loss` hook is optional; it is
-needed only for the default `val_loss` when [`metrics`](@ref) is not defined.
+needed only for the default validation `loss` when [`metrics`](@ref) is not defined.
 """
 function train_step end
 
@@ -644,11 +653,10 @@ The run's checkpointer. Default `_field(e, :checkpointer, Checkpointer())`; also
 keyword. `nothing` disables checkpointing. Called once per construction, and not at all when the
 keyword is given.
 
-To rank checkpoints by one of the experiment's own `metrics` keys instead of `:val_loss`, define
-this accessor, so every run ranks the same way:
+Checkpoints rank by the run's [`monitor`](@ref); set that, not a metric here:
 
 ```julia
-ReactantNitro.checkpointer(::MyExp) = Checkpointer(metric = :f1, mode = :max)
+ReactantNitro.monitor(::MyExp) = :f1 => :max
 ```
 """
 function checkpointer end
@@ -672,6 +680,96 @@ handle with no `val` split.
 """
 function early_stop end
 early_stop(e) = _field(e, :early_stop, nothing)
+
+"""
+    monitor(e) -> Pair{Symbol, Symbol} or nothing
+
+The validation metric the run is judged by, as `metric => mode` with `mode` `:min` or `:max`.
+Default `_field(e, :monitor, nothing)`; also a `Nitro` keyword. Left at `nothing`, setup uses
+`:loss => :min` when the validation loss is guaranteed to exist: the experiment defines no
+`metrics`, or [`eval_loss`](@ref) is on. Otherwise there is no default, and setup refuses a
+checkpointer with a `Best` selector, an `EarlyStopping` or a `Plateau` that would follow it. The [`Checkpointer`](@ref),
+[`EarlyStopping`](@ref) and every [`Plateau`](@ref) watch it unless given their own `metric` and
+`mode`, so it is set in one place:
+
+```julia
+ReactantNitro.monitor(::MyExp) = :acc => :max
+```
+
+`metric` is a key of the validation metrics: what [`finalize_metrics`](@ref) returns (by default,
+what [`metrics`](@ref) returns), or `:loss`, which the framework supplies when the experiment
+defines no `metrics`. Metric names carry no split, since the split is the context: the validation
+loss is `:loss` and an accuracy is `:acc`, never `:val_acc`, and a logging backend's display name
+(`validate_acc`) is not the key. With a custom `metrics` the key cannot be checked before validation
+runs, so a misspelled one raises at the end of the first epoch. `:val_loss`, the name before
+0.2.0, is accepted as `:loss` with a warning until 1.0.0.
+"""
+function monitor end
+monitor(e) = _field(e, :monitor, nothing)
+
+"""
+    eval_loss(e) -> Bool
+
+Whether validation and evaluation also report the loss when the experiment defines its own
+[`metrics`](@ref). Default `_field(e, :eval_loss, false)`; also a `Nitro` keyword. When on, each
+eval batch also runs `loss` in its own small compiled program, on the device as in training, and
+`loss` and each `loss/<term>` it returns are added to what [`finalize_metrics`](@ref) returns,
+averaged over batches. A split whose batches lack the fields `loss` reads is skipped. A key that
+`metrics` also returns is an error naming both sources. Without `metrics` the framework reports the
+loss anyway, so the flag changes nothing there.
+
+Prefer it to calling `loss` inside `metrics`: under the default `:host` residency that runs `loss`
+on the CPU, outside the program that trains, with the experiment's `Device` fields still on the
+device.
+"""
+function eval_loss end
+eval_loss(e) = _field(e, :eval_loss, false)
+
+# `:val_loss`, the framework's validation loss key before 0.2.0, is `:loss`; accepted until 1.0.0.
+canonical_metric(m) = m
+function canonical_metric(m::Symbol)
+    m === :val_loss || return m
+    @warn "ReactantNitro: `:val_loss` is now `:loss`. Metric names carry no split: `monitor` and \
+           what follows it read the validation metrics, so the validation loss is `:loss`, as an \
+           accuracy is `:acc` and not `:val_acc`. `:val_loss` is accepted until 1.0.0." maxlog = 1
+    return :loss
+end
+
+const SPLIT_PREFIXES = ("val_", "valid_", "validation_", "validate_", "train_", "test_", "eval_")
+
+# A note for a watched metric named with a split prefix; `""` for any other name.
+function split_prefix_hint(m::Symbol)
+    any(p -> startswith(string(m), p), SPLIT_PREFIXES) || return ""
+    return " Metric names carry no split: the validation metrics are read as `metrics` (or \
+            `finalize_metrics`) returns them, and the framework's validation loss is `:loss`."
+end
+
+"""
+    ReactantNitro.check_monitor(m, what = "`monitor`") -> Pair{Symbol, Symbol}
+
+Refuse anything but `metric => mode` with `mode` `:min` or `:max`. A bare metric is refused, since
+guessing its mode is how an accuracy ends up minimized.
+"""
+function check_monitor(m, what = "`monitor`")
+    m isa Pair && first(m) isa Symbol && last(m) in (:min, :max) &&
+        return canonical_metric(first(m)) => last(m)
+    error(
+        """
+        ReactantNitro: $what is $(repr(m)); it must be `metric => mode` with `mode` `:min` or
+        `:max`, as in `:acc => :max` or `:loss => :min`."""
+    )
+end
+
+# A component's own `metric` and `mode`: both, or neither to follow the run's `monitor`.
+function _own_monitor(metric, mode, what)
+    metric === nothing && mode === nothing && return nothing
+    (metric === nothing || mode === nothing) && error(
+        """
+        ReactantNitro: $what was given `$(metric === nothing ? "mode" : "metric")` alone. Give
+        both `metric` and `mode`, or neither to follow the run's `monitor`."""
+    )
+    return check_monitor(metric => mode, what)
+end
 
 """
     logger(e)

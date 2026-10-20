@@ -33,7 +33,7 @@ count must divide by `accum`.
 
 Schedules run on the host, so ordinary Julia control flow is fine inside them: an `if`, a `for`, a
 call into any library. A schedule need not be a pure function of the step, but one that closes over
-training state does not resume exactly.
+training state does not resume exactly. To react to validation, use [`Plateau`](@ref), which does.
 
 ## The two namespaces
 
@@ -138,6 +138,38 @@ are setup errors naming the offender.
 
 Manual mode uses the same syntax with different values: there are no groups or ratios, a path is a
 path into `opt_state`, and every value is absolute ([Manual training](manual.md)).
+
+## Reacting to validation: `Plateau`
+
+[`Plateau`](@ref) wraps any schedule and scales it down when a validation metric stops improving,
+as PyTorch's `ReduceLROnPlateau` does:
+
+```julia
+schedules(e::MyExp) = (;
+    eta = Plateau(total -> OneCycle(total, 1f-3); patience = 3),
+    device = (; aux_weight = Plateau(0.5f0; metric = :auc, mode = :max, factor = 0.5)),
+)
+```
+
+The value at step `t` is `inner(t) * scale`. The scale starts at 1. After each validation, more
+than `patience` epochs without improvement multiply it by `factor`, floored at `min_scale`, and
+then `cooldown` epochs pass before bad epochs count again. The rule and the defaults are PyTorch's
+(`factor = 0.1`, `patience = 10`, `threshold = 1f-4` relative), so `patience = 2` reduces at the
+third bad epoch. A bare number as `inner` is the plain `ReduceLROnPlateau`.
+
+Every value is a pure function of the step and the run's validation history. The counters are
+stored in each checkpoint, so a resume continues the same sequence; a `weights` load starts fresh.
+Each key has its own counters. A reduction changes a value and never a type, so it recompiles
+nothing.
+
+The validation line logs `schedule/plateau/<key>`, each reduction is reported with `@info`, and the
+binding report marks the key with its metric, mode, factor and patience. Setup requires a `val`
+split, and an experiment without [`metrics`](@ref) can only watch `:loss`.
+
+A plateau watches the run's [`monitor`](@ref), as the checkpointer and [`EarlyStopping`](@ref) do,
+unless given its own `metric` and `mode`, as `aux_weight`'s is above. With a custom `metrics`, a
+metric name cannot be checked until validation first runs, so a misspelled one raises at the end of
+the first epoch, not at setup.
 
 ## How schedules interact with `Device` values
 

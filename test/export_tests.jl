@@ -756,10 +756,10 @@
             # checkpointer, so the handle's own checkpointer is the one that can write.
             writer = Nitro(
                 ExportProv(); data = (;), run_dir = dir,
-                checkpointer = TopKCheckpointer(; k = 1, metric = :val_loss, mode = :min, dir)
+                checkpointer = TopKCheckpointer(; k = 1, metric = :loss, mode = :min, dir)
             )
             save_checkpoint!(
-                writer.checkpointer, 3, (; val_loss = 0.25f0), ReactantNitro.snapshot(writer)
+                writer.checkpointer, 3, (; loss = 0.25f0), ReactantNitro.snapshot(writer)
             )
             # The checkpoint layer's own manifest is a `.jld2` in the same directory, so it has to
             # be excluded or

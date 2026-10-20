@@ -160,7 +160,7 @@ because `stats` come from the closure itself.
 Validation, checkpointing, early stopping, `request_stop!`, phases, and the prefetch pipeline all
 work exactly as in the automatic loop. The eval side (`validate`, `evaluate`, `predict`) never
 consults the mode: it uses `forward` and `metrics`, so a manual experiment defines those for its
-eval surface, and `loss` becomes optional, needed only for the framework's `val_loss`
+eval surface, and `loss` becomes optional, needed only for the framework's `loss`
 substitution when `metrics` is also absent.
 
 ## The very simple GAN

@@ -11,17 +11,17 @@
 """
     Nitro(e; seed, resume, run_dir, data, n_devs, weights, accum, max_epochs, schedules,
              gradient_clip_norm, check_divergence, autolog_schedules, log_every_n_steps, logger,
-             checkpointer, early_stop, ema, run_ref, w0, restore_optimizer, restore_best,
+             checkpointer, early_stop, monitor, eval_loss, ema, run_ref, w0, restore_optimizer, restore_best,
              eval_weights, load_ema, compile_options) -> Nitro
 
 Build a handle for experiment `e` by running the setup sequence below. Nothing is trained or
 compiled.
 
-Fourteen keywords default to the accessor of the same name: [`seed`](@ref), [`run_dir`](@ref),
+Sixteen keywords default to the accessor of the same name: [`seed`](@ref), [`run_dir`](@ref),
 [`n_devs`](@ref), [`accum`](@ref), [`max_epochs`](@ref), [`schedules`](@ref),
 [`gradient_clip_norm`](@ref), [`check_divergence`](@ref), [`autolog_schedules`](@ref),
-[`log_every_n_steps`](@ref), [`logger`](@ref), [`checkpointer`](@ref), [`early_stop`](@ref) and
-[`ema`](@ref).
+[`log_every_n_steps`](@ref), [`logger`](@ref), [`checkpointer`](@ref), [`early_stop`](@ref),
+[`monitor`](@ref), [`eval_loss`](@ref) and [`ema`](@ref).
 Passing one replaces the accessor's value for this run; omitting it calls the accessor, before
 step 1. `data`, `weights`, `resume` and `run_ref` have no accessor, since each names a fact about
 this construction: `data` supplies the collection and skips `build_data`, and `run_ref`, a `Ref`,
@@ -153,7 +153,7 @@ average of records' (`run => Average(sel)`), or another handle's. A source witho
 transferred parameters, for L2-SP fine-tuning), or a parameter tree.
 
 `checkpoint = path` is the deprecated spelling of `weights = path`. It still works, warns once, and
-is removed in 0.2.0.
+will be removed in a later release.
 
 **Without a `train` split** steps 9 and 11 are skipped. Routing falls back to the first batch of
 whichever split exists; with no split at all it is deferred to the first `predict` call.
@@ -184,7 +184,7 @@ end
 # heartbeat. The keyword defaults live here, on the function that reads `e`.
 function _build_nitro(
         e;
-        # Fourteen keywords default to an accessor of the same name, so an experiment
+        # Sixteen keywords default to an accessor of the same name, so an experiment
         # declares what it IS and a caller passes only what this run changes.
         seed::Integer = ReactantNitro.seed(e),
         run_dir::AbstractString = ReactantNitro.run_dir(e),
@@ -199,6 +199,8 @@ function _build_nitro(
         logger = ReactantNitro.logger(e),
         checkpointer = ReactantNitro.checkpointer(e),
         early_stop = ReactantNitro.early_stop(e),
+        monitor = ReactantNitro.monitor(e),
+        eval_loss::Bool = ReactantNitro.eval_loss(e),
         ema = ReactantNitro.ema(e),
         # A preset name is a fact about how this handle was built; `Nitro(E, :name)` sets it.
         preset::Union{Symbol, Nothing} = nothing,
@@ -219,7 +221,7 @@ function _build_nitro(
         eval_weights = nothing,
         # Whether a `weights` source's average is loaded in place of its weights.
         load_ema::Bool = false,
-        # DEPRECATED spelling of `weights = path`; removed in 0.2.0.
+        # DEPRECATED spelling of `weights = path`; to be removed in a later release.
         checkpoint = nothing,
         # PROTOTYPE: hooks supplied as values shadow the method of the same name (Hooks.jl).
         hooks = (;),
@@ -229,6 +231,13 @@ function _build_nitro(
         compile_options = (;)
     )
     check_hooks(hooks)
+    monitor === nothing || (monitor = check_monitor(monitor))
+    # Resolved before anything ranks, `weights = run => :best` included; whether `metrics` is
+    # defined is a fact about methods, so no data is needed.
+    monitor = resolve_monitor(
+        monitor, declared(hook_fn(hooks, :metrics, metrics), Tuple{typeof(e), Any}) !== nothing,
+        eval_loss
+    )
     compile_options = check_compile_options(compile_options)
     eval_weights = check_ema(ema, eval_weights, load_ema, weights)
     if checkpoint !== nothing
@@ -247,6 +256,8 @@ function _build_nitro(
     # explicit `dir` adopts it here. An explicit `dir` pins it and is never overwritten.
     checkpointer isa Checkpointer && checkpointer.dir === nothing &&
         (checkpointer.dir = String(run_dir))
+    # Every setup, so a checkpointer reused across handles follows the current one's `monitor`.
+    checkpointer isa Checkpointer && (checkpointer.monitor = monitor)
     # The filename hook is bound here too, as a closure calling the generic function, so
     # `save_checkpoint!` never receives `e` (an object full of device leaves handed to the
     # serializer) and a revised `checkpoint_filename` takes effect on the next write.
@@ -504,10 +515,12 @@ function _build_nitro(
 
     # Here because both need the split collection and the resolved routing: a policy with no `val`
     # split, or naming a metric the experiment cannot emit, is a configuration error.
-    check_early_stop(early_stop, collection, routing)
+    check_monitor_emitted(monitor, collection, routing)
+    training && check_monitor_needed(monitor, checkpointer, early_stop, nothing)
     early_stop = setup_early_stop(
-        early_stop, record !== nothing && !weights_only ? record.early_stop : nothing
+        early_stop, record !== nothing && !weights_only ? record.early_stop : nothing, monitor
     )
+    check_early_stop(early_stop, collection, routing)
     check_checkpointer(checkpointer, collection, routing)
     training && warn_keep_latest(checkpointer, resume)
     training && warn_retention_scope(checkpointer)
@@ -592,6 +605,10 @@ function _build_nitro(
             landed = check_grad_bindings(e, resolved, bindings.landed)
             bindings = merge(bindings, (; landed))
         end
+        check_monitor_needed(monitor, nothing, nothing, resolved)
+        follow_monitor!(resolved, monitor)
+        check_plateaus(resolved, collection, routing)
+        resumed && restore_plateaus!(resolved, record.schedule_state)
     end
 
     # ── 12. the logger, BEFORE the first compile, which can crash ──────────────────
@@ -635,6 +652,7 @@ function _build_nitro(
         record === nothing ? nothing : record.run_url,
         String(run_dir), Int(seed), Int(accum), Int(max_epochs), gradient_clip_norm,
         check_divergence, autolog_schedules, Int(log_every_n_steps), checkpointer, early_stop,
+        monitor, eval_loss,
         probe_accessors(e),
         # The compile options ride with the dispatch freeze: both are compile-cache key components
         # fixed at construction (Cache.jl `compile_cached`).
@@ -654,6 +672,7 @@ function _build_nitro(
         record !== nothing && weights_only ? record.averaged_from : nothing,
         ema, ema_weights, eval_weights
     )
+    training && warn_split_prefixes(watchers(nitro))
     # Two builds from one set of pieces: the text goes to `log_other!` so the record says where
     # every value bound, and the sections are what `show(nitro)` appends to the handle's display.
     # Nothing is printed here; a constructor that printed its return value would display the
@@ -951,7 +970,7 @@ The deprecation notice for `Nitro(...; checkpoint = path)`, logged once per sess
 """
 function warn_checkpoint_keyword()
     @warn "ReactantNitro: `Nitro(...; checkpoint = path)` is deprecated and will be removed in \
-           0.2.0. Use `weights = path`, which loads the same parameters, or `weights = :latest => \
+           a later release. Use `weights = path`, which loads the same parameters, or `weights = :latest => \
            :best` / `weights = :latest => :latest` for a checkpoint of `run_dir`." maxlog = 1
     return nothing
 end
@@ -1054,7 +1073,7 @@ end
 
 const DRIVER_ONLY_FIELDS = (
     :seed, :max_epochs, :run_dir, :n_devs, :logger, :checkpointer,
-    :early_stop, :check_divergence, :autolog_schedules, :log_every_n_steps,
+    :early_stop, :monitor, :eval_loss, :check_divergence, :autolog_schedules, :log_every_n_steps,
 )
 
 """
@@ -1667,7 +1686,7 @@ end
 # fire their side effects and compare by identity anyway; a revised one is not detected here.
 const _PROBED = (
     :seed, :accum, :max_epochs, :gradient_clip_norm, :check_divergence, :autolog_schedules,
-    :log_every_n_steps, :run_dir,
+    :log_every_n_steps, :run_dir, :monitor, :eval_loss,
 )
 
 """

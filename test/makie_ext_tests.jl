@@ -13,11 +13,11 @@
     end
 
     rows = NamedTuple[
-        (; epoch = i, step = 4i, loss = 1.0 / i, mae = 0.5 + abs(i - 23) / 100, another = i / 7)
+        (; epoch = i, step = 4i, train_loss = 1.0 / i, mae = 0.5 + abs(i - 23) / 100, another = i / 7)
             for i in 1:40
     ]
     h = MetricHistory(
-        :Synth, "runs/synth", rows, [:epoch, :step, :loss, :mae, :another],
+        :Synth, "runs/synth", rows, [:epoch, :step, :train_loss, :mae, :another],
         Pair{Symbol, String}[:cm => "2x2"], (; metric = :mae, mode = :min, epoch = 23), 1
     )
     axes_of(fig) = [c for c in fig.content if c isa Axis]
@@ -45,7 +45,7 @@
         axes = axes_of(fig)
         @test length(axes) == 3
         @test all(ax -> ax.xlabel[] == "step", axes)
-        @test [ax.title[] for ax in axes] == ["loss", "mae (min), best at epoch 23", "another"]
+        @test [ax.title[] for ax in axes] == ["train_loss", "mae (min), best at epoch 23", "another"]
         # Only the checkpointer's panel carries a star.
         @test count(ax -> any(p -> p isa Scatter, ax.scene.plots), axes) == 1
         # Indexing narrows what the plot sees.
@@ -58,7 +58,7 @@
     @testset "the layout embeds in a caller's figure" begin
         fig = Figure()
         plot(fig[1, 1], h)
-        plot(fig[2, 1], h; metrics = :loss)
+        plot(fig[2, 1], h; metrics = :train_loss)
         @test length(axes_of(fig)) == 2
     end
 end

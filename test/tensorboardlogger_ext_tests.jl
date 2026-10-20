@@ -29,7 +29,7 @@
         lg = TBLogger(joinpath(mktempdir(), "run"), tb_overwrite)
 
         log_metrics!(lg, (; loss = 0.31, acc = 0.9); step = 4, epoch = 1, context = "train")
-        log_metrics!(lg, (; val_loss = 0.29); step = 8, epoch = 1, context = "validate")
+        log_metrics!(lg, (; loss = 0.29); step = 8, epoch = 1, context = "validate")
         log_metrics!(lg, (; data_wait_frac = 0.01); step = 8, epoch = 1, context = "data")
         log_other!(lg, "elapsed", 12.5)
 
@@ -38,11 +38,11 @@
         seen = Dict{String, Tuple{Int, Float32}}()
         map_summaries((n, s, v) -> (seen[n] = (s, v)), logdir(lg))
 
-        # Every context prefixes its own tags, so `train/loss` and `validate/val_loss` are
+        # Every context prefixes its own tags, so `train/loss` and `validate/loss` are
         # separate series rather than one series whose meaning depends on the caller.
         @test seen["train/loss"] == (4, 0.31f0)
         @test seen["train/acc"] == (4, 0.9f0)
-        @test seen["validate/val_loss"] == (8, 0.29f0)
+        @test seen["validate/loss"] == (8, 0.29f0)
         @test seen["data/data_wait_frac"] == (8, 0.01f0)
         # The epoch rides along in each context, which is what lets a curve be read back against
         # epoch without the run directory.

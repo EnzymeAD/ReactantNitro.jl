@@ -6,7 +6,7 @@
 #
 # THE AUDIT IS THE POINT, AND THE BARE-RUN TEST IS ITS ACCEPTANCE. The failure this file exists to
 # catch is not a wrong default, it is two right ones that cannot both be taken: `metrics`
-# defaulting to nothing and a checkpointer defaulting to `metric = :val_loss` were each defensible
+# defaulting to nothing and a checkpointer defaulting to `metric = :loss` were each defensible
 # and jointly unusable, which
 # is how the `TopKCheckpointer(metric)` gap arose. So the row-by-row testsets below are the cheap
 # half, and the last two testsets, which run the whole chain with NOTHING PASSED, are the point.
@@ -174,7 +174,7 @@
             @test n.early_stop === nothing
             @test isempty(n.schedules)                 # `schedules(e)` is `(;)`, so nothing varies
             @test n.checkpointer isa Checkpointer
-            @test (n.checkpointer.k, n.checkpointer.metric, n.checkpointer.mode) == (3, :val_loss, :min)
+            @test (n.checkpointer.k, n.checkpointer.metric, n.checkpointer.mode) == (3, :loss, :min)
             # By default, `n_devs = 1` skips the mesh entirely rather than building a one-device
             # one.
             @test n.mesh === nothing
@@ -263,8 +263,8 @@
 
         @testset "it validated, through the metrics substitution, not a `metrics` method" begin
             m = validate(n)
-            @test keys(m) == (:val_loss,)
-            @test m.val_loss isa Real && isfinite(m.val_loss)
+            @test keys(m) == (:loss,)
+            @test m.loss isa Real && isfinite(m.loss)
         end
 
         @testset "it checkpointed, into the default `run_dir`, relative to the working directory" begin
@@ -278,7 +278,7 @@
             @test read_manifest(BARE_DIR)[1].file ==
                 only(filter(f -> endswith(f, ".jld2") && f != "manifest.jld2", readdir(BARE_DIR)))
             @test occursin(
-                Regex("^epoch-0001-step-$(length(BARE_TRAIN))-val_loss=[-0-9.e+]+\\.jld2\$"),
+                Regex("^epoch-0001-step-$(length(BARE_TRAIN))-loss=[-0-9.e+]+\\.jld2\$"),
                 read_manifest(BARE_DIR)[1].file
             )
             @test isfile(BARE_CKPT1())
@@ -289,11 +289,11 @@
             @test rec.config == NamedTuple()                 # no GraphConst fields to bake or compare
             @test rec.devices == NamedTuple()
             @test rec.stop_reason === :completed
-            # THE ROW THIS TEST IS NAMED FOR: the default checkpointer selects on `:val_loss`, and
+            # THE ROW THIS TEST IS NAMED FOR: the default checkpointer selects on `:loss`, and
             # the only reason that key exists is the metrics substitution for an experiment
             # defining no `metrics`.
             # Two defaults, jointly usable, which is the whole claim this audit is checking.
-            @test keys(rec.metrics) == (:val_loss,)
+            @test keys(rec.metrics) == (:loss,)
             @test read_manifest(BARE_DIR)[1].score isa Float64
         end
 
@@ -331,8 +331,8 @@
             # entry's score became `nothing` and that epoch dropped out of the top-K ranking. Silent, on
             # the default path, and reachable by running `train!` twice.
             after = load_checkpoint(TopKCheckpointer(), BARE_CKPT1())
-            @test keys(after.metrics) == (:val_loss,)
-            @test after.metrics.val_loss == before.metrics.val_loss
+            @test keys(after.metrics) == (:loss,)
+            @test after.metrics.loss == before.metrics.loss
             @test after.stop_reason === :completed
             @test read_manifest(BARE_DIR)[1].score isa Float64
         end
@@ -355,12 +355,12 @@
             # check exists. An experiment defining no `metrics` cannot select on anything else, and the
             # framework says so AT SETUP rather than an epoch later, naming the substitution.
             err = try
-                check_checkpointer(TopKCheckpointer(; metric = :mae), collection, routing)
+                check_checkpointer(TopKCheckpointer(; metric = :mae, mode = :min), collection, routing)
             catch ex
                 ex
             end
             @test err isa ErrorException
-            @test occursin("val_loss", err.msg) && occursin("defines no", err.msg)
+            @test occursin("loss", err.msg) && occursin("defines no", err.msg)
         end
 
         @testset "`checkpointer = nothing` is the documented opt-out, and nothing else changes" begin

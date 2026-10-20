@@ -32,12 +32,12 @@ using PrecompileTools: @setup_workload, @compile_workload
         try
             # The default filename method, which nearly every run uses.
             ckpt = Checkpointer(;
-                keep = Best(1), metric = :val_loss, mode = :min, dir,
+                keep = Best(1), metric = :loss, mode = :min, dir,
                 name = (; kwargs...) -> checkpoint_filename(nothing; kwargs...)
             )
             # Two writes: the second exercises retention, and carried its own seconds.
-            save_checkpoint!(ckpt, 1, (; val_loss = 1.0f0), snap)
-            save_checkpoint!(ckpt, 2, (; val_loss = 0.5f0), merge(snap, (; epoch = 2, step = 2)))
+            save_checkpoint!(ckpt, 1, (; loss = 1.0f0), snap)
+            save_checkpoint!(ckpt, 2, (; loss = 0.5f0), merge(snap, (; epoch = 2, step = 2)))
             # The read side, which a `resume` pays on its way in rather than on its way out.
             entries = read_manifest(dir)
             isempty(entries) || load_checkpoint(ckpt, joinpath(dir, first(entries).file))

@@ -34,6 +34,7 @@ Everything a checkpoint holds: the `snapshot` passed to [`save_checkpoint!`](@re
 | `early_stop` | optional | The early-stopping counters, so a resume continues its patience |
 | `averaged_from` | optional | For an averaged record, what it averages: the spec, run, directory, files, epochs, weights and the state's file |
 | `ema` | optional | The weights' exponential moving average ([`EMA`](@ref)), a tree like `ps`; `nothing` without one |
+| `schedule_state` | optional | Each [`Plateau`](@ref) schedule's counters, by key, so a resume continues its sequence |
 
 Every value is a host value; setup moves them to the device when it loads a record.
 """
@@ -65,6 +66,8 @@ struct CheckpointRecord
     averaged_from::Any
     # The weights' moving average, when the run kept one; `nothing` otherwise and in older records.
     ema::Any
+    # Each `Plateau` schedule's counters by key; `nothing` without one and in older records.
+    schedule_state::Any
 end
 
 # ── Showing a record never shows the weights ─────────────────────────────────────────
@@ -217,7 +220,7 @@ admits(sel::Every, pool, ckpt, epoch, score) = epoch % sel.n == 0
 # ── The checkpointer ────────────────────────────────────────────────────────────────
 
 """
-    Checkpointer(; keep = (Best(3), Last(1)), metric = :val_loss, mode = :min, dir = nothing,
+    Checkpointer(; keep = (Best(3), Last(1)), metric = nothing, mode = nothing, dir = nothing,
                    name = nothing, scope = :run)
 
 The default checkpointer. After each epoch it writes a full [`CheckpointRecord`](@ref) into
@@ -232,9 +235,10 @@ Checkpointer(; keep = Last(5))               # a rolling window
 Checkpointer(; keep = Best(3))               # the best 3 only
 ```
 
-`metric` must be a key the experiment's `metrics` emits. The default, `:val_loss`, is what the
-framework emits when the experiment defines no `metrics`; setup checks that case, and otherwise a
-missing key is an error at the first checkpoint. `dir` and `name` left as `nothing` are filled in
+`metric` and `mode` default to `nothing`, which follows the run's [`monitor`](@ref); give both to
+rank by something else. Setup fills a following checkpointer in, every time it builds a `Nitro`. A
+checkpointer used without setup (in [`average_checkpoints`](@ref), say) ranks by the metric and
+mode the run's newest scored entry was written under. `dir` and `name` left as `nothing` are filled in
 at setup: `dir` with `run_dir`, and `name`, the filename function
 `name(; epoch, step, metric, score)`, with the experiment's [`checkpoint_filename`](@ref).
 
@@ -277,8 +281,10 @@ deprecated.
 """
 mutable struct Checkpointer
     keep::Tuple
-    metric::Symbol
-    mode::Symbol
+    # The checkpointer's own selection; `nothing` follows `monitor` (read through `getproperty`).
+    own::Union{Pair{Symbol, Symbol}, Nothing}
+    # The run's `monitor`, assigned at setup.
+    monitor::Union{Pair{Symbol, Symbol}, Nothing}
     dir::Union{String, Nothing}
     name::Any
     manifest::Any
@@ -290,12 +296,37 @@ mutable struct Checkpointer
 end
 
 function Checkpointer(;
-        keep = (Best(3), Last(1)), metric::Symbol = :val_loss, mode::Symbol = :min,
-        dir::Union{String, Nothing} = nothing, name = nothing, scope::Symbol = :run
+        keep = (Best(3), Last(1)), metric::Union{Symbol, Nothing} = nothing,
+        mode::Union{Symbol, Nothing} = nothing, dir::Union{String, Nothing} = nothing,
+        name = nothing, scope::Symbol = :run
     )
     check_scope(scope)
     keep = check_keep(keep isa Selector ? (keep,) : Tuple(keep))
-    return Checkpointer(keep, metric, mode, dir, name, nothing, nothing, nothing, scope)
+    own = _own_monitor(metric, mode, "the checkpointer")
+    return Checkpointer(keep, own, nothing, dir, name, nothing, nothing, nothing, scope)
+end
+
+# The selection in force: the checkpointer's own, else the run's `monitor`; `nothing` before setup.
+_selection(c::Checkpointer) = something(getfield(c, :own), getfield(c, :monitor), Some(nothing))
+
+# A copy that ranks by `sel`, for a checkpointer used without setup.
+_with_monitor(c::Checkpointer, sel) = Checkpointer(
+    c.keep, getfield(c, :own), sel, c.dir, c.name, c.manifest, c.run, c.parent, c.scope
+)
+
+"""
+    ReactantNitro.bind_selection(ckpt, entries) -> ckpt
+
+`ckpt` itself when it has a selection, else a copy ranking by the metric and mode the newest
+scored entry of `entries` was written under. `ckpt` unchanged when no entry is scored.
+"""
+bind_selection(ckpt, entries) = ckpt
+function bind_selection(ckpt::Checkpointer, entries)
+    _selection(ckpt) === nothing || return ckpt
+    scored = [e for e in entries if e.score !== nothing && e.metric !== nothing]
+    isempty(scored) && return ckpt
+    e = scored[argmax([e.written for e in scored])]
+    return _with_monitor(ckpt, e.metric => e.mode)
 end
 
 function check_keep(keep::Tuple)
@@ -322,20 +353,25 @@ end
 function Base.getproperty(c::Checkpointer, s::Symbol)
     s === :k && return maximum((sel.k for sel in getfield(c, :keep) if sel isa Best); init = 0)
     s === :keep_latest && return any(sel -> sel isa Last, getfield(c, :keep))
+    s === :metric && return (sel = _selection(c); sel === nothing ? nothing : first(sel))
+    s === :mode && return (sel = _selection(c); sel === nothing ? nothing : last(sel))
     return getfield(c, s)
 end
-Base.propertynames(::Checkpointer) = (fieldnames(Checkpointer)..., :k, :keep_latest)
+Base.propertynames(::Checkpointer) =
+    (fieldnames(Checkpointer)..., :metric, :mode, :k, :keep_latest)
 
 """
-    TopKCheckpointer(; k = 3, metric = :val_loss, mode = :min, dir = nothing, name = nothing,
+    TopKCheckpointer(; k = 3, metric = nothing, mode = nothing, dir = nothing, name = nothing,
                        keep_latest = true, scope = :run) -> Checkpointer
 
 Deprecated: use [`Checkpointer`](@ref)`(; keep = (Best(k), Last(1)))`, or `keep = Best(k)` for
 `keep_latest = false`. Builds exactly that `Checkpointer`, so the files and the manifest are the
-same as before. Warns once per session; supported until at least 1.0.0.
+same as before. Warns once per session; supported until at least 1.0.0. `metric` and `mode` follow
+[`monitor`](@ref) as `Checkpointer`'s do.
 """
 function TopKCheckpointer(;
-        k::Int = 3, metric::Symbol = :val_loss, mode::Symbol = :min,
+        k::Int = 3, metric::Union{Symbol, Nothing} = nothing,
+        mode::Union{Symbol, Nothing} = nothing,
         dir::Union{String, Nothing} = nothing, name = nothing, keep_latest::Bool = true,
         scope::Symbol = :run
     )
@@ -377,21 +413,27 @@ function save_checkpoint! end
 save_checkpoint!(::Nothing, epoch, metrics, snapshot) = nothing
 
 function save_checkpoint!(ckpt::Checkpointer, epoch, metrics, snapshot)
+    # Without a selection only unranked selectors work: setup refuses a `Best` with no monitor.
+    ckpt.metric === nothing && any(s -> s isa Best, ckpt.keep) && error(
+        "ReactantNitro: this `Checkpointer` ranks with `Best` and has no metric: it follows the \
+         run's `monitor`, which `Nitro` setup fills in. Give it `metric` and `mode` to save with \
+         it by hand."
+    )
     dir = checkpoint_dir(ckpt)
     mkpath(dir)
     # The selection metric drives retention, which is control flow, so the readback is validated.
     # A metric that is only logged is not, and that asymmetry is deliberate.
-    score = haskey(metrics, ckpt.metric) ?
+    score = ckpt.metric !== nothing && haskey(metrics, ckpt.metric) ?
         check_control_readback(
             getproperty(metrics, ckpt.metric), "the checkpointer",
             ckpt.metric
         ) : nothing
-    (score === nothing && !isempty(metrics)) && error(
+    (score === nothing && ckpt.metric !== nothing && !isempty(metrics)) && error(
         """
         ReactantNitro: the checkpointer selects on `$(ckpt.metric)`, which `metrics` does not emit.
         The available metrics are $(keys(metrics)).
-        `:val_loss` is not a magic name: it is what the framework substitutes when an experiment
-        defines no `metrics`. An experiment defining its own names one of its own keys."""
+        `:loss` is what the framework supplies when an experiment defines no `metrics`; an
+        experiment defining its own names one of its own keys.$(split_prefix_hint(ckpt.metric))"""
     )
     (score === nothing && all(sel -> sel isa Best, ckpt.keep)) && error(
         """
@@ -427,7 +469,8 @@ function save_checkpoint!(ckpt::Checkpointer, epoch, metrics, snapshot)
         hasproperty(snapshot, :derived) ? snapshot.derived : nothing,
         hasproperty(snapshot, :early_stop) ? snapshot.early_stop : nothing,
         nothing,
-        hasproperty(snapshot, :ema) ? snapshot.ema : nothing
+        hasproperty(snapshot, :ema) ? snapshot.ema : nothing,
+        hasproperty(snapshot, :schedule_state) ? snapshot.schedule_state : nothing
     )
 
     name = owned_name(
@@ -599,13 +642,18 @@ function read_manifest(dir)
         ManifestEntry(
             (
                 String(e.file), Int(e.epoch), e.score, e.stop_reason,
-                field(e, :run, nothing), field(e, :metric, nothing), field(e, :mode, nothing),
+                field(e, :run, nothing), _migrate_metric(field(e, :metric, nothing)),
+                field(e, :mode, nothing),
                 Float64(field(e, :written, 0.0)), field(e, :parent, nothing),
             )
         )
             for e in raw
     ]
 end
+
+# Entries scored before 0.2.0 name the validation loss `:val_loss`; it is `:loss` now, so they keep
+# ranking with the entries written since. Silent, since nothing is wrong with the run. Until 1.0.0.
+_migrate_metric(m) = m === :val_loss ? :loss : m
 
 # The runs a manifest holds, most recent first: ordered by each run's latest `written`, so the
 # unnamed legacy run, written at `0.0`, is the oldest.
@@ -673,7 +721,7 @@ end
 
 The filename of a checkpoint; a hook a model package may extend.
 
-    epoch-0006-step-4500-val_loss=0.0416831.jld2
+    epoch-0006-step-4500-loss=0.0416831.jld2
     epoch-0006-step-4500.jld2                          # a run with no `val` split
 
 The epoch comes first, zero-padded, so lexicographic order is training order; the step is
@@ -810,7 +858,7 @@ _load_record_quietly(path) = Base.CoreLogging.with_logger(
 )
 
 # Field-shape migrations: the `tunables` to `devices` rename, and the additions of `preset`,
-# `derived`, `early_stop`, `averaged_from` and `ema`.
+# `derived`, `early_stop`, `averaged_from`, `ema` and `schedule_state`.
 # JLD2 reconstructs an old record as a ReconstructedMutable with the on-disk field names, and the
 # rename is done here. A function because `checkpoint_info` reads the same records. FORMAT_VERSION
 # stays 1, since the semantics did not change.
@@ -818,7 +866,7 @@ function _migrate_record(raw, path = "<record>")
     raw isa CheckpointRecord && return raw
     if hasproperty(raw, :tunables) || !hasproperty(raw, :preset) || !hasproperty(raw, :derived) ||
             !hasproperty(raw, :early_stop) || !hasproperty(raw, :averaged_from) ||
-            !hasproperty(raw, :ema)
+            !hasproperty(raw, :ema) || !hasproperty(raw, :schedule_state)
         return CheckpointRecord(
             raw.format_version, raw.framework_version,
             raw.ps, raw.st, raw.opt_state, raw.flat_permutation,
@@ -830,7 +878,8 @@ function _migrate_record(raw, path = "<record>")
             hasproperty(raw, :derived) ? raw.derived : nothing,
             hasproperty(raw, :early_stop) ? raw.early_stop : nothing,
             hasproperty(raw, :averaged_from) ? raw.averaged_from : nothing,
-            hasproperty(raw, :ema) ? raw.ema : nothing
+            hasproperty(raw, :ema) ? raw.ema : nothing,
+            hasproperty(raw, :schedule_state) ? raw.schedule_state : nothing
         )
     end
     return error("ReactantNitro: `$path` does not hold a `CheckpointRecord`; it holds a \
@@ -1189,8 +1238,8 @@ end
 """
     ReactantNitro.check_checkpointer(ckpt, collection, routing) -> nothing
 
-The checkpointer's setup-time checks: `k`, `mode`, `scope`, and the selection metric when the
-experiment defines no `metrics`, so that the only key is `:val_loss`. With a `metrics` method the
+The checkpointer's setup-time checks: `k`, `scope`, and the selection metric when the
+experiment defines no `metrics`, so that the only key is `:loss`. With a `metrics` method the
 keys exist only once it has run, and [`save_checkpoint!`](@ref) raises at the first checkpoint
 instead. A run with no `val` split passes, since the newest checkpoint is kept regardless, except
 under `keep_latest = false`, which keeps nothing unscored: a handle with a `train` split and no
@@ -1199,18 +1248,17 @@ under `keep_latest = false`, which keeps nothing unscored: a handle with a `trai
 check_checkpointer(::Nothing, collection, routing) = nothing
 
 function check_checkpointer(ckpt::Checkpointer, collection, routing)
-    ckpt.mode in (:min, :max) || error("ReactantNitro: the checkpointer's `mode` is \
-        $(repr(ckpt.mode)); it must be `:min` or `:max`.")
+    # `mode` was checked at construction (`check_monitor`).
     check_scope(ckpt.scope)
     check_keep(ckpt.keep)
     (
         haskey(collection, :val) && routing !== nothing && routing.metrics === nothing &&
-            ckpt.metric !== :val_loss
+            ckpt.metric !== nothing && ckpt.metric !== :loss
     ) && error(
         """
         ReactantNitro: the checkpointer selects on `$(ckpt.metric)`, and this experiment defines no
-        `metrics` method, so the only metric the framework will emit is `:val_loss`.
-        Either select on `:val_loss`, or define `metrics` emitting `$(ckpt.metric)`."""
+        `metrics` method, so the only metric the framework will emit is `:loss`, the validation loss.
+        Either select on `:loss`, or define `metrics` emitting `$(ckpt.metric)`.$(split_prefix_hint(ckpt.metric))"""
     )
     (all(sel -> sel isa Best, ckpt.keep) && haskey(collection, :train) && !haskey(collection, :val)) && error(
         """
@@ -1324,6 +1372,7 @@ selected_checkpoint(::Nothing, run_dir; run = :recent) = nothing
 function selected_checkpoint(ckpt::Checkpointer, run_dir; run = :recent)
     dir = lookup_dir(ckpt, run_dir)
     scope = run_scope(dir, run)
+    ckpt = bind_selection(ckpt, scope.entries)
     scored = [e for e in scope.entries if e.score !== nothing && same_selection(e, ckpt)]
     isempty(scored) && return nothing
     pick = ckpt.mode === :max ? argmax : argmin
@@ -1628,6 +1677,7 @@ function resolve_average(ckpt, run_dir, run, avg::Average; what)
          layout check across runs. Name one run: `:latest => $(avg)` or `\"<run id>\" => $(avg)`."
     )
     pool, label, dir, r = run_pool(ckpt, run_dir, run; what)
+    ckpt = bind_selection(ckpt, pool)
     view = (; run = r, metric = ckpt.metric, mode = ckpt.mode, scope = :run)
     ranks(avg.sel) && warn_mixed_metrics(pool, ckpt, what)
     picked = sort(select(avg.sel, pool, view); by = e -> e.epoch)
@@ -1783,6 +1833,7 @@ function resolve_checkpoint(ckpt, run_dir, run, which::Symbol; what)
     pick = if which === :latest
         pool[argmax([e.epoch for e in pool])]
     else
+        ckpt = bind_selection(ckpt, pool)
         warn_mixed_metrics(pool, ckpt, what)
         scored = [e for e in pool if e.score !== nothing && same_selection(e, ckpt)]
         if isempty(scored)

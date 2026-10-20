@@ -166,7 +166,7 @@ Validation, checkpointing, early stopping, `request_stop!`, phases, `data_wait_f
 logging, and the prefetch pipeline work as in the automatic loop. The eval side (`validate`,
 `evaluate`, `predict`) never consults the mode: it uses `forward` and `metrics`, so a manual
 experiment defines those for its eval surface, and `loss` is only needed if you want the framework
-to substitute `val_loss` when `metrics` is absent.
+to substitute `loss` when `metrics` is absent.
 
 ## Deferred
 

@@ -25,15 +25,14 @@ reads one record's metadata without its weights.
 ## Which checkpoints a run keeps
 
 ```julia
-ReactantNitro.checkpointer(::MyExp) =
-    Checkpointer(; keep = (Best(3), Last(1)), metric = :val_loss, mode = :min)
+ReactantNitro.checkpointer(::MyExp) = Checkpointer(; keep = (Best(3), Last(1)))
 ```
 
 `keep` is a set of selectors, and the run keeps their **union**:
 
 | Selector | Keeps |
 | --- | --- |
-| [`Best`](@ref)`(k)` | the `k` best by `metric` and `mode` |
+| [`Best`](@ref)`(k)` | the `k` best by the run's [`monitor`](@ref) |
 | [`Last`](@ref)`(n)` | this run's latest `n`, whatever they scored |
 | [`Epochs`](@ref)`(r)` | this run's entries whose epoch is in `r` |
 | [`Every`](@ref)`(n)` | this run's entries whose epoch is a multiple of `n` |
@@ -49,9 +48,23 @@ Checkpointer(; keep = (Best(1), Every(10)))  # the best, and every tenth epoch f
 Checkpointer(; keep = Best(3))               # the best three only
 ```
 
-`metric` must be a key the experiment's metrics emit, and finite: a `NaN` compares false against
-everything, so it is refused when read. `:val_loss` is what the framework emits when the experiment
-defines no `metrics`. `checkpointer = nothing` writes nothing.
+Checkpoints are ranked by the run's [`monitor`](@ref), `metric => mode`, which
+[`EarlyStopping`](@ref) and [`Plateau`](@ref) schedules also watch, so it is set once:
+
+```julia
+ReactantNitro.monitor(::MyExp) = :acc => :max
+```
+
+Without `metrics`, `monitor` defaults to `:loss => :min`. With `metrics`, declare it, or turn on
+[`eval_loss`](@ref) to report the validation loss and keep that default; setup refuses a `Best`
+selector with nothing to rank by, and `Checkpointer(; keep = Last(1))` needs no metric at all.
+`Checkpointer(; metric, mode)` ranks by something else; give both. The metric must be a key
+`finalize_metrics` returns, not the name a logging backend shows (`:acc`, not `:validate_acc`), and
+finite: a `NaN` compares false against everything, so it is refused when read. Names carry no
+split: `:loss` is the validation loss the framework supplies when the experiment defines no
+`metrics`, and an accuracy is `:acc`, never `:val_acc`. With a custom
+`metrics`, a name cannot be checked until validation first runs, so a misspelled one raises at the
+end of the first epoch. `checkpointer = nothing` writes nothing.
 
 **An epoch is written only if some selector would keep it.** With a [`Last`](@ref), every epoch is
 written. Without one, as in `keep = Best(3)`, an epoch that cannot enter the top three is never

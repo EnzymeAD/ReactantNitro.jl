@@ -1368,7 +1368,7 @@
         (; mae = (sum(abs, wc_metric_helper(out .- lab)), length(lab)))
     ReactantNitro.train_metrics(::MetricHelperExp, out; lab) = (; d = sum(wc_tm_helper(out)))
     ReactantNitro.metrics_residency(::MetricHelperExp, ::Symbol) = :device
-    # `metrics` replaces the `val_loss` substitution, so the default checkpointer has nothing to rank.
+    # `metrics` replaces the `loss` substitution, so the default checkpointer has nothing to rank.
     ReactantNitro.checkpointer(::MetricHelperExp) =
         ReactantNitro.TopKCheckpointer(; k = 1, metric = :mae, mode = :min)
 
@@ -1396,7 +1396,7 @@
                     k -> any(p -> p[1].name === :wc_metric_helper, ReactantNitro.CACHE_CLOSURES[k]),
                     metric_keys
                 )
-                # `HOOK === :metrics` folds, so the `val_loss` arm (which calls `loss`) is not in a metrics
+                # `HOOK === :metrics` folds, so the `loss` arm (which calls `loss`) is not in a metrics
                 # program's closure. This needs the match's static parameters in `world_closure`: with them
                 # missing, both arms were inferred and every loss edit poisoned the metrics programs too.
                 is_our_loss(p) = occursin("loss", string(p[1].name)) &&

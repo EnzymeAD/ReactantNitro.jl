@@ -85,7 +85,7 @@ finalize_metrics(e, acc, split)             # acc.acc is a mean; acc.confusion i
 | `train_metrics` | `:device`, traced with the loss | every micro-batch | the gradient program recompiles |
 | `metrics` | `:host`, ordinary Julia | every eval batch | nothing recompiles |
 
-`metrics_residency(e, hook)` flips either. No `metrics` method at all substitutes `val_loss` with a
+`metrics_residency(e, hook)` flips either. No `metrics` method at all substitutes `loss` with a
 count of 1.
 
 ## Schedules: a key to its slot
@@ -136,9 +136,9 @@ e.max_epochs                # else a field of the same name, when the struct dec
 1                           # else the framework's value
 ```
 
-Fourteen keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`,
+Sixteen keywords follow this chain: `seed`, `run_dir`, `n_devs`, `accum`, `max_epochs`,
 `schedules`, `gradient_clip_norm`, `check_divergence`, `autolog_schedules`, `log_every_n_steps`,
-`logger`, `checkpointer`, `early_stop`, `ema`. `schedules` is the one whose accessor reads no field. Four keywords name a fact about this construction and have no accessor: `data`,
+`logger`, `checkpointer`, `early_stop`, `monitor`, `eval_loss`, `ema`. `schedules` is the one whose accessor reads no field. Four keywords name a fact about this construction and have no accessor: `data`,
 `weights`, `resume`, `run_ref`. `w0`, `restore_optimizer`, `restore_best`, `eval_weights` and `load_ema` are more of that
 kind, and `checkpoint` is the deprecated spelling of `weights = path`.
 

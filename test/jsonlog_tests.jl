@@ -38,7 +38,7 @@
         @testset "params, metrics, tags, other, confusion, finish" begin
             log_params!(l, (; seed = 42, max_epochs = 2))
             log_metrics!(l, (; loss = 0.31, acc = 0.9); context = "train", epoch = 1, step = 4)
-            log_metrics!(l, (; val_loss = 0.29); context = "validate", epoch = 1, step = 8)
+            log_metrics!(l, (; loss = 0.29); context = "validate", epoch = 1, step = 8)
             log_tags!(l, (; run = "probe"))
             log_other!(l, "binding_report", "report text")
             log_confusion!(l, [1 0; 0 1], ["a", "b"]; epoch = 1)
@@ -51,7 +51,7 @@
             @test ls[2]["type"] == "metrics" && ls[2]["context"] == "train"
             @test ls[2]["epoch"] == 1 && ls[2]["step"] == 4
             @test ls[2]["loss"] == 0.31 && ls[2]["acc"] == 0.9
-            @test ls[3]["type"] == "metrics" && ls[3]["context"] == "validate" && ls[3]["val_loss"] == 0.29
+            @test ls[3]["type"] == "metrics" && ls[3]["context"] == "validate" && ls[3]["loss"] == 0.29
             @test ls[4]["type"] == "tags" && ls[4]["run"] == "probe"
             @test ls[5]["type"] == "other" && ls[5]["key"] == "binding_report"
             @test ls[5]["value"] == "report text"

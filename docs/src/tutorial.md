@@ -225,7 +225,7 @@ function ReactantNitro.metrics(::MnistMLP, logits; label)
 end
 ```
 
-Without a [`metrics`](@ref) method, the framework reports `val_loss` with a count of 1, so its
+Without a [`metrics`](@ref) method, the framework reports `loss` with a count of 1, so its
 denominator is the number of batches. Dividing every metric by an inferred batch size would scale
 `confusion` into nonsense and report a per-batch mean as a per-image one.
 
@@ -367,10 +367,10 @@ ReactantNitro.gradient_clip_norm(::MnistMLP) = 1f0
 # `Nitro` keyword, and the keyword wins for that one run.
 ReactantNitro.accum(::MnistMLP)        = 2        # 550 batches per epoch, so 275 optimizer steps
 ReactantNitro.run_dir(::MnistMLP)      = "runs/mnist"
-ReactantNitro.checkpointer(::MnistMLP) =
-    Checkpointer(; keep = (Best(3), Last(1)), metric = :macro_recall, mode = :max)
-ReactantNitro.early_stop(::MnistMLP)   =
-    EarlyStopping(; metric = :macro_recall, mode = :max, patience = 5)
+# The metric the run is judged by: checkpoints rank by it and early stopping watches it.
+ReactantNitro.monitor(::MnistMLP)      = :macro_recall => :max
+ReactantNitro.checkpointer(::MnistMLP) = Checkpointer(; keep = (Best(3), Last(1)))
+ReactantNitro.early_stop(::MnistMLP)   = EarlyStopping(; patience = 5)
 
 # `max_epochs` needs no accessor: it is already a `Host` field on the struct, and each run-knob
 # accessor in this block reads a field of its own name when the experiment declares one. Keep the
@@ -647,25 +647,25 @@ h.macro_recall             # the column, as a Vector
 
 ```text
 history of MnistMLP  (runs/mnist, 14 of 25 epochs)
-┌──────────────────────────────────────────────┐
-│ epoch  step    loss  macro_recall     acc    │
-├──────────────────────────────────────────────┤
-│     1   275  2.2659        0.3614  0.3682    │
-│     2   550  1.7067        0.8100  0.8138    │
-│     3   825  0.9654        0.9026  0.9036    │
-│     4  1100  0.6851        0.9278  0.9284    │
-│     5  1375  0.5988        0.9412  0.9420    │
-│     ⋮                                        │
-│    17  4675  0.3625        0.9805  0.9808    │
-│    18  4950  0.3582        0.9801  0.9804    │
-│    19  5225  0.3546        0.9807  0.9810    │
-│    20  5500  0.3513        0.9824  0.9826  * │
-│    21  5775  0.3483        0.9814  0.9816    │
-│    22  6050  0.3456        0.9817  0.9820    │
-│    23  6325  0.3434        0.9816  0.9820    │
-│    24  6600  0.3412        0.9795  0.9798    │
-│    25  6875  0.3394        0.9807  0.9810    │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│ epoch  step  train_loss  macro_recall     acc    │
+├──────────────────────────────────────────────────┤
+│     1   275      2.2659        0.3614  0.3682    │
+│     2   550      1.7067        0.8100  0.8138    │
+│     3   825      0.9654        0.9026  0.9036    │
+│     4  1100      0.6851        0.9278  0.9284    │
+│     5  1375      0.5988        0.9412  0.9420    │
+│     ⋮                                            │
+│    17  4675      0.3625        0.9805  0.9808    │
+│    18  4950      0.3582        0.9801  0.9804    │
+│    19  5225      0.3546        0.9807  0.9810    │
+│    20  5500      0.3513        0.9824  0.9826  * │
+│    21  5775      0.3483        0.9814  0.9816    │
+│    22  6050      0.3456        0.9817  0.9820    │
+│    23  6325      0.3434        0.9816  0.9820    │
+│    24  6600      0.3412        0.9795  0.9798    │
+│    25  6875      0.3394        0.9807  0.9810    │
+└──────────────────────────────────────────────────┘
   * best macro_recall (max), the checkpointer's metric
   11 of 25 epochs thinned to fit; select fewer, `h[11:25]` say, for every row
 ```

@@ -21,12 +21,12 @@
         @test length(h) == 3
         @test h.epoch == [1, 2, 3]
         @test h.step == [4, 8, 12]                  # four batches per epoch at accum 1
-        @test all(isfinite, h.loss)
+        @test all(isfinite, h.train_loss)
         @test h.mae isa Vector{<:Real}
         @test length(h.mae) == 3
         @test h.cm[1] == 2 .* ones(Int, 2, 2)       # summed over the two val batches, never divided
         # The fixed column order: the axes, the train loss, the checkpointer's metric.
-        @test h.columns == [:epoch, :step, :loss, :mae]
+        @test h.columns == [:epoch, :step, :train_loss, :mae]
         @test first.(h.hidden) == [:cm]
         @test :cm in propertynames(h)
         @test h.best.metric === :mae
@@ -55,10 +55,10 @@
         @test Tables.istable(h)
         @test Tables.columnaccess(h)
         @test !Tables.rowaccess(h)
-        @test keys(Tables.columntable(h)) == (:epoch, :step, :loss, :mae)
+        @test keys(Tables.columntable(h)) == (:epoch, :step, :train_loss, :mae)
         @test Tables.columntable(h).mae == h.mae
         @test Tables.rowtable(h)[2].epoch == 2
-        @test Tables.schema(h).names == (:epoch, :step, :loss, :mae)
+        @test Tables.schema(h).names == (:epoch, :step, :train_loss, :mae)
         err = try
             h[9]
         catch e
@@ -143,17 +143,17 @@
         # Synthetic, so forty epochs are fitted without training forty.
         rows = NamedTuple[
             (;
-                epoch = i, step = 4i, loss = 1.0 / i, mae = 0.5 + abs(i - 23) / 100,
+                epoch = i, step = 4i, train_loss = 1.0 / i, mae = 0.5 + abs(i - 23) / 100,
                 extra_long_metric_name = Float32(i), another = i / 7,
             ) for i in 1:40
         ]
         h = MetricHistory(
             :Synth, "runs/synth", rows,
-            [:epoch, :step, :loss, :mae, :extra_long_metric_name, :another],
+            [:epoch, :step, :train_loss, :mae, :extra_long_metric_name, :another],
             Pair{Symbol, String}[:cm => "2x2"], (; metric = :mae, mode = :min, epoch = 23), 1
         )
         t = history_table(h, 24, 80)
-        @test t.labels[1:4] == ["epoch", "step", "loss", "mae"]
+        @test t.labels[1:4] == ["epoch", "step", "train_loss", "mae"]
         @test t.labels[end] == " "
         @test size(t.cells, 1) <= 15
         @test t.cells[t.best_row, end] == "*"
@@ -231,20 +231,20 @@
         @test occursin("<code>", html) || !occursin("`", html)
         @test !occursin("`", html)
         empty = MetricHistory(
-            :Synth, "runs/synth", NamedTuple[], [:epoch, :step, :loss],
+            :Synth, "runs/synth", NamedTuple[], [:epoch, :step, :train_loss],
             Pair{Symbol, String}[], nothing, 1
         )
         @test occursin("0 epochs", sprint(show, MIME"text/html"(), empty))
     end
 
     @testset "columns are typed, and a gap is missing" begin
-        rows = NamedTuple[(; epoch = i, step = i, loss = 1.0, acc = 0.5f0) for i in 1:4]
-        rows[3] = (; epoch = 3, step = 3, loss = 1.0)
+        rows = NamedTuple[(; epoch = i, step = i, train_loss = 1.0, acc = 0.5f0) for i in 1:4]
+        rows[3] = (; epoch = 3, step = 3, train_loss = 1.0)
         h = MetricHistory(
-            :Synth, "runs/synth", rows, [:epoch, :step, :loss, :acc], Pair{Symbol, String}[],
+            :Synth, "runs/synth", rows, [:epoch, :step, :train_loss, :acc], Pair{Symbol, String}[],
             nothing, 1
         )
-        @test h.loss isa Vector{Float64}
+        @test h.train_loss isa Vector{Float64}
         @test h.epoch isa Vector{Int}
         @test h.acc isa Vector{Union{Missing, Float32}}
         @test ismissing(h.acc[3])
@@ -257,15 +257,15 @@
     @testset "history_series picks the curves a plot draws" begin
         using ReactantNitro: history_series
         rows = NamedTuple[
-            (; epoch = i, step = 4i, loss = 1.0 / i, mae = 0.5 + abs(i - 23) / 100, another = i / 7)
+            (; epoch = i, step = 4i, train_loss = 1.0 / i, mae = 0.5 + abs(i - 23) / 100, another = i / 7)
                 for i in 1:40
         ]
         # Epoch 30 never reported `another`, and epoch 31's mae is NaN.
-        rows[30] = (; epoch = 30, step = 120, loss = 1 / 30, mae = 0.57)
-        rows[31] = (; epoch = 31, step = 124, loss = 1 / 31, mae = NaN, another = 31 / 7)
+        rows[30] = (; epoch = 30, step = 120, train_loss = 1 / 30, mae = 0.57)
+        rows[31] = (; epoch = 31, step = 124, train_loss = 1 / 31, mae = NaN, another = 31 / 7)
         best = (; metric = :mae, mode = :min, epoch = 23)
         h = MetricHistory(
-            :Synth, "runs/synth", rows, [:epoch, :step, :loss, :mae, :another],
+            :Synth, "runs/synth", rows, [:epoch, :step, :train_loss, :mae, :another],
             Pair{Symbol, String}[:cm => "2x2"], best, 1
         )
         # The default is the checkpointer's metric alone, with its best epoch marked.
@@ -283,10 +283,10 @@
         @test history_series(h; x = :step).panels[1].best == (92, 0.5)
         @test history_series(h; x = :step).xlabel == "step"
         # `:all` is every column but the axes; a name or names select in column order.
-        @test [p.name for p in history_series(h; metrics = :all).panels] == [:loss, :mae, :another]
+        @test [p.name for p in history_series(h; metrics = :all).panels] == [:train_loss, :mae, :another]
         @test [p.name for p in history_series(h; metrics = :another).panels] == [:another]
-        @test [p.name for p in history_series(h; metrics = (:another, :loss)).panels] ==
-            [:another, :loss]
+        @test [p.name for p in history_series(h; metrics = (:another, :train_loss)).panels] ==
+            [:another, :train_loss]
         # A row without the metric is skipped, not zeroed; the other panels carry no mark.
         pa = history_series(h; metrics = :another).panels[1]
         @test length(pa.x) == 39
@@ -297,14 +297,14 @@
         @test history_series(h[30:40]).panels[1].best === nothing
         @test history_series(h[20:25]).panels[1].best == (23, 0.5)
         # Without a checkpointer's metric in the columns, the default is every metric, and a
-        # history of only loss draws the loss.
+        # history of only the train loss draws it.
         @test [p.name for p in history_series(h[:another]).panels] == [:another]
         nb = MetricHistory(
-            :Synth, "runs/synth", rows, [:epoch, :step, :loss, :mae, :another],
+            :Synth, "runs/synth", rows, [:epoch, :step, :train_loss, :mae, :another],
             Pair{Symbol, String}[], nothing, 1
         )
         @test [p.name for p in history_series(nb).panels] == [:mae, :another]
-        @test [p.name for p in history_series(nb[:loss]).panels] == [:loss]
+        @test [p.name for p in history_series(nb[:train_loss]).panels] == [:train_loss]
         # Refusals name the problem.
         for (kw, needle) in (
                 ((; x = :time), "`:epoch` or `:step`"),
@@ -320,7 +320,7 @@
             @test occursin(needle, err.msg)
         end
         empty = MetricHistory(
-            :Synth, "runs/synth", NamedTuple[], [:epoch, :step, :loss],
+            :Synth, "runs/synth", NamedTuple[], [:epoch, :step, :train_loss],
             Pair{Symbol, String}[], nothing, 1
         )
         err = try

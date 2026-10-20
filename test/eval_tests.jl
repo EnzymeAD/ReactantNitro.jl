@@ -208,12 +208,12 @@
         n = mk(EvalBare)
         @test n.routing.metrics === nothing                # no method: the substitution keys off this
         m = validate(n)
-        @test keys(m) == (:val_loss,)                      # the name two other defaults already use
+        @test keys(m) == (:loss,)                      # the name two other defaults already use
 
         # `count` is 1, so this is the mean over BATCHES rather than over samples: a stated
         # inexactness, and the reference has to be computed the same way to be a reference at all.
         per_batch = [mean(abs2, predict(n, b) .- b.y) for b in VAL_B]
-        @test m.val_loss ≈ mean(per_batch) rtol = 1.0e-5
+        @test m.loss ≈ mean(per_batch) rtol = 1.0e-5
     end
 
     # ── no-train variants ────────────────────────────────────────────────────────────────

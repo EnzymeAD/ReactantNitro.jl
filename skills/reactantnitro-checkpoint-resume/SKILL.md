@@ -35,12 +35,18 @@ Ask for it explicitly after a restart.
 ## Configuring it
 
 ```julia
-Checkpointer(; keep = (Best(3), Last(1)), metric = :val_loss, mode = :min, dir = nothing,
+ReactantNitro.monitor(::MyExp) = :acc => :max      # what Best ranks by; default :loss => :min
+Checkpointer(; keep = (Best(3), Last(1)), metric = nothing, mode = nothing, dir = nothing,
                scope = :run)
 ```
 
-`metric` names a key your `finalize_metrics` returns (`:val_loss` is what the default `metrics`
-emits, not a magic name). A metric nothing emits is a setup error naming the ones available.
+**Set `monitor` once; the checkpointer, `EarlyStopping` and every `Plateau` follow it** unless
+given both their own `metric` and `mode` (one alone is refused). The metric is a key your
+`finalize_metrics` returns, never the backend's display name (`:acc`, not `:validate_acc`).
+Names carry no split: the framework's validation loss is `:loss`, which exists only when the
+experiment defines no `metrics`; `:val_loss` still works as `:loss` with a warning until 1.0.0. A checkpointer used without setup
+(`average_checkpoints`) ranks by what the run's newest scored entry was written under.
+`TopKCheckpointer` follows the same rule.
 `checkpointer = nothing` writes nothing.
 
 **It must also be FINITE**, and that is checked, because the checkpointer compares it against the
@@ -137,18 +143,14 @@ for the parameters.
 ## Early stopping
 
 ```julia
-train!(e; early_stop = EarlyStopping(; metric = :val_loss, mode = :min,
-                                       patience = 5, min_delta = 1f-4))
+train!(e; early_stop = EarlyStopping(; patience = 5, min_delta = 1f-4))   # watches `monitor`
 ```
 
 `early_stop` defaults to `nothing`, so a bare experiment does not early-stop. `EarlyStopping` is a
-small dedicated component, independent of the checkpointer even though both track improvement: the
-metrics can legitimately differ (checkpoint on `mae`, stop on `val_loss`), and the jobs differ
-(retention versus control flow). They share only the convention of a `metric` name and a
-`:min`/`:max` mode.
+small dedicated component, separate from the checkpointer: both watch `monitor` by default, and
+either can be given its own `metric` and `mode` (checkpoint on `mae`, stop on `loss`).
 
-`metric` names a key your `finalize_metrics` returns, the same rule as the checkpointer, and a
-metric nothing emits is an error naming the ones available, checked before training when the
+A metric nothing emits is an error naming the ones available, checked before training when the
 framework can know the key set. `patience` counts **epochs without improvement** and `min_delta`
 is **absolute**, both matching Keras and Lightning: an epoch improves when it beats the best seen
 by more than `min_delta`, and anything else, including an equal or slightly better value, counts
@@ -159,6 +161,14 @@ written, the logger finalizes, and the run exits through the normal `Done` path.
 the checkpoint record says `:early_stop` rather than `:completed`, which is what makes resume
 comprehensible: a run that early-stopped and is resumed with `:auto` would immediately re-satisfy
 the condition, and with the reason stored it says so instead of exiting silently.
+
+A custom `metrics` key cannot be checked before validation runs, so a misspelled `monitor` costs
+one epoch before it raises.
+
+**The early-stopping counters, and each [`Plateau`](@ref) schedule's counters (the record's
+`schedule_state`), are updated before the epoch's checkpoint is written**, so a resume from any
+record continues exactly; a stored plateau resumes only when its key, metric and mode match, and a
+`weights` load starts both fresh.
 
 `request_stop!` sets the same flag imperatively, from a REPL or a phase monitor. Both are checked
 once per epoch after validation. Custom policies implement `should_stop(es, epoch, metrics)` for

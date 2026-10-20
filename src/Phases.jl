@@ -173,6 +173,9 @@ mutable struct Nitro
     log_every_n_steps::Int
     checkpointer::Any
     early_stop::Any
+    # The run's `monitor`, which components without their own follow; `nothing` when none applies.
+    monitor::Union{Pair{Symbol, Symbol}, Nothing}
+    eval_loss::Bool                 # whether eval splits also report the loss beside `metrics`
     # What the pure scalar run accessors returned at construction, for `fixed_config_report`. The
     # stored field cannot be compared against the accessor: a passed keyword is indistinguishable
     # from the accessor default by the time the body runs.

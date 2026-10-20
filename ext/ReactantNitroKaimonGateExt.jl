@@ -410,7 +410,7 @@ function _weights_arg(weights, checkpoint)
          `weights`, and both were given. Pass `weights` only."
     )
     @warn "ReactantNitro ReactantNitroKaimonGateExt: the tools' `checkpoint` argument is deprecated \
-           and will be removed in 0.2.0. Pass `weights` (a checkpoint path, or a source such as \
+           and will be removed in a later release. Pass `weights` (a checkpoint path, or a source such as \
            \"latest => best\")." maxlog = 1
     return _parse_weights(checkpoint)
 end

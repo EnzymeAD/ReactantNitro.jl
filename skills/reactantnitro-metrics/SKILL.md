@@ -20,8 +20,9 @@ Two hooks, both optional. `metrics` runs on an evaluation split, once per eval b
 metrics(e, outputs; y) -> NamedTuple of `value => mode`
 ```
 
-With no `metrics` method at all, the framework reports the validation loss as `val_loss`, so a bare
-experiment still validates. The full reference is the Metrics page of the docs (`docs/src/metrics.md`).
+With no `metrics` method at all, the framework reports the validation loss as `loss`, so a bare
+experiment still validates. **Names carry no split**: `acc`, never `val_acc`; the split is the
+context the logger receives, and `monitor` reads the validation metrics by these keys. The full reference is the Metrics page of the docs (`docs/src/metrics.md`).
 
 ## The `value => mode` contract
 
@@ -124,18 +125,27 @@ quantiles.
 - **Memory.** `:concat` holds the split's per-sample values in host memory for one evaluation pass.
   The other modes hold one value per key.
 
-### The validation loss's components
+### The loss and its terms
 
-`metrics` sees `forward`'s outputs, not the loss. To log `val_loss` and its terms, **call your own
-`loss` on the arrays the hook already has**:
+**`loss` may return `(l, terms)`**, a flat `NamedTuple` of scalars. Each term is logged as
+`loss/<term>`: on the train line straight from the gradient program, and wherever the validation
+loss is reported. Only `l` is differentiated.
 
 ```julia
-ReactantNitro.metrics(e, out; y) =
-    (; val_loss = loss(e, out; y) => 1, acc = n_correct(out, y) => size(y, 2))
+ReactantNitro.loss(e::MyExp, ŷ; y) = (ce = crossent(ŷ, y); kl = kldiv(ŷ); (ce + 0.1f0 * kl, (; ce, kl)))
 ```
 
-It is the same function the optimizer differentiates, so the two numbers cannot drift. A loss that
-returns its parts can hand every term to a separate key.
+**Validation reports the loss without `metrics`, and with them only under `eval_loss = true`**,
+which runs `loss` in its own small program on the device, as in training, and adds `loss` and every
+`loss/<term>` after `finalize_metrics`. A key both sources report is an error naming both.
+
+**Do not call `loss` from a `:host` `metrics`.** There it runs on the CPU over host arrays, with
+`e`'s `Device` fields still on the device: eager per-op compiles or an error, Reactant-only code
+failing, and a number that is not quite the trained objective. Use `eval_loss = true`.
+
+With `metrics` defined and `eval_loss` off, there is no `monitor` default: declare
+`monitor(e) = :key => :min | :max`, or a ranking checkpointer, `EarlyStopping` or `Plateau` is
+refused at setup.
 
 ## Residency: `:host` or `:device`
 

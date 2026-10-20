@@ -60,6 +60,7 @@ include("Optimizer.jl")   # optimizer construction and parameter groups
 include("GradRules.jl")   # gradient rules: SAM and the default single gradient
 include("EMA.jl")         # the exponential moving average of the weights
 include("Schedules.jl")   # schedules
+include("Plateau.jl")     # metric-driven schedules
 include("TraceHook.jl")   # opt-in precise invalidation: records what each trace went through
 include("Cache.jl")       # the compiled-program cache
 include("Setup.jl")       # the setup sequence
@@ -101,9 +102,9 @@ export no_decay, default_no_decay
 export no_perturb
 # The exponential moving average of the weights.
 export EMA, ema
-export schedules, nonschedulable, dispatch_variant, max_epochs
+export schedules, Plateau, nonschedulable, dispatch_variant, max_epochs
 # The run accessors: each one's `Nitro` keyword defaults to the accessor call.
-export seed, accum, n_devs, checkpointer, early_stop, logger, check_divergence, autolog_schedules,
+export seed, accum, n_devs, checkpointer, early_stop, monitor, eval_loss, logger, check_divergence, autolog_schedules,
     log_every_n_steps
 
 # Asking a run's artifacts what they are: `read_manifest(dir)` lists retained checkpoints from the
