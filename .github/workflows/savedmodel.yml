@@ -6,13 +6,13 @@ on:
   push:
     branches: [main]
     paths:
-      - 'src/Export.jl'
+      - 'src/output/Export.jl'
       - 'ext/ReactantNitroPythonCallExt.jl'
       - 'test/savedmodel/**'
       - '.github/workflows/savedmodel.yml'
   pull_request:
     paths:
-      - 'src/Export.jl'
+      - 'src/output/Export.jl'
       - 'ext/ReactantNitroPythonCallExt.jl'
       - 'test/savedmodel/**'
       - '.github/workflows/savedmodel.yml'

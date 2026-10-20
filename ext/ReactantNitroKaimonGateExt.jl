@@ -1078,7 +1078,7 @@ end
 """
     ReactantNitro.run_state(run_id) -> NamedTuple
 
-The method behind `ReactantNitro.run_state`, which is documented in `src/Runs.jl`: the facts
+The method behind `ReactantNitro.run_state`, which is documented in `src/core/Runs.jl`: the facts
 `nitro_status` renders, as a `NamedTuple`, plus `elapsed_s`.
 """
 function ReactantNitro.run_state(run_id::AbstractString)

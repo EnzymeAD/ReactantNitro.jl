@@ -811,7 +811,7 @@ end
 const FORMAT_VERSION = 1
 
 function framework_version()
-    p = joinpath(dirname(@__DIR__), "Project.toml")
+    p = joinpath(dirname(dirname(@__DIR__)), "Project.toml")
     m = isfile(p) ? match(r"(?m)^version\s*=\s*\"([^\"]+)\"", read(p, String)) : nothing
     return m === nothing ? "unknown" : m.captures[1]
 end
