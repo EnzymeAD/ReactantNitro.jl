@@ -9,9 +9,11 @@
     ReactantNitro.MetricHistory
 
 The per-epoch metric series a handle keeps, as returned by [`history`](@ref). Each trained epoch
-adds one row, `(; epoch, step, loss, metrics...)`: `step` is the optimizer step the epoch ended
-on, `loss` the epoch's mean train loss (`NaN` if it ran no micro-batch), and the rest that epoch's
-finalized validation metrics as host values (none without a `val` split). Integers and ranges
+adds one row, `(; epoch, step, train_loss, metrics...)`: `step` is the optimizer step the epoch
+ended on, `train_loss` the epoch's mean train loss (`NaN` if it ran no micro-batch), and the rest
+that epoch's finalized validation metrics as host values (none without a `val` split), under the
+names they were reported with, so the validation loss is `loss`. The train loss is the one column
+named with its split, since the table holds both. Integers and ranges
 select epochs, symbols select metrics, and a selection always keeps `epoch` and `step`:
 
 ```julia
@@ -23,12 +25,12 @@ h[:acc, :macro_recall]       # two metrics, every epoch
 h[10:20, :acc]               # both
 h[step = 5_000:20_000]       # the epochs whose closing step is in that range
 h.acc                        # the column as a Vector, for a plot or a threshold
-h.epoch, h.step, h.loss      # the axes and the train loss
+h.epoch, h.step, h.train_loss  # the axes and the train loss
 ```
 
 It is a Tables.jl table with column access, so `DataFrame(h)` and `CSV.write(path, h)` accept it;
 with a Makie backend loaded, `plot(h)` draws it (see [`history_series`](@ref)). The columns are
-`epoch`, `step`, `loss`, the checkpointer's selection metric if it has one, then the other scalar
+`epoch`, `step`, `train_loss`, the checkpointer's selection metric if it has one, then the other scalar
 metrics in order of first appearance; an epoch lacking a metric has `missing`. A non-scalar metric,
 such as a confusion matrix, is not a table column, but `propertynames(h)` lists it and
 `h.confusion` returns it per epoch.
@@ -45,9 +47,10 @@ struct MetricHistory
     first_epoch::Int
 end
 
-# The row appended once per validated epoch. `loss` is `NaN` for an epoch that ran no micro-batch.
+# The row appended once per validated epoch. `train_loss` is `NaN` for an epoch that ran no
+# micro-batch.
 history_row(nitro, loss_sum, loss_n, metrics_out) = merge(
-    (; epoch = nitro.epoch, step = nitro.step, loss = loss_n == 0 ? NaN : loss_sum / loss_n),
+    (; epoch = nitro.epoch, step = nitro.step, train_loss = loss_n == 0 ? NaN : loss_sum / loss_n),
     metrics_out,
 )
 
@@ -65,14 +68,14 @@ function history(nitro::Nitro)
     sel = ck isa Checkpointer ? (ck.metric, ck.mode) : nothing
     scalar, hidden = Symbol[], Pair{Symbol, String}[]
     for r in rows, (k, v) in pairs(r)
-        k in (:epoch, :step, :loss) && continue
+        k in (:epoch, :step, :train_loss) && continue
         if v isa Real
             k in scalar || push!(scalar, k)
         elseif !any(h -> first(h) == k, hidden)
             push!(hidden, k => _shape_note(v))
         end
     end
-    columns = Symbol[:epoch, :step, :loss]
+    columns = Symbol[:epoch, :step, :train_loss]
     if sel !== nothing && sel[1] in scalar
         push!(columns, sel[1])
         filter!(!=(sel[1]), scalar)
@@ -200,7 +203,7 @@ function Base.show(io::IO, h::MetricHistory)
     n = length(h)
     print(io, "history of ", getfield(h, :experiment), ": ", n, n == 1 ? " epoch" : " epochs")
     n == 0 || print(io, " (", firstindex(h), " to ", lastindex(h), ")")
-    m = count(c -> !(c in (:epoch, :step, :loss)), _columns(h))
+    m = count(c -> !(c in (:epoch, :step, :train_loss)), _columns(h))
     print(io, ", ", m, m == 1 ? " metric" : " metrics", ", ", getfield(h, :run_dir))
     return nothing
 end
@@ -280,7 +283,7 @@ end
 
 Everything a renderer needs to draw `h` in a `height` x `width` terminal: `title`, `labels`,
 `cells::Matrix{String}`, `alignment`, `best_row`, `gap_rows` and `note`. Rows are thinned with
-[`thin_rows`](@ref). Columns after `epoch`, `step`, `loss` and the selection metric are dropped from
+[`thin_rows`](@ref). Columns after `epoch`, `step`, `train_loss` and the selection metric are dropped from
 the right until the table fits `width`, and `note` says what was left out and how to select it.
 """
 function history_table(h::MetricHistory, height::Integer, width::Integer)
@@ -377,7 +380,7 @@ end
 Everything a plot of `h` draws, computed without a plotting package: `title`, `xlabel`, and
 `panels`, one per curve, each `(; name, x, y, best, subtitle)`. `x` is `:epoch` or `:step`.
 `metrics` is `nothing` (the checkpointer's metric if the history has it, else every scalar metric
-but `loss`, else `loss`), `:all` (every scalar column including `loss`), one name, or a collection
+but `train_loss`, else `train_loss`), `:all` (every scalar column including `train_loss`), one name, or a collection
 of names. `best` is the `(x, y)` point of the checkpointer's chosen epoch on that metric's panel,
 else `nothing`. A row lacking the metric is skipped; a non-finite value is kept, so the line breaks
 where the run did. The Makie extension turns this into `plot(h)`.
@@ -394,8 +397,8 @@ function history_series(h::MetricHistory; x::Symbol = :epoch, metrics = nothing)
         if best !== nothing && best.metric in plottable
             [best.metric]
         else
-            rest = filter(!=(:loss), plottable)
-            isempty(rest) ? [:loss] : rest
+            rest = filter(!=(:train_loss), plottable)
+            isempty(rest) ? [:train_loss] : rest
         end
     elseif metrics === :all
         plottable

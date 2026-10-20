@@ -156,6 +156,19 @@ fields as `schedule/<field>`, rule values as `schedule/<group>/<field>` after th
 scaling, so `schedule/backbone/eta` is the rate the backbone actually trained at. Do not log a schedule yourself from
 `train_metrics` or a monitor. `autolog_schedules = false` turns it off.
 
+| form | value at step `t` |
+| --- | --- |
+| `1f-3` | constant |
+| `total -> t -> ...` | the callable the factory returns |
+| `Plateau(inner; metric, mode, factor, patience, cooldown, threshold, min_scale)` | `inner(t) * scale`, the scale cut by `factor` on a validation plateau |
+
+**`Plateau` is the only schedule that reads validation**, with PyTorch's `ReduceLROnPlateau` rule
+and defaults (`patience = 2` reduces at the third bad epoch). It works on any key. Its counters are
+in each checkpoint's `schedule_state`, so `resume` continues the sequence and `weights` starts it
+fresh. The validation line logs `schedule/plateau/<key>`. It watches the run's `monitor` unless
+given its own `metric` and `mode`. Do not write a schedule that closes over
+training state yourself: it will not resume.
+
 ### Use the ecosystem's schedules, not your own
 
 **The framework takes no dependency on any schedule library, and that is so you can use whichever

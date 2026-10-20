@@ -710,7 +710,7 @@
         for (a, b) in zip(Functors.fleaves(parameters(plain)), Functors.fleaves(parameters(pref)))
             @test Array(a) == Array(b)
         end
-        @test validate(pref).val_loss == validate(plain).val_loss
+        @test validate(pref).loss == validate(plain).loss
 
         # THE PAYOFF OF ORDERED DELIVERY, and the assertion the reorder buffer exists for. A source
         # that DOES implement the trait, fanned out over four workers, must reach the same weights
@@ -726,7 +726,7 @@
         for (a, b) in zip(Functors.fleaves(parameters(plain)), Functors.fleaves(parameters(fanned)))
             @test Array(a) == Array(b)
         end
-        @test validate(fanned).val_loss == validate(plain).val_loss
+        @test validate(fanned).loss == validate(plain).loss
 
         @testset "and the data-source contract still names the source, through the wrapper" begin
             # `check_data_source` is given `prefetch_source`, so a bad loader is reported as itself
@@ -785,11 +785,11 @@
         # No training has happened, and the seed is the same, so the weights are identical and the
         # metric must agree EXACTLY. Ordered delivery is what makes that true of the fan-out: metrics
         # accumulate by summation, so a different arrival order would disagree in the last bits.
-        a = validate(inline).val_loss
-        @test validate(single).val_loss == a
-        @test validate(fanned).val_loss == a
+        a = validate(inline).loss
+        @test validate(single).loss == a
+        @test validate(fanned).loss == a
         # And the pass is repeatable on a handle whose stream was already built and torn down once.
-        @test validate(fanned).val_loss == a
+        @test validate(fanned).loss == a
     end
 
     @testset "a fan-out train split trains end to end, and sees every batch once" begin
@@ -810,7 +810,7 @@
         # The framework's own assertion is about ONE stream advancing the token by exactly one, which
         # `check_epoch_advanced` checked on the way in.
         @test epoch_token(src) == 2
-        @test validate(fan).val_loss isa Real
+        @test validate(fan).loss isa Real
     end
 
 end

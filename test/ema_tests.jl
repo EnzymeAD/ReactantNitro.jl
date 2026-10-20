@@ -83,7 +83,7 @@
     @testset "evaluation reads the EMA by default, and `load_ema` loads it" begin
         cache_reset!()
         n = train!(handle(; beta = 0.9))
-        on_ema = validate(n).val_loss
+        on_ema = validate(n).loss
         raw = Nitro(
             LinEma(); data = (; val = VAL), run_dir = mktempdir(), weights = n,
             eval_weights = :raw
@@ -92,8 +92,8 @@
             LinEma(); data = (; val = VAL), run_dir = mktempdir(), weights = n,
             load_ema = true, eval_weights = :raw
         )
-        @test validate(loaded).val_loss ≈ on_ema rtol = 1.0e-6
-        @test !isapprox(validate(raw).val_loss, on_ema; rtol = 1.0e-6)
+        @test validate(loaded).loss ≈ on_ema rtol = 1.0e-6
+        @test !isapprox(validate(raw).loss, on_ema; rtol = 1.0e-6)
         # The EMA has the weights' types, so evaluating it reuses the one forward program.
         @test count(k -> k[1] === fwd_program, keys(CACHE)) == 1
     end

@@ -18,7 +18,7 @@
 
 """
     ReactantNitro.grad_program(ev, model, ps, st, batch, g_accum::NTuple{G}, is_first, inv_n,
-                               routers, lref, ::Val{TM}) -> (loss, g_accum::NTuple{G}, st_new, aux)
+                               routers, lref, ::Val{TM}) -> (loss, g_accum::NTuple{G}, st_new, aux, terms)
 
 The gradient program: compiled once per run, invoked once per micro-batch. It writes the scaled
 gradient into `g_accum` in place and returns it.
@@ -42,7 +42,8 @@ trace `make_zero` folds to a constant, so the allocation costs nothing at runtim
 
 `aux` is the `train_metrics` result when `TM === :device` and the raw `outputs` when
 `TM === :host`, where the driver calls `train_metrics` on the transferred outputs. `TM` is
-type-level, so the two are separate programs and cache entries.
+type-level, so the two are separate programs and cache entries. `terms` is the `NamedTuple` a `loss`
+returning `(l, terms)` gave, else `(;)`.
 """
 function grad_program(
         ev, model, ps, st, batch, g_accum, is_first, inv_n, routers, lref,
@@ -51,7 +52,7 @@ function grad_program(
     # Allocated here on every invocation, never hoisted: Enzyme accumulates into the shadow it is
     # handed, and a reused `dps` would sum every past micro-batch's gradient with no error.
     dps = Enzyme.make_zero(ps)
-    _, (l, st_new, aux) = Enzyme.autodiff(
+    _, (l, st_new, (aux, terms)) = Enzyme.autodiff(
         Enzyme.set_abi(Enzyme.ReverseWithPrimal, Reactant.ReactantABI),
         Enzyme.Const(objective_wrapper), Enzyme.Duplicated,
         Enzyme.Const(ev), Enzyme.Const(model),
@@ -66,7 +67,7 @@ function grad_program(
     # Written into `g_accum` rather than returned as a new tree: Reactant donates only the arguments
     # a trace mutates, so a fresh result would leave the old accumulator for the GC every micro-batch.
     foreach((s, a) -> (a .= ifelse.(is_first .> 0.0f0, s, a .+ s)), g_scaled, g_accum)
-    return l, g_accum, program_out(st_new), program_out(aux)
+    return l, g_accum, program_out(st_new), program_out(aux), program_out(terms)
 end
 
 # ── Gradient rules in the driver ───────────────────────────────────────────────────
@@ -75,17 +76,18 @@ end
     ReactantNitro.micro_grad!(rule, nitro, gctx, ev, st, b, flag) -> (l, st_out, aux, extra)
 
 One micro-batch's gradient into `nitro.g_accum` under `rule`. `extra` is what the deferred half
-needs beyond the loss: empty for [`SingleGrad`](@ref), `(; l2, ps_adv)` for a
-[`PerturbRule`](@ref).
+needs beyond the loss: `(; terms)`, the loss terms, for [`SingleGrad`](@ref), and
+`(; terms, l2, ps_adv)` for a [`PerturbRule`](@ref), whose terms are pass 1's.
 """
 function micro_grad!(::SingleGrad, nitro, gctx, ev, st, b, flag)
-    l, nitro.g_accum, st_out, aux = grad_call(nitro, gctx, ev, nitro.ps, st, b, nitro.g_accum, flag)
-    return l, st_out, aux, (;)
+    l, nitro.g_accum, st_out, aux, terms =
+        grad_call(nitro, gctx, ev, nitro.ps, st, b, nitro.g_accum, flag)
+    return l, st_out, aux, (; terms)
 end
 
 function micro_grad!(rule::PerturbRule, nitro, gctx, ev, st, b, flag)
     # Pass 1 overwrites the scratch; its loss, state and outputs are the micro-batch's.
-    l, gctx.scratch[], st_out, aux =
+    l, gctx.scratch[], st_out, aux, terms =
         grad_call(nitro, gctx, ev, nitro.ps, st, b, gctx.scratch[], gctx.is_first)
     ps_adv = compile_cached(
         eps_program, ev, rule, nitro.ps, gctx.scratch[], gctx.masks, gctx.adaptive, gctx.lref;
@@ -94,8 +96,8 @@ function micro_grad!(rule::PerturbRule, nitro, gctx, ev, st, b, flag)
     )(rule, nitro.ps, gctx.scratch[], gctx.masks, gctx.adaptive, gctx.lref)
     # The same input `st`: the gradient program does not donate it, and reusing it gives pass 2
     # the same RNG key, so dropout draws the same masks.
-    l2, nitro.g_accum, _, _ = grad_call(nitro, gctx, ev, ps_adv, st, b, nitro.g_accum, flag)
-    return l, st_out, aux, (; l2, ps_adv)
+    l2, nitro.g_accum, _, _, _ = grad_call(nitro, gctx, ev, ps_adv, st, b, nitro.g_accum, flag)
+    return l, st_out, aux, (; terms, l2, ps_adv)
 end
 
 function grad_call(nitro, gctx, ev, ps, st, b, acc, flag)
@@ -160,8 +162,9 @@ end
     ReactantNitro.objective_wrapper(ev, model, ps, st, batch, routers, ::Val{TM} = Val(:device))
 
 The differentiated function: `forward`, then `loss`, then (when `TM === :device`) `train_metrics`,
-returning `(l, ignore_derivatives(st_new), ignore_derivatives(aux))`. Under `TM === :host`, `aux`
-is the raw `outputs`.
+returning `(l, ignore_derivatives(st_new), ignore_derivatives((aux, terms)))`. Under
+`TM === :host`, `aux` is the raw `outputs`; `terms` is what [`split_loss`](@ref) separated from
+`loss`'s return.
 
 The return activity is `Enzyme.Duplicated` with `set_abi(ReverseWithPrimal, ReactantABI)`, and
 every element but the loss is wrapped in `EnzymeCore.ignore_derivatives`. Reactant seeds every
@@ -177,7 +180,7 @@ function objective_wrapper(ev, model, ps, st, batch, routers, ::Val{TM} = Val(:d
     outputs, st_new = call_hook(
         hook_fn(fns, :forward, forward), :forward, routers.forward, batch, ev, model, ps, st
     )
-    l = call_hook(hook_fn(fns, :loss, loss), :loss, routers.loss, batch, ev, outputs)
+    l, terms = split_loss(call_hook(hook_fn(fns, :loss, loss), :loss, routers.loss, batch, ev, outputs))
     # Under `:host` the hook is outside every program: what leaves is the primal and the driver
     # calls `train_metrics` on it. `TM` is type-level, so this branch folds at trace time.
     aux = TM === :host ? outputs :
@@ -191,9 +194,44 @@ function objective_wrapper(ev, model, ps, st, batch, routers, ::Val{TM} = Val(:d
     return (
         l,
         Enzyme.EnzymeCore.ignore_derivatives(st_new),
-        Enzyme.EnzymeCore.ignore_derivatives(aux),
+        Enzyme.EnzymeCore.ignore_derivatives((aux, terms)),
     )
 end
+
+"""
+    ReactantNitro.split_loss(r) -> (l, terms)
+
+`loss`'s return as the scalar and its terms: `(r, (;))` for a scalar, and `(l, terms)` for a
+`(l, terms::NamedTuple)`, whose values must be scalars. Called inside the traces and on the host.
+"""
+split_loss(l) = (l, (;))
+function split_loss(r::Tuple)
+    (length(r) == 2 && r[2] isa NamedTuple) || error(
+        "ReactantNitro: `loss` returned a `Tuple` of $(length(r)); it returns a scalar, or \
+         `(l, terms)` with `terms` a `NamedTuple` of scalars logged as `loss/<term>`."
+    )
+    for (k, v) in pairs(r[2])
+        (v isa Number || (v isa AbstractArray && length(v) == 1)) || error(
+            "ReactantNitro: `loss` term `$k` is a `$(typeof(v))`; each term is a scalar. Terms are \
+             flat: a nested `NamedTuple` is not supported yet."
+        )
+    end
+    return r[1], r[2]
+end
+
+# A key reported by both the framework's loss and `what` is refused, naming both sources.
+function check_term_keys(ours::NamedTuple, theirs::NamedTuple, what)
+    both = intersect(keys(ours), keys(theirs))
+    isempty(both) && return nothing
+    error(
+        "ReactantNitro: $(join(("`$k`" for k in both), ", ")) is reported by both the framework's \
+         loss (`loss` and its terms, as `loss/<term>`) and $(what). Rename or drop it in $(what)."
+    )
+end
+
+# The terms under the keys they are logged with, `loss/<term>` on every split.
+loss_term_keys(terms::NamedTuple) =
+    NamedTuple{Tuple(Symbol("loss/", k) for k in keys(terms))}(values(terms))
 
 # ── Mutating layer state ────────────────────────────────────────────────────────────
 #
@@ -651,13 +689,17 @@ function _train!(nitro::Nitro)
                 step = nitro.step, epoch = nitro.epoch,
                 context = "validate"
             )
+            # Before the checkpoint, so the record holds this epoch's counters.
+            update_plateaus!(nitro, metrics_out)
+            log_plateaus!(nitro)
+            # `should_stop` runs even when a stop is already requested so a stateful policy stays
+            # consistent.
+            stopped = should_stop(nitro.early_stop, nitro.epoch, metrics_out)
             set_phase!(nitro, Checkpointing())
             wrote_epoch = save_checkpoint_reported!(nitro, nitro.epoch, metrics_out) !== false
 
             # Both stopping routes set one flag, checked after validation and the checkpoint, so a
-            # stop is a finished epoch exiting through `Done`. `should_stop` runs even when a stop
-            # is already requested so a stateful policy stays consistent.
-            stopped = should_stop(nitro.early_stop, nitro.epoch, metrics_out)
+            # stop is a finished epoch exiting through `Done`.
             if stopped || nitro.stop_requested
                 nitro.stop_reason = stopped ? :early_stop : :requested
                 break
@@ -743,10 +785,16 @@ function complete_micro_batch!(nitro::Nitro, rec, tmv)
         ) : rec.aux
     # Once per logged optimizer step, the cadence the metrics contract names. The stats are the
     # closing micro-batch's, unreduced. `finite_only` drops a non-finite loss when the check is off.
-    rec.closes && step_line_due(nitro, rec.step + 1) && log_metrics!(
-        nitro.logger, finite_only((; loss = lh, gap..., stats..., rec.sched..., rec.ema_log...));
-        step = rec.step + 1, epoch = rec.epoch, context = "train"
-    )
+    if rec.closes && step_line_due(nitro, rec.step + 1)
+        # Read back on logged steps only, like a device `train_metrics`.
+        terms = loss_term_keys(map(read_loss, rec.extra.terms))
+        check_term_keys(terms, stats, "`train_metrics`")
+        log_metrics!(
+            nitro.logger,
+            finite_only((; loss = lh, terms..., gap..., stats..., rec.sched..., rec.ema_log...));
+            step = rec.step + 1, epoch = rec.epoch, context = "train"
+        )
+    end
     # Freed here, not when the compiled call returns: XLA is asynchronous and the executable holds
     # its inputs, but the readback above awaited this record's program, so `b`'s buffers are dead.
     # A use-after-free would surface as `AssertionError: buffer.buffer !== C_NULL`.
@@ -930,10 +978,12 @@ function _train_manual!(nitro::Nitro)
                 step = nitro.step, epoch = nitro.epoch,
                 context = "validate"
             )
+            update_plateaus!(nitro, metrics_out)
+            log_plateaus!(nitro)
+            stopped = should_stop(nitro.early_stop, nitro.epoch, metrics_out)
             set_phase!(nitro, Checkpointing())
             wrote_epoch = save_checkpoint_reported!(nitro, nitro.epoch, metrics_out) !== false
 
-            stopped = should_stop(nitro.early_stop, nitro.epoch, metrics_out)
             if stopped || nitro.stop_requested
                 nitro.stop_reason = stopped ? :early_stop : :requested
                 break
@@ -1226,6 +1276,7 @@ function snapshot(nitro::Nitro)
         preset = nitro.preset,                  # the named configuration, if any
         derived = nitro.derived,
         early_stop = early_stop_state(nitro.early_stop),
+        schedule_state = plateau_state(nitro.schedules),
     )
     # A structural walk over leaves, not elements: about a hundred checks per epoch.
     assert_host_record(snap)
@@ -1603,7 +1654,7 @@ end
 The traced metric path: `metrics` compiled as its own program on outputs and batch fields sliced to
 `NREAL` inside the trace. `NREAL` is type-level because a traced length cannot slice, which also
 puts the two shapes (full and remainder) in the cache key. `HOOK` selects the user's `metrics` or
-the framework's `val_loss` substitution for an experiment defining none; the substitution is
+the framework's `loss` substitution for an experiment defining none; the substitution is
 traced whatever `metrics_residency` says, because it calls `loss`, a traced hook by contract.
 """
 function eval_metric_program(
@@ -1611,9 +1662,12 @@ function eval_metric_program(
     ) where {NREAL, HOOK}
     o = slice_last(outputs, NREAL)
     b = slice_last(batch, NREAL)
-    m = HOOK === :metrics ?
-        call_hook(hook_fn(fns, :metrics, metrics), :metrics, router, b, ev, o) :
-        (; val_loss = call_hook(hook_fn(fns, :loss, loss), :loss, router, b, ev, o) => 1)
+    m = if HOOK === :metrics
+        call_hook(hook_fn(fns, :metrics, metrics), :metrics, router, b, ev, o)
+    else
+        l, terms = split_loss(call_hook(hook_fn(fns, :loss, loss), :loss, router, b, ev, o))
+        (; loss = l => 1, map(v -> v => 1, loss_term_keys(terms))...)
+    end
     return program_out(m)
 end
 
@@ -1673,13 +1727,19 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
     e, ev = nitro.e, compile_view(nitro.e)
     routing = nitro.routing
     st = Lux.testmode(nitro.st)                 # the framework owns the switch
-    # With no `metrics` the framework substitutes the validation loss through `loss`'s own router.
-    hook = routing.metrics === nothing ? :val_loss : :metrics
-    router = hook === :val_loss ? routing.loss : routing.metrics
+    # With no `metrics` the framework substitutes the split's loss through `loss`'s own router.
+    hook = routing.metrics === nothing ? :loss : :metrics
+    router = hook === :loss ? routing.loss : routing.metrics
     # The substitution is traced whatever the residency says.
-    traced = hook === :val_loss || nitro.frozen.metrics_residency === :device
+    traced = hook === :loss || nitro.frozen.metrics_residency === :device
+    # `eval_loss`: the loss and its terms in their own traced program, beside a user `metrics`.
+    # Every split shares the setup schema, so the fields `loss` reads are present in all or none.
+    with_loss = nitro.eval_loss && hook === :metrics && routing.loss !== nothing &&
+        issubset(keys(routing.loss), nitro.schema)
     # A host metric reads the split's own host batch, so only `forward`'s fields are transferred.
-    xfer = traced ? routing : (; forward = routing.forward)
+    xfer = traced ? routing :
+        with_loss ? (; forward = routing.forward, loss = routing.loss) : (; forward = routing.forward)
+    loss_acc = nothing
     protected = protected_buffers(nitro, st)
     acc, prev_phase = nothing, nitro.phase
     set_phase!(nitro, EvalStepping())
@@ -1726,6 +1786,20 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
                 )
             end
             acc = accumulate_metrics(acc, host_metrics(m, split, n_real), split)
+            if with_loss
+                lthunk = compile_cached(
+                    eval_metric_program, ev, ev, outputs, b, routing.loss,
+                    Val(n_real), Val(:loss), hook_fns(nitro.routing); phase = EvalCompiling(),
+                    worlds = nitro.frozen.worlds_eval, nitro
+                )
+                lm = program_in(
+                    lthunk(
+                        ev, outputs, b, routing.loss, Val(n_real), Val(:loss),
+                        hook_fns(nitro.routing)
+                    )
+                )
+                loss_acc = accumulate_metrics(loss_acc, host_metrics(lm, split, n_real), split)
+            end
             # Freed eagerly: leaving eval outputs to the GC is what OOMs validation on this stack.
             free_device_buffers!(protected, b, outputs)
         end
@@ -1752,10 +1826,15 @@ function run_eval(nitro::Nitro, split::Symbol; report::Bool = true, honor_stop::
         # The boundary assertion on the output: `finalize_metrics` is user code and its result
         # reaches the logger, the phase monitors and the checkpoint metric.
         reduced = reduce_metrics(acc)
-        assert_host(
+        fin = assert_host(
             check_concat_reduced(acc, reduced, finalize_metrics(e, reduced, split), split),
             "the metrics `finalize_metrics` returned for the `$split` split"
         )
+        loss_acc === nothing && return fin
+        # Added after `finalize_metrics`, which replaces what it is given.
+        lout = host_tree(reduce_metrics(loss_acc))
+        check_term_keys(lout, fin, "`metrics` (or `finalize_metrics`), with `eval_loss = true`")
+        merge(fin, lout)
     end
     # After the finalize stretch: `:done` prints the newline that closes the reused terminal line.
     report && progress_done!()

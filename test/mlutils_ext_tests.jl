@@ -199,6 +199,6 @@
         for (a, b) in zip(Functors.fleaves(parameters(one)), Functors.fleaves(parameters(many)))
             @test Array(a) == Array(b)
         end
-        @test validate(many).val_loss == validate(one).val_loss
+        @test validate(many).loss == validate(one).loss
     end
 end

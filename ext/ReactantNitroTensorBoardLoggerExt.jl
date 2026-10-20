@@ -5,7 +5,7 @@
 # TensorBoardLogger keeps its own global step, incremented by every `@info` that reaches it.
 # Nothing here goes through `handle_message`: `log_value` and `log_text` take an explicit `step`,
 # so the driver's step is the only one in the file. Keys are prefixed with the contract's
-# `context`, so `train/loss` and `validate/val_loss` are separate tags; `step` is the x axis for
+# `context`, so `train/loss` and `validate/loss` are separate tags; `step` is the x axis for
 # every context, and the epoch rides along as `<context>/epoch`.
 #
 # TensorBoard's HParams dashboard wants the hyperparameters and the metric tags in one call, and the

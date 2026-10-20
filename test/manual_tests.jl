@@ -471,7 +471,7 @@
 
     @testset "checkpoint/resume round-trips the user's opt_state" begin
         dir = mktempdir()
-        ck = TopKCheckpointer(; metric = :d, mode = :min)   # ToyGAN's metrics emit `d`, not val_loss
+        ck = TopKCheckpointer(; metric = :d, mode = :min)   # ToyGAN's metrics emit `d`, not loss
         n1 = Nitro(ToyGAN(); checkpointer = ck, run_dir = dir)
         train!(n1)
         # `resume = :auto`, which is opt in, restores ps, st, opt_state, step, and epoch.

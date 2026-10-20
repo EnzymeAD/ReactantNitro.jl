@@ -128,8 +128,8 @@ end
             record("m2_shards_differ", all(m -> m[:, :, :, 1:4] != m[:, :, :, 5:8], mm2))
             record("m2_masks_equal_d1", mm2 == md1)
             record("m2_seed_equal_d1", Array(rng.seed) == Array(d1.st.drop.rng.seed))
-            record("m2_loss_rdiff", abs(m2.history[end].loss - d1.history[end].loss) /
-                abs(d1.history[end].loss))
+            record("m2_loss_rdiff", abs(m2.history[end].train_loss - d1.history[end].train_loss) /
+                abs(d1.history[end].train_loss))
             record("m2_ps_maxdiff", maxdiff(flat(parameters(m2)), flat(parameters(d1))))
             record("m2_ps_replicas_agree", all(agree, Functors.fleaves(parameters(m2))))
 
@@ -227,16 +227,16 @@ end
             record("bn_monitor_calls", calls[])
             record("bn_steps", s2.step)
             record("bn_train_out_maxdiff", maximum(maxdiff.(o1, o2)))
-            record("bn_loss_rdiff", abs(s1.history[end].loss - s2.history[end].loss) /
-                abs(s1.history[end].loss))
+            record("bn_loss_rdiff", abs(s1.history[end].train_loss - s2.history[end].train_loss) /
+                abs(s1.history[end].train_loss))
             record("bn_grad_maxdiff", maxdiff(flat(s1.g_accum), flat(s2.g_accum)))
             record("bn_ps_maxdiff", maxdiff(flat(parameters(s1)), flat(parameters(s2))))
             record("bn_mean_maxdiff", maxdiff(Array(bn1.running_mean), Array(bn2.running_mean)))
             record("bn_var_maxdiff", maxdiff(Array(bn1.running_var), Array(bn2.running_var)))
             record("bn_stats_moved", any(!iszero, Array(bn2.running_mean)))
             record("bn_stats_replicas_agree", agree(bn2.running_mean) && agree(bn2.running_var))
-            record("bn_val_rdiff", abs(s1.last_metrics.val_loss - s2.last_metrics.val_loss) /
-                abs(s1.last_metrics.val_loss))
+            record("bn_val_rdiff", abs(s1.last_metrics.loss - s2.last_metrics.loss) /
+                abs(s1.last_metrics.loss))
             record("bn_eval_out_maxdiff", maxdiff(predict(s1, PROBE), predict(s2, PROBE)))
             record("batchnorm", "ok")
         catch err
@@ -305,8 +305,8 @@ end
             s1 = run!(; n_devs = 1)
             s2 = run!(; n_devs = 2)
             p1, p2 = predict(s1, PROBE), predict(s2, PROBE)
-            record("out_val_rdiff", abs(s1.last_metrics.val_loss - s2.last_metrics.val_loss) /
-                abs(s1.last_metrics.val_loss))
+            record("out_val_rdiff", abs(s1.last_metrics.loss - s2.last_metrics.loss) /
+                abs(s1.last_metrics.loss))
             record("out_keys_maxdiff", maximum(k -> maxdiff(p1[k], p2[k]), keys(p1)))
             record("out_xin_is_input", p2.xin == PROBE.x)
             record("out_xr_shape", size(p2.xr) == (2, 2, 8))
@@ -399,8 +399,8 @@ end
             s1 = run!(; n_devs = 1)
             s2 = run!(; n_devs = 2)
             record("ema_maxdiff", maxdiff(flat(s1.ema_weights), flat(s2.ema_weights)))
-            record("ema_val_rdiff", abs(s1.last_metrics.val_loss - s2.last_metrics.val_loss) /
-                abs(s1.last_metrics.val_loss))
+            record("ema_val_rdiff", abs(s1.last_metrics.loss - s2.last_metrics.loss) /
+                abs(s1.last_metrics.loss))
             record("ema", "ok")
         catch err
             record("ema", firstline(err))

@@ -19,7 +19,7 @@ checkpoints. Each line is one object with a `"type"` key (`params`, `tags`, `met
 ```json
 {"seed":42,"max_epochs":40,"width":128,"type":"params"}
 {"loss":0.31,"type":"metrics","context":"train","epoch":1,"step":4}
-{"val_loss":0.29,"type":"metrics","context":"validate","epoch":1,"step":160}
+{"loss":0.29,"type":"metrics","context":"validate","epoch":1,"step":160}
 {"data_wait_frac":0.012,"type":"metrics","context":"data","epoch":1,"step":160}
 {"type":"other","key":"binding_report","value":"..."}
 {"type":"finish","status":"completed"}

@@ -114,7 +114,7 @@
         @test [v.m.loss for v in lg.lines] == [Float64(x.k)^2 for x in expected(accum, epochs)]
         @test current_step(n) == epochs * (N_BATCHES ÷ accum)
         # The epoch mean sees every micro-batch, the drained last one included: mean(k^2, 1:6).
-        @test [r.loss for r in n.history] ≈ fill(sum(abs2, 1:N_BATCHES) / N_BATCHES, epochs)
+        @test [r.train_loss for r in n.history] ≈ fill(sum(abs2, 1:N_BATCHES) / N_BATCHES, epochs)
     end
 
     # A trainable control: the parameter-free loss above pins attribution; this pins that real,
@@ -133,7 +133,7 @@
         losses = [v.m.loss for v in n.logger.lines]
         @test length(losses) == 2N_BATCHES
         @test !allequal(losses)                  # the parameters really moved
-        @test [r.loss for r in n.history] ≈
+        @test [r.train_loss for r in n.history] ≈
             [mean(losses[1:N_BATCHES]), mean(losses[(N_BATCHES + 1):end])]
     end
 
@@ -168,7 +168,7 @@
         # every other line is untouched.
         @test isempty(lines[3].m)
         @test [lines[i].m.loss for i in (1, 2, 4, 5, 6)] == [1.0, 4.0, 16.0, 25.0, 36.0]
-        @test isnan(only(n.history).loss)
+        @test isnan(only(n.history).train_loss)
     end
 
     @testset "`check_divergence` resolves keyword, then field, then the default" begin
@@ -200,7 +200,7 @@
         train!(n)
         @test n.stop_reason === :requested
         @test observed(n.logger) == [(; step = 1, epoch = 1, k = 1)]
-        @test only(n.history).loss == 1.0
+        @test only(n.history).train_loss == 1.0
         # The consumed batch, the first transferred on this ordered single-producer path, is freed
         # by the drain. Batches prefetched behind it are the stream close's business, and one still
         # inside the transfer task at the close is left to the GC with or without the lag (checked

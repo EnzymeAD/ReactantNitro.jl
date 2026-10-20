@@ -321,7 +321,7 @@
             withm = [(p, info) for (p, _, _, info) in a if haskey(info, :metrics)]
             @test length(withm) == 1
             @test first(withm)[1] isa TrainStepping                  # EvalStepping -> TrainStepping
-            @test haskey(first(withm)[2].metrics, :val_loss)
+            @test haskey(first(withm)[2].metrics, :loss)
         end
 
         @testset "a cache HIT publishes no compile phase" begin
@@ -392,44 +392,49 @@
     # ── early stopping ───────────────────────────────────────────────────────────────────
 
     @testset "`should_stop` counts epochs without improvement, with an absolute `min_delta`" begin
-        es = EarlyStopping(; metric = :val_loss, mode = :min, patience = 2, min_delta = 0.1)
-        @test should_stop(es, 1, (; val_loss = 1.0)) === false      # first epoch sets the best
+        es = EarlyStopping(; metric = :loss, mode = :min, patience = 2, min_delta = 0.1)
+        @test should_stop(es, 1, (; loss = 1.0)) === false      # first epoch sets the best
         @test es.best == 1.0
-        @test should_stop(es, 2, (; val_loss = 0.95)) === false     # better, but not BY min_delta
+        @test should_stop(es, 2, (; loss = 0.95)) === false     # better, but not BY min_delta
         @test es.wait == 1
-        @test should_stop(es, 3, (; val_loss = 0.5)) === false      # a real improvement resets patience
+        @test should_stop(es, 3, (; loss = 0.5)) === false      # a real improvement resets patience
         @test es.wait == 0 && es.best == 0.5
-        @test should_stop(es, 4, (; val_loss = 0.6)) === false
-        @test should_stop(es, 5, (; val_loss = 0.6)) === true       # patience exhausted
+        @test should_stop(es, 4, (; loss = 0.6)) === false
+        @test should_stop(es, 5, (; loss = 0.6)) === true       # patience exhausted
 
         mx = EarlyStopping(; metric = :acc, mode = :max, patience = 1, min_delta = 0.0)
         @test should_stop(mx, 1, (; acc = 0.5)) === false
         @test should_stop(mx, 2, (; acc = 0.7)) === false
         @test should_stop(mx, 3, (; acc = 0.7)) === true            # equal is not an improvement
 
-        @test should_stop(nothing, 1, (; val_loss = 1.0)) === false # the shipped no-op default
+        @test should_stop(nothing, 1, (; loss = 1.0)) === false # the shipped no-op default
     end
 
     @testset "the metric must exist, and must survive its readback" begin
-        es = EarlyStopping(; metric = :nope)
+        es = EarlyStopping(; metric = :nope, mode = :min)
         err = try
-            should_stop(es, 1, (; val_loss = 1.0))
+            should_stop(es, 1, (; loss = 1.0))
             nothing
         catch ex
             ex
         end
         @test err isa ErrorException
-        @test occursin("(:val_loss,)", err.msg)                     # names what IS available
+        @test occursin("(:loss,)", err.msg)                     # names what IS available
 
         # A scalar the framework BRANCHES on is validated, because a failed readback returns
         # garbage without raising on this stack.
-        @test_throws ErrorException should_stop(EarlyStopping(), 1, (; val_loss = NaN))
+        @test_throws ErrorException should_stop(
+            EarlyStopping(; metric = :loss, mode = :min), 1, (; loss = NaN)
+        )
+        # A following policy is filled in by setup, so on its own it says so.
+        @test_throws "monitor" should_stop(EarlyStopping(), 1, (; loss = 1.0))
         @test check_control_readback(1.5, "a test", :m) === 1.5
         @test_throws ErrorException check_control_readback([1, 2], "a test", :m)
     end
 
     @testset "setup rejects what it can see, before the run rather than an epoch in" begin
-        @test_throws ErrorException mk_life(; early_stop = EarlyStopping(; mode = :lower))
+        @test_throws "alone" EarlyStopping(; mode = :max)
+        @test_throws ErrorException EarlyStopping(; metric = :loss, mode = :lower)
         @test_throws ErrorException mk_life(; early_stop = EarlyStopping(; patience = 0))
         # No `val` split to evaluate the condition on: the run would silently never stop early.
         err = try
@@ -443,16 +448,16 @@
         end
         @test err isa ErrorException
         @test occursin("val", err.msg)
-        # This experiment defines no `metrics`, so `:val_loss` is the only key that can ever appear, and
+        # This experiment defines no `metrics`, so `:loss` is the only key that can ever appear, and
         # THAT much the framework can check at setup.
         err2 = try
-            mk_life(; early_stop = EarlyStopping(; metric = :accuracy))
+            mk_life(; early_stop = EarlyStopping(; metric = :accuracy, mode = :max))
             nothing
         catch ex
             ex
         end
         @test err2 isa ErrorException
-        @test occursin("accuracy", err2.msg) && occursin("val_loss", err2.msg)
+        @test occursin("accuracy", err2.msg) && occursin("loss", err2.msg)
     end
 
     @testset "early-stopping counters belong to the handle and survive a resume" begin
@@ -468,6 +473,13 @@
         r = train!(Nitro(LifeMLP(); run_dir = dir, max_epochs = 5, resume = :auto, early_stop = es))
         @test r.stop_reason === :early_stop
         @test current_epoch(r) == 4
+
+        # Every record, not only the final rewrite, holds the counters after its own epoch.
+        d2 = mktempdir()
+        ck = Checkpointer(; keep = Last(5))
+        train!(Nitro(LifeMLP(); run_dir = d2, max_epochs = 2, early_stop = es, checkpointer = ck))
+        e1 = only(e for e in read_manifest(d2) if e.epoch == 1)
+        @test load_checkpoint(ck, joinpath(d2, e1.file)).early_stop.best !== nothing
     end
 
     @testset "a run that stops on patience exits through `Done`, gracefully" begin
@@ -612,12 +624,12 @@
 
         # The last epoch's validation metrics, on the handle, as HOST values.
         @test !isempty(n.last_metrics)
-        @test haskey(n.last_metrics, :val_loss)
-        @test n.last_metrics.val_loss isa Real
+        @test haskey(n.last_metrics, :loss)
+        @test n.last_metrics.loss isa Real
         @test n.elapsed isa Real && n.elapsed > 0
 
         long = sprint(show, MIME"text/plain"(), n)
-        @test occursin("metrics", long) && occursin("val_loss", long)
+        @test occursin("metrics", long) && occursin("loss", long)
         @test occursin("elapsed", long)
         # `mk_life` passes `checkpointer = nothing`, so there is no selected checkpoint and the
         # row is absent rather than present and empty.
@@ -1209,7 +1221,7 @@
 
         bc = n.best_checkpoint
         @test bc !== nothing
-        @test bc.metric === :val_loss
+        @test bc.metric === :loss
         @test bc.score isa Real
         @test isfile(bc.path)
         # The BEST, not the newest: `mode = :min` by default, so no retained entry scores lower.
@@ -1219,7 +1231,7 @@
         long = sprint(show, MIME"text/plain"(), n)
         @test occursin("checkpoint", long)
         @test occursin("epoch $(bc.epoch)", long)
-        @test occursin("val_loss", long)
+        @test occursin("loss", long)
         @test occursin(basename(bc.path), long)          # the file, pasteable
         @test length(long) < DISPLAY_BUDGET
 

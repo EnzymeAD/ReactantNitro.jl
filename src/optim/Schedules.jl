@@ -38,7 +38,13 @@ struct ResolvedSchedules{T <: NamedTuple, O <: NamedTuple, R <: NamedTuple, B <:
     source::Dict{Symbol, Symbol}     # display key        -> :keyword | :accessor
     constant::Vector{Symbol}        # display keys that were bare Numbers
     horizon_dependent::Bool
+    plateaus::Vector                # key => PlateauSchedule, from `collect_plateaus`
 end
+
+ResolvedSchedules(device, opt, grad, bind, source, constant, horizon_dependent) = ResolvedSchedules(
+    device, opt, grad, bind, source, constant, horizon_dependent,
+    collect_plateaus(device, opt, grad, bind)
+)
 
 Base.isempty(r::ResolvedSchedules) =
     isempty(r.device) && isempty(r.opt) && isempty(r.grad) && isempty(r.bind)
@@ -1060,6 +1066,9 @@ function binding_report_pieces(nitro)
         name = string(nameof(typeof(nitro.e))), splits,
         clip = nitro.gradient_clip_norm,
         clip_source = clip_source(nitro.e, nitro.gradient_clip_norm),
+        monitor = nitro.monitor,
+        monitor_source = monitor_source(nitro),
+        watchers = watchers(nitro),
         schedules = nitro.schedules, groups,
         manual = get(nitro.frozen, :manual, false),
         level2 = nitro.bindings.level2,
@@ -1091,10 +1100,33 @@ accessor returns, `:method` for a user accessor method, `:field` for a declared 
 constructor body runs a passed keyword cannot be told apart from the accessor default; a keyword
 equal to the accessor's value reports the accessor's source.
 """
-clip_source(e, resolved) =
-    resolved != gradient_clip_norm(e) ? :keyword :
-    !is_framework_default(gradient_clip_norm, Tuple{typeof(e)}) ? :method :
-    hasfield(typeof(e), :gradient_clip_norm) ? :field : :default
+clip_source(e, resolved) = accessor_source(gradient_clip_norm, e, resolved, :gradient_clip_norm)
+
+# Which route supplied a run accessor's resolved value; see `clip_source`.
+accessor_source(f, e, resolved, field::Symbol) =
+    resolved != f(e) ? :keyword :
+    !is_framework_default(f, Tuple{typeof(e)}) ? :method :
+    hasfield(typeof(e), field) ? :field : :default
+
+# The accessor's `nothing` resolved by setup reads as the framework's default.
+monitor_source(nitro) =
+    monitor(nitro.e) === nothing && nitro.monitor in (nothing, :loss => :min) ? :default :
+    accessor_source(monitor, nitro.e, nitro.monitor, :monitor)
+
+# What reads a validation metric, as `(who, metric => mode)` after setup filled in the monitor.
+function watchers(nitro)
+    out = Tuple{String, Pair{Symbol, Symbol}}[]
+    ck = nitro.checkpointer
+    ck isa Checkpointer && ck.metric !== nothing &&
+        push!(out, ("checkpointer", ck.metric => ck.mode))
+    es = nitro.early_stop
+    es isa EarlyStopping && es.metric !== nothing &&
+        push!(out, ("early stopping", es.metric => es.mode))
+    for (k, s) in plateaus(nitro.schedules)
+        push!(out, ("plateau `$k`", s.p.metric => s.p.mode))
+    end
+    return out
+end
 
 _commas(n::Integer) = replace(string(n), r"(?<=[0-9])(?=(?:[0-9]{3})+$)" => ",")
 _g(x) = string(round(Float64(x); sigdigits = 3))
@@ -1158,7 +1190,8 @@ size and preset belong to the `state` band, so no fact is printed twice.
 function binding_report_sections(;
         name = "", splits = (), clip = 0,
         clip_source::Symbol = :default, schedules = nothing, groups = (),
-        level2 = (), manual = false, landed = Dict()
+        level2 = (), manual = false, landed = Dict(), monitor = missing,
+        monitor_source::Symbol = :default, watchers = ()
     )
     sections = TableSection[]
 
@@ -1205,6 +1238,21 @@ function binding_report_sections(;
         ]
     )
 
+    if monitor === missing
+        # Not given: a report built by hand, without a run.
+    elseif monitor === nothing
+        push!(rows, ["monitor", "none: `metrics` is defined and `eval_loss` is off; nothing ranks", "[" * _source_label(monitor_source) * "]"])
+        push!(srcs, monitor_source)
+    else
+        follow = [w for (w, m) in watchers if m == monitor]
+        own = ["$w on $(first(m)) ($(last(m)))" for (w, m) in watchers if m != monitor]
+        what = "$(first(monitor)) ($(last(monitor)))" *
+            (isempty(follow) ? "; nothing follows it" : "; followed by " * join(follow, ", ")) *
+            (isempty(own) ? "" : "; own: " * join(own, ", "))
+        push!(rows, ["monitor", what, "[" * _source_label(monitor_source) * "]"])
+        push!(srcs, monitor_source)
+    end
+
     if schedules !== nothing && !isempty(schedules)
         tables = (
             (:opt, schedules.opt), (:device, schedules.device), (:grad, schedules.grad),
@@ -1221,7 +1269,7 @@ function binding_report_sections(;
                     ns === :grad ? "gradient rule field, the ε program only" :
                     ns === :bind ? "bound by hand: " * join(get(landed, disp, String[]), ", ") :
                     "Device field   e.$k"
-                note = disp in schedules.constant ? "  (constant)" : ""
+                note = (disp in schedules.constant ? "  (constant)" : "") * _plateau_desc(tbl[k])
                 # The source keeps its brackets; `[train! keyword]` is the token used everywhere.
                 src = get(schedules.source, disp, :accessor)
                 push!(rows, [string(disp), what * note, "[" * _source_label(src) * "]"])

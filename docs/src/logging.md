@@ -56,7 +56,7 @@ run's directory.
 ```json
 {"type":"params","seed":42,"max_epochs":40,"width":128}
 {"type":"metrics","context":"train","epoch":1,"step":4,"loss":0.31}
-{"type":"metrics","context":"validate","epoch":1,"step":160,"val_loss":0.29}
+{"type":"metrics","context":"validate","epoch":1,"step":160,"loss":0.29}
 {"type":"metrics","context":"data","epoch":1,"step":160,"data_wait_frac":0.012}
 {"type":"other","key":"binding_report","value":"..."}
 {"type":"finish","status":"completed"}
@@ -106,7 +106,7 @@ tensorboard --logdir tb
 ```
 
 Each metric becomes a scalar summary tagged `<context>/<name>`, such as `train/loss`,
-`train/schedule/backbone/eta` or `validate/val_loss`, with `step` as the x axis in every context and
+`train/schedule/backbone/eta` or `validate/loss`, with `step` as the x axis in every context and
 the epoch logged as `<context>/epoch`. A metric value that is not a `Real` is an error naming the
 key; write it through `backend` instead (see [below](#Past-the-ten-verbs)).
 

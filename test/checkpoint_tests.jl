@@ -127,7 +127,7 @@
         @test rec.config == (; tag = 1, width = 6)              # GraphConst fields only
         @test keys(rec.devices) == (:scale,)                   # Devices recorded, not compared
         @test rec.devices.scale === 1.0f0                        # and read back to a HOST value
-        @test haskey(rec.metrics, :val_loss)
+        @test haskey(rec.metrics, :loss)
         @test rec.flat_permutation == n.layout.permutation
         # The per-epoch record is written BEFORE the run knows how it ended, so the outcome
         # reaches the record through the final rewrite of the last epoch's checkpoint.
@@ -227,11 +227,11 @@
 
     @testset "top-K retains the best K in union with the newest" begin
         dir = mktempdir()
-        ck = TopKCheckpointer(; k = 2, metric = :val_loss, mode = :min, dir, name = short_name)
+        ck = TopKCheckpointer(; k = 2, metric = :loss, mode = :min, dir, name = short_name)
         snap = snapshot(Nitro(CkptMLP(); run_dir = mktempdir(), checkpointer = nothing))
         # Deliberately worsening, so the newest is NOT among the best and the union is K+1.
         for (epoch, v) in enumerate([1.0, 2.0, 3.0, 4.0])
-            save_checkpoint!(ck, epoch, (; val_loss = v), merge(snap, (; epoch)))
+            save_checkpoint!(ck, epoch, (; loss = v), merge(snap, (; epoch)))
         end
         kept = sort(filter(f -> startswith(f, "epoch-"), readdir(dir)))
         @test kept == ["epoch-0001.jld2", "epoch-0002.jld2", "epoch-0004.jld2"]
@@ -240,10 +240,10 @@
         # And exactly K when the newest IS among the best.
         dir2 = mktempdir()
         ck2 = TopKCheckpointer(;
-            k = 2, metric = :val_loss, mode = :min, dir = dir2, name = short_name
+            k = 2, metric = :loss, mode = :min, dir = dir2, name = short_name
         )
         for (epoch, v) in enumerate([4.0, 3.0, 2.0, 1.0])
-            save_checkpoint!(ck2, epoch, (; val_loss = v), merge(snap, (; epoch)))
+            save_checkpoint!(ck2, epoch, (; loss = v), merge(snap, (; epoch)))
         end
         @test sort(filter(f -> startswith(f, "epoch-"), readdir(dir2))) ==
             ["epoch-0003.jld2", "epoch-0004.jld2"]
@@ -262,7 +262,7 @@
             # It drives retention, which is control flow, and a failed readback returns garbage without
             # raising on this stack.
             @test_throws ErrorException save_checkpoint!(
-                ck, 9, (; val_loss = NaN),
+                ck, 9, (; loss = NaN),
                 merge(snap, (; epoch = 9))
             )
             @test_throws ErrorException save_checkpoint!(
@@ -279,8 +279,8 @@
     @testset "the filename carries epoch, step, and the selection metric with its value" begin
         cf(; kwargs...) = checkpoint_filename(CkptMLP(); kwargs...)
 
-        @test cf(epoch = 6, step = 4500, metric = :val_loss, score = 0.0416831) ==
-            "epoch-0006-step-4500-val_loss=0.0416831.jld2"
+        @test cf(epoch = 6, step = 4500, metric = :loss, score = 0.0416831) ==
+            "epoch-0006-step-4500-loss=0.0416831.jld2"
         # `%.6g`, the predecessor stack's format, so a score in a name is reproducible with printf.
         @test cf(epoch = 43, step = 32250, metric = :mae, score = -1.234567e-7) ==
             "epoch-0043-step-32250-mae=-1.23457e-07.jld2"
@@ -292,7 +292,7 @@
         @testset "`score === nothing` omits the segment rather than filling it" begin
             # What a run with no `val` split produces. No metric segment means no metric was
             # computed, and a token such as `no_score` would reserve a name a real metric could take.
-            @test cf(epoch = 6, step = 4500, metric = :val_loss, score = nothing) ==
+            @test cf(epoch = 6, step = 4500, metric = :loss, score = nothing) ==
                 "epoch-0006-step-4500.jld2"
         end
 
@@ -306,7 +306,7 @@
             # The VALUE needs none: the readback check refuses a non-finite selection metric
             # before this is
             # reached, so `%g` output is always within `[0-9.eE+-]`.
-            @test sanitize_metric_name(:val_loss) == "val_loss"
+            @test sanitize_metric_name(:loss) == "loss"
             @test sanitize_metric_name(Symbol("a/b")) == "a_b"       # no path separator survives
             @test sanitize_metric_name(Symbol("a*b?c[d]")) == "a_b_c_d_"   # no glob metacharacter
             @test sanitize_metric_name(Symbol("a:b|c")) == "a_b_c"   # nothing Windows-hostile
@@ -339,8 +339,8 @@
         @testset "the return is checked, since a hook is a user method" begin
             snap = snapshot(Nitro(CkptMLP(); run_dir = mktempdir(), checkpointer = nothing))
             bad(name) = save_checkpoint!(
-                TopKCheckpointer(; dir = mktempdir(), name),
-                1, (; val_loss = 1.0), merge(snap, (; epoch = 1))
+                TopKCheckpointer(; metric = :loss, mode = :min, dir = mktempdir(), name),
+                1, (; loss = 1.0), merge(snap, (; epoch = 1))
             )
             @test_throws "not a checkpoint filename" bad((; kwargs...) -> "no-extension")
             @test_throws "not a checkpoint filename" bad((; kwargs...) -> "")
@@ -351,8 +351,8 @@
             @test_throws "path separator" bad((; kwargs...) -> "../escape.jld2")
             # A checkpointer that never went through setup has no name to call.
             @test_throws "has no `name`" save_checkpoint!(
-                TopKCheckpointer(; dir = mktempdir()),
-                1, (; val_loss = 1.0), merge(snap, (; epoch = 1))
+                TopKCheckpointer(; metric = :loss, mode = :min, dir = mktempdir()),
+                1, (; loss = 1.0), merge(snap, (; epoch = 1))
             )
         end
 
@@ -365,13 +365,13 @@
             # a hook and Revise can change one mid-run.
             dir = mktempdir()
             snap = snapshot(Nitro(CkptMLP(); run_dir = mktempdir(), checkpointer = nothing))
-            ck = TopKCheckpointer(; dir, name = short_name)
-            save_checkpoint!(ck, 1, (; val_loss = 1.0), merge(snap, (; epoch = 1)))
+            ck = TopKCheckpointer(; metric = :loss, mode = :min, dir, name = short_name)
+            save_checkpoint!(ck, 1, (; loss = 1.0), merge(snap, (; epoch = 1)))
             @test filter(endswith(".jld2"), readdir(dir)) |> sort ==
                 ["epoch-0001.jld2", "manifest.jld2"]
 
             ck.name = (; epoch, kwargs...) -> "renamed-$(epoch).jld2"
-            save_checkpoint!(ck, 1, (; val_loss = 1.0), merge(snap, (; epoch = 1)))
+            save_checkpoint!(ck, 1, (; loss = 1.0), merge(snap, (; epoch = 1)))
             @test sort(filter(endswith(".jld2"), readdir(dir))) ==
                 ["manifest.jld2", "renamed-1.jld2"]
             @test length(read_manifest(dir)) == 1
@@ -385,9 +385,9 @@
             # the same file, and the manifest a resume reads never stops growing.
             dir = mktempdir()
             snap = snapshot(Nitro(CkptMLP(); run_dir = mktempdir(), checkpointer = nothing))
-            ck = TopKCheckpointer(; dir, name = (; kwargs...) -> "best.jld2")
+            ck = TopKCheckpointer(; metric = :loss, mode = :min, dir, name = (; kwargs...) -> "best.jld2")
             for (epoch, v) in enumerate([3.0, 1.0, 2.0])
-                save_checkpoint!(ck, epoch, (; val_loss = v), merge(snap, (; epoch)))
+                save_checkpoint!(ck, epoch, (; loss = v), merge(snap, (; epoch)))
             end
             @test sort(filter(endswith(".jld2"), readdir(dir))) == ["best.jld2", "manifest.jld2"]
             entries = read_manifest(dir)
@@ -505,7 +505,7 @@
             CkptMLP(; tag = 2); weights = path, data = (; test = CK_VAL), run_dir = mktempdir()
         )
         @test params_of(served) == params_of(n)
-        @test evaluate(served; split = :test).val_loss isa Real
+        @test evaluate(served; split = :test).loss isa Real
 
         err = try
             Nitro(CkptMLP(; width = 8); weights = path, data = (;), run_dir = mktempdir())
@@ -543,7 +543,7 @@
             rec.opt_state, moved, rec.step, rec.epoch, rec.seed, rec.config,
             rec.devices, rec.metrics, rec.run_id, rec.run_url, rec.logger_state,
             rec.logger_type, rec.anchor_checksum, rec.stop_reason, rec.preset, rec.derived,
-            rec.early_stop, rec.averaged_from, rec.ema
+            rec.early_stop, rec.averaged_from, rec.ema, rec.schedule_state
         )
         err = try
             check_permutation_compatible(bad, n.layout, "x")
@@ -800,7 +800,7 @@
         @test current_step(served) == 0
         @test served.opt_state === nothing                       # and no moments: step 9 is skipped
         # This is the evaluation construction, and it works with no training data at all.
-        @test evaluate(served; split = :test).val_loss isa Real
+        @test evaluate(served; split = :test).loss isa Real
 
         # `load_checkpoint` dispatches on the checkpointer, so `checkpointer = nothing` has no
         # loader. Asking to load one anyway is a contradiction, and answering with freshly initialized
@@ -861,21 +861,21 @@
     @testset "the checkpointer's own configuration is checked at setup" begin
         @test_throws ErrorException Nitro(
             CkptMLP(); run_dir = mktempdir(),
-            checkpointer = TopKCheckpointer(; mode = :lowest)
+            checkpointer = TopKCheckpointer(; metric = :loss, mode = :lowest)
         )
         @test_throws ErrorException Nitro(
             CkptMLP(); run_dir = mktempdir(),
             checkpointer = TopKCheckpointer(; k = 0)
         )
-        # This experiment defines no `metrics`, so `:val_loss` is the only key that can appear.
+        # This experiment defines no `metrics`, so `:loss` is the only key that can appear.
         err = try
-            Nitro(CkptMLP(); run_dir = mktempdir(), checkpointer = TopKCheckpointer(; metric = :acc))
+            Nitro(CkptMLP(); run_dir = mktempdir(), checkpointer = TopKCheckpointer(; metric = :acc, mode = :max))
             nothing
         catch ex
             ex
         end
         @test err isa ErrorException
-        @test occursin("acc", err.msg) && occursin("val_loss", err.msg)
+        @test occursin("acc", err.msg) && occursin("loss", err.msg)
     end
 
 
@@ -1074,7 +1074,7 @@
         @test run_files(dir, run_of(b)) == expected_kept(b_entries, 1)
         @test all(isfile(joinpath(dir, e.file)) for e in b_entries)
         # And every entry records the metric and mode that produced its score.
-        @test all(e.metric === :val_loss && e.mode === :min for e in read_manifest(dir))
+        @test all(e.metric === :loss && e.mode === :min for e in read_manifest(dir))
         # After `train!`, the handle reports ITS run's selection, not the directory's.
         @test a.best_checkpoint.path in (joinpath(dir, f) for f in a_files)
         @test basename(b.best_checkpoint.path) in run_files(dir, run_of(b))
@@ -1183,7 +1183,7 @@
         # under `:min`, which `:max` cannot rank, so they stay.
         r = Nitro(
             CkptMLP(); run_dir = dir, max_epochs = 5, resume = :auto,
-            checkpointer = TopKCheckpointer(; k = 1, mode = :max)
+            checkpointer = TopKCheckpointer(; k = 1, metric = :loss, mode = :max)
         )
         @test run_of(r) == run_of(a)
         train!(r)
@@ -1203,7 +1203,7 @@
         train!(
             Nitro(
                 CkptMLP(); run_dir = dir, max_epochs = 2, seed = 3,
-                checkpointer = TopKCheckpointer(; k = 1, mode = :max)
+                checkpointer = TopKCheckpointer(; k = 1, metric = :loss, mode = :max)
             )
         )
         @test issubset(before, Set(e.file for e in read_manifest(dir)))
@@ -1305,7 +1305,7 @@
     #
     # The scores are scripted rather than taken from the fixture's loss curve, so which epochs are
     # top K is a property of the test and not of the optimizer. `finalize_metrics` runs once per
-    # validation, host-side, and replaces the measured `val_loss` with the script's next value.
+    # validation, host-side, and replaces the measured `loss` with the script's next value.
     @experiment struct ScriptedCkpt
         max_epochs::Host{Int} = 4
     end
@@ -1317,7 +1317,7 @@
     const SCRIPT_AT = Ref(0)
     script!(v) = (SCRIPT[] = Float64.(v); SCRIPT_AT[] = 0; nothing)
     ReactantNitro.finalize_metrics(::ScriptedCkpt, acc, ::Symbol) =
-        (SCRIPT_AT[] += 1; (; val_loss = SCRIPT[][SCRIPT_AT[]]))
+        (SCRIPT_AT[] += 1; (; loss = SCRIPT[][SCRIPT_AT[]]))
     drop_latest(k) = Checkpointer(; keep = Best(k))
     epochs_of(dir, run) = Set(e.epoch for e in run_entries(dir, run))
     ckpt_files(dir) = Set(filter(f -> endswith(f, ".jld2") && f != "manifest.jld2", readdir(dir)))
@@ -1331,10 +1331,10 @@
         counting(; epoch, kwargs...) = (push!(named, epoch); short_name(; epoch, kwargs...))
 
         dir = mktempdir()
-        ck = TopKCheckpointer(; k = 2, dir, name = counting, keep_latest = false)
+        ck = TopKCheckpointer(; metric = :loss, mode = :min, k = 2, dir, name = counting, keep_latest = false)
         # Worsening after epoch 2, so the default would keep the newest as a K+1th file.
         wrote = [
-            save_checkpoint!(ck, epoch, (; val_loss = v), merge(snap, (; epoch)))
+            save_checkpoint!(ck, epoch, (; loss = v), merge(snap, (; epoch)))
                 for (epoch, v) in enumerate([2.0, 1.0, 3.0, 4.0])
         ]
         @test wrote == [true, true, false, false]
@@ -1345,18 +1345,18 @@
         @test find_latest(ck, dir) == joinpath(dir, "epoch-0002.jld2")
 
         # An improvement enters, displacing the worst of the K; a tie with the K-th does not.
-        @test save_checkpoint!(ck, 5, (; val_loss = 2.0), merge(snap, (; epoch = 5))) === false
-        @test save_checkpoint!(ck, 6, (; val_loss = 0.5), merge(snap, (; epoch = 6))) === true
+        @test save_checkpoint!(ck, 5, (; loss = 2.0), merge(snap, (; epoch = 5))) === false
+        @test save_checkpoint!(ck, 6, (; loss = 0.5), merge(snap, (; epoch = 6))) === true
         @test ckpt_files(dir) == Set(["epoch-0002.jld2", "epoch-0006.jld2"])
         @test named == [1, 2, 6]
 
         # The final `stop_reason` rewrite: an epoch already in the top K is rewritten in place,
         # and one that was declined stays declined.
         fin = merge(snap, (; epoch = 6, stop_reason = :completed))
-        @test save_checkpoint!(ck, 6, (; val_loss = 0.5), fin) === true
+        @test save_checkpoint!(ck, 6, (; loss = 0.5), fin) === true
         @test load_checkpoint(ck, joinpath(dir, "epoch-0006.jld2")).stop_reason === :completed
         @test length(read_manifest(dir)) == 2
-        @test save_checkpoint!(ck, 7, (; val_loss = 9.0), merge(fin, (; epoch = 7))) === false
+        @test save_checkpoint!(ck, 7, (; loss = 9.0), merge(fin, (; epoch = 7))) === false
         @test ckpt_files(dir) == Set(["epoch-0002.jld2", "epoch-0006.jld2"])
 
         @testset "`mode = :max` ranks the other way" begin
@@ -1374,7 +1374,7 @@
         end
 
         @testset "an unscored epoch cannot be kept, and says so" begin
-            c = TopKCheckpointer(; k = 1, dir = mktempdir(), name = short_name, keep_latest = false)
+            c = TopKCheckpointer(; metric = :loss, mode = :min, k = 1, dir = mktempdir(), name = short_name, keep_latest = false)
             @test_throws "keep_latest = false" save_checkpoint!(c, 1, (;), merge(snap, (; epoch = 1)))
         end
     end
@@ -1383,20 +1383,20 @@
 
     @testset "selectors, driven by hand: union retention and the write decision" begin
         snap = snapshot(Nitro(CkptMLP(); run_dir = mktempdir(), checkpointer = nothing))
-        save!(c, epoch, v) = save_checkpoint!(c, epoch, (; val_loss = v), merge(snap, (; epoch)))
+        save!(c, epoch, v) = save_checkpoint!(c, epoch, (; loss = v), merge(snap, (; epoch)))
         files(epochs) = Set("epoch-" * lpad(e, 4, '0') * ".jld2" for e in epochs)
         scores = [5.0, 1.0, 4.0, 3.0, 6.0, 7.0, 8.0, 9.0]
 
         @testset "`Last(n)` keeps the latest n, whatever they scored" begin
             d = mktempdir()
-            c = Checkpointer(; keep = Last(3), dir = d, name = short_name)
+            c = Checkpointer(; keep = Last(3), metric = :loss, mode = :min, dir = d, name = short_name)
             @test all(save!(c, e, v) for (e, v) in enumerate(scores))
             @test ckpt_files(d) == files(6:8)
         end
 
         @testset "`(Best(2), Last(3))` keeps the union" begin
             d = mktempdir()
-            c = Checkpointer(; keep = (Best(2), Last(3)), dir = d, name = short_name)
+            c = Checkpointer(; keep = (Best(2), Last(3)), metric = :loss, mode = :min, dir = d, name = short_name)
             foreach(((e, v),) -> save!(c, e, v), enumerate(scores))
             @test ckpt_files(d) == files([2, 4, 6, 7, 8])
         end
@@ -1405,7 +1405,7 @@
             named = Int[]
             counting(; epoch, kwargs...) = (push!(named, epoch); short_name(; epoch, kwargs...))
             d = mktempdir()
-            c = Checkpointer(; keep = (Every(3), Epochs(7:8)), dir = d, name = counting)
+            c = Checkpointer(; keep = (Every(3), Epochs(7:8)), metric = :loss, mode = :min, dir = d, name = counting)
             wrote = [save!(c, e, v) for (e, v) in enumerate(scores)]
             @test wrote == [false, false, true, false, false, true, true, true]
             @test named == [3, 6, 7, 8]
@@ -1415,8 +1415,8 @@
         @testset "`TopKCheckpointer` builds the equivalent `Checkpointer`, with identical files" begin
             for kl in (true, false)
                 da, db = mktempdir(), mktempdir()
-                a = TopKCheckpointer(; k = 2, keep_latest = kl, dir = da, name = short_name)
-                b = Checkpointer(; keep = kl ? (Best(2), Last(1)) : Best(2), dir = db, name = short_name)
+                a = TopKCheckpointer(; metric = :loss, mode = :min, k = 2, keep_latest = kl, dir = da, name = short_name)
+                b = Checkpointer(; metric = :loss, mode = :min, keep = kl ? (Best(2), Last(1)) : Best(2), dir = db, name = short_name)
                 @test a.keep == b.keep && a.k == b.k == 2 && a.keep_latest == b.keep_latest == kl
                 wa = [save!(a, e, v) for (e, v) in enumerate(scores)]
                 wb = [save!(b, e, v) for (e, v) in enumerate(scores)]
@@ -1837,7 +1837,7 @@
         @test n.restored_best.epoch == 2 && n.restored_best.path == best
         # The trajectory is as training ended.
         @test current_epoch(n) == 4 && current_step(n) == 4 * length(CK_TRAIN)
-        @test length(history(n)) == 4 && n.last_metrics.val_loss == 4.0
+        @test length(history(n)) == 4 && n.last_metrics.loss == 4.0
         # The display says it, and names the run.
         s = sprint(show, MIME"text/plain"(), n)
         @test occursin("restored to the best checkpoint, epoch 2", s)
@@ -1911,7 +1911,7 @@
     # ── mixed metrics: selection sees the current metric only, and never prunes the others ──
 
     # Entries under `:acc`, written by hand into a directory as run `accrun01`: an experiment that
-    # emits only `val_loss` cannot score them itself, which is exactly the situation to cover.
+    # emits only `loss` cannot score them itself, which is exactly the situation to cover.
     acc_name(; epoch, kwargs...) = "acc-" * lpad(epoch, 4, '0') * ".jld2"
     function acc_run!(dir)
         snap = snapshot(Nitro(ScriptedCkpt(); run_dir = mktempdir(), checkpointer = nothing))
@@ -1927,7 +1927,7 @@
         dir = mktempdir()
         acc_files = acc_run!(dir)
         @test run_files(dir, "accrun01") == acc_files
-        # A `val_loss` run in the same directory, retention over the whole directory: the `acc`
+        # A `loss` run in the same directory, retention over the whole directory: the `acc`
         # entries are in its scope, so setup says they are mixed, and training prunes around them.
         script!([3.0, 1.0, 2.0])
         n = @test_logs (:warn, r"retention considers checkpoints scored under other metrics: `acc` \(max\) x2") match_mode = :any Nitro(
@@ -1938,14 +1938,14 @@
         @test run_files(dir, "accrun01") == acc_files
         @test all(isfile(joinpath(dir, f)) for f in acc_files)
         @test epochs_of(dir, run_of(n)) == Set([2, 3])
-        # `:all => :best` considers them, says so, and picks among `val_loss` entries only.
+        # `:all => :best` considers them, says so, and picks among `loss` entries only.
         w = @test_logs (:warn, r"other metrics: `acc` \(max\) x2.*kept"s) match_mode = :any Nitro(
             ScriptedCkpt(); data = (; test = CK_VAL), run_dir = dir, weights = :all => :best
         )
         @test w.checkpoint_source == run_file(dir, run_of(n), 2)
         # A run with nothing under the current metric cannot answer `:best`, and says what it has.
         m = errmsg(() -> Nitro(ScriptedCkpt(); data = (; test = CK_VAL), run_dir = dir, weights = "accrun01" => :best))
-        @test occursin("`val_loss` (min)", m) && occursin("`acc` (max) x2", m)
+        @test occursin("`loss` (min)", m) && occursin("`acc` (max) x2", m)
         @test occursin("Set the checkpointer's `metric`", m) && occursin("checkpoint's path", m)
         # Selecting on `acc` reads them.
         wa = Nitro(
@@ -1956,7 +1956,7 @@
         # `runs` reports the mix per run.
         rs = Dict(r.id => r for r in runs(dir))
         @test rs["accrun01"].metric === :acc && rs["accrun01"].best == 0.9
-        @test rs[run_of(n)].metric === :val_loss && rs[run_of(n)].best == 1.0
+        @test rs[run_of(n)].metric === :loss && rs[run_of(n)].best == 1.0
     end
 
     @testset "a resume under another mode keeps the run's earlier entries through pruning" begin
@@ -1965,9 +1965,9 @@
         a = train!(Nitro(ScriptedCkpt(); run_dir = dir, max_epochs = 3, checkpointer = TopKCheckpointer(; k = 1)))
         min_files = run_files(dir, run_of(a))
         @test epochs_of(dir, run_of(a)) == Set([2, 3])
-        r = @test_logs (:warn, r"this run's retention considers checkpoints scored under other metrics: `val_loss` \(min\) x2") match_mode = :any Nitro(
+        r = @test_logs (:warn, r"this run's retention considers checkpoints scored under other metrics: `loss` \(min\) x2") match_mode = :any Nitro(
             ScriptedCkpt(); run_dir = dir, max_epochs = 6, resume = :auto,
-            checkpointer = TopKCheckpointer(; k = 1, mode = :max)
+            checkpointer = TopKCheckpointer(; k = 1, metric = :loss, mode = :max)
         )
         @test run_of(r) == run_of(a)
         script!([5.0, 9.0, 7.0])
@@ -1979,7 +1979,7 @@
         # Each selection ranks its own pair only.
         mx = @test_logs (:warn, r"other metrics") match_mode = :any Nitro(
             ScriptedCkpt(); data = (; test = CK_VAL), run_dir = dir, weights = :latest => :best,
-            checkpointer = TopKCheckpointer(; mode = :max)
+            checkpointer = TopKCheckpointer(; metric = :loss, mode = :max)
         )
         @test mx.checkpoint_source == run_file(dir, run_of(a), 5)
         mn = Nitro(ScriptedCkpt(); data = (; test = CK_VAL), run_dir = dir, weights = :latest => :best)
@@ -2029,7 +2029,7 @@
             script!([2.0, 1.0, 3.0])
             train!(Nitro(ScriptedCkpt(); run_dir = d, max_epochs = 3, checkpointer = ck()))
             @test issubset(acc_files, ckpt_files(d))
-            @test length(setdiff(ckpt_files(d), acc_files)) == 1     # K = 1 for `val_loss`
+            @test length(setdiff(ckpt_files(d), acc_files)) == 1     # K = 1 for `loss`
         end
 
         @testset "identical names across runs never overwrite" begin
@@ -2060,7 +2060,7 @@
         ra = rs[2]
         @test ra.checkpoints == length(run_entries(src_dir, ida)) == 3
         @test ra.epochs == [1, 2, 3]
-        @test ra.metric === :val_loss && ra.mode === :min && ra.best == 0.2
+        @test ra.metric === :loss && ra.mode === :min && ra.best == 0.2
         @test ra.parent === nothing
         @test rs[1].checkpoints == length(run_entries(src_dir, idb))
         @test rs[1].written >= ra.written

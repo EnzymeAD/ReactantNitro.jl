@@ -48,34 +48,35 @@ tells it apart from a `MethodError`; `detail` names the missing piece.
 
 # ── Load order matters only where a macro or a type must exist before use. ──────────
 
-include("Config.jl")      # the experiment macro and the field categories
-include("Phases.jl")      # the phase system and the phase registry
-include("Runs.jl")        # the run registry's machine-readable face; methods live in the KaimonGate extension
-include("Interface.jl")   # the user hooks: signatures and defaults
-include("Hooks.jl")       # PROTOTYPE: hooks supplied as a map of values
-include("Batch.jl")       # batch routing
-include("Data.jl")        # the data contract and the dataloaders
-include("Decay.jl")       # weight decay
-include("Optimizer.jl")   # optimizer construction and parameter groups
-include("GradRules.jl")   # gradient rules: SAM and the default single gradient
-include("EMA.jl")         # the exponential moving average of the weights
-include("Schedules.jl")   # schedules
-include("TraceHook.jl")   # opt-in precise invalidation: records what each trace went through
-include("Cache.jl")       # the compiled-program cache
-include("Setup.jl")       # the setup sequence
-include("Train.jl")       # the training loop
-include("Logging.jl")     # the logger contract
-include("JSONLog.jl")     # the shipped JSON default logger
-include("EarlyStop.jl")   # early stopping
-include("IORetry.jl")     # retrying I/O
-include("Checkpoint.jl")  # checkpointing and resume
-include("SourceSyntax.jl") # the string form of a checkpoint source, for the gate tools
-include("History.jl")     # the per-epoch metric history a handle keeps, and its table
-include("Render.jl")      # the framed table renderer, text and HTML
+include("core/Config.jl")             # the experiment macro and the field categories
+include("core/Phases.jl")             # the phase system and the phase registry
+include("core/Runs.jl")               # the run registry's machine-readable face; methods live in the KaimonGate extension
+include("core/Interface.jl")          # the user hooks: signatures and defaults
+include("core/Hooks.jl")              # PROTOTYPE: hooks supplied as a map of values
+include("data/Batch.jl")              # batch routing
+include("data/Data.jl")               # the data contract and the dataloaders
+include("optim/Decay.jl")             # weight decay
+include("optim/Optimizer.jl")         # optimizer construction and parameter groups
+include("optim/GradRules.jl")         # gradient rules: SAM and the default single gradient
+include("optim/EMA.jl")               # the exponential moving average of the weights
+include("optim/Schedules.jl")         # schedules
+include("optim/Plateau.jl")           # metric-driven schedules
+include("compile/TraceHook.jl")       # opt-in precise invalidation: records what each trace went through
+include("compile/Cache.jl")           # the compiled-program cache
+include("train/Setup.jl")             # the setup sequence
+include("train/Train.jl")             # the training loop
+include("logging/Logging.jl")         # the logger contract
+include("logging/JSONLog.jl")         # the shipped JSON default logger
+include("train/EarlyStop.jl")         # early stopping
+include("checkpoint/IORetry.jl")      # retrying I/O
+include("checkpoint/Checkpoint.jl")   # checkpointing and resume
+include("checkpoint/SourceSyntax.jl") # the string form of a checkpoint source, for the gate tools
+include("logging/History.jl")         # the per-epoch metric history a handle keeps, and its table
+include("logging/Render.jl")          # the framed table renderer, text and HTML
 # After `Train.jl`, since visualization needs `predict` and the batch routers.
-include("Visualize.jl")   # rendering
+include("output/Visualize.jl")        # rendering
 # Last, since export consumes almost everything above it.
-include("Export.jl")      # export to a served bundle
+include("output/Export.jl")           # export to a served bundle
 
 # ── Exports: this list is the public surface. Everything not listed here is ─────────
 # internal and may change without a breaking release.
@@ -101,9 +102,9 @@ export no_decay, default_no_decay
 export no_perturb
 # The exponential moving average of the weights.
 export EMA, ema
-export schedules, nonschedulable, dispatch_variant, max_epochs
+export schedules, Plateau, nonschedulable, dispatch_variant, max_epochs
 # The run accessors: each one's `Nitro` keyword defaults to the accessor call.
-export seed, accum, n_devs, checkpointer, early_stop, logger, check_divergence, autolog_schedules,
+export seed, accum, n_devs, checkpointer, early_stop, monitor, eval_loss, logger, check_divergence, autolog_schedules,
     log_every_n_steps
 
 # Asking a run's artifacts what they are: `read_manifest(dir)` lists retained checkpoints from the

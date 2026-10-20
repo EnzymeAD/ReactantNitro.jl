@@ -32,8 +32,35 @@ refused on the first batch that returns it.
 
 Metrics never see padding. The framework pads a short final batch, runs the compiled program,
 slices the outputs back, and only then calls you. With no `metrics` method the framework reports
-`val_loss = loss(e, outputs; ...) => 1`, the mean of the per-batch losses, so a bare experiment
+`loss = loss(e, outputs; ...) => 1`, the mean of the per-batch losses, so a bare experiment
 still validates.
+
+**Names carry no split.** The split is the context a metric is logged under, so the validation loss
+is `loss`, as the train loss is, and an accuracy is `acc`, never `val_acc`. A backend shows the
+context its own way (`validate_acc` on Comet, `validate/acc` on TensorBoard), and that display name
+is not the key. [`monitor`](@ref) and everything that follows it read the validation metrics by
+these keys. `:val_loss`, the name before 0.2.0, is accepted as `:loss` with a warning until 1.0.0.
+
+## The loss and its terms
+
+`loss` may return `(l, terms)`, with `terms` a flat `NamedTuple` of scalars. Each term is logged as
+`loss/<term>`, the same key on every split: on the train line, read from the gradient program
+itself so nothing is recomputed, and on validation and test wherever the loss is reported. Only `l`
+is differentiated.
+
+```julia
+ReactantNitro.loss(e::MyExp, ŷ; y) = (ce = crossent(ŷ, y); kl = kldiv(ŷ); (ce + 0.1f0 * kl, (; ce, kl)))
+```
+
+Without `metrics`, validation reports `loss` and each `loss/<term>`. With `metrics`, it reports
+exactly what they return, unless [`eval_loss`](@ref) is on: then each eval batch also runs `loss` in
+its own small compiled program, on the device as in training, and `loss` and its terms are added
+after `finalize_metrics`. A key both report is an error naming both. Prefer it to calling `loss`
+inside a `:host` `metrics`, which runs it on the CPU, outside the trained program.
+
+[`monitor`](@ref) defaults to `:loss => :min` only when that key is guaranteed: no `metrics`, or
+`eval_loss` on. With `metrics` and `eval_loss` off there is no default, and setup refuses a ranking
+checkpointer, an `EarlyStopping` or a `Plateau` until you declare one.
 
 ## Groups
 
@@ -102,8 +129,7 @@ end
 The ranks are `[5, 1, 3, 2, 4]` and the positives hold 5, 2, and 4, so
 `auroc = (11 - 6) / 6 = 0.833`: the positive scores higher in 5 of the 6 positive-negative pairs.
 Only what `finalize_metrics` returns, `(; accuracy = 0.6, worst = 0.7, auroc = 0.833)`, reaches the
-run history, the logger, and checkpoint selection, so `Checkpointer(metric = :auroc, mode = :max)`
-works.
+run history, the logger, and checkpoint selection, so `monitor(e) = :auroc => :max` works.
 
 `n_pos` is here to show a mixed group; `count(label)` in `finalize_metrics` gives the same number.
 

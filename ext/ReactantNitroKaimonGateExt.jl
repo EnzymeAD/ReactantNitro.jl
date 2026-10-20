@@ -410,7 +410,7 @@ function _weights_arg(weights, checkpoint)
          `weights`, and both were given. Pass `weights` only."
     )
     @warn "ReactantNitro ReactantNitroKaimonGateExt: the tools' `checkpoint` argument is deprecated \
-           and will be removed in 0.2.0. Pass `weights` (a checkpoint path, or a source such as \
+           and will be removed in a later release. Pass `weights` (a checkpoint path, or a source such as \
            \"latest => best\")." maxlog = 1
     return _parse_weights(checkpoint)
 end
@@ -1078,7 +1078,7 @@ end
 """
     ReactantNitro.run_state(run_id) -> NamedTuple
 
-The method behind `ReactantNitro.run_state`, which is documented in `src/Runs.jl`: the facts
+The method behind `ReactantNitro.run_state`, which is documented in `src/core/Runs.jl`: the facts
 `nitro_status` renders, as a `NamedTuple`, plus `elapsed_s`.
 """
 function ReactantNitro.run_state(run_id::AbstractString)

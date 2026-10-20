@@ -126,7 +126,7 @@
     n = Nitro(MapOnly(); hooks = full, run_dir = dir, checkpointer = nothing, logger = nothing)
     train!(n)
     @test n.epoch == 1
-    @test n.last_metrics.val_loss isa Real
+    @test n.last_metrics.loss isa Real
     # Routing resolved from the MAP's keyword declarations, not from any method.
     @test keys(n.routing.forward) == (:x,)
     @test keys(n.routing.loss) == (:y,)
