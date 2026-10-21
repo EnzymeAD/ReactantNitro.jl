@@ -190,10 +190,10 @@ ReactantNitro.gradient_clip_norm(::MnistMLP) = 1.0f0
 # keyword, and the keyword wins for that one run.
 ReactantNitro.accum(::MnistMLP) = 2                  # 550 batches per epoch, so 275 optimizer steps
 ReactantNitro.run_dir(::MnistMLP) = "runs/mnist"
-ReactantNitro.checkpointer(::MnistMLP) =
-    TopKCheckpointer(; k = 3, metric = :macro_recall, mode = :max)
-ReactantNitro.early_stop(::MnistMLP) =
-    EarlyStopping(; metric = :macro_recall, mode = :max, patience = 5)
+# The metric the run is judged by: checkpoints rank by it and early stopping watches it.
+ReactantNitro.monitor(::MnistMLP) = :macro_recall => :max
+ReactantNitro.checkpointer(::MnistMLP) = Checkpointer(; keep = (Best(3), Last(1)))
+ReactantNitro.early_stop(::MnistMLP) = EarlyStopping(; patience = 5)
 
 # ── The run ─────────────────────────────────────────────────────────────────────────
 
