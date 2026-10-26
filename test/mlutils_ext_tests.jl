@@ -8,7 +8,7 @@
     using Test
     using ReactantNitro
     using ReactantNitro: auto_prefetch, begin_epoch!, check_batch_at, check_source_options,
-        fanout_capable, planned_batch_at, prefetch_config, prefetch_source
+        delegates_parallelism, fanout_capable, planned_batch_at, prefetch_config, prefetch_source
     using Functors, Lux, MLUtils, Random, Statistics
 
     const ML = Float32
@@ -118,6 +118,13 @@
             @test_logs check_source_options(ml_loader(; parallel = true), :train, fanned)
         end
 
+        # `parallel` may be a task count since MLUtils 0.4.11; `4 && ...` would be a `TypeError`.
+        @testset "`parallel = n` warns like `parallel = true`" begin
+            @test_logs (:warn, r"break ordering guarantees") check_source_options(
+                ml_loader(; parallel = 4), :train, single
+            )
+        end
+
         @testset "the default loader is silent on both paths" begin
             @test_logs check_source_options(ml_loader(), :train, single)
             @test_logs check_source_options(ml_loader(), :train, fanned)
@@ -175,6 +182,52 @@
         end
     end
 
+    # ── num_workers: MLUtils' worker processes, behind the loader's own `iterate` ─────
+
+    # Constructing a loader starts no processes; the pool starts at the first `iterate`.
+    @testset "`num_workers > 0` resolves to one producer over the loader" begin
+        dl = ml_loader(; num_workers = 2)
+        @test delegates_parallelism(dl)
+        @test !delegates_parallelism(ml_loader())
+        # Still index-addressable, so the routing must check delegation first.
+        @test fanout_capable(dl)
+
+        cfg = prefetch_config(PrefetchIterator(dl; workers = 4, ordered = false))
+        @test cfg.path === :delegated
+        @test cfg.workers == 1
+        @test !cfg.ordered
+    end
+
+    @testset "`num_workers > 0` requires `ordered = false` on the split" begin
+        dl = ml_loader(; num_workers = 2)
+
+        err = try
+            check_source_options(dl, :train, prefetch_config(auto_prefetch((; train = dl)).train))
+        catch ex
+            ex
+        end
+        @test err isa ErrorException
+        @test occursin("num_workers = 2", err.msg)
+        @test occursin("ordered = false", err.msg)
+
+        # Eval splits too: one rule for every split.
+        @test_throws ErrorException check_source_options(
+            dl, :val, prefetch_config(PrefetchIterator(dl))
+        )
+
+        err = try
+            check_source_options(dl, :train, prefetch_config(NoPrefetch(dl)))
+        catch ex
+            ex
+        end
+        @test err isa ErrorException
+        @test occursin("NoPrefetch", err.msg)
+
+        @test_logs check_source_options(
+            dl, :train, prefetch_config(PrefetchIterator(dl; ordered = false))
+        )
+    end
+
     # ── end to end ──────────────────────────────────────────────────────────────────
 
     # The payoff, and the reason ordered delivery is the default: fanning a shuffled loader out over
@@ -200,5 +253,31 @@
             @test Array(a) == Array(b)
         end
         @test validate(many).loss == validate(one).loss
+    end
+
+    # One worker process builds batches one at a time, so delivery happens to be in order and the
+    # run must match one in-process producer over the same permutation. This is what shows the
+    # delegated path is fed the loader's own batches, through MLUtils' shared-memory transport.
+    @testset "a `num_workers` DataLoader trains to the same weights as one producer" begin
+        seeded(; kw...) = ml_loader(; shuffle = true, rng = Random.MersenneTwister(99), kw...)
+        val = ml_loader()
+
+        one = train!(
+            MLUtilsMLP(); run_dir = mktempdir(),
+            data = (; train = PrefetchIterator(seeded(); workers = 1), val)
+        )
+        procs = train!(
+            MLUtilsMLP(); run_dir = mktempdir(),
+            data = (;
+                train = PrefetchIterator(seeded(; num_workers = 1); ordered = false), val,
+            )
+        )
+
+        @test prefetch_config(procs.data.train).path === :delegated
+        @test current_step(procs) == current_step(one) == length(seeded())
+        for (a, b) in zip(Functors.fleaves(parameters(one)), Functors.fleaves(parameters(procs)))
+            @test Array(a) == Array(b)
+        end
+        MLUtils.close_dataloader_pool()
     end
 end

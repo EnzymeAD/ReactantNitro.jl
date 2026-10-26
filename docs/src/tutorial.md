@@ -169,6 +169,13 @@ calls the loader's `iterate`; `buffer = true` warns that it has no effect. On a 
 framework holds several in flight, and `parallel = true` warns, because MLUtils' own worker threads
 break ordering and a fixed seed stops reproducing.
 
+A `DataLoader` with `num_workers > 0` loads in separate worker processes, so the allocations of
+`getobs` stay out of the training process's GC. The framework then runs one producer over the
+loader's own `iterate` instead of fanning out, and `workers` is ignored. MLUtils delivers batches
+as the processes finish them, so setup refuses the split unless it is wrapped in
+`PrefetchIterator(loader; ordered = false)`. Each worker imports the packages that the data
+container's types come from, so define a dataset type in a module that does not load Reactant.
+
 ## Forward and loss
 
 Each hook declares the batch fields it wants as keyword arguments. The framework resolves the

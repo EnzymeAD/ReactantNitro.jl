@@ -35,6 +35,7 @@ qualified, as `ReactantNitro.epoch_token(::MySource)`, and is documented here.
 
 ```@docs
 ReactantNitro.epoch_token
+ReactantNitro.delegates_parallelism
 ReactantNitro.check_source_options
 ReactantNitro.release!
 ```

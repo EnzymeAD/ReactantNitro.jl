@@ -1164,6 +1164,8 @@ _prefetch_note(pf) =
     "prefetch: 1 producer, $(_prefetch_buffers(pf)); source is a materialized `Vector`" :
     pf.path === :single_no_trait ?
     "prefetch: 1 producer, $(_prefetch_buffers(pf)); source is NOT index-addressable" :
+    pf.path === :delegated ?
+    "prefetch: 1 producer, $(_prefetch_buffers(pf)); the source parallelizes itself" :
     pf.path === :inline ? "prefetch: none (NoPrefetch)" :
     pf.path === :eval ? "prefetch: none; the eval path does not stream" :
     "prefetch: $(pf.path)"

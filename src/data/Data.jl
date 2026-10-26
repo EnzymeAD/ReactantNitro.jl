@@ -381,6 +381,16 @@ fanout_capable(source) =
 )
 
 """
+    ReactantNitro.delegates_parallelism(source) -> Bool
+
+Whether `source` builds its batches in parallel inside its own `iterate`, so the framework should
+run one producer over it rather than fan out. Checked before [`fanout_capable`](@ref), since the
+fan-out never calls `iterate` and would bypass the source's parallelism. The default is `false`;
+`ReactantNitroMLUtilsExt` returns `true` for a `DataLoader` with `num_workers > 0`.
+"""
+delegates_parallelism(source) = false
+
+"""
     ReactantNitro.default_prefetch_workers() -> Int
 
 The default producer count: `Threads.nthreads(:default)`, the default thread pool size (`N` under
@@ -415,7 +425,8 @@ Construct one only to change the defaults; [`NoPrefetch`](@ref) opts a split out
   * **`ordered = true`** emits in source order through a reorder buffer, so a fixed seed reproduces
     bitwise at any `workers`. `ordered = false` emits batches as they finish, so the epoch's
     accumulation groups change and runs no longer reproduce bitwise; every batch is still seen
-    exactly once. Applies only to the fan-out; one producer always emits in order.
+    exactly once. One producer emits in the source's own order, which a source that parallelizes
+    its own `iterate` may not keep; such a source's checks require `ordered = false`.
 
 The transfer runs on one task because device memory cannot be bounded by a semaphore: XLA runs
 asynchronously and the executable holds its inputs, so there is no point at which the consumer is
@@ -541,6 +552,9 @@ The prefetch settings a split resolves to, which may differ from the requested o
   * `:single`: one producer over the source's own `iterate`, because `workers == 1` was asked for.
   * `:materialized`: one producer over a `Vector` of already-built batches; nothing to spread.
   * `:single_no_trait`: one producer because the source lacks the trait. The setup warning's case.
+  * `:delegated`: one producer over a source that parallelizes its own `iterate`
+    ([`delegates_parallelism`](@ref)). `workers` is ignored, and `ordered` is passed through for the
+    source's checks, which decide whether the source can honour it.
   * `:inline`: no stream at all, a [`NoPrefetch`](@ref) split.
 """
 function prefetch_config(split)
@@ -555,6 +569,7 @@ function prefetch_config(split)
     cfg(workers, path) = (;
         device_batches = d, host_batches = h, workers = workers, ordered = o, path = path,
     )
+    delegates_parallelism(src) && return cfg(1, :delegated)
     if fanout_capable(src)
         w == 1 && return cfg(1, :single)
         return cfg(w, o ? :fanout : :fanout_unordered)
@@ -642,9 +657,9 @@ gradient program. An exception in a producer is rethrown at the consumer, since 
 closed with it. The checks run on the consumer, against the host batch, so errors are raised on the
 training task.
 
-Three paths: the fan-out ([`PrefetchStream`](@ref)) when `workers > 1` and the source is
-[`fanout_capable`](@ref); one producer feeding a `Channel` of `device_batches` otherwise; and an
-inline generator for a [`NoPrefetch`](@ref) split. All go through `prepared_stream` with a
+Three paths, as [`prefetch_config`](@ref) resolves them: the fan-out ([`PrefetchStream`](@ref));
+one producer feeding a `Channel` of `device_batches`; and an inline generator for a
+[`NoPrefetch`](@ref) split. All go through `prepared_stream` with a
 `prepare` function from host batch to device payload: a plain transfer here, pad then transfer in
 [`eval_stream`](@ref).
 """
@@ -659,15 +674,13 @@ each host batch. A separate name because a `batch_stream(split, prepare)` method
 same arity as `batch_stream(split, routing)` and overwrite it.
 """
 function prepared_stream(split, prepare)
-    device_batches = prefetch_device_batches(split)
-    device_batches == 0 && return ((b, prepare(b)) for b in split)
+    cfg = prefetch_config(split)
+    cfg.path === :inline && return ((b, prepare(b)) for b in split)
     src = prefetch_source(split)
-    workers = prefetch_workers(split)
-    (workers > 1 && fanout_capable(src)) && return fanout_stream(
-        src, workers, device_batches, prefetch_host_batches(split),
-        prepare, prefetch_ordered(split)
+    (cfg.path === :fanout || cfg.path === :fanout_unordered) && return fanout_stream(
+        src, cfg.workers, cfg.device_batches, cfg.host_batches, prepare, cfg.ordered
     )
-    return Channel{Tuple{Any, Any}}(device_batches; spawn = true) do ch
+    return Channel{Tuple{Any, Any}}(cfg.device_batches; spawn = true) do ch
         for b in src
             put!(ch, (b, prepare(b)))
         end

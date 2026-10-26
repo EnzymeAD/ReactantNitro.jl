@@ -1045,8 +1045,9 @@ One `@warn` at setup when the training split resolved to no host-side concurrenc
 implement, since a single producer can starve the device with no other sign.
 
 It warns rather than raises: a single producer trains correctly, some sources cannot be indexed,
-and `NoPrefetch` is a legitimate choice. `:fanout`, `:fanout_unordered` and `:materialized` (a `Vector`
-of already-built batches, so no host work to spread) say nothing.
+and `NoPrefetch` is a legitimate choice. `:fanout`, `:fanout_unordered`, `:delegated` (the source
+parallelizes itself) and `:materialized` (a `Vector` of already-built batches, so no host work to
+spread) say nothing.
 """
 function warn_no_concurrency(train_split)
     cfg = prefetch_config(train_split)
