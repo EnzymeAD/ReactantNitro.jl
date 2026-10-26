@@ -1063,6 +1063,8 @@ function report_data_wait!(nitro::Nitro, t_wait::Float64, t_step::Float64)
     on device, $(pf.host_batches) on host, path $(pf.path). $(
         (pf.path === :fanout || pf.path === :fanout_unordered) ?
             "The fan-out is active, so the source itself is the limit: profile it in a CPU gate by iterating `build_data(e, nothing).train` directly, and check for a decoded-cache cap or a contended sample server." :
+            pf.path === :delegated ?
+            "The source parallelizes its own `iterate` (for a `DataLoader`, `num_workers` processes), so raise its own worker count or profile its per-batch work." :
             "There is no host-side concurrency here; see the prefetch warning at setup for the two methods that enable it."
     )""" maxlog = 1
     return nothing

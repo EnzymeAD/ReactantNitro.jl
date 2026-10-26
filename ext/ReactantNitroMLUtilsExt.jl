@@ -7,7 +7,8 @@
 # is immutable, so `begin_epoch!` returns the plan rather than storing it, which is what the
 # three-argument `batch_at` exists for; the file is two pure methods with no side table to collide
 # when two handles share one loader. The one thing that must keep matching upstream is the order of
-# operations: shuffle the observations, then batch them.
+# operations: shuffle the observations, then batch them. A loader with `num_workers > 0` is not fanned
+# out: MLUtils' worker processes run inside `iterate`, so the framework runs one producer over it.
 
 module ReactantNitroMLUtilsExt
 
@@ -41,10 +42,19 @@ accepts any plan.
 ReactantNitro.batch_at(dl::DataLoader, i::Integer, plan) = getobs(plan, i)
 
 """
+    ReactantNitro.delegates_parallelism(dl::MLUtils.DataLoader) -> Bool
+
+`true` when `num_workers > 0`, so the split runs one producer over the loader's own `iterate`,
+where MLUtils' worker processes build the batches. The fan-out would call `getobs` in this process
+and never start them.
+"""
+ReactantNitro.delegates_parallelism(dl::DataLoader) = dl.num_workers > 0
+
+"""
     ReactantNitro.check_source_options(dl::MLUtils.DataLoader, name::Symbol, cfg) -> nothing
 
-Check a `DataLoader`'s `partial`, `buffer` and `parallel` options for split `name` before anything
-compiles.
+Check a `DataLoader`'s `partial`, `num_workers`, `buffer` and `parallel` options for split `name`
+before anything compiles.
 
 `partial` is checked on every split, and only when the observation count does not divide by
 `batchsize`. `partial = true` on `train` is an error, since the compiled program has a fixed shape
@@ -59,9 +69,15 @@ the split resolved to (`cfg.path`). On the fan-out paths, which index the loader
 an error, because the loader reuses one batch buffer while the framework reads ahead, so a batch
 would be overwritten before its transfer; `parallel = true` warns, since MLUtils documents that it
 breaks ordering. On the `:inline` path only `partial` is checked.
+
+`num_workers > 0` resolves to the `:delegated` path, and MLUtils delivers batches as its worker
+processes finish them. That is an error unless the split is a `PrefetchIterator` with
+`ordered = false`, so losing bitwise reproducibility is stated in the code. MLUtils itself rejects
+`num_workers` combined with `parallel` or `buffer`.
 """
 function ReactantNitro.check_source_options(dl::DataLoader, name::Symbol, cfg)
     _check_partial(dl, name)
+    dl.num_workers > 0 && return _check_num_workers(dl, name, cfg)
     cfg.path === :inline && return nothing
     fanned = cfg.path === :fanout || cfg.path === :fanout_unordered
     if fanned
@@ -82,13 +98,39 @@ function ReactantNitro.check_source_options(dl::DataLoader, name::Symbol, cfg)
         Drop `buffer` (the default is `false`), or wrap the split in `NoPrefetch` to run its data
         path inline on the training task, where one batch is consumed before the next is built."""
     )
-    dl.parallel && @warn """
+    _parallel(dl.parallel) && @warn """
     ReactantNitro: the `$name` split is an `MLUtils.DataLoader` with `parallel = true`, and it \
     resolved to ONE producer, so MLUtils' own worker threads are what build its batches. MLUtils \
     documents that they break ordering guarantees, so a fixed seed no longer reproduces a run \
     bitwise, whatever `ordered` says.
     Give the split more workers to use this framework's fan-out instead, which preserves the \
     source's order, or keep it and treat the run as unordered.""" maxlog = 1
+    return nothing
+end
+
+# `parallel` is a `Bool` or a worker-task count.
+_parallel(p::Bool) = p
+_parallel(p::Integer) = p > 0
+
+function _check_num_workers(dl::DataLoader, name::Symbol, cfg)
+    cfg.path === :inline && error(
+        """
+        ReactantNitro: the `$name` split is an `MLUtils.DataLoader` with
+        `num_workers = $(dl.num_workers)` wrapped in `NoPrefetch`. MLUtils delivers batches as its
+        worker processes finish them, so the order of an epoch, and with it the run, does not
+        reproduce.
+        Wrap the split in `PrefetchIterator(loader; ordered = false)` to accept that, or set
+        `num_workers = 0`."""
+    )
+    cfg.ordered && error(
+        """
+        ReactantNitro: the `$name` split is an `MLUtils.DataLoader` with
+        `num_workers = $(dl.num_workers)`, and the split asks for ordered delivery. MLUtils delivers
+        batches as its worker processes finish them, so a fixed seed no longer reproduces the run
+        bitwise.
+        Wrap the split in `PrefetchIterator(loader; ordered = false)` to accept that, or set
+        `num_workers = 0` to use this framework's ordered fan-out over threads."""
+    )
     return nothing
 end
 
