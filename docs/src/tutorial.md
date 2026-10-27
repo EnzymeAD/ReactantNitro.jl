@@ -175,6 +175,8 @@ loader's own `iterate` instead of fanning out, and `workers` is ignored. MLUtils
 as the processes finish them, so setup refuses the split unless it is wrapped in
 `PrefetchIterator(loader; ordered = false)`. Each worker imports the packages that the data
 container's types come from, so define a dataset type in a module that does not load Reactant.
+[Data loading](data.md) compares the strategies, including how to keep worker memory down and how
+to write a source of your own.
 
 ## Forward and loss
 

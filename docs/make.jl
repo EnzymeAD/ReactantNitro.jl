@@ -62,6 +62,7 @@ makedocs(;
         ],
         "Writing an experiment" => [
             "Experiments" => "experiments.md",
+            "Data loading" => "data.md",
             "Metrics" => "metrics.md",
             "Optimization" => "optimization.md",
             "Schedules" => "schedules.md",
