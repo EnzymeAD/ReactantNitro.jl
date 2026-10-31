@@ -946,6 +946,8 @@ function _train_manual!(nitro::Nitro)
                     free_batch!(b)
                     nitro.step += 1
                     note_progress!()
+                    # Through the synchronous loss readback, so it includes the device time.
+                    seen > 1 && (t_step += time() - t_body)
                     nitro.stop_requested && break
                     t0 = time()
                     it = iterate(stream, st_stream)
