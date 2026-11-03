@@ -132,6 +132,13 @@ that is not a record (none, a bare `Nitro`, `other => :current`: restoring a liv
 optimizer is not supported yet), refuses alongside `resume`, which restores the optimizer anyway,
 and refuses on a handle with no `train` split, which has no optimizer to restore into.
 
+**`strict = false`** loads a `weights` source whose tree differs from this model's, as PyTorch's
+`load_state_dict(strict = False)` does: leaves of `ps` and `st` are matched by keypath, one the
+source lacks keeps its fresh initialization, and one this model lacks is dropped. Both warn with
+the list of leaves. A parameter held at different sizes refuses either way. A layer-state leaf that
+does not fit only warns and keeps its fresh initialization, under either setting. A partial load refuses
+`restore_optimizer`, and `resume` refuses `strict = false`.
+
 **`restore_best = true`** ends every `train!` that does not fail (completion, early stop, a
 requested stop) by loading this run's own best checkpoint, under the current metric, into `ps` and
 `st`; step, epoch, `history` and the last metrics stay as training ended. `checkpoint_source`
@@ -215,6 +222,8 @@ function _build_nitro(
         w0 = :build_model,
         # Whether a `weights` record's optimizer state comes with its parameters.
         restore_optimizer::Bool = false,
+        # Whether a `weights` source must hold exactly this model's leaves.
+        strict::Bool = true,
         # Whether `train!` ends by loading this run's best checkpoint into the handle.
         restore_best = false,
         # Which weights evaluation reads: `:ema` when there is an average, else `:raw`.
@@ -248,7 +257,7 @@ function _build_nitro(
         )
         weights, checkpoint = checkpoint, nothing
     end
-    check_weights_kwargs(weights, w0; resume, restore_optimizer)
+    check_weights_kwargs(weights, w0; resume, restore_optimizer, strict)
     check_restore_average(restore_best, checkpointer)
 
     # ── before step 2: locate a checkpoint (the resume path) ───────────────────────
@@ -427,23 +436,28 @@ function _build_nitro(
 
     # Step 6's rebuild happens before the restore, in spite of being thrown away, because the
     # anchor checksum is verified against a fresh `w0` and the record's tree against its layout.
+    # A partial load (`strict = false`) restores no run's layout, so the permutation and anchor
+    # checks below have nothing to compare.
+    partial = false
     if record !== nothing
-        check_record_tree_compatible(record, build_layout(e, ps), source)
-        # `from_host` first: a record may hold a surrogate (`HostRNG`) that `to_rarray` cannot
-        # recognise.
-        ps = place_replicated(from_host(to_host(record.ps)), mesh)
-        st = place_replicated(from_host(to_host(record.st)), mesh)
+        ps, st, partial = restore_trees(ps, st, record.ps, record.st, "the checkpoint at `$source`"; strict)
+        partial && restore_optimizer && error(
+            "ReactantNitro: `restore_optimizer = true` with a partial `strict = false` load: the \
+             record's optimizer state follows its own leaves, not this model's. Drop one of the two."
+        )
+        ps, st = place_replicated(ps, mesh), place_replicated(st, mesh)
     end
 
-    # Through host memory, so the source may live on another mesh. Checked against the fresh
-    # layout: the transferred tree has to fit this model.
+    # Through host memory, so the source may live on another mesh.
     if weights !== nothing
-        check_weights_compatible(weights, build_layout(e, ps))
         load_ema && weights.ema_weights === nothing && error(
             "ReactantNitro: `load_ema = true`, and the `Nitro` passed as `weights` keeps no EMA."
         )
-        ps = place_replicated(from_host(to_host(load_ema ? weights.ema_weights : weights.ps)), mesh)
-        st = place_replicated(from_host(to_host(weights.st)), mesh)
+        src = load_ema ? weights.ema_weights : weights.ps
+        ps, st, _ = restore_trees(
+            ps, st, src, weights.st, "`weights = Nitro($(nameof(typeof(weights.e))))`"; strict
+        )
+        ps, st = place_replicated(ps, mesh), place_replicated(st, mesh)
     end
     w0_tree = resolve_w0(w0, w0_tree, ps, e, mesh)
 
@@ -454,8 +468,8 @@ function _build_nitro(
 
     # ── after 8: the permutation and the decay anchor, both refusals ───────────────
     if record !== nothing
-        check_permutation_compatible(record, layout, source)
-        check_anchors_compatible(record, layout, anchors, source)
+        partial || check_permutation_compatible(record, layout, source)
+        partial || check_anchors_compatible(record, layout, anchors, source)
         # `weights_only` continues no run, so declining the logger drops no history.
         check_logger_compatible(record, logger, source; weights_only)
     end
@@ -690,16 +704,17 @@ function _build_nitro(
 end
 
 """
-    ReactantNitro.check_weights_kwargs(weights, w0; resume, restore_optimizer = false) -> nothing
+    ReactantNitro.check_weights_kwargs(weights, w0; resume, restore_optimizer = false, strict = true) -> nothing
 
 The weight-source keywords, validated before anything is built. `weights` and `resume` are each a
 checkpoint source ([`check_source`](@ref)); `weights` may also be a `Nitro` and `resume` also
 `false` or `:auto`. At most one of the two may be given.
 `restore_optimizer` needs a checkpoint record in `weights`, a path or `run => :best | :latest`,
 and is meaningless with `resume`, which always restores the optimizer. `w0` is `:build_model`,
-`:weights`, or a parameter tree, and `:weights` needs a `weights` to point at.
+`:weights`, or a parameter tree, and `:weights` needs a `weights` to point at. `strict = false`
+needs a `weights` too: a resume continues one run, which always matches.
 """
-function check_weights_kwargs(weights, w0; resume, restore_optimizer::Bool = false)
+function check_weights_kwargs(weights, w0; resume, restore_optimizer::Bool = false, strict::Bool = true)
     check_source(weights, :weights)
     check_source(resume, :resume)
     resuming = resume !== false && resume !== nothing
@@ -708,6 +723,11 @@ function check_weights_kwargs(weights, w0; resume, restore_optimizer::Bool = fal
          names a checkpoint to continue training from, weights and all. Two sources for one set \
          of weights; pass one. `resume` also restores the optimizer state and the step, which \
          `weights` never does."
+    )
+    strict || weights !== nothing || error(
+        "ReactantNitro: `strict = false` loads a `weights` source partially, and \
+         $(resuming ? "`resume` continues a run, whose checkpoint always matches it" : "no `weights` was given"). \
+         Drop `strict`$(resuming ? ", or start a new run with `weights = <source>, strict = false`" : "")."
     )
     if restore_optimizer
         resuming && error(
@@ -981,24 +1001,6 @@ weights_origin(src::Nitro) = (;
     experiment = nameof(typeof(src.e)), epoch = src.epoch, step = src.step,
     run_dir = src.run_dir,
 )
-
-"""
-    ReactantNitro.check_weights_compatible(source::Nitro, layout::FlatLayout) -> nothing
-
-Refuse a warm start whose parameter tree does not fit this model, with a diff by keypath. Only
-the keypaths and sizes are compared: the group a leaf belongs to is decided by this experiment's
-`param_group` and may differ from the source's.
-"""
-function check_weights_compatible(source::Nitro, layout::FlatLayout)
-    return _check_tree_fits(source.layout.permutation, layout.permutation) do diff
-        """
-        ReactantNitro: `weights = ` names a Nitro($(nameof(typeof(source.e)))) whose parameter tree
-        does not match the model this experiment builds:
-        $diff
-        A warm start copies leaf for leaf, so the two trees must agree on every keypath and size.
-        This usually means the architecture fields differ between the two experiments."""
-    end
-end
 
 # The shared diff: two permutations compared on keypath and size, and `msg(diff)` composes the
 # error around the lines. Six lines then an ellipsis, as the resume check prints.

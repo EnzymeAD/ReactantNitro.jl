@@ -23,10 +23,13 @@
         width::GraphConst{Int} = 6
         "Driver-only: excluded, since raising `max_epochs` on resume is the normal case."
         max_epochs::Host{Int} = 2
+        "A third layer, for the `strict = false` partial load."
+        head::GraphConst{Bool} = false
     end
 
-    ckpt_chain(w) = Lux.Chain(Lux.Dense(4 => w, tanh), Lux.Dense(w => 2))
-    ReactantNitro.build_model(e::CkptMLP, rng) = (m = ckpt_chain(e.width); (m, Lux.setup(rng, m)...))
+    ckpt_chain(w, head = false) =
+        Lux.Chain(Lux.Dense(4 => w, tanh), Lux.Dense(w => 2), (head ? (Lux.Dense(2 => 2),) : ())...)
+    ReactantNitro.build_model(e::CkptMLP, rng) = (m = ckpt_chain(e.width, e.head); (m, Lux.setup(rng, m)...))
     ReactantNitro.forward(::CkptMLP, model, ps, st; x) = Lux.apply(model, x, ps, st)
     ReactantNitro.loss(e::CkptMLP, ŷ; y) = e.scale * mean(abs2, ŷ .- y)
     ReactantNitro.learning_rate(::CkptMLP) = 1.0f-2
@@ -124,7 +127,7 @@
         @test rec.format_version == 1 && rec.framework_version isa String
         @test rec.epoch == 2 && rec.step == 8                   # 2 epochs x 4 batches, accum = 1
         @test rec.seed == 42
-        @test rec.config == (; tag = 1, width = 6)              # GraphConst fields only
+        @test rec.config == (; tag = 1, width = 6, head = false)            # GraphConst fields only
         @test keys(rec.devices) == (:scale,)                   # Devices recorded, not compared
         @test rec.devices.scale === 1.0f0                        # and read back to a HOST value
         @test haskey(rec.metrics, :loss)
@@ -514,7 +517,7 @@
             ex
         end
         @test err isa ErrorException && occursin("does not match the model", err.msg)
-        @test occursin("size (6, 4) in the checkpoint, (8, 4) now", err.msg)
+        @test occursin("layer_1.weight: size (6, 4) in the source, (8, 4) now", err.msg)
 
         @testset "averaging reads records written before a field was added" begin
             for e in read_manifest(dir)
@@ -525,6 +528,66 @@
             )
             @test occursin("epochs 2, 3", m.checkpoint_source)
         end
+    end
+
+    @testset "`strict = false` loads the leaves that fit and warns about the rest" begin
+        dir = mktempdir()
+        n = train!(Nitro(CkptMLP(); run_dir = dir, max_epochs = 1))
+        path = find_latest(n.checkpointer, dir)
+        load(e; kw...) = Nitro(e; weights = path, data = (;), run_dir = mktempdir(), kw...)
+
+        err = try
+            load(CkptMLP(; head = true))
+            nothing
+        catch ex
+            ex
+        end
+        @test err isa ErrorException && occursin("layer_3.weight: absent in the source", err.msg)
+        @test occursin("strict = false", err.msg)
+
+        grown = @test_logs (:warn, r"tag|head") (:warn, r"layer_3.bias: absent") match_mode = :any load(
+            CkptMLP(; head = true); strict = false
+        )
+        @test Array(grown.ps.layer_1.weight) == Array(n.ps.layer_1.weight)
+        @test Array(grown.ps.layer_2.bias) == Array(n.ps.layer_2.bias)
+        @test size(grown.ps.layer_3.weight) == (2, 2)
+
+        # The reverse: a checkpoint with a leaf this model lacks drops it.
+        hdir = mktempdir()
+        h = train!(Nitro(CkptMLP(; head = true); run_dir = hdir, max_epochs = 1))
+        hpath = find_latest(h.checkpointer, hdir)
+        shrunk = @test_logs (:warn, r"layer_3.weight: size \(2, 2\) in the source, absent now") match_mode = :any Nitro(
+            CkptMLP(); weights = hpath, data = (;), run_dir = mktempdir(), strict = false
+        )
+        @test !haskey(shrunk.ps, :layer_3)
+        @test Array(shrunk.ps.layer_2.weight) == Array(h.ps.layer_2.weight)
+
+        # A size mismatch refuses even under `strict = false`, as in PyTorch.
+        err = try
+            load(CkptMLP(; width = 8); strict = false)
+            nothing
+        catch ex
+            ex
+        end
+        @test err isa ErrorException && occursin("refuses even under `strict = false`", err.msg)
+
+        @test_throws "resume` continues a run" Nitro(CkptMLP(); run_dir = dir, resume = :auto, strict = false)
+        @test_throws "optimizer state follows its own leaves" Nitro(
+            CkptMLP(; head = true); weights = path, run_dir = mktempdir(), strict = false,
+            restore_optimizer = true
+        )
+    end
+
+    @testset "a layer state that does not fit warns and keeps the fresh leaf" begin
+        ps = (; w = ones(Float32, 2))
+        fresh = (; bn = (; running_mean = zeros(Float32, 3)), kept = (; v = zeros(Float32, 2)))
+        src = (; bn = (; running_mean = ones(Float32, 4)), extra = (; v = ones(Float32, 1)))
+        _, st, partial = @test_logs (:warn, r"st.bn.running_mean: size \(4,\) in the source, \(3,\) now") match_mode = :any ReactantNitro.restore_trees(
+            ps, fresh, ps, src, "the test source"
+        )
+        @test !partial
+        @test st.bn.running_mean == zeros(Float32, 3)
+        @test st.kept.v == zeros(Float32, 2) && !haskey(st, :extra)
     end
 
     @testset "a changed permutation refuses, naming the leaf that moved" begin

@@ -142,6 +142,7 @@ never overwritten.
 | a record's parameters, fresh optimizer | `weights = run => :best` |
 | another handle's parameters, in memory | `weights = other` |
 | a record's EMA as the parameters, fresh optimizer | `weights = run => :best, load_ema = true` |
+| the leaves that still fit a changed model, the rest freshly initialized | `weights = run => :best, strict = false` |
 
 A resume restores the seed from the record, overriding a `seed` keyword with a warning, and
 recomputes derived values by running `derive` again. It refuses, with a diff, when:
@@ -153,8 +154,16 @@ recomputes derived values by running `derive` again. It refuses, with a diff, wh
 3. a `:w0` decay anchor does not match its recorded checksum
 4. the logger backend differs from the one whose state is in the record
 
-Every restore refuses a record whose parameter tree does not fit the model, naming the leaf and
-both sizes. A `weights` load only warns about a changed `GraphConst` config: it builds the program
+Every restore refuses a record whose parameter tree does not fit the model, naming the leaves by
+keypath. A layer-state leaf (a BatchNorm running statistic, say) that does not fit only warns and
+keeps this model's initialization.
+
+**`strict = false`** loads a `weights` source into a model that gained or lost layers, as PyTorch's
+`load_state_dict(strict = False)` does. Leaves are matched by keypath: a leaf the source lacks
+keeps this model's initialization, and a leaf this model lacks is dropped. Either case warns,
+listing the leaves. A parameter both hold at different sizes still refuses. A partial load skips the
+permutation and anchor checks, since no run's layout describes it, and refuses
+`restore_optimizer` and `resume`. A `weights` load only warns about a changed `GraphConst` config: it builds the program
 from the current experiment, so evaluating old weights under a different graph is allowed.
 
 A seed sweep that varies the seed and not `run_dir` resumes into itself under `resume = :auto`; vary
