@@ -338,6 +338,15 @@
         @test !haskey(m, Symbol("schedule/disc/eta"))
     end
 
+    @testset "manual mode times the step body, so `data_wait_frac` is not pinned at 1" begin
+        # An in-memory source never blocks; the step body was once left out of `t_step`.
+        lg = ManualLog([])
+        train!(Nitro(ToyGAN(); logger = lg, checkpointer = nothing, run_dir = mktempdir()))
+        dl = [x for x in lg.lines if x.context == "data"]
+        @test length(dl) == 2
+        @test all(x -> 0.0 <= x.m.data_wait_frac < 1.0, dl)
+    end
+
     @testset "path-bound `opt` schedules: the key says what eta binds to" begin
         # A bare key binds EVERY rule with the field (the absolute value; manual mode has no base
         # rate and no ratios); a nested key is a PATH into the user's `opt_state` and binds the rules
