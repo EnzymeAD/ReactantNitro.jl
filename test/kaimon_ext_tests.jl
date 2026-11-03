@@ -40,10 +40,15 @@
 
         "Epochs to train for. Driver-only."
         max_epochs::Int = 2
+
+        "A third layer, for a `strict = false` load."
+        head::GraphConst{Bool} = false
     end
 
     ReactantNitro.build_model(e::GateMLP, rng) = begin
-        m = Lux.Chain(Lux.Dense(3 => e.width, tanh), Lux.Dense(e.width => 1))
+        m = Lux.Chain(
+            Lux.Dense(3 => e.width, tanh), Lux.Dense(e.width => 1), (e.head ? (Lux.Dense(1 => 1),) : ())...
+        )
         (m, Lux.setup(rng, m)...)
     end
     ReactantNitro.forward(::GateMLP, model, ps, st; x) = Lux.apply(model, x, ps, st)
@@ -543,6 +548,24 @@
         @test e.nitro.checkpoint_source ==
             ReactantNitro.resolve_checkpoint(TopKCheckpointer(; dir), dir, :all, :best; what = "the test").path
         @test isfile(best.path)
+    end
+
+    @testset "`strict` through the tools" begin
+        dir = mktempdir()
+        @test wait_run(run_id(EXT.nitro_train(GATE_SPEC, max_epochs = 1, run_dir = dir))).status == :completed
+        ev(; kw...) = wait_run(
+            run_id(
+                EXT.nitro_evaluate(;
+                    experiment = GATE_SPEC, split = "test", run_dir = dir, weights = "latest => best",
+                    overrides = "head=true", kw...
+                )
+            )
+        )
+        refused = ev()
+        @test refused.status == :failed && occursin("strict = false", refused.error)
+        loaded = ev(; strict = false)
+        @test loaded.status == :completed
+        @test haskey(loaded.nitro.ps, :layer_3)
     end
 
     @testset "a resume through the tools continues the logged run" begin

@@ -356,7 +356,7 @@ end
 
 const TOOL_NITRO_KWARGS = (
     :max_epochs, :run_dir, :seed, :n_devs, :accum, :gradient_clip_norm, :preset, :resume,
-    :weights, :restore_optimizer, :restore_best,
+    :weights, :restore_optimizer, :restore_best, :strict,
 )
 
 function _check_overrides(::Type{T}, overrides::Dict{Symbol}, kwargs) where {T}
@@ -706,7 +706,7 @@ end
 
 """
     nitro_train(experiment; max_epochs, run_dir, seed, n_devs, accum, gradient_clip_norm,
-                preset, resume, weights, restore_optimizer, restore_best, overrides) -> String
+                preset, resume, weights, restore_optimizer, restore_best, strict, overrides) -> String
 
 Start training an experiment in the background and return the run id immediately.
 
@@ -725,7 +725,9 @@ run's checkpoints, written as in Julia: `"latest => Average(Last(10))"`,
 refused. `resume` also takes `"auto"` (the same as `"latest => latest"`, starting fresh when there
 is nothing to resume) and `"false"` (the default). `weights` gives the parameters alone, with a
 fresh optimizer; `restore_optimizer = true` also takes that record's optimizer state, with a fresh
-step, epoch and schedule. `restore_best = true` ends the run by loading its own best checkpoint
+step, epoch and schedule. `strict = false` (every tool that takes `weights`) loads a source whose tree
+differs from the model's: matching leaves load, the rest keep their fresh initialization, with a
+warning; a size mismatch still refuses. `restore_best = true` ends the run by loading its own best checkpoint
 (`restore_best = "Average(Last(10))"`: the average of its own latest 10) into the handle, which a later `nitro_validate`/`nitro_evaluate`/`nitro_export` with this run's id
 then uses. `overrides` carries experiment-field values as a comma-separated `name=value` list of
 Julia literals, e.g. `overrides="width=128, labels=[1.0,2.0]"`; an unknown field or a key given in
@@ -753,6 +755,7 @@ function nitro_train(
         resume::Union{String, Nothing} = nothing,
         weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
+        strict::Bool = true,
         restore_optimizer::Bool = false,
         restore_best::Union{Bool, String, Nothing} = nothing,
         overrides::Union{String, Nothing} = nothing,
@@ -761,6 +764,7 @@ function nitro_train(
         max_epochs, run_dir, seed, n_devs, accum, gradient_clip_norm, preset, resume,
     )
     w = _weights_arg(weights, checkpoint)
+    strict || push!(kwargs, :strict => false)
     w === nothing || push!(kwargs, :weights => w)
     # Passed only when set, so the constructor's own default stays the one authority.
     restore_optimizer && push!(kwargs, :restore_optimizer => true)
@@ -791,6 +795,7 @@ function nitro_validate(
         experiment::Union{String, Nothing} = nothing,
         weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
+        strict::Bool = true,
         overrides::Union{String, Nothing} = nothing,
         max_epochs::Union{Int, Nothing} = nothing,
         run_dir::Union{String, Nothing} = nothing,
@@ -808,6 +813,7 @@ function nitro_validate(
     # Parsed here, not in the run body: a malformed source is the caller's mistake and is refused
     # before a run exists.
     w = _weights_arg(weights, checkpoint)
+    strict || push!(kwargs, :strict => false)
     state = _new_run(:validate, label)
     _launch_run!(state) do
         nitro = _target_nitro(state, run_id, experiment, w, overrides, kwargs, preset)
@@ -836,6 +842,7 @@ function nitro_evaluate(
         split::String = "test",
         weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
+        strict::Bool = true,
         overrides::Union{String, Nothing} = nothing,
         max_epochs::Union{Int, Nothing} = nothing,
         run_dir::Union{String, Nothing} = nothing,
@@ -853,6 +860,7 @@ function nitro_evaluate(
     # Parsed here, not in the run body: a malformed source is the caller's mistake and is refused
     # before a run exists.
     w = _weights_arg(weights, checkpoint)
+    strict || push!(kwargs, :strict => false)
     state = _new_run(:evaluate, label)
     _launch_run!(state) do
         nitro = _target_nitro(state, run_id, experiment, w, overrides, kwargs, preset)
@@ -881,6 +889,7 @@ function nitro_predict(
         inputs::String = "",
         weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
+        strict::Bool = true,
         overrides::Union{String, Nothing} = nothing,
         max_epochs::Union{Int, Nothing} = nothing,
         run_dir::Union{String, Nothing} = nothing,
@@ -898,6 +907,7 @@ function nitro_predict(
     # Parsed here, not in the run body: a malformed source is the caller's mistake and is refused
     # before a run exists.
     w = _weights_arg(weights, checkpoint)
+    strict || push!(kwargs, :strict => false)
     state = _new_run(:predict, label)
     _launch_run!(state) do
         nitro = _target_nitro(state, run_id, experiment, w, overrides, kwargs, preset)
@@ -952,6 +962,7 @@ function nitro_export(
         provenance::Union{String, Nothing} = nothing,
         weights::Union{String, Nothing} = nothing,
         checkpoint::Union{String, Nothing} = nothing,
+        strict::Bool = true,
         overrides::Union{String, Nothing} = nothing,
         max_epochs::Union{Int, Nothing} = nothing,
         run_dir::Union{String, Nothing} = nothing,
@@ -986,6 +997,7 @@ function nitro_export(
     # Parsed here, not in the run body: a malformed source is the caller's mistake and is refused
     # before a run exists.
     w = _weights_arg(weights, checkpoint)
+    strict || push!(kwargs, :strict => false)
     state = _new_run(:export, label)
     _launch_run!(state) do
         nitro = _target_nitro(state, run_id, experiment, w, overrides, kwargs, preset)
