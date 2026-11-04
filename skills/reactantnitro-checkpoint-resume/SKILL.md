@@ -270,6 +270,13 @@ with no `train` split.
 | the exact training state of a record (a branch unless it is the newest) | `resume = run => :best` |
 | a record's parameters and optimizer state, fresh step and schedule | `weights = run => :best, restore_optimizer = true` |
 | a record's parameters, fresh optimizer | `weights = run => :best` |
+| a changed model (a new head, a dropped layer), loading what fits | `weights = run => :best, strict = false` |
+
+**`strict = false`: a partial load, as in PyTorch's `load_state_dict`.** Leaves of `ps` and `st`
+are matched by keypath; one the source lacks keeps its fresh initialization, one this model lacks
+is dropped, and both always warn with the list. A parameter size mismatch refuses regardless. A
+layer-state leaf that does not fit only warns and keeps the fresh leaf, under either setting. Only `weights`
+takes it; `resume` and `restore_optimizer` refuse a partial load.
 
 **`restore_best = true`: end `train!` holding the run's best weights.** When training completes,
 stops early or is stopped on request (not on error), the handle loads `ps` and `st` from its OWN

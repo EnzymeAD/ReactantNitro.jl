@@ -81,8 +81,8 @@ that made the tools appear.
 ### Run knobs and experiment fields
 
 The typed keywords (`max_epochs`, `run_dir`, `seed`, `n_devs`, `accum`, `gradient_clip_norm`,
-`preset`, `resume`, `weights`, and on `nitro_train` the booleans `restore_optimizer` and
-`restore_best`) are run knobs passed to `Nitro`, where a keyword overrides the experiment's own
+`preset`, `resume`, `weights`, `strict` on every tool that takes `weights`, and on `nitro_train`
+the booleans `restore_optimizer` and `restore_best`) are run knobs passed to `Nitro`, where a keyword overrides the experiment's own
 accessor for this run. `weights` and `resume` take a
 checkpoint source as a string: a path, or `"run => checkpoint"` with the run `latest`, `all` or a
 run id and the checkpoint `best` or `latest`, spaces optional (`"latest => best"`,

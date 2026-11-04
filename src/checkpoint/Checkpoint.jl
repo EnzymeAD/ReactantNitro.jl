@@ -981,33 +981,82 @@ function _declared_default(::Type{E}, k::Symbol) where {E}
 end
 
 """
-    ReactantNitro.check_record_tree_compatible(record, layout::FlatLayout, path) -> nothing
+    ReactantNitro.restore_trees(ps, st, src_ps, src_st, what; strict = true) -> (ps, st, partial)
 
-Refuse a record whose parameter tree does not fit the model this experiment builds, naming the
-first mismatching leaves by keypath with both sizes. `layout` is the fresh model's, built before
-the record's parameters replace it. Keyed by keypath, so a changed `param_group` is not a mismatch.
+The parameters and layer state a `weights` source restores, on the host, checked against the
+fresh `ps` and `st` this experiment built. Array leaves are matched by keypath, so a changed
+`param_group` is not a mismatch. A parameter both trees hold at different sizes always refuses. A
+parameter only one tree holds refuses under `strict`; otherwise it warns, the fresh leaf is kept
+for a missing one and an unexpected one is dropped, as PyTorch's `load_state_dict(strict = false)`
+does. A layer-state leaf that does not fit only warns and keeps the fresh leaf. `partial` is `true`
+when parameters were kept or dropped. `what` names the source in messages.
 """
-function check_record_tree_compatible(record, layout::FlatLayout, path)
-    was = Dict(r.keypath => r.size for r in record.flat_permutation)
-    now = Dict(r.keypath => r.size for r in layout.permutation)
-    diff = String[]
-    for r in layout.permutation
-        haskey(was, r.keypath) || push!(diff, "  $(r.keypath): absent in the checkpoint, size $(r.size) now")
-        haskey(was, r.keypath) && was[r.keypath] != r.size &&
-            push!(diff, "  $(r.keypath): size $(was[r.keypath]) in the checkpoint, $(r.size) now")
-    end
-    for r in record.flat_permutation
-        haskey(now, r.keypath) || push!(diff, "  $(r.keypath): size $(r.size) in the checkpoint, absent now")
-    end
-    isempty(diff) && return nothing
-    length(diff) > 6 && (diff = push!(diff[1:6], "  ..."))
-    error(
+function restore_trees(ps, st, src_ps, src_st, what; strict::Bool = true)
+    sps, sst = from_host(to_host(src_ps)), from_host(to_host(src_st))
+    p, s = tree_diff(sps, ps, "ps"), tree_diff(sst, st, "st")
+    keyed = [p.missing; p.unexpected]
+    stdiff = [s.mismatched; s.missing; s.unexpected]
+    lines(v) = join(length(v) > 6 ? [v[1:6]; "  ..."] : v, "\n")
+    (!isempty(p.mismatched) || (strict && !isempty(keyed))) && error(
         """
-        ReactantNitro: the checkpoint at `$path` holds a parameter tree that does not match the model
-        this experiment builds:
-        $(join(diff, "\n"))
-        This usually means the architecture fields differ from the ones the checkpoint was trained with."""
+        ReactantNitro: $what holds a parameter tree that does not match the model this experiment builds:
+        $(lines([p.mismatched; keyed]))
+        $(
+            isempty(p.mismatched) ? "Pass `strict = false` to load the leaves that match and keep \
+          this model's initialization for the rest." :
+                "A size mismatch refuses even under `strict = false`. This usually means the \
+          architecture fields differ from the ones the source was trained with."
+        )"""
     )
+    partial = !isempty(keyed)
+    partial && @warn """
+    ReactantNitro: `strict = false` loaded $what partially. Parameters absent in the source keep \
+    this model's initialization; parameters this model lacks are dropped:
+    $(lines(keyed))"""
+    isempty(stdiff) || @warn """
+    ReactantNitro: the layer state of $what does not fit this model. Leaves absent or sized \
+    differently in the source keep this model's initialization; leaves this model lacks are dropped:
+    $(lines(stdiff))"""
+    ps_out = partial ? merge_by_keypath(from_host(to_host(ps)), sps) : sps
+    # Always into the fresh structure: a layer with no array state (a new Dense, a Dropout) still
+    # needs its entry.
+    st_out = merge_by_keypath(from_host(to_host(st)), sst)
+    return ps_out, st_out, partial
+end
+
+# Array leaves of two trees compared by keypath, as message lines naming `root.keypath`.
+function tree_diff(was, now, root)
+    w, n = leaf_sizes(was), leaf_sizes(now)
+    keypath_repr(k) = join((root, string.(k)...), ".")
+    missing = ["  $(keypath_repr(k)): absent in the source, size $(n[k]) now" for k in keys(n) if !haskey(w, k)]
+    unexpected = ["  $(keypath_repr(k)): size $(w[k]) in the source, absent now" for k in keys(w) if !haskey(n, k)]
+    mismatched = [
+        "  $(keypath_repr(k)): size $(w[k]) in the source, $(n[k]) now"
+            for k in keys(n) if haskey(w, k) && w[k] != n[k]
+    ]
+    return (; missing = sort(missing), unexpected = sort(unexpected), mismatched = sort(mismatched))
+end
+
+function leaf_sizes(tree)
+    sizes = Dict{Tuple, Dims}()
+    Functors.fmap_with_path(tree) do kp, x
+        x isa AbstractArray && (sizes[Tuple(kp)] = size(x))
+        return x
+    end
+    return sizes
+end
+
+# `fresh`'s structure with each leaf `src` holds at the same keypath, unless its size differs.
+function merge_by_keypath(fresh, src)
+    leaves = Dict{Tuple, Any}()
+    Functors.fmap_with_path(src) do kp, x
+        leaves[Tuple(kp)] = x
+        return x
+    end
+    return Functors.fmap_with_path(fresh) do kp, x
+        y = get(leaves, Tuple(kp), x)
+        return x isa AbstractArray && y isa AbstractArray && size(x) != size(y) ? x : y
+    end
 end
 
 # A long value, such as program text, is cut so the diff stays readable in a size-limited console.
