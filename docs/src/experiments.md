@@ -138,7 +138,7 @@ end
 | Marker | Reaches traced code as | In the compile key? | Reach for it when |
 | --- | --- | --- | --- |
 | `GraphConst{T}` | a baked literal, ordinary Julia semantics | yes, changing it recompiles | the value changes the graph: a shape, a class count, a layer width, a variant selector |
-| `Device{T}` | a device-resident traced input | no, by construction | a numeric knob you might sweep or schedule |
+| `Device{T}` | a device-resident traced input; baked at its current value on export | no, by construction | a numeric knob you might sweep or schedule |
 | unmarked, i.e. `Host{T}` | not at all | no | everything else, including anything dataset-sized |
 
 Unmarked means `Host` because most fields are. Writing `Host{T}` explicitly is legal, and useful
@@ -156,6 +156,14 @@ visible in `ReactantNitro.cache_stats()`.
 
 Keep dataset-sized state unmarked, or off the experiment entirely; the `compile_view` section below
 says why.
+
+A `Device` knob read in `forward` needs no special handling for export: the export trace sees each
+`Device` value copied to the host, so the knob is baked into the bundle at the export handle's value.
+See [Export](export.md).
+
+A `GraphConst{Float64}` scalar broadcast against a `Float32` array promotes the result to `Float64`,
+so convert it to the model's element type (`Float32(e.scale)`). A `Device{Float32}` field needs no
+conversion.
 
 ## Why a macro
 
@@ -207,6 +215,57 @@ Keep dataset-sized state unmarked (`Host`), or off the experiment entirely. Off 
 usually better: `build_data` hands the collection to the framework, which holds it apart from `e`.
 Since unmarked already means `Host`, the remaining risk is a dataset-sized field marked
 `GraphConst`.
+
+## [The model: read `e` at call time](@id model-shape)
+
+The canonical model is one `@compact` to which [`forward`](@ref) passes the experiment as an input.
+The model reads `GraphConst` and `Device` fields from it directly:
+
+```julia
+function ReactantNitro.build_model(e::MyExp, rng)
+    model = @compact(enc = encoder(e.width), block = Dense(e.width => e.width, tanh)) do (x, e)
+        @return iterate_block(e, block, enc(x))
+    end
+    return model, Lux.setup(rng, model)...
+end
+
+ReactantNitro.forward(e::MyExp, model, ps, st; x) = Lux.apply(model, (x, e), ps, st)
+```
+
+[`build_model`](@ref) may read fields to size layers, and an initializer may close over a number
+taken from `e`. The model must not store `e`, or a value taken from a `Device` field.
+`build_model` sees the converted experiment, so a stored copy holds setup-time device buffers that
+[`set_device!`](@ref) and schedules never reach, holds the real `Host` fields where traced code can
+read them, and is refused at export. The `e` that `forward` passes in is the compile view in training
+and the export view at export, so reading it has none of these problems.
+
+Do not give the model a configuration struct that mirrors experiment fields; pass `e` instead. This
+is the flat-struct rule below, applied to the model.
+
+## `@trace` loops
+
+A `@trace` loop whose body reads `e`, or a captured activation, needs `track_numbers = false`:
+
+```julia
+function iterate_block(e, block, x)
+    h = zero(x)                           # traced, since x is
+    @trace track_numbers = false checkpointing = true for _ in 1:(e.n_iters)
+        h = block_step(e, block, x, h)
+    end
+    return h
+end
+```
+
+The loop retraces every variable its body references. By default it promotes every plain number
+inside them to a traced number, and a struct whose field types are not type parameters cannot hold
+one, so compiling fails with `NoFieldMatchError: Cannot convert type ...`. The experiment is one such
+struct, since `GraphConst` fields keep their declared types. A lazy wrapper such as the
+`ReshapedArray` that `GroupNorm` returns is another. With `track_numbers = false` those numbers stay
+constants and traced values, `Device` fields included, stay traced.
+
+Loop state must then already be traced when the loop starts, since a plain Julia number is no longer
+promoted. The loop counter is unaffected. Writing the loop body as a top-level function that takes
+what it reads as arguments keeps the captures explicit.
 
 ## One flat struct: no configuration struct inside a field
 
