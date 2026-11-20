@@ -1,6 +1,6 @@
 name = "ReactantNitro"
 uuid = "641982cc-88f5-4d80-bec4-e68c6a8af0a5"
-version = "0.2.3"
+version = "0.2.4"
 authors = ["Carroll Vance <cvance@medicalmetrics.com>"]
 
 [deps]
@@ -64,7 +64,7 @@ ProgressMeter = "1"
 PythonCall = "0.9.25"
 Random = "1"
 Reactant = "0.2.264"
-ReactantServerExport = "1.1"
+ReactantServerExport = "1.1, 2"
 SHA = "0.7, 1"
 Statistics = "1"
 Tables = "1"
