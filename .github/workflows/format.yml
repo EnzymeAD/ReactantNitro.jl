@@ -21,7 +21,7 @@ on:
       - '.github/workflows/format.yml'
 
 concurrency:
-  group: format-${{ github.ref }}
+  group: format-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref }}
   cancel-in-progress: true
 
 # actions: write is needed because julia-actions/cache prunes its own old caches.
