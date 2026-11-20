@@ -750,9 +750,8 @@ function schedule_bindings(e, layout, sched, chains; anchors = nothing, masks = 
     fields, slots = Vector{Tuple}(undef, G), Vector{Tuple}(undef, G)
     report = []
     for (gi, g) in enumerate(layout.groups)
-        decays = !iszero(lambda(e, Val(g))) || any(
-            k -> _binds(sched, k, g) &&
-                last(_schedule_target(k)) === :lambda, keys(sched.opt)
+        decays = has_decay(
+            e, g, any(k -> _binds(sched, k, g) && last(_schedule_target(k)) === :lambda, keys(sched.opt))
         )
         fs = _varying_fields(sched, g, decays)
         slots[gi] = ()
@@ -820,7 +819,7 @@ function _probe_field(
     one_key = NamedTuple{(field,)}
     with(v) = bind ? merge(base, (; bind = merge(base.bind, one_key((elt(v),))))) :
         merge(base, one_key((elt(v),)))
-    keep_decay = :lambda in scheduled
+    keep_decay = has_decay(e, g, :lambda in scheduled)
     chain(v) = optimizer(
         e, g, resolve_hp(e, layout, gi; host = with(v), keep_decay, anchors, masks, device = false)
     )

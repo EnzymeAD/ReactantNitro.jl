@@ -683,6 +683,15 @@
         train!(nz)
         @test phase(nz) isa Done
         @test Float32(nz.opt_state[1].rule.opts[2].lambda) == 0.0f0
+
+        # So does an `eta` schedule reaching zero, which zeroes the applied `eta * lambda` (#66).
+        ne = Nitro(
+            MomGroups(); schedules = (; opt = (; eta = _ -> t -> 0.0f0)),
+            checkpointer = nothing, logger = nothing, run_dir = mktempdir()
+        )
+        train!(ne)
+        @test phase(ne) isa Done
+        @test Float32(ne.opt_state[1].rule.opts[2].lambda) == 0.0f0
     end
 
     @testset "the schedule log reports the applied values, once per optimizer step" begin

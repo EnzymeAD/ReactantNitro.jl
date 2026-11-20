@@ -1092,9 +1092,10 @@ function rebuild_rules(
     sched = nitro.schedules
     return ntuple(Val(G)) do gi
         g = layout.groups[gi]
-        keep_decay = sched !== nothing && any(
-            k -> _binds(sched, k, g) &&
-                last(_schedule_target(k)) === :lambda, keys(sched.opt)
+        keep_decay = has_decay(
+            nitro.e, g, sched !== nothing && any(
+                k -> _binds(sched, k, g) && last(_schedule_target(k)) === :lambda, keys(sched.opt)
+            )
         )
         # `mesh` is required: without it the rule's scalars are placed for one device while the
         # moments are replicated across the mesh, and the program refuses to rebuild the `Leaf`.
