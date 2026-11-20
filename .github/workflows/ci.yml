@@ -36,8 +36,10 @@ permissions:
   contents: read
 
 # A newer PR run cancels the old one. Main and tag runs finish; only the newest queued one waits.
+# PR runs are grouped by number, not `github.ref`: a run queued after its PR merged sees the base
+# branch as `github.ref`, and with `cancel-in-progress` it cancelled main's runs.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
