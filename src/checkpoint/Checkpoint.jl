@@ -1166,6 +1166,60 @@ function check_optimizer_compatible(record, fresh, path)
     )
 end
 
+"""
+    ReactantNitro.check_resume_rules(restored, fresh, source; manual = false) -> nothing
+
+Check, on a resume, that every `Leaf` of the restored optimizer state carries the same rules as the
+state this run just built. A resume skips [`check_optimizer_compatible`](@ref), but the
+configuration may still have changed since the run was written, and a mismatch would otherwise fail
+inside the optimizer program's trace with an error naming neither the cause nor the fix. In the
+automatic loop pass both as `NamedTuple`s keyed by group, so the error names groups.
+"""
+function check_resume_rules(restored, fresh, source; manual::Bool = false)
+    was, now = _leaf_rules(restored), _leaf_rules(fresh)
+    where(p) = manual ? p : "group :$p"
+    diff = if length(was) != length(now)
+        ["  the checkpoint has $(length(was)) optimizer leaves and this run has $(length(now))"]
+    else
+        [
+            "  $(where(p)): $(_rule_label(a)) in the checkpoint, $(_rule_label(b)) now"
+                for ((p, a), (_, b)) in zip(was, now) if _rule_kinds(a) != _rule_kinds(b)
+        ]
+    end
+    isempty(diff) && return nothing
+    causes = manual ? "  - `setup_optimizers`" :
+        """
+        - the `optimizer` hook
+        - a group's `lambda`: a group with zero `lambda` and no `lambda` schedule has no `Decay` tail"""
+    return error(
+        """
+        ReactantNitro: cannot resume from `$source`: the optimizer state in it was built for other
+        rules than this run builds.
+        $(join(first(diff, 6), "\n"))
+        The state (moments, step counts) fits only the rules that wrote it. Since that run, one of
+        these changed:
+        $causes
+        To continue the run, restore the configuration it was started with. To keep its weights with
+        a fresh optimizer, start a new run with
+            weights = $(repr(source))"""
+    )
+end
+
+# Every `Leaf` in an optimizer state tree as `path => rule`, in tree order.
+function _leaf_rules(x, path::String = "", out = Pair{String, Any}[])
+    sub(k) = isempty(path) ? string(k) : string(path, ".", k)
+    if x isa Optimisers.Leaf
+        push!(out, path => x.rule)
+    elseif x isa NamedTuple
+        foreach(k -> _leaf_rules(getproperty(x, k), sub(k), out), keys(x))
+    elseif x isa Tuple
+        foreach(i -> _leaf_rules(x[i], sub(i), out), eachindex(x))
+    elseif !(x isa Union{AbstractArray, Number, AbstractString, Symbol}) && isstructtype(typeof(x))
+        foreach(f -> _leaf_rules(getfield(x, f), sub(f), out), fieldnames(typeof(x)))
+    end
+    return out
+end
+
 _rule_name(r::Optimisers.OptimiserChain) = "OptimiserChain(" * join(map(_rule_name, r.opts), ", ") * ")"
 _rule_name(r) = string(nameof(typeof(r)))
 _leaf_shape(x) = x isa AbstractArray ? size(x) : ()

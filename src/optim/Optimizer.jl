@@ -463,10 +463,14 @@ function hp_host(e, group::Symbol, sv::NamedTuple = (;); elt::Type = Float32)
     return (; eta, lambda = lam, rest...)
 end
 
+# Whether group `g`'s chain has a `Decay` tail. Fixed for the run, since the optimizer state is built
+# from the chain: a step whose `eta * lambda` is 0 decays by 0 rather than dropping the tail.
+has_decay(e, g::Symbol, lambda_scheduled::Bool) = lambda_scheduled || !iszero(lambda(e, Val(g)))
+
 # The `hp` setup builds a group's chain from: `sv` is the group's [`setup_schedule_values`](@ref).
 setup_hp(e, layout, gi, sv::NamedTuple; kwargs...) = resolve_hp(
-    e, layout, gi; host = hp_host(e, layout.groups[gi], sv), keep_decay = haskey(sv, :lambda),
-    kwargs...
+    e, layout, gi; host = hp_host(e, layout.groups[gi], sv),
+    keep_decay = has_decay(e, layout.groups[gi], haskey(sv, :lambda)), kwargs...
 )
 
 """
@@ -477,8 +481,8 @@ setup_hp(e, layout, gi, sv::NamedTuple; kwargs...) = resolve_hp(
 Build group `gi`'s hyperparameter carrier `hp` for one step: `eta`, `lambda`, `anchor` and
 `no_decay_mask`, plus one key per scheduled rule field. `host` is the group's [`hp_host`](@ref)
 values; without it they are computed from `eta_t`, the `eta` schedule's value or `nothing`. A zero
-`lambda` becomes `nothing`, which drops the `Decay` tail, unless `keep_decay` is set; a scheduled
-`lambda` sets it, so the chain does not change when the schedule reaches zero. `device = false`
+`lambda` becomes `nothing`, which drops the `Decay` tail, unless `keep_decay` is set; callers pass
+[`has_decay`](@ref), so the chain does not change when `eta` or `lambda` reaches zero. `device = false`
 keeps host values, for the setup-time probe in [`schedule_bindings`](@ref).
 
 Every scalar is converted to `elt`, the flat buffer's element type, before it moves to the device:

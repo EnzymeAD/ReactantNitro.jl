@@ -683,6 +683,15 @@
         train!(nz)
         @test phase(nz) isa Done
         @test Float32(nz.opt_state[1].rule.opts[2].lambda) == 0.0f0
+
+        # So does an `eta` schedule reaching zero, which zeroes the applied `eta * lambda` (#66).
+        ne = Nitro(
+            MomGroups(); schedules = (; opt = (; eta = _ -> t -> 0.0f0)),
+            checkpointer = nothing, logger = nothing, run_dir = mktempdir()
+        )
+        train!(ne)
+        @test phase(ne) isa Done
+        @test Float32(ne.opt_state[1].rule.opts[2].lambda) == 0.0f0
     end
 
     @testset "the schedule log reports the applied values, once per optimizer step" begin
@@ -797,6 +806,9 @@
         m = L2_MODE[]
         m === :direct && return Optimisers.Momentum(hp.eta, get(hp, :rho, 0.9f0))
         m === :ignore && return Optimisers.Momentum(hp.eta, 0.9f0)
+        # `:switch` picks its rule from a value, so setup's zero placeholder picks another one.
+        m === :switch && return iszero(hp.rho) ? Optimisers.Momentum(hp.eta, 0.5f0) :
+            Optimisers.Nesterov(hp.eta, hp.rho)
         m === :shared && return Optimisers.OptimiserChain(
             Optimisers.Adam(hp.eta), Optimisers.Descent(0.1f0 * hp.eta)
         )
@@ -835,6 +847,18 @@
         end
         @test err isa ErrorException
         @test occursin("schedules rho", err.msg) && occursin(":default", err.msg)
+    end
+
+    @testset "Level 2: a factory whose rules change after setup is refused at that step" begin
+        err = try
+            l2_run(:switch, (; opt = (; rho = _ -> t -> 0.9f0)))
+            nothing
+        catch ex
+            ex
+        end
+        @test err isa ErrorException
+        @test occursin("group :default's optimizer chain changed from\n    Momentum\nto\n    Nesterov", err.msg)
+        @test occursin("rho = 0.9", err.msg) && occursin("iszero(hp.rho)", err.msg)
     end
 
     @testset "Level 2: two rules may share a field name" begin

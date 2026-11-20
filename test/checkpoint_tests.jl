@@ -471,6 +471,35 @@
         @test Nitro(CkptMLP(); run_dir = dir, max_epochs = 9).max_epochs == 9   # raised: no warning
     end
 
+    # The same model with a settable `lambda`: zero `lambda` builds no `Decay` tail.
+    @experiment struct DecayCkpt
+        max_epochs::Host{Int} = 1
+    end
+    const DECAY_CKPT_LAMBDA = Ref(0.0f0)
+    ReactantNitro.lambda(::DecayCkpt) = DECAY_CKPT_LAMBDA[]
+    ReactantNitro.build_model(::DecayCkpt, rng) = (m = ckpt_chain(6); (m, Lux.setup(rng, m)...))
+    ReactantNitro.forward(::DecayCkpt, model, ps, st; x) = Lux.apply(model, x, ps, st)
+    ReactantNitro.loss(::DecayCkpt, ŷ; y) = mean(abs2, ŷ .- y)
+    ReactantNitro.build_data(::DecayCkpt, dist) = (; train = CK_TRAIN)
+
+    @testset "a resume whose optimizer rules changed refuses, naming the change and the way out" begin
+        dir = mktempdir()
+        DECAY_CKPT_LAMBDA[] = 0.0f0
+        train!(Nitro(DecayCkpt(); run_dir = dir))
+        DECAY_CKPT_LAMBDA[] = 1.0f-2
+        err = try
+            Nitro(DecayCkpt(); run_dir = dir, resume = :auto)
+            nothing
+        catch ex
+            ex
+        finally
+            DECAY_CKPT_LAMBDA[] = 0.0f0
+        end
+        @test err isa ErrorException
+        @test occursin("group :default: RAdam in the checkpoint, RAdam + Decay now", err.msg)
+        @test occursin("`lambda`", err.msg) && occursin("weights = ", err.msg)
+    end
+
     # A record written before a `GraphConst` field existed, as an older framework run leaves it.
     function drop_config_field!(path, k)
         rec = JLD2.load(path, "record")
