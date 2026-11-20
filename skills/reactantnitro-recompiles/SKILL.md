@@ -133,6 +133,10 @@ reads it from there.** A config object is a legal `GraphConst`, and marking it i
 contents in the key. Assert it in your own tests, which is one line: the key hash moves when the
 config changes and does not move when a `Host` field does.
 
+The simplest way to satisfy it is the canonical model shape in `reactantnitro-experiment`: the
+model reads `e` passed in by `forward` and captures nothing, so every graph-determining value is a
+`GraphConst` the key already covers.
+
 ## When a compile is genuinely slow
 
 Compile cost is dominated by what the tracer has to walk. The usual cause of an unexpectedly long

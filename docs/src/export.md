@@ -80,6 +80,11 @@ run one portably.
 
 ## Caveats
 
+Export traces `forward` against the experiment with every `Device` value copied to the host, so a
+`Device` field `forward` reads is baked into the bundle at the export handle's value. A value
+overridden on the export handle ships silently; build the handle from the preset and weights the run
+used. A device value stored in the model itself is refused, naming its path.
+
 A view-shaped program output has to be `copy`ed before it leaves the traced graph, or the bundle
 carries a wrapper rather than an array. This does not apply to parameters, which the flat layout
 reconstructs through a `copy` already.

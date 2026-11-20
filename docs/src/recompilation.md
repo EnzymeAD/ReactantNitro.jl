@@ -129,6 +129,9 @@ The rule: a value that determines the emitted graph must be reachable from `e` a
 [`GraphConst`](@ref), even if the traced code reads it from somewhere else. A config object is a
 legal `GraphConst`, and marking it puts its contents in the key.
 
+The simplest way to satisfy it is to have `forward` pass `e` to the model and the model capture
+nothing; see [the model shape](@ref model-shape).
+
 ## Nitro is a fixed point
 
 The programs a handle uses are determined at construction. A revised hook needs a new handle, and

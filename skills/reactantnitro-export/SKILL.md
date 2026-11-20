@@ -61,6 +61,21 @@ for a checkpoint parser you have gone around the surface rather than through it.
 `data = (;)` is not a workaround either. `Nitro(e)` runs setup and nothing else, so an evaluation or
 serving construction never needs the training data, and export is the purest case of that.
 
+## What `forward` reads from the experiment at export
+
+Export traces `forward` against a view of the experiment with `Host` fields stripped and every
+`Device` value copied to the host. **A `Device` field `forward` reads is baked into the bundle at the
+export handle's value.** So a sweepable knob stays `Device`; nothing extra is needed to export it.
+
+Two consequences:
+
+- **The bundle carries the handle's value, not necessarily the trained one.** A `Device` value
+  overridden when building the export handle ships silently. Build the handle from the preset and
+  weights the run used.
+- **The model must not capture a device value.** The view covers only the `e` that `forward` passes
+  in. A device value stored in the model by `build_model` is outside it, and export refuses it,
+  naming the path. See the model shape in `reactantnitro-experiment`.
+
 ## The hooks
 
 Two required, four optional.

@@ -5,10 +5,12 @@ description: >
   markers (Device, Host, GraphConst) and which one a field wants, why every knob is a
   FLAT field and never a configuration struct held in one, the batch contract
   and keyword routing, what a hook may return and why a batch-reduced scalar may not be an
-  output leaf, derived values, and what `Nitro(e)` does. Start here for any ReactantNitro
-  task; this skill also indexes the rest. Invoke when writing a new experiment,
-  porting a training loop onto ReactantNitro, adding a knob to an existing one, or reading
-  one you did not write.
+  output leaf, derived values, and what `Nitro(e)` does. Also the canonical model shape
+  (one `@compact`, the experiment passed in by `forward`, never captured) and the rule for
+  `@trace` loops that read the experiment or a captured activation (`track_numbers = false`).
+  Start here for any ReactantNitro task; this skill also indexes the rest. Invoke when
+  writing a new experiment or model, porting a training loop onto ReactantNitro, adding a
+  knob to an existing one, writing a `@trace` loop, or reading one you did not write.
 ---
 
 # Authoring a ReactantNitro experiment
@@ -58,7 +60,7 @@ host-ness would otherwise surprise a reader.
 | Marker | Reaches traced code as | In the compile key? | Reach for it when |
 | --- | --- | --- | --- |
 | `GraphConst{T}` | a baked literal, ordinary Julia semantics | **yes**, so changing it recompiles | the value changes the graph: a shape, a class count, a layer width, a variant selector |
-| `Device{T}` | a device-resident traced input | no, by construction | a numeric knob you might sweep or schedule, **or a buffer set the graph reads and nothing trains** (see below) |
+| `Device{T}` | a device-resident traced input; **baked at its current value on export** | no, by construction | a numeric knob you might sweep or schedule, **or a buffer set the graph reads and nothing trains** (see below) |
 | unmarked / `Host{T}` | not at all | no | everything else, including anything dataset-sized |
 
 **Getting it wrong is loud, in both directions.** Reading an unmarked field from traced code raises
@@ -72,6 +74,16 @@ element, on one thread, every time a program compiles. It does not raise and doe
 emitted graph: compile time simply grows with your data, which reads like a data-loading problem and
 is not one. `Host` is the fix, and it is now the default, so this bites only a field someone marked
 `GraphConst` by hand.
+
+**A `Device` knob read in `forward` needs no export handling.** Export traces against a view of the
+experiment with every `Device` value copied to the host, so the knob is baked into the bundle at the
+export handle's value. Do not make a sweepable knob `GraphConst` for export's sake, and do not invent
+a marker for "traced in training, constant at export": that is what `Device` already does.
+
+**Match `GraphConst` floats to the model's element type.** A `GraphConst{Float64}` scalar broadcast
+against a `Float32` array promotes the result to `Float64`; write `T(e.scale)` or `Float32(e.scale)`. A
+`Device{Float32}` field arrives as a `Float32` in training and at export, so it needs no conversion
+and no helper.
 
 The generated accessors are `device_fields(T)`, `host_fields(T)`, and `config_metadata(T)`. There is
 deliberately no `graphconst_fields`: two traits determine three categories and the third is the
@@ -130,6 +142,73 @@ network in `build_data` and yielding features, puts a device program where the f
 account for it, and the framework's prefetch fan-out will then run as many copies of it as there
 are producer tasks. Many producers each holding a copy of the backbone's workspace exhaust device
 memory within minutes, and the run ends in `RESOURCE_EXHAUSTED`.
+
+## The model: one `@compact`, the experiment passed in by `forward`
+
+The canonical shape. `forward` hands the experiment to the model as an input, and the model reads
+`GraphConst` and `Device` fields from it directly:
+
+```julia
+function ReactantNitro.build_model(e::MyExp, rng)
+    model = @compact(enc = encoder(e.width), block = Dense(e.width => e.width, tanh)) do (x, e)
+        @return iterate_block(e, block, enc(x))   # reads e.n_iters, e.alpha, ...
+    end
+    return model, Lux.setup(rng, model)...
+end
+
+ReactantNitro.forward(e::MyExp, model, ps, st; x) = Lux.apply(model, (x, e), ps, st)
+```
+
+**Read `e` at call time; never capture it.** `build_model` may read fields to size layers, and an
+initializer may close over a number taken from `e`. The model itself must not store `e` or a value
+taken from a `Device` field. `build_model` receives the converted experiment, so a captured copy:
+
+- holds the setup-time device buffers, which `set_device!` and schedules never reach;
+- holds the real `Host` fields, which the tracer then walks and traced code can read silently;
+- is refused at export, since a device value inside the model would become an argument the bundle
+  cannot supply.
+
+Reading `e` passed in by `forward` has none of these problems: the traced code sees the compile view
+(Host stripped, Device traced) in training and the export view (Device baked) at export.
+
+**No config struct on the model.** A struct that mirrors experiment fields so the model can carry
+them duplicates the single declaration of each value, and is the "flat struct" rule below applied to
+the model. Pass `e` instead.
+
+## `@trace` loops: `track_numbers = false` when the body reads `e` or a captured activation
+
+```julia
+function iterate_block(e, block, x)
+    h = zero(x)                                   # traced, since x is
+    @trace track_numbers = false checkpointing = true for _ in 1:(e.n_iters)
+        h = block_step(e, block, x, h)            # reads e.alpha directly
+    end
+    return h
+end
+```
+
+A `@trace` loop makes every variable its body references into loop state and retraces it. With the
+default `track_numbers = true`, every plain `Int` or `Float64` inside that state becomes a traced
+number, and a struct whose field types are not type parameters cannot hold one. Compiling fails with
+`NoFieldMatchError: Cannot convert type ...`, naming the struct but not the variable. Two common
+cases:
+
+- the experiment: `GraphConst` fields keep their concrete declared types;
+- a lazy wrapper over a traced array, such as the `ReshapedArray` that `GroupNorm` returns, whose
+  `dims` field is a tuple of `Int`s.
+
+`track_numbers = false` leaves those numbers as constants, which is what a `GraphConst` is meant to
+be; traced values such as `Device` fields stay traced. Three consequences:
+
+- loop state must already be traced when the loop starts, so compute it from a traced input; a
+  plain Julia number is left a constant rather than promoted;
+- the loop counter is unaffected: `@trace for` promotes its bounds itself;
+- a plain `Vector{Float64}` captured under the default would become an array of traced scalars, one
+  loop operand per element; under `track_numbers = false` it stays a constant.
+
+Write the loop body as a top-level function that takes what it reads as arguments, so the captures
+are exactly the call's arguments. Hoisting constant arrays out of the loop is then an optimization,
+not a requirement.
 
 ## One flat struct: no configuration struct inside a field
 
