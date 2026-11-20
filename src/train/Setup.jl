@@ -497,6 +497,7 @@ function _build_nitro(
             # asks for the record's, which must fit the one just built.
             if record !== nothing && (!weights_only || restore_optimizer)
                 weights_only && check_optimizer_compatible(record, opt_state, source)
+                weights_only || check_resume_rules(record.opt_state, opt_state, source; manual)
                 opt_state = to_device_leaf(record.opt_state; mesh)
                 assert_opt_state_device(opt_state)
             end
@@ -591,6 +592,10 @@ function _build_nitro(
             # unless `restore_optimizer` asks for the record's, which must fit the one just built.
             if record !== nothing && (!weights_only || restore_optimizer)
                 weights_only && check_optimizer_compatible(record, opt_state, source)
+                groups = layout.groups
+                weights_only || check_resume_rules(
+                    NamedTuple{groups}(record.opt_state), NamedTuple{groups}(opt_state), source
+                )
                 opt_state = to_device_leaf(record.opt_state; mesh)
                 for gi in 1:n_groups(layout)
                     assert_device_state(

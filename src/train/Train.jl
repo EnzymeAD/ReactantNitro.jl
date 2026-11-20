@@ -1107,8 +1107,48 @@ function rebuild_rules(
         chain = place_slots(
             build_chain(nitro.e, g, hp), nitro.bindings.slots[gi], gi; memo, mesh = nitro.mesh
         )
+        # The host values as the factory saw them: `lambda` is `nothing` without a `Decay` tail.
+        seen = merge(applied[gi], (; lambda = keep_decay ? applied[gi].lambda : nothing))
+        check_chain_fixed(nitro, g, nitro.opt_state[gi].rule, chain, seen)
         Optimisers.Leaf(chain, nitro.opt_state[gi].state, nitro.opt_state[gi].frozen)
     end
+end
+
+# A chain's rules by name, through a single-rule wrapper such as `ReactantOptimiser`.
+_rule_kinds(r) = map(x -> nameof(typeof(_rule_core(x))), _rules_of(_rule_core(r)))
+_rule_label(r) = join(_rule_kinds(r), " + ")
+
+"""
+    ReactantNitro.check_chain_fixed(nitro, group, was, now, hp) -> nothing
+
+Error if the chain rebuilt for the next step has different rules than `was`, the chain the group's
+optimizer state was built for. The state's layout follows the rules, so a changed chain would hand
+one rule another's state and fail inside the optimizer program's trace.
+"""
+function check_chain_fixed(nitro::Nitro, group::Symbol, was, now, hp)
+    _rule_kinds(was) == _rule_kinds(now) && return nothing
+    level2 = !is_framework_default(optimizer, Tuple{typeof(nitro.e), Symbol, Any})
+    cause = level2 ? """
+        `optimizer(e, $(repr(group)), hp)` returned different rules for this step's values:
+            hp = $(repr(hp; context = :compact => true))
+        Pick the rules from the experiment's configuration, never from a value in `hp`. Setup calls
+        the factory with 0 for every scheduled field, so a branch such as `iszero(hp.rho)` or
+        `hp.eta > 1f-2` picks other rules once the schedule moves. `hp.lambda === nothing` is safe
+        to branch on: it holds for the whole run when the group never decays.""" :
+        """
+        The framework built this chain from `optimizer(e)` and the group's `lambda`, so this is a
+        framework bug. Please report it with the experiment's `optimizer`, `lambda`, and
+        `schedules`."""
+    return error(
+        """
+        ReactantNitro: at step $(nitro.step + 1), group $(repr(group))'s optimizer chain changed from
+            $(_rule_label(was))
+        to
+            $(_rule_label(now))
+        The optimizer state (moments, step counts) was built for the first chain, and a chain's rules
+        are fixed for the run: a schedule may change their values, not which rules there are.
+        $cause"""
+    )
 end
 
 """
