@@ -1,0 +1,581 @@
+/* ReactantNitro theme: a burnt-brown / dark-orange / gold theme for the
+ * DocumenterLandingPage landing page and for Documenter's own chrome, in the
+ * light ("paper and ember") and dark ("espresso and ember") themes.
+ *
+ * Structure, mirroring how the plugin and Documenter's own themes are scoped:
+ * the light palette lives on html without a theme class (Documenter sets no
+ * html.theme--* class for the default light theme, and picks theme--x for
+ * every other theme at runtime), the dark palette under
+ * html.theme--documenter-dark, and the catppuccin themes are deliberately
+ * left untouched (their palettes keep the shipped defaults). Each palette
+ * block defines both the landing variables (--landing-*) and the chrome
+ * variables (--brand-*); the chrome rules below consume the --brand-* vars,
+ * so in the catppuccin themes, where no --brand-* var is defined, the rules
+ * no-op and the shipped chrome wins.
+ *
+ * Landing overrides follow the plugin's documented contract: the landing
+ * consumes --landing-name-color/--landing-name-background and
+ * --landing-glow/--landing-glow-filter before the shipped -default variants,
+ * and --landing-accent drives the brand button, tile hover border, and
+ * selection. The name ramps are opaque; the glow stops carry alpha (~0.5,
+ * the same as the shipped defaults) so the blurred halo stays soft.
+ */
+
+/* ---- Landing: light (paper and ember) ---- */
+html:root:not(.theme--documenter-dark):not([class*="theme--catppuccin"]) {
+    --landing-name-color: transparent;
+    --landing-name-background: linear-gradient(120deg, #7c2d12, #c2410c 50%, #d97706);
+    --landing-glow: linear-gradient(-45deg, #b4530980 50%, #e3b34180 50%);
+    --landing-accent: #c2410c;
+    /* Warm the tile surfaces to match the paper page. */
+    --landing-surface: #f1ead9;
+    --landing-surface-2: #e6dcc6;
+    --landing-border: #e0d0ae;
+}
+
+/* ---- Landing: dark (espresso and ember) ---- */
+/* The plugin's html.theme--documenter-dark block defines --landing-accent
+ * directly, so the :root variant is required to outrank it regardless of
+ * load order. */
+html.theme--documenter-dark:root {
+    --landing-name-color: transparent;
+    --landing-name-background: linear-gradient(120deg, #e3b341, #d97706 50%, #b45309);
+    --landing-glow: linear-gradient(-45deg, #b4530980 50%, #e3b34180 50%);
+    --landing-accent: #e3b341;
+    /* Warm the tile surfaces to match the espresso page. */
+    --landing-surface: #2b2115;
+    --landing-surface-2: #33271a;
+    --landing-border: #4a3820;
+}
+
+/* ---- Chrome palettes ---- */
+html:root:not(.theme--documenter-dark):not([class*="theme--catppuccin"]) {
+    --brand-bg: #f7f3ec;
+    --brand-text: #3d2f20;
+    --brand-muted: #8a6a44;
+    --brand-heading: #7c2d12;
+    --brand-link: #b45309;
+    --brand-link-hover: #7c2d12;
+    --brand-focus-ring: rgba(180, 83, 9, 0.25);
+    --brand-sidebar-bg: #efe6d6;
+    --brand-sidebar-border: #ddcba4;
+    --brand-sidebar-structure: #c9a86a;
+    --brand-sidebar-link: #6b4a28;
+    --brand-sidebar-link-hover: #a03c10;
+    --brand-sidebar-hover-bg: #f0e2c8;
+    --brand-sidebar-active-bg: #e9d9bb;
+    --brand-sidebar-active-text: #a03c10;
+    --brand-navbar-bg: #fbf7ef;
+    --brand-navbar-border: #e0d0ae;
+    --brand-breadcrumb: #8a6a44;
+    --brand-code-bg: #f1e6d2;
+    --brand-code-text: #9a3412;
+    --brand-codeblock-bg: #f6f1e4;
+    --brand-codeblock-border: #e0d0ae;
+    --brand-table-head-bg: #efe6d6;
+    --brand-table-border: #dfcdaa;
+    --brand-blockquote-bg: #f2e8d4;
+    --brand-blockquote-border: #d9b98a;
+    --brand-footer: #9a8259;
+    --brand-search-bg: #fffdf8;
+    --brand-search-border: #d9c8a6;
+    --brand-selection-bg: #e9d9bb;
+    --brand-selection-text: #5f2210;
+    --brand-admonition-bg: #f6f1e4;
+    --brand-admonition-header: #7c2d12;
+    --brand-admonition-border: #d9b98a;
+    --brand-admonition-info: #d9a54e;
+    --brand-admonition-success: #a89a5a;
+    --brand-admonition-warning: #e0b54e;
+    --brand-admonition-danger: #c94f1d;
+    --brand-admonition-compat: #b0a05a;
+    --brand-admonition-todo: #c9b294;
+}
+html.theme--documenter-dark {
+    --brand-bg: #241c12;
+    --brand-text: #e8dcc4;
+    --brand-muted: #a08a66;
+    --brand-heading: #e3b341;
+    --brand-link: #f0a23c;
+    --brand-link-hover: #ffc46b;
+    --brand-focus-ring: rgba(240, 162, 60, 0.25);
+    --brand-sidebar-bg: #1d160d;
+    --brand-sidebar-border: #3a2c1a;
+    --brand-sidebar-structure: #6b5428;
+    --brand-sidebar-link: #c9b294;
+    --brand-sidebar-link-hover: #f0a23c;
+    --brand-sidebar-hover-bg: #33271a;
+    --brand-sidebar-active-bg: #3a2a16;
+    --brand-sidebar-active-text: #f0a23c;
+    --brand-navbar-bg: #2b2115;
+    --brand-navbar-border: #4a3820;
+    --brand-breadcrumb: #b08d5c;
+    --brand-code-bg: #3a2c1a;
+    --brand-code-text: #f0c674;
+    --brand-codeblock-bg: #1a130b;
+    --brand-codeblock-border: #4a3820;
+    --brand-table-head-bg: #33271a;
+    --brand-table-border: #4a3820;
+    --brand-blockquote-bg: #2f2515;
+    --brand-blockquote-border: #8a6a30;
+    --brand-footer: #a08a66;
+    --brand-search-bg: #241c12;
+    --brand-search-border: #4a3820;
+    --brand-selection-bg: #3a2a16;
+    --brand-selection-text: #f0c674;
+    --brand-admonition-bg: #2b2115;
+    --brand-admonition-header: #e3b341;
+    --brand-admonition-border: #8a6a30;
+    --brand-admonition-info: #d9a54e;
+    --brand-admonition-success: #a89a5a;
+    --brand-admonition-warning: #e0b54e;
+    --brand-admonition-danger: #e0602a;
+    --brand-admonition-compat: #b0a05a;
+    --brand-admonition-todo: #c9b294;
+}
+
+/* ---- Chrome: the rules consume the palette vars above. The html:root
+ * prefix matches or beats the specificity of both the unscoped light theme
+ * rules and the html.theme--documenter-dark scoped rules, and this sheet
+ * loads after every theme sheet, so order resolves any tie. ---- */
+html:root body {
+    background-color: var(--brand-bg, transparent);
+    color: var(--brand-text, inherit);
+}
+html:root a {
+    color: var(--brand-link, inherit);
+}
+html:root a:hover {
+    color: var(--brand-link-hover, inherit);
+}
+html:root .content h1,
+html:root .content h2,
+html:root .content h3,
+html:root .content h4,
+html:root .content h5,
+html:root .content h6 {
+    color: var(--brand-heading, inherit);
+}
+/* Heading text is wrapped in a.docs-heading-anchor links, which would
+ * otherwise take the link color; pin it to the heading color. */
+html:root h1 .docs-heading-anchor,
+html:root h1 .docs-heading-anchor:hover,
+html:root h1 .docs-heading-anchor:visited,
+html:root h2 .docs-heading-anchor,
+html:root h2 .docs-heading-anchor:hover,
+html:root h2 .docs-heading-anchor:visited,
+html:root h3 .docs-heading-anchor,
+html:root h3 .docs-heading-anchor:hover,
+html:root h3 .docs-heading-anchor:visited,
+html:root h4 .docs-heading-anchor,
+html:root h4 .docs-heading-anchor:hover,
+html:root h4 .docs-heading-anchor:visited,
+html:root h5 .docs-heading-anchor,
+html:root h5 .docs-heading-anchor:hover,
+html:root h5 .docs-heading-anchor:visited,
+html:root h6 .docs-heading-anchor,
+html:root h6 .docs-heading-anchor:hover,
+html:root h6 .docs-heading-anchor:visited {
+    color: var(--brand-heading, inherit);
+}
+html:root #documenter .docs-sidebar {
+    background-color: var(--brand-sidebar-bg, transparent);
+    border-right: 1px solid var(--brand-sidebar-border, transparent);
+}
+/* The theme leaves the sidebar scrollbar track near-white; tie it to the
+ * palette (standard scrollbar-color for Firefox, -webkit- pseudos for the
+ * WebKit engines the theme already styles). */
+html:root #documenter .docs-sidebar {
+    scrollbar-color: var(--brand-sidebar-border, currentColor) var(--brand-sidebar-bg, transparent);
+}
+html:root #documenter .docs-sidebar::-webkit-scrollbar-track,
+html:root #documenter .docs-sidebar ul.docs-menu::-webkit-scrollbar-track {
+    background-color: var(--brand-sidebar-bg, transparent);
+}
+html:root #documenter .docs-sidebar::-webkit-scrollbar-thumb,
+html:root #documenter .docs-sidebar ul.docs-menu::-webkit-scrollbar-thumb {
+    background-color: var(--brand-sidebar-border, currentColor);
+}
+html:root #documenter .docs-sidebar::-webkit-scrollbar-thumb:hover {
+    background-color: var(--brand-sidebar-link-hover, currentColor);
+}
+html:root #documenter .docs-sidebar .docs-package-name a {
+    color: var(--brand-heading, inherit);
+}
+html:root #documenter .docs-sidebar ul.docs-menu .tocitem {
+    color: var(--brand-sidebar-link, inherit);
+}
+/* The theme paints every nav row the default page background; make the rows
+ * transparent so the sidebar's own background shows through (the active
+ * block below still paints its highlight). */
+html:root #documenter .docs-sidebar ul.docs-menu li,
+html:root #documenter .docs-sidebar ul.docs-menu .tocitem {
+    background-color: transparent;
+}
+/* The theme's li.is-active rule outranks the transparent rule above, so
+ * the active section's li edges kept the default page background; paint
+ * the whole active block with the highlight. */
+html:root #documenter .docs-sidebar ul.docs-menu li.is-active {
+    background-color: var(--brand-sidebar-active-bg, transparent);
+}
+html:root #documenter .docs-sidebar ul.docs-menu a.tocitem:hover {
+    background-color: var(--brand-sidebar-hover-bg, transparent);
+    color: var(--brand-sidebar-link-hover, inherit);
+}
+html:root #documenter .docs-sidebar ul.docs-menu li.is-active .tocitem {
+    background-color: var(--brand-sidebar-active-bg, transparent);
+    color: var(--brand-sidebar-active-text, inherit);
+}
+html:root #documenter .docs-sidebar li.is-active ul.internal .tocitem:hover {
+    background-color: var(--brand-sidebar-active-bg, transparent);
+}
+html:root #documenter .docs-sidebar #documenter-search-query {
+    background-color: var(--brand-search-bg, transparent);
+    border-color: var(--brand-search-border, currentColor);
+    color: var(--brand-text, inherit);
+}
+html:root #documenter .docs-sidebar #documenter-search-query:focus {
+    border-color: var(--brand-link, currentColor);
+}
+html:root .docs-version-selector .button.is-static,
+html:root .docs-version-selector .select select {
+    background-color: var(--brand-sidebar-bg, transparent);
+    border-color: var(--brand-sidebar-border, currentColor);
+    color: var(--brand-muted, inherit);
+}
+html:root #documenter .docs-main header.docs-navbar {
+    background-color: var(--brand-navbar-bg, transparent);
+    border-bottom: 1px solid var(--brand-navbar-border, transparent);
+    /* The sidebar is 18rem while docs-main starts at a 20rem margin, and
+     * docs-main carries 1rem right padding; both leave strips of page
+     * background at the header's sides (invisible in the stock theme,
+     * where all surfaces are one color, but a visible seam here). Pull the
+     * header flush with the sidebar and the column edge. */
+    margin-left: -2rem;
+    margin-right: -1rem;
+    padding-left: 2rem;
+    padding-right: 1rem;
+}
+html:root .breadcrumb a {
+    color: var(--brand-breadcrumb, inherit);
+}
+html:root .breadcrumb li.is-active a {
+    color: var(--brand-text, inherit);
+}
+html:root code {
+    background-color: var(--brand-code-bg, transparent);
+    color: var(--brand-code-text, inherit);
+}
+html:root pre code {
+    background-color: transparent;
+    color: inherit;
+}
+html:root pre,
+html:root .hljs {
+    background-color: var(--brand-codeblock-bg, transparent) !important;
+    border: 1px solid var(--brand-codeblock-border, transparent);
+    color: var(--brand-text, inherit);
+}
+/* The theme's .content pre rule (a 2px stock border) outranks the base pre
+ * rule; pin it to the palette too. */
+html:root .content pre {
+    border: 1px solid var(--brand-codeblock-border, currentColor);
+    border-radius: 4px;
+}
+/* Sidebar structure borders (menu list, internal lists, the active block,
+ * the version selector) get a dedicated, clearly visible divider color; the
+ * footer rule and the search divider keep the soft border tone. */
+html:root #documenter .docs-sidebar ul.docs-menu,
+html:root #documenter .docs-sidebar ul.docs-menu > li li,
+html:root #documenter .docs-sidebar ul.docs-menu li.is-active,
+html:root #documenter .docs-sidebar ul.docs-menu ul.internal,
+html:root #documenter .docs-sidebar .docs-version-selector {
+    border-color: var(--brand-sidebar-structure, currentColor);
+}
+html:root #documenter .docs-main .docs-footer,
+html:root .search-divider {
+    border-color: var(--brand-sidebar-border, currentColor);
+}
+/* ---- DocumenterCodeBlocks line-number gutters ---- */
+/* The CodeBlocks sheets load after this one and define their own theme
+ * tokens; override them at higher specificity so the gutters follow the
+ * paper/espresso palette. --ln-bg must match the code block background. */
+html:root:not(.theme--documenter-dark):not([class*="theme--catppuccin"]) {
+    --ln-bg: #f6f1e4;
+    --ln-fg: #a08a66;
+    --ln-fg-hover: #b45309;
+    --ln-border: #e0d0ae;
+    --ln-hl-bg: rgba(233, 217, 187, 0.5);
+    --ln-hl-gutter-bg: #e9d9bb;
+    --ln-hl-fg: #7c2d12;
+}
+html.theme--documenter-dark:root {
+    --ln-bg: #1a130b;
+    --ln-fg: #8a7a5c;
+    --ln-fg-hover: #f0a23c;
+    --ln-border: #4a3820;
+    --ln-hl-bg: rgba(227, 179, 65, 0.12);
+    --ln-hl-gutter-bg: #3a2a16;
+    --ln-hl-fg: #e3b341;
+}
+html:root .content blockquote {
+    background-color: var(--brand-blockquote-bg, transparent);
+    border-left: 3px solid var(--brand-blockquote-border, currentColor);
+}
+html:root table td,
+html:root table th {
+    border-color: var(--brand-table-border, currentColor);
+}
+html:root table th {
+    background-color: var(--brand-table-head-bg, transparent);
+}
+html:root #documenter .docs-main .docs-footer {
+    color: var(--brand-footer, inherit);
+}
+html:root hr {
+    background-color: var(--brand-navbar-border, currentColor);
+}
+/* ---- Docstrings: the theme outlines each box with the stock border color,
+ * paints the summary bar with the stock surface, and tags the source links
+ * with the stock accent; warm all of it. ---- */
+html:root #documenter details.docstring {
+    border: 2px solid var(--brand-sidebar-border, currentColor);
+    background-color: transparent;
+}
+html:root #documenter details.docstring > summary {
+    background-color: var(--brand-sidebar-hover-bg, transparent);
+    border-bottom: 1px solid var(--brand-sidebar-border, currentColor);
+    color: var(--brand-text, inherit);
+}
+html:root #documenter details.docstring > section {
+    border-bottom: 1px solid var(--brand-sidebar-border, currentColor);
+}
+html:root #documenter details.docstring > summary::before {
+    color: var(--brand-link, inherit);
+}
+html:root #documenter details.docstring > section > a.docs-sourcelink,
+html:root #documenter details.docstring > section > a.docs-sourcelink.is-link {
+    background-color: var(--brand-sidebar-hover-bg, transparent);
+    border: 1px solid var(--brand-sidebar-border, currentColor);
+    color: var(--brand-sidebar-link, inherit);
+}
+/* Accent-colored chrome: links inside code, the code copy button, the
+ * heading permalink icons, and table borders. */
+html:root .content a code {
+    color: var(--brand-link, inherit);
+}
+html:root pre .copy-button:hover,
+html:root pre .copy-button:focus,
+html:root .link-icon:hover {
+    color: var(--brand-link, inherit);
+}
+html:root #documenter .content table td,
+html:root #documenter .content table th {
+    border-color: var(--brand-table-border, currentColor);
+}
+/* ---- Settings modal (theme picker) ---- */
+html:root .modal-card,
+html:root .modal-card-body {
+    background-color: var(--brand-sidebar-bg, transparent);
+    color: var(--brand-text, inherit);
+}
+html:root .modal-card-head {
+    background-color: var(--brand-navbar-bg, transparent);
+    border-bottom: 1px solid var(--brand-navbar-border, transparent);
+}
+html:root .modal-card-title,
+html:root #documenter-settings .label {
+    color: var(--brand-heading, inherit);
+}
+html:root #documenter-settings .select select {
+    background-color: var(--brand-search-bg, transparent);
+    border-color: var(--brand-search-border, currentColor);
+    color: var(--brand-text, inherit);
+}
+html:root #documenter-settings hr {
+    background-color: var(--brand-navbar-border, currentColor);
+}
+html:root #documenter-settings a {
+    color: var(--brand-link, inherit);
+}
+/* The theme paints the card's footer and its head/foot borders in its own
+ * greys (#282f2f, #343c3d, #5e6d6f in documenter-dark), which read green
+ * against this palette; the select's chevron, hover and focus borders take
+ * the theme's link color. Give every one of those the brand's own values. */
+html:root .modal-card-foot {
+    background-color: var(--brand-navbar-bg, transparent);
+    border-top: 1px solid var(--brand-navbar-border, transparent);
+}
+html:root .modal-card-head,
+html:root .modal-card-foot {
+    border-color: var(--brand-navbar-border, transparent);
+}
+html:root #documenter-settings .select:not(.is-multiple):not(.is-loading)::after,
+html:root #documenter-settings .select:not(.is-multiple):not(.is-loading):hover::after {
+    border-color: var(--brand-link, currentColor);
+}
+html:root #documenter-settings .select select:hover,
+html:root #documenter-settings .select select:active {
+    border-color: var(--brand-link, currentColor);
+}
+html:root #documenter-settings .select select:focus {
+    border-color: var(--brand-link, currentColor);
+    box-shadow: 0 0 0 0.125em var(--brand-focus-ring, transparent);
+}
+html:root #documenter-settings .select select option {
+    background-color: var(--brand-search-bg, transparent);
+    color: var(--brand-text, inherit);
+}
+html:root #documenter-settings .delete {
+    background-color: var(--brand-muted, currentColor);
+}
+html:root #documenter-settings .delete:hover,
+html:root #documenter-settings .delete:focus {
+    background-color: var(--brand-link-hover, currentColor);
+}
+html:root ::selection {
+    background-color: var(--brand-selection-bg, currentColor);
+    color: var(--brand-selection-text, inherit);
+}
+
+/* ---- Admonitions: warm accents keep the semantic color coding ---- */
+html:root .admonition {
+    background-color: var(--brand-admonition-bg, transparent);
+    border-left: 3px solid var(--brand-admonition-border, currentColor);
+    /* The theme's Bulma-style top border carries the variant color; warm it. */
+    border-top-color: var(--brand-admonition-border, currentColor);
+}
+/* The theme also sets the background on each variant class with higher
+ * specificity than the base rule (html.theme--x .admonition.is-info), so
+ * mirror the background there too. */
+html:root .admonition.is-default,
+html:root .admonition.is-info,
+html:root .admonition.is-success,
+html:root .admonition.is-warning,
+html:root .admonition.is-danger,
+html:root .admonition.is-compat,
+html:root .admonition.is-todo {
+    background-color: var(--brand-admonition-bg, transparent);
+}
+/* `border-color`, not `border-left-color` plus `border-top-color`. The theme sets the variant
+ * colour on ALL FOUR sides (`.admonition.is-success { border-color: #259a12 }`), so overriding two
+ * of them left the right and bottom edges in the theme's green while the rest of the box was warm.
+ * Specificity here is (0,3,1), the same as the dark theme's `html.theme--documenter-dark
+ * .admonition.is-success`, and a tie goes to the later stylesheet: this file loads after both
+ * themes, which is the same thing the background rule above relies on. */
+html:root .admonition.is-info {
+    border-color: var(--brand-admonition-info, currentColor);
+}
+html:root .admonition.is-success {
+    border-color: var(--brand-admonition-success, currentColor);
+}
+html:root .admonition.is-warning {
+    border-color: var(--brand-admonition-warning, currentColor);
+}
+html:root .admonition.is-danger {
+    border-color: var(--brand-admonition-danger, currentColor);
+}
+html:root .admonition.is-compat {
+    border-color: var(--brand-admonition-compat, currentColor);
+}
+html:root .admonition.is-todo {
+    border-color: var(--brand-admonition-todo, currentColor);
+}
+
+/* The header colour, per variant, and the variant is why these exist rather than the one unqualified
+ * rule that used to be here.
+ *
+ * THE DARK THEME QUALIFIES ITS HEADER RULE AND THE LIGHT THEME DOES NOT, which is what made this a
+ * dark-only bug: light says `.admonition.is-success > .admonition-header` at (0,3,0), which an
+ * unqualified `html:root .admonition > .admonition-header` at (0,3,1) already beats, while dark
+ * says `html.theme--documenter-dark .admonition.is-success > .admonition-header` at (0,4,1), which
+ * it does not. Naming the variant brings these to (0,4,1) as well, and the tie resolves here
+ * because this file is last. A `tip` on a dark page therefore stops printing its title in the
+ * theme's green. */
+html:root .admonition.is-default > .admonition-header,
+html:root .admonition.is-info > .admonition-header,
+html:root .admonition.is-success > .admonition-header,
+html:root .admonition.is-warning > .admonition-header,
+html:root .admonition.is-danger > .admonition-header,
+html:root .admonition.is-compat > .admonition-header,
+html:root .admonition.is-todo > .admonition-header,
+html:root .admonition > .admonition-header {
+    color: var(--brand-admonition-header, inherit);
+}
+
+/* ---- Form controls: the theme switcher and the search box ---- */
+/* The theme accents a focused control and the select's arrow with its own link colour, and that
+ * colour is a green (#1abc9c in documenter-dark, the catppuccin greens elsewhere). Unbranded, a
+ * focused theme switcher glows a colour nothing else on the page uses.
+ *
+ * Specificity matches the theme's (the `:not()`s count toward it) and this file loads last, so the
+ * ties resolve here, the same way the admonition rules above work. */
+html:root .select select:focus,
+html:root .select select:active,
+html:root .select select.is-focused,
+html:root .select select.is-active,
+html:root .input:focus,
+html:root .input:active,
+html:root .textarea:focus,
+html:root #documenter .docs-sidebar form.docs-search > input:focus {
+    border-color: var(--brand-link, currentColor);
+    box-shadow: 0 0 0 0.125em var(--brand-focus-ring, transparent);
+}
+/* The dropdown arrow, drawn as two rotated borders on `::after`. */
+html:root .select:not(.is-multiple):not(.is-loading)::after {
+    border-color: var(--brand-link, currentColor);
+}
+
+/* ---- Code tokens: a warm pass over the highlight.js palette ---- */
+html:root .hljs-comment {
+    color: var(--brand-muted, inherit);
+}
+html:root .hljs-keyword,
+html:root .hljs-attribute,
+html:root .hljs-selector-tag,
+html:root .hljs-doctag,
+html:root .hljs-name {
+    color: var(--brand-heading, inherit);
+}
+html:root .hljs-type,
+html:root .hljs-string,
+html:root .hljs-number,
+html:root .hljs-selector-id,
+html:root .hljs-selector-class,
+html:root .hljs-quote,
+html:root .hljs-template-tag,
+html:root .hljs-deletion {
+    color: var(--brand-code-text, inherit);
+}
+html:root .hljs-title,
+html:root .hljs-section {
+    color: var(--brand-link, inherit);
+}
+html:root .hljs-symbol,
+html:root .hljs-variable,
+html:root .hljs-template-variable,
+html:root .hljs-link,
+html:root .hljs-selector-attr,
+html:root .hljs-operator,
+html:root .hljs-selector-pseudo {
+    color: var(--brand-admonition-warning, inherit);
+}
+html:root .hljs-literal {
+    color: var(--brand-admonition-compat, inherit);
+}
+html:root .hljs-built_in,
+html:root .hljs-bullet,
+html:root .hljs-code,
+html:root .hljs-addition {
+    color: var(--brand-admonition-success, inherit);
+}
+html:root .hljs-meta {
+    color: var(--brand-admonition-info, inherit);
+}
+html:root .hljs-meta .hljs-string {
+    color: var(--brand-admonition-warning, inherit);
+}
+html:root .hljs-tag,
+html:root .hljs-punctuation {
+    color: var(--brand-muted, inherit);
+}
